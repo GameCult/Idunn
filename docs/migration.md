@@ -27,23 +27,30 @@ that path takes a command string.
 
 Migrate in dependency order, and migrate the authority's own dependencies last:
 
-1. **`ghostlight`** — first. It is actively developed, already has a build in
-   `/srv/ghostlight`, and its failure blast radius is one service.
-2. **`codex-connector`** — second. Same shape, and the census's dependency chain
-   puts it before Ghostlight's consumers.
-3. **`gjallar`**, **`heimdall`**, **`repixelizer`**, **`streampixels`** — the
+1. **`codex-connector`** — first. Single service, small blast radius, and it
+   already consumes the core stack from CultLib rather than forking it, so its
+   dependency story is the one closest to correct.
+2. **`gjallar`** — second. Quiet repository, one systemd unit, no compose
+   indirection. It is the cheapest proof that the systemd-transient workload
+   driver works end to end on this host.
+3. **`ghostlight`** — **blocked, not merely later.** A world-elaboration and
+   ontology rebuild is running in it right now: commits landed 2026-09-05 across
+   178 branches, with work parked on `codex/ghostlight-dungeon-mvp`. Adding
+   `deployment/idunn/recipe.toml` to that tree collides with live work. Migrate
+   it when the rebuild lands, and coordinate rather than assuming.
+4. **`heimdall`**, **`repixelizer`**, **`streampixels`** — the
    simple ones. `heimdall` and `repixelizer` currently restart via
    `docker compose`, so they are the first real test of a compose-shaped
    workload under the systemd-transient driver.
-4. **`bifrost-persona-feedback`** — the only target that carries signed-release
+5. **`bifrost-persona-feedback`** — the only target that carries signed-release
    authority. Migrate it *after* at least three ref-head targets work, because
    it is the one that exercises `selection = "signed-release"`.
-5. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
+6. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
    repository. Prove the binding-per-target model here.
-6. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
-7. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
+7. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
+8. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
    promotion, so migrating Odin changes the thing that gates the migrations.
-8. **Idunn itself** — the installed unit and binary. See *Cutting over the
+9. **Idunn itself** — the installed unit and binary. See *Cutting over the
    authority* below.
 
 ## Per target
