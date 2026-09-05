@@ -1382,6 +1382,10 @@ enum Command {
         state_store: PathBuf,
         command_id: Option<String>,
     },
+    Validate {
+        recipe: PathBuf,
+        binding: Option<PathBuf>,
+    },
 }
 
 pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
@@ -1404,7 +1408,39 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             state_store,
             command_id,
         } => status(&state_store, command_id.as_deref()),
+        Command::Validate { recipe, binding } => validate(&recipe, binding.as_deref()),
     }
+}
+
+/// Offline admission check for authoring. Reads a recipe, optionally reads a
+/// binding, and runs the same `admit` the daemon runs at load. It opens no
+/// store, contacts no host, and actuates nothing, so it is safe to run against
+/// a candidate binding before installing it.
+fn validate(recipe_path: &Path, binding_path: Option<&Path>) -> Result<()> {
+    let recipe_text = fs::read_to_string(recipe_path)
+        .with_context(|| format!("reading recipe {}", recipe_path.display()))?;
+    let recipe = crate::deployment::TargetDeclaration::parse(&recipe_text)
+        .with_context(|| format!("validating recipe {}", recipe_path.display()))?;
+    println!("recipe ok: {} declares target {}", recipe_path.display(), recipe.target);
+
+    let Some(binding_path) = binding_path else {
+        return Ok(());
+    };
+    let binding_text = fs::read_to_string(binding_path)
+        .with_context(|| format!("reading operator binding {}", binding_path.display()))?;
+    let binding = OperatorBinding::parse(&binding_text)
+        .with_context(|| format!("validating operator binding {}", binding_path.display()))?;
+    ensure!(
+        binding.target == recipe.target,
+        "operator binding targets {} but the recipe declares {}",
+        binding.target,
+        recipe.target
+    );
+    binding
+        .admit(&recipe)
+        .with_context(|| format!("admitting {} against its recipe", binding.target))?;
+    println!("binding ok: {} admits target {}", binding_path.display(), binding.target);
+    Ok(())
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Command> {
@@ -1414,6 +1450,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command> {
         "serve" => parse_serve(args),
         "up" => parse_up(args),
         "status" => parse_status(args),
+        "validate" => parse_validate(args),
         "--help" | "-h" | "help" => bail!(usage()),
         _ => bail!("unknown Idunn command {command:?}\n\n{}", usage()),
     }
@@ -1519,6 +1556,21 @@ fn parse_status(mut args: impl Iterator<Item = String>) -> Result<Command> {
         state_store,
         command_id,
     })
+}
+
+fn parse_validate(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut recipe = None;
+    let mut binding = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--recipe" => recipe = Some(path_value(&mut args, &argument)?),
+            "--binding" => binding = Some(path_value(&mut args, &argument)?),
+            "--help" | "-h" => bail!(usage()),
+            _ => bail!("unknown Idunn validate option {argument:?}"),
+        }
+    }
+    let recipe = recipe.ok_or_else(|| anyhow!("validate requires --recipe"))?;
+    Ok(Command::Validate { recipe, binding })
 }
 
 #[derive(Clone)]
@@ -5248,7 +5300,8 @@ fn usage() -> &'static str {
     "Idunn deployment, admission, and continuity control plane\n\n\
      idunn serve [runtime options]\n\
      idunn up <service|profile:name> [--state-store PATH] [--no-wait]\n\
-     idunn status [--state-store PATH] [--command ID]\n\n\
+     idunn status [--state-store PATH] [--command ID]\n\
+     idunn validate --recipe PATH [--binding PATH]\n\n\
      Recipes describe capability and process requirements. Idunn seals exact\n\
      source and artifacts, admits one incarnation, and delegates execution to\n\
      systemd and routing mechanics to the configured proxy."
@@ -5377,6 +5430,40 @@ mod tests {
             warming_presence_sha256: sha256_id(&[7]),
             lease_epoch: 1,
             issued_at_unix_millis: 100,
+        }
+    }
+
+    #[test]
+    fn validate_is_offline_and_declarative() {
+        // It must accept a recipe alone, accept a recipe plus a binding, and
+        // refuse to be handed anything executable. It opens no store and
+        // actuates nothing, which is what makes it safe to run on a candidate
+        // binding before that binding is installed.
+        let parsed = parse(
+            ["validate", "--recipe", "/tmp/recipe.toml"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            Command::Validate { binding: None, .. }
+        ));
+
+        assert!(
+            parse(
+                ["validate", "--recipe", "/r.toml", "--binding", "/b.toml"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_ok()
+        );
+        assert!(parse(["validate"].into_iter().map(str::to_owned)).is_err());
+        for rejected in [
+            vec!["validate", "--recipe", "/r.toml", "--deploy-command", "sh -c bad"],
+            vec!["validate", "--recipe", "/r.toml", "--state-store", "/s.cc"],
+        ] {
+            assert!(parse(rejected.into_iter().map(str::to_owned)).is_err());
         }
     }
 

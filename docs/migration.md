@@ -41,23 +41,45 @@ Migrate in dependency order, and migrate the authority's own dependencies last:
    resident to produce frames nothing rendered. The only reference to
    `gjallar.overview` in the estate is one Odin test file. Stopped and disabled;
    420 MB under `/srv/gjallar` is reclaimable.
-1. **`heimdall`**, **`repixelizer`**, **`streampixels`** — first, now. They
-   restart via `docker compose`, so they are the first real test of a
-   compose-shaped workload under the systemd-transient driver.
-2. **`ghostlight`** — **blocked, not merely later.** A world-elaboration and
+1. **`heimdall`** — first. It is the only target already shaped like a release:
+   `node /srv/heimdall/app/current/dist/src/index.js`, with a `current` symlink
+   over a built `dist/`. That is what `release_root` and the workload driver
+   expect, so it is the shortest distance between what runs and what a recipe
+   describes.
+2. **`repixelizer`** — second. Unit is `repixelizer-gui` (the target name and
+   the unit name differ). Runs `/srv/repixelizer/.venv/bin/python` against a
+   source checkout at `/srv/repixelizer/app`, so the recipe needs a real build
+   step producing an artifact rather than a checkout to point at.
+3. **`streampixels`** — third, and the hardest of the three despite looking
+   simple. It is **two units** under one target name, `streampixels-service` and
+   `streampixels-web`, and the service one runs
+   `node node_modules/tsx/dist/cli.mjs apps/service/src/index.ts` — raw
+   TypeScript transpiled at startup, from a checkout, with no build artifact to
+   seal. Idunn's model is sealed exact source *and* artifacts; this target has
+   to grow a build before it can have a recipe.
+
+   **Their continuity is already broken, and has been.** The legacy actuator
+   restarts all three with
+   `docker compose -f /srv/compose/yggdrasil-apps.yaml restart <name>`, and that
+   file **does not exist** — `/srv/compose` holds only `odin`, `voidbot` and
+   `voidbot-retrieval`. The path is guarded by `require_root_owned_regular_path`,
+   so every restart of these three has been failing at the guard. They are
+   running only because nothing has asked them to restart. This is the
+   difference between a supervised service and a service that happens to be up.
+4. **`ghostlight`** — **blocked, not merely later.** A world-elaboration and
    ontology rebuild is running in it right now: commits landed 2026-09-05 across
    178 branches, with work parked on `codex/ghostlight-dungeon-mvp`. Adding
    `deployment/idunn/recipe.toml` to that tree collides with live work. Migrate
    it when the rebuild lands, and coordinate rather than assuming.
-3. **`bifrost-persona-feedback`** — the only target that carries signed-release
+5. **`bifrost-persona-feedback`** — the only target that carries signed-release
    authority. Migrate it *after* at least three ref-head targets work, because
    it is the one that exercises `selection = "signed-release"`.
-4. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
+6. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
    repository. Prove the binding-per-target model here.
-5. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
-6. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
+7. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
+8. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
    promotion, so migrating Odin changes the thing that gates the migrations.
-7. **Idunn itself** — the installed unit and binary. See *Cutting over the
+9. **Idunn itself** — the installed unit and binary. See *Cutting over the
    authority* below.
 
 ## Per target
