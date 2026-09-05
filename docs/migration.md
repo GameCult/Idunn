@@ -41,22 +41,14 @@ Migrate in dependency order, and migrate the authority's own dependencies last:
    resident to produce frames nothing rendered. The only reference to
    `gjallar.overview` in the estate is one Odin test file. Stopped and disabled;
    420 MB under `/srv/gjallar` is reclaimable.
-1. **`heimdall`** — first. It is the only target already shaped like a release:
-   `node /srv/heimdall/app/current/dist/src/index.js`, with a `current` symlink
-   over a built `dist/`. That is what `release_root` and the workload driver
-   expect, so it is the shortest distance between what runs and what a recipe
-   describes.
-2. **`repixelizer`** — second. Unit is `repixelizer-gui` (the target name and
-   the unit name differ). Runs `/srv/repixelizer/.venv/bin/python` against a
-   source checkout at `/srv/repixelizer/app`, so the recipe needs a real build
-   step producing an artifact rather than a checkout to point at.
-3. **`streampixels`** — third, and the hardest of the three despite looking
-   simple. It is **two units** under one target name, `streampixels-service` and
-   `streampixels-web`, and the service one runs
-   `node node_modules/tsx/dist/cli.mjs apps/service/src/index.ts` — raw
-   TypeScript transpiled at startup, from a checkout, with no build artifact to
-   seal. Idunn's model is sealed exact source *and* artifacts; this target has
-   to grow a build before it can have a recipe.
+1. **`streampixels`** — first of the three. See *The first three targets*: it
+   already has real build scripts and no external dependencies, but must split
+   into two Idunn targets and stop running TypeScript through `tsx`.
+2. **`repixelizer`** — second. No CultLib dependency at all; needs an artifact
+   story for Python before a recipe means anything. Unit is `repixelizer-gui`.
+3. **`heimdall`** — third, not first. Most release-shaped, but takes CultLib
+   from a sibling checkout via `file:../CultLib`, so it needs a `vendor/CultLib`
+   gitlink before its source can be sealed.
 
    **Their continuity is already broken, and has been.** The legacy actuator
    restarts all three with
@@ -107,11 +99,20 @@ reaches for host authority is rejected by `admit()` rather than honoured.
 variants — eight in total. So recipe authoring is *not* the bottleneck for those
 targets; the missing halves are the operator bindings and the daemon cutover.
 
-Read `CodexConnector/deployment/idunn/recipe.toml` before writing a new one. It
-is the richest worked example — it carries `[[external_inputs]]` pinned by
-sha256, a non-Rust runner, and a typed credential-store schema — and since that
-target is being retired rather than migrated, it is a reference with no live
-claim on it. `Odin`'s is the minimal example.
+`Odin/deployment/idunn/recipe.toml` is the reference. It is minimal, and
+`idunn validate` accepts it.
+
+**Do not copy `CodexConnector`'s.** It is the richest-looking example and it is
+**stale**: it declares `required_gitlinks = ["vendor/cultcache-rs",
+"vendor/cultnet-rs"]`, but that repository has no `.gitmodules`, no `vendor/`,
+and now takes CultLib as a pinned cargo git dependency. The recipe describes a
+repository shape that stopped existing.
+
+That drift is the general hazard, not a CodexConnector quirk: a recipe lives in
+the target's repo and nothing re-checks it when the repo changes underneath.
+`idunn validate --recipe` catches malformed recipes; it does not yet catch a
+recipe whose declared gitlinks are absent from the tree. Run it in each target's
+CI so drift fails at the repo, not on the host.
 
 ### 3. Write the binding, on the host
 
@@ -162,6 +163,80 @@ leaves a dangling `\` continuation, and repairing that by hand is how you
 silently drop a `*` from a neighbouring grant and break a live target's deploy
 path — as happened here on 2026-09-06 to `deploy streampixels`, caught by
 diffing and not by reading.
+
+## The first three targets, and what each needs first
+
+Surveyed 2026-09-06. **None of the three can take a recipe as they stand.** Each
+needs a change in its own repository first, and the changes are not the same
+shape, so they are not one piece of work. Ordered by how much has to happen.
+
+### `streampixels` — split one target into two, then use the build it already has
+
+Both apps already have build scripts: `apps/service` runs `tsc -p
+tsconfig.json`, `apps/web` runs `next build`, and the root has `pnpm -r build`.
+No submodules, no `file:` dependencies. The obstacle is not the build.
+
+- **The service does not use its own build.** The unit runs
+  `node node_modules/tsx/dist/cli.mjs apps/service/src/index.ts` — TypeScript
+  transpiled at startup from a checkout at `/srv/streampixels/app`. Idunn seals
+  artifacts; there is nothing sealed about a source tree plus a transpiler. Point
+  the unit at the `tsc` output.
+- **One legacy target is two Idunn targets.** A recipe declares a single
+  `[service]`, and a binding a single `unit_prefix`. `streampixels-service` and
+  `streampixels-web` have different environments, different ports, and an
+  ordering dependency (`web` is `After=` `service`). They were one target only
+  because the shell actuator restarted both with one `docker compose` line.
+  Split them; the dependency belongs in the recipe's `[[provides]]`/dependency
+  surface, not in a shared name.
+- Runtime artifact question to settle: a Node service's release is `dist/` plus
+  its production `node_modules`, unless it is bundled. Decide which before
+  writing `[[artifacts]]`.
+
+### `repixelizer` — needs an artifact story for Python
+
+Simplest dependency story of the three: `pyproject.toml`, no CultLib dependency,
+no submodules. But it runs `/srv/repixelizer/.venv/bin/python
+/srv/repixelizer/app/scripts/run_gui.py` — an interpreter from a venv against a
+checkout, so there is no artifact to seal and no revision observable from the
+process. It needs a build step producing something exact (a wheel, or a venv
+materialized into the release root) before a recipe means anything.
+
+Note also the name mismatch: the target is `repixelizer`, the unit is
+`repixelizer-gui`.
+
+### `heimdall` — needs CultLib as a gitlink
+
+Ironically the most release-shaped of the three and the one needing the deepest
+change. It already deploys to `/srv/heimdall/app/releases/<sha>/app` behind a
+`current` symlink, which is exactly what `release_root` expects, and it builds
+with `tsc` to `dist/`.
+
+But its `package.json` takes CultLib as
+`"cultcache-ts": "file:../CultLib/packages/cultcache-ts"` — a **sibling checkout
+outside the repository**. A sealed source cannot reach it, and no revision of
+Heimdall pins which CultLib was used. The current deploy manifest works around
+this by cloning CultLib separately and hardcoding `cultlib_commit=5cefa0db...`
+in shell, which is precisely the untyped authority the recipe model exists to
+replace.
+
+The estate's answer is a vendor submodule: Ghostlight has `vendor/eve`, and
+`required_gitlinks` plus the binding's `[repository.gitlinks]` is how a recipe
+declares one. Heimdall needs `vendor/CultLib` as a gitlink and its `file:`
+dependencies repointed at it. Then the CultLib revision is pinned by the
+Heimdall commit, and the seal covers both.
+
+Do this one last of the three, and expect it to be a real change to how Heimdall
+builds rather than a deployment edit.
+
+### What this survey says generally
+
+Every one of these targets runs from a checkout or an unpinned sibling, and each
+was fine as long as a shell script did the deploying, because a shell script can
+just `cd` somewhere. The recipe model asks a question the old one never did —
+*what exactly is this release, and can you name it?* — and for three of eleven
+targets the honest answer today is no. That is the migration's real cost, and it
+is worth paying: it is the same question as "is everyone on main and current
+with each other", asked where it can be enforced.
 
 ## Why retirement forces the migration
 
