@@ -34,27 +34,30 @@ Migrate in dependency order, and migrate the authority's own dependencies last:
    `401 ... token_expired` against `chatgpt.com/backend-api/codex/models`, with
    no established connections on its port. Migrating it would mean writing a
    binding for a corpse. See *Retiring Codex* below.
-1. **`gjallar`** — first. Quiet repository, one systemd unit, no compose
-   indirection. It is the cheapest proof that the systemd-transient workload
-   driver works end to end on this host.
+0b. **`gjallar` — do not migrate. Retired 2026-09-06.** Had a brief useful life
+   on Nightwing's framebuffer, then broke and was never fixed. The Yggdrasil
+   incarnation ran `--headless --refresh-hz 2` for eleven days: a compositor
+   with no display, recomposing twice a second, 55 minutes of CPU and 125 MB
+   resident to produce frames nothing rendered. The only reference to
+   `gjallar.overview` in the estate is one Odin test file. Stopped and disabled;
+   420 MB under `/srv/gjallar` is reclaimable.
+1. **`heimdall`**, **`repixelizer`**, **`streampixels`** — first, now. They
+   restart via `docker compose`, so they are the first real test of a
+   compose-shaped workload under the systemd-transient driver.
 2. **`ghostlight`** — **blocked, not merely later.** A world-elaboration and
    ontology rebuild is running in it right now: commits landed 2026-09-05 across
    178 branches, with work parked on `codex/ghostlight-dungeon-mvp`. Adding
    `deployment/idunn/recipe.toml` to that tree collides with live work. Migrate
    it when the rebuild lands, and coordinate rather than assuming.
-3. **`heimdall`**, **`repixelizer`**, **`streampixels`** — the
-   simple ones. `heimdall` and `repixelizer` currently restart via
-   `docker compose`, so they are the first real test of a compose-shaped
-   workload under the systemd-transient driver.
-4. **`bifrost-persona-feedback`** — the only target that carries signed-release
+3. **`bifrost-persona-feedback`** — the only target that carries signed-release
    authority. Migrate it *after* at least three ref-head targets work, because
    it is the one that exercises `selection = "signed-release"`.
-5. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
+4. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
    repository. Prove the binding-per-target model here.
-6. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
-7. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
+5. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
+6. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
    promotion, so migrating Odin changes the thing that gates the migrations.
-8. **Idunn itself** — the installed unit and binary. See *Cutting over the
+7. **Idunn itself** — the installed unit and binary. See *Cutting over the
    authority* below.
 
 ## Per target
@@ -130,6 +133,49 @@ trust anchor.
 Remove its line from the sudoers `Cmnd_Alias`, then its `case` arm, then its
 manifest under `/srv/odin/deploy-manifests/`. Sudoers first: the grant is the
 privileged half and must not outlive its consumer.
+
+Validate with `visudo -c -f` **before** installing, and diff the resulting grant
+set against a backup afterwards. Removing the last entry from a `Cmnd_Alias`
+leaves a dangling `\` continuation, and repairing that by hand is how you
+silently drop a `*` from a neighbouring grant and break a live target's deploy
+path — as happened here on 2026-09-06 to `deploy streampixels`, caught by
+diffing and not by reading.
+
+## Why retirement forces the migration
+
+The previous generation **cannot express that a target is retired.** Its target
+list is compiled into the binary; `idunn --help` on the installed daemon offers
+`restart` and `redeploy` and no way to remove a daemon from supervision. So when
+`codex-connector` was stopped on 2026-09-05, the supervisor immediately began
+deciding:
+
+```
+Idunn decision for yggdrasil-codex-connector: restart
+  (health is failed; restart authority is available)
+```
+
+— eighty log lines in ten minutes, against a service deliberately retired. The
+only brake that generation has is the **deployment** brake, and doctrine forbids
+using it here: a deployment brake must not suspend continuity. Retiring a target
+means suspending continuity *for that target only*, which is exactly what the
+current generation's **lifecycle brake** is, and exactly what the old one lacks.
+
+Until cutover, the available mitigation is to remove the sudo grant, so the
+restart attempts fail at the privilege boundary rather than half-succeeding.
+That is a compensator, not an owner, and it is worth noticing that the estate
+found the argument for its own migration by trying to throw something away.
+
+Gjallar, by contrast, was handled correctly, because its failure classified as
+`dependency-unavailable` rather than `failed`:
+
+```
+Idunn decision for yggdrasil-gjallar: alarm
+  (local restart/deploy is not the owner of this failure)
+```
+
+Alarm, not resurrection. The distinction the old generation *can* draw is
+between failures it owns and failures it does not — not between a target that
+is broken and a target that is finished.
 
 ## Cutting over the authority
 

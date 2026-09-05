@@ -1,6 +1,9 @@
+# Narrow root actuator grant for the Idunn Yggdrasil deployment/continuity path.
+# One line per live target. codex-connector and gjallar were retired 2026-09-06;
+# their grants are removed here first, because the privileged half of a retired
+# target must not outlive its consumer.
 Cmnd_Alias IDUNN_YGGDRASIL_DEPLOY = \
   /usr/local/libexec/idunn-yggdrasil deploy odin *, \
-  /usr/local/libexec/idunn-yggdrasil deploy codex-connector *, \
   /usr/local/libexec/idunn-yggdrasil deploy ghostlight *, \
   /usr/local/libexec/idunn-yggdrasil deploy voidbot *, \
   /usr/local/libexec/idunn-yggdrasil deploy heimdall *, \
@@ -8,17 +11,14 @@ Cmnd_Alias IDUNN_YGGDRASIL_DEPLOY = \
   /usr/local/libexec/idunn-yggdrasil deploy epiphany *, \
   /usr/local/libexec/idunn-yggdrasil deploy bifrost-persona-feedback *, \
   /usr/local/libexec/idunn-yggdrasil deploy repixelizer *, \
-  /usr/local/libexec/idunn-yggdrasil deploy streampixels *, \
-  /usr/local/libexec/idunn-yggdrasil deploy gjallar *
+  /usr/local/libexec/idunn-yggdrasil deploy streampixels *
 Cmnd_Alias IDUNN_YGGDRASIL_RESTART = \
   /usr/local/libexec/idunn-yggdrasil restart odin, \
-  /usr/local/libexec/idunn-yggdrasil restart codex-connector, \
   /usr/local/libexec/idunn-yggdrasil restart ghostlight, \
   /usr/local/libexec/idunn-yggdrasil restart voidbot, \
   /usr/local/libexec/idunn-yggdrasil restart heimdall, \
   /usr/local/libexec/idunn-yggdrasil restart epiphany, \
   /usr/local/libexec/idunn-yggdrasil restart repixelizer, \
-  /usr/local/libexec/idunn-yggdrasil restart streampixels, \
-  /usr/local/libexec/idunn-yggdrasil restart gjallar
+  /usr/local/libexec/idunn-yggdrasil restart streampixels
 
 idunn ALL=(root) NOPASSWD: IDUNN_YGGDRASIL_DEPLOY, IDUNN_YGGDRASIL_RESTART
