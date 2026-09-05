@@ -11,7 +11,7 @@ decision about which source, release, runtime identity, process write lease, and
 route membership are authoritative.
 
 The detailed contract is
-[`idunn-deployment-authority.md`](idunn-deployment-authority.md).
+[`deployment-authority.md`](deployment-authority.md).
 
 ## Authority map
 

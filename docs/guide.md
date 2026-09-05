@@ -1,10 +1,19 @@
 # Idunn
 
-> **Note.** This guide predates Idunn's extraction from Odin on 2026-09-05.
-> Build and run commands have been updated from Odin's npm wrappers to direct
-> cargo invocations, and paths on the lost `E:` drive have been generalised.
-> Anything else describing Odin's tree may still be stale; the README is
-> current, this document is the deeper reference.
+> **This guide describes the previous generation and is kept for the migration.**
+>
+> It documents the keepalive daemon driven by `--swarm-profile`, hardcoded swarm
+> targets, and a root shell actuator. Commit `330e4cd` ("Rebuild Idunn around
+> typed authority ports") removed that machinery, and the current binary rejects
+> every command line in this document — `idunn --swarm-profile ...` returns
+> `unknown Idunn command`.
+>
+> That generation is still what runs on yggdrasil, which is why this is here
+> rather than deleted. For the current model read the [README](../README.md);
+> for the route from one to the other read [migration.md](migration.md).
+>
+> Its durable content — what a daemon must publish, and why keepalive is not
+> deployment — remains true. Its commands do not.
 
 Idunn is the keepalive daemon for the Odin swarm.
 
