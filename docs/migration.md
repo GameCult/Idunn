@@ -27,30 +27,34 @@ that path takes a command string.
 
 Migrate in dependency order, and migrate the authority's own dependencies last:
 
-1. **`codex-connector`** — first. Single service, small blast radius, and it
-   already consumes the core stack from CultLib rather than forking it, so its
-   dependency story is the one closest to correct.
-2. **`gjallar`** — second. Quiet repository, one systemd unit, no compose
+0. **`codex-connector` — do not migrate. Retire it.** The operator is not
+   returning to Codex, so a credential-isolated transport for Codex subscription
+   inference has nothing left to isolate. It is already dead in practice: the
+   deployed daemon has been failing every three minutes with
+   `401 ... token_expired` against `chatgpt.com/backend-api/codex/models`, with
+   no established connections on its port. Migrating it would mean writing a
+   binding for a corpse. See *Retiring Codex* below.
+1. **`gjallar`** — first. Quiet repository, one systemd unit, no compose
    indirection. It is the cheapest proof that the systemd-transient workload
    driver works end to end on this host.
-3. **`ghostlight`** — **blocked, not merely later.** A world-elaboration and
+2. **`ghostlight`** — **blocked, not merely later.** A world-elaboration and
    ontology rebuild is running in it right now: commits landed 2026-09-05 across
    178 branches, with work parked on `codex/ghostlight-dungeon-mvp`. Adding
    `deployment/idunn/recipe.toml` to that tree collides with live work. Migrate
    it when the rebuild lands, and coordinate rather than assuming.
-4. **`heimdall`**, **`repixelizer`**, **`streampixels`** — the
+3. **`heimdall`**, **`repixelizer`**, **`streampixels`** — the
    simple ones. `heimdall` and `repixelizer` currently restart via
    `docker compose`, so they are the first real test of a compose-shaped
    workload under the systemd-transient driver.
-5. **`bifrost-persona-feedback`** — the only target that carries signed-release
+4. **`bifrost-persona-feedback`** — the only target that carries signed-release
    authority. Migrate it *after* at least three ref-head targets work, because
    it is the one that exercises `selection = "signed-release"`.
-6. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
+5. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
    repository. Prove the binding-per-target model here.
-7. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
-8. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
+6. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
+7. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
    promotion, so migrating Odin changes the thing that gates the migrations.
-9. **Idunn itself** — the installed unit and binary. See *Cutting over the
+8. **Idunn itself** — the installed unit and binary. See *Cutting over the
    authority* below.
 
 ## Per target
@@ -73,8 +77,16 @@ contract, state slots, provides. It must name no host path, no image, and no
 privilege; `TargetDeclaration::parse` rejects unknown fields, and a recipe that
 reaches for host authority is rejected by `admit()` rather than honoured.
 
-`Odin/deployment/idunn/recipe.toml` is the only worked example in the estate.
-Read it before writing the second one.
+**Several targets already have one.** Recipes exist in `Odin`, `Ghostlight`,
+`Ghostlight-interruptfu`, `CodexConnector`, and the four `Ghostlight-worlds`
+variants — eight in total. So recipe authoring is *not* the bottleneck for those
+targets; the missing halves are the operator bindings and the daemon cutover.
+
+Read `CodexConnector/deployment/idunn/recipe.toml` before writing a new one. It
+is the richest worked example — it carries `[[external_inputs]]` pinned by
+sha256, a non-Rust runner, and a typed credential-store schema — and since that
+target is being retired rather than migrated, it is a reference with no live
+claim on it. `Odin`'s is the minimal example.
 
 ### 3. Write the binding, on the host
 
@@ -136,6 +148,46 @@ Idunn last, and not by deploying Idunn with Idunn.
 **The window matters.** Between step 4's stop and a verified step 5, nothing is
 supervising the swarm. Do it with the targets already migrated, so the new
 daemon has bindings to load and the window is short.
+
+## Retiring Codex
+
+Decided by the operator 2026-09-05: the estate is not going back to Codex.
+Generic token capacity comes from elsewhere, and anything *served* to third
+parties needs an EU supplier with a DPA — `together.ai` is the current
+direction. That makes the Codex integration a maintenance liability with no
+consumer, and it is deep enough to be worth naming before anyone starts pulling.
+
+**Live state.** `codex-connector.service` on yggdrasil is `active (running)` and
+has been failing `401 token_expired` on a three-minute loop against
+`https://chatgpt.com/backend-api/codex/models`. Nothing is connected to port
+`4103`. It should be stopped and disabled first — it is generating repeated
+failed authentications against a third party from the host's address, which is
+the one part of this that is actively worth stopping today rather than planning.
+
+**Blast radius**, in the order it should come out:
+
+| Surface | What it is |
+|---|---|
+| `codex-connector.service` on yggdrasil | running, 401-looping, no consumers |
+| the sudoers `deploy`/`restart codex-connector` grants | privileged half — remove before the script |
+| `GameCult/CodexConnector` | the whole repo; a transport for a provider we no longer buy |
+| `Epiphany/epiphany-openai-codex-spine` | an OpenAI/Codex adapter crate |
+| `Epiphany/epiphany-codex-bridge` + vendored `app-server` | Codex JSON-RPC protocol edge |
+| `VoidBot` config | `turnCodexModel`, `mindCodexModel`, `imaginationCodexModel`, `codexModelReasoningEffort` and their model lists |
+| `~/.codex/AGENTS.md` and per-repo `AGENTS.md` | doctrine maintained for a second agent runtime |
+
+**Do not simply delete the Epiphany and Ghostlight side.** Those are minds that
+need *an* inference transport; CodexConnector was one implementation of that
+seam, and the seam is worth keeping. The correct shape is to replace the
+provider behind it, not to remove the boundary and let each mind grow its own
+HTTP client — that would be re-forking the wire law CodexConnector's README
+exists to prevent. Retire the Codex-specific backend; decide deliberately
+whether the transport daemon is rebuilt against the new supplier or whether
+CultNet already covers it.
+
+Sequencing note: `epiphany` and `epiphany-capstone-17` are on this migration
+list. Do not write bindings for them until the provider question is settled —
+their deployment shape depends on whether they still front a transport daemon.
 
 ## What is not carried forward
 
