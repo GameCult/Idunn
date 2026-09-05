@@ -157,12 +157,24 @@ parties needs an EU supplier with a DPA — `together.ai` is the current
 direction. That makes the Codex integration a maintenance liability with no
 consumer, and it is deep enough to be worth naming before anyone starts pulling.
 
-**Live state.** `codex-connector.service` on yggdrasil is `active (running)` and
-has been failing `401 token_expired` on a three-minute loop against
-`https://chatgpt.com/backend-api/codex/models`. Nothing is connected to port
-`4103`. It should be stopped and disabled first — it is generating repeated
-failed authentications against a third party from the host's address, which is
-the one part of this that is actively worth stopping today rather than planning.
+**Live state.** `codex-connector.service` was `active (running)` and failing
+`401 token_expired` on a three-minute loop against
+`https://chatgpt.com/backend-api/codex/models`, with nothing connected to port
+`4103`. **Stopped and disabled 2026-09-05**; the port is closed and the loop has
+ended. It had consumed 1min 30s of CPU and peaked at 1.2 GB doing nothing but
+retrying expired credentials.
+
+Two loose ends that stop left behind:
+
+- `ghostlight-dungeon.service` carries
+  `Environment=GHOSTLIGHT_MODEL_CONNECTOR=127.0.0.1:4103`, which now points at
+  nothing. It had logged nothing for 24 hours before the stop, so this broke
+  no working path — but it is where the provider replacement lands first.
+- `epiphany-model-connector.service` binds **the same port** with
+  `--model gpt-5.4 --codex-home ...`. It is inactive and disabled. Two Codex
+  connectors were competing for one endpoint, which is duplicate authority of
+  exactly the kind the census was looking for; both are now off, and only one
+  of them has a repository.
 
 **Blast radius**, in the order it should come out:
 
