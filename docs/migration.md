@@ -41,14 +41,21 @@ Migrate in dependency order, and migrate the authority's own dependencies last:
    resident to produce frames nothing rendered. The only reference to
    `gjallar.overview` in the estate is one Odin test file. Stopped and disabled;
    420 MB under `/srv/gjallar` is reclaimable.
-1. **`streampixels`** — first of the three. See *The first three targets*: it
-   already has real build scripts and no external dependencies, but must split
-   into two Idunn targets and stop running TypeScript through `tsx`.
-2. **`repixelizer`** — second. No CultLib dependency at all; needs an artifact
-   story for Python before a recipe means anything. Unit is `repixelizer-gui`.
-3. **`heimdall`** — third, not first. Most release-shaped, but takes CultLib
-   from a sibling checkout via `file:../CultLib`, so it needs a `vendor/CultLib`
-   gitlink before its source can be sealed.
+1. **`heimdall`** — first. Most release-shaped of what remains, and its one
+   prerequisite follows an existing estate pattern: it takes CultLib from a
+   sibling checkout via `file:../CultLib`, so it needs a `vendor/CultLib`
+   gitlink before its source can be sealed. See *The first three targets*.
+2. **`repixelizer`** — second. No CultLib dependency at all, but runs a venv
+   interpreter against a checkout, so it needs an artifact story for Python
+   before a recipe means anything. Unit is `repixelizer-gui`.
+3. **`streampixels`** — **blocked, like Ghostlight.** The product has changed
+   direction: 2D animation could not express what the spec required, so it is
+   moving to a 3D-rendered overlay, and whether that runs in WebGL or needs
+   rendering infrastructure is undecided. Its deployment shape depends on that
+   answer — a WebGL overlay is the current two-unit shape, rendering
+   infrastructure is a new target class with hardware requirements. Do not
+   migrate it, and do not "fix" the 2D animation path: it is being replaced, not
+   repaired. There is a paying client, so coordinate rather than assume.
 
    **Their continuity is already broken, and has been.** The legacy actuator
    restarts all three with
@@ -170,7 +177,23 @@ Surveyed 2026-09-06. **None of the three can take a recipe as they stand.** Each
 needs a change in its own repository first, and the changes are not the same
 shape, so they are not one piece of work. Ordered by how much has to happen.
 
-### `streampixels` — split one target into two, then use the build it already has
+### `streampixels` — blocked on a product redirection, do not migrate
+
+**Superseded 2026-09-06.** The findings below were surveyed before learning the
+product is changing direction. 2D animation could not express what the spec
+required; StreamPixels is moving to a **3D-rendered overlay**, and whether that
+is achievable in WebGL or needs dedicated rendering infrastructure is still
+open. The client funding it reportedly cannot absorb rendering overhead, which
+is what makes the WebGL question load-bearing rather than a preference.
+
+Its deployment shape is downstream of that decision. A WebGL overlay keeps
+roughly the current two-unit shape; rendering infrastructure is a new target
+class with hardware requirements Idunn has never expressed on this host. Writing
+a binding now would pin the shape being replaced.
+
+Keep the survey below only as a record of the current deployment's defects, and
+do not act on it — in particular, do not repair the `tsx`-at-runtime path. It is
+being replaced, not fixed.
 
 Both apps already have build scripts: `apps/service` runs `tsc -p
 tsconfig.json`, `apps/web` runs `next build`, and the root has `pnpm -r build`.
