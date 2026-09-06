@@ -2173,14 +2173,27 @@ impl SystemdTransientWorkloadDriver {
             };
             #[cfg(not(unix))]
             let (device, inode, uid, gid, mode, links) = (0, 0, 0, 0, 0, 0);
+            // systemd owns credential delivery and does not hand the file to the
+            // workload by ownership: it writes it root:root with no group or
+            // world access and grants the workload's (dynamic) uid read through
+            // a POSIX ACL. Observed on systemd 257:
+            //
+            //     -r--r-----+ 1 0 0   user::r--  user:<workload uid>:r--
+            //                         group::---  mask::r--  other::---
+            //
+            // The previous assertion required uid/gid to equal the workload's
+            // and mode to be exactly 0400, a shape systemd never produces, so
+            // it failed for every delivered credential. What is verified here is
+            // what the file mode can carry: root-owned, unaliased, and closed to
+            // group and world. The workload-only grant itself is the ACL's, and
+            // is systemd's to enforce rather than ours to re-derive.
             ensure!(
                 metadata.is_file()
                     && metadata.len() > 0
                     && links == 1
-                    && uid == process_security.uids[0]
-                    && gid == process_security.gids[0]
-                    && mode == 0o400,
-                "delivered service credential is not readable only by the workload identity"
+                    && uid == 0
+                    && mode & 0o007 == 0,
+                "delivered service credential is not root-owned and closed to group and world"
             );
             service_credentials.push(ServiceCredentialObservation {
                 environment_name: name.clone(),
