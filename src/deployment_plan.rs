@@ -889,7 +889,13 @@ fn endpoint_scheme(transport: ServiceTransport) -> Result<&'static str> {
     match transport {
         ServiceTransport::Http => Ok("http"),
         ServiceTransport::Tcp => Ok("tcp"),
-        ServiceTransport::Rudp | ServiceTransport::Private => {
+        ServiceTransport::Rudp => Ok("rudp"),
+        // Private transport is the only one with no route: `route_required` is
+        // false for it, so a private target never reaches this function. RUDP
+        // does route -- `admit` accepts (route_required, Rudp, nginx-stream-udp)
+        // against an `rudp://` stable endpoint, and the nginx driver already
+        // writes `listen ... udp reuseport` for it.
+        ServiceTransport::Private => {
             bail!("service transport has no stable route scheme")
         }
     }
@@ -1482,6 +1488,37 @@ nodes = ["yggdrasil"]
         let mut invalid_release = release;
         invalid_release.artifacts[0].size_bytes += 1;
         assert!(invalid_release.expected_projection(&plan).is_err());
+    }
+
+    #[test]
+    fn routed_rudp_target_projects_an_rudp_route() {
+        // Odin is the only routed RUDP target, and it is the bootstrap target:
+        // if this projection cannot be built, nothing else can ever warm.
+        let recipe = RECIPE.replace("transport = \"http\"", "transport = \"rudp\"");
+        let binding = BINDING
+            .replace("nginx-stream-tcp", "nginx-stream-udp")
+            .replace("http://127.0.0.1:17999", "rudp://127.0.0.1:17999");
+        let plan = compile_deployment_plan(
+            recipe.as_bytes(),
+            binding.as_bytes(),
+            source(&recipe),
+            "service-incarnation-rudp",
+            Some(18003),
+            111,
+            &[ready_odin_provider("odin", "odin-yggdrasil", 1)],
+        )
+        .unwrap();
+        let release = SealedRelease::new(
+            &plan,
+            vec![artifact_receipt()],
+            vec![external_input_receipt()],
+            120,
+        )
+        .unwrap();
+        let route = release.expected_projection(&plan).unwrap().route.unwrap();
+        assert_eq!(route.transport, "rudp");
+        assert_eq!(route.stable_endpoint, "rudp://127.0.0.1:17999");
+        assert_eq!(route.candidate_endpoint, "rudp://127.0.0.1:18003");
     }
 
     #[test]
