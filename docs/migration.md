@@ -395,6 +395,17 @@ binding cannot widen access, and each one cost a failed deployment to discover:
 | runner network | must exist | the binding names a docker network; the operator provisions it |
 | runtime presence identity | `root:root`, mode `0400`, `nlink` 1 | passed to the workload as a parent-only descriptor, so it must be unwritable and unaliased -- a second hard link would be a second path to the signing key |
 
+**Secrets reach the workload as systemd credentials, not as readable files.**
+The workload runs under `DynamicUser`, so it cannot open a `heimdall:heimdall
+0600` key no matter where it sits, and giving it a supplementary group to make
+that work would be widening access to fix a permissions error. Put the secret in
+`[workload.secret_files]` instead: Idunn loads it as a credential and sets an
+environment variable **named after the entry**, whose value is the credential
+path. Naming the entry after the variable the service already reads --
+`GC_ACCESS_SIGNING_PRIVATE_KEY_PATH` for Heimdall -- wires it up with no code
+change at all. Setting the same name in `[workload.environment]` as well is
+refused as a collision, which is the mechanism telling you there is one owner.
+
 **The Idunn unit also needs the target.s roots.** `ProtectSystem=full` makes
 `/etc` read-only, so a target whose `runtime_root` is not in `ReadWritePaths`
 fails at "creating runtime bundle". Every migration adds exactly three paths --
