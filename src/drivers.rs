@@ -4044,6 +4044,15 @@ impl NginxRouteDriver {
 
     fn current_configuration(&self) -> Result<Option<Vec<u8>>> {
         Ok(match fs::read(&self.binding.config_path) {
+            // A fragment with no bytes grants no route, so it is absence, not a
+            // membership of zero servers. The distinction matters on the first
+            // deployment of a routed target: the preflight bind-mounts its
+            // candidate over config_path, and systemd materializes that mount
+            // point, leaving an empty file behind on the host. Read as content,
+            // it made the baseline "change" during validation, and then made
+            // every retry report an unadmitted incumbent -- the target could
+            // never be deployed a first time, and the wedge was permanent.
+            Ok(bytes) if bytes.is_empty() => None,
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("reading route fragment"),
@@ -6840,6 +6849,34 @@ mod tests {
                 schema_id: Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA.into()),
             },
         )
+    }
+
+    #[test]
+    fn an_empty_route_fragment_is_absence_not_a_membership() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config_path = temp.path().join("odin.conf");
+        let driver = NginxRouteDriver::new(RouteBinding {
+            driver: RouteDriver::NginxStreamUdp,
+            route_id: "odin-rudp".into(),
+            stable_endpoint: "rudp://127.0.0.1:17872".into(),
+            private_host: "127.0.0.1".into(),
+            private_port_start: 27872,
+            private_port_end: 27879,
+            config_path: config_path.clone(),
+            reload_unit: "nginx.service".into(),
+        });
+        assert_eq!(driver.current_configuration()?, None);
+        // What systemd leaves behind when it materializes the preflight's bind
+        // mount point on a target's first deployment.
+        std::fs::write(&config_path, b"")?;
+        assert_eq!(
+            driver.current_configuration()?,
+            None,
+            "an empty fragment must not read as an unadmitted incumbent"
+        );
+        std::fs::write(&config_path, b"server {}")?;
+        assert_eq!(driver.current_configuration()?, Some(b"server {}".to_vec()));
+        Ok(())
     }
 
     #[test]
