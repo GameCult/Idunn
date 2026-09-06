@@ -3167,7 +3167,16 @@ impl Engine {
                 });
             }
             let Some((admitted, authenticated)) = self.admit_latest_topology(current, None)? else {
-                return Ok(());
+                // Only the first-Odin bootstrap above observes presence
+                // directly. Every other target's warming presence arrives as
+                // Odin's authenticated runtime topology correlation, so until
+                // Odin is admitted and publishing, a candidate warms forever
+                // with nothing to say why.
+                return self.record_gate_wait(
+                    current,
+                    "no authenticated Odin topology correlation yet: warming presence for a \
+                     non-Odin target is observed through Odin, which must be admitted first",
+                );
             };
             if admitted.envelope != current.envelope {
                 return Ok(());

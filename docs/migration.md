@@ -76,10 +76,45 @@ Migrate in dependency order, and migrate the authority's own dependencies last:
 6. **`epiphany`** and **`epiphany-capstone-17`** — two targets sharing a
    repository. Prove the binding-per-target model here.
 7. **`voidbot`** — deployed, live retrieval path, 5.7 GB of state. Not early.
-8. **`odin`** — last of the targets. Idunn reads Odin's topology to gate
-   promotion, so migrating Odin changes the thing that gates the migrations.
+8. **`odin`** — see the correction below. This entry said "last of the
+   targets"; it is first, and the reason is structural.
 9. **Idunn itself** — the installed unit and binary. See *Cutting over the
    authority* below.
+
+## Correction: Odin is migrated first, not last
+
+**Found 2026-09-06 by deploying Heimdall.** This document ordered Odin last, on
+the reasoning that Idunn reads Odin's topology to gate promotion and migrating
+Odin would move the thing gating the migrations. That is backwards.
+
+A candidate's *warming presence* — the evidence Idunn requires before it will
+fence an incumbent — is observed through Odin's authenticated runtime topology
+correlation. `advance_warming` has exactly one exception:
+
+```rust
+if current.value.target == "odin" && snapshot.admitted_for("odin").is_none() {
+    // first Odin bootstrap: presence observed directly
+```
+
+Only `odin`, and only while no Odin is admitted, may warm on directly observed
+presence. Every other target waits for Odin to publish. So with the previous
+generation's Odin still running — which publishes nothing the new Idunn reads —
+a Heimdall candidate starts, serves, publishes health, and warms indefinitely.
+It never fails and never promotes.
+
+Verified live: the candidate ran on its assigned bind, and the transaction sat
+in `Warming` with no gate reason recorded until one was added.
+
+**Odin is the bootstrap target.** It is not a dependency to defer; it is the
+root of the observation chain, which is also why it has the only recipe that was
+ever kept current. Migrate it first, admit it, confirm it publishes topology
+correlation, and only then expect any other target to reach promotion.
+
+A related consequence for interpreted targets: health published over RUDP to the
+previous generation's `--rudp-health-bind` goes nowhere. The current `serve`
+has no such flag. A target still configured with `GC_ACCESS_IDUNN_RUDP_HEALTH`
+pointed at the old endpoint will log timeouts forever and is not the reason
+promotion stalls.
 
 ## Per target
 
