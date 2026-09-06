@@ -393,6 +393,7 @@ binding cannot widen access, and each one cost a failed deployment to discover:
 | `cache_root` parent | root-owned, not group- or world-writable | `/srv/build` is `idunn:idunn` and therefore fails; put caches under Idunn.s own root |
 | frozen source stage | root-owned, non-writable | source is frozen *as* `idunn`, then copied into a root-owned actuation stage |
 | runner network | must exist | the binding names a docker network; the operator provisions it |
+| runtime presence identity | `root:root`, mode `0400`, `nlink` 1 | passed to the workload as a parent-only descriptor, so it must be unwritable and unaliased -- a second hard link would be a second path to the signing key |
 
 **The Idunn unit also needs the target.s roots.** `ProtectSystem=full` makes
 `/etc` read-only, so a target whose `runtime_root` is not in `ReadWritePaths`
