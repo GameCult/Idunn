@@ -349,6 +349,38 @@ targets.
 `/run/idunn/route-preflight`; the unit now declares `RuntimeDirectory=idunn`,
 which creates and removes `/run/idunn` with the service.
 
+## Blocker for every TypeScript target: the CultLib store formats diverged
+
+Found 2026-09-06 while enrolling Heimdall's signer. **`cultcache-ts` cannot read
+a single-file store written by `cultcache-rs`.** Verified against a real
+`idunn-provision` enrolment on yggdrasil, not inferred:
+
+```
+cultcache-rs   [ [key, type, payload, stored_at, schema_id], ... ]
+cultcache-ts   [ formatVersion, catalog, records ]   envelopes as named objects
+```
+
+Handing the Rust file to `SingleFileMessagePackBackingStore.pullAll()` throws
+`invalid_type: expected object, received array` at path `[0]`.
+
+This matters because Idunn writes every store a target must read — the runtime
+presence identity, the process write lease, the expected incarnation in the
+runtime bundle. A Rust target consumes them with its own client. A TypeScript
+target cannot, and has to decode the Rust layout by hand. Heimdall does that in
+`src/idunn-store.ts`, which exists solely because the two forks disagree and
+should be deleted the moment they are reconciled.
+
+Two things follow. Every future TypeScript target hits this, so it is a
+per-runtime problem rather than a Heimdall quirk. And **the schemas are
+identical while the container formats are not** — the identity record itself
+uses the same `gamecult.provider_health_identity.private.v1` schema and the same
+`linux_file_mode_machine_id_binding` protector in both runtimes, which is why an
+`idunn-provision` enrolment is readable once the envelope is unwrapped
+correctly. The contracts held; the store framing drifted.
+
+Which format is canonical is a CultLib decision and is not made here. The C#
+implementation is the stated reference, so it is the tiebreaker.
+
 ## Cutting over the authority
 
 Idunn last, and not by deploying Idunn with Idunn.
