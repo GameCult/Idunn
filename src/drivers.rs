@@ -3339,6 +3339,7 @@ impl CultCacheTopologyDriver {
                 },
             ]);
             if store.compare_exchange_snapshot(&entries, &replacement)? {
+                publish_projection_mode(&self.projection_store)?;
                 return admitted_expected.canonical_sha256();
             }
         }
@@ -3714,6 +3715,7 @@ impl TopologyPort for CultCacheTopologyDriver {
                 },
             ],
         )?;
+        publish_projection_mode(&self.projection_store)?;
         expected.canonical_sha256()
     }
 
@@ -3812,6 +3814,7 @@ impl TopologyPort for CultCacheTopologyDriver {
                 return Ok(());
             }
             if store.compare_exchange_snapshot(&entries, &retained)? {
+                publish_projection_mode(&self.projection_store)?;
                 return Ok(());
             }
         }
@@ -3842,6 +3845,7 @@ impl TopologyPort for CultCacheTopologyDriver {
                 schema_id: Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA.into()),
             },
         )?;
+        publish_projection_mode(&self.projection_store)?;
         activation.canonical_sha256()
     }
 
@@ -3864,6 +3868,7 @@ impl TopologyPort for CultCacheTopologyDriver {
                 schema_id: Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA.into()),
             },
         )?;
+        publish_projection_mode(&self.projection_store)?;
         lease.canonical_sha256()
     }
 
@@ -3906,6 +3911,7 @@ impl TopologyPort for CultCacheTopologyDriver {
                 return Ok(());
             }
             if store.compare_exchange_snapshot(&entries, &retained)? {
+                publish_projection_mode(&self.projection_store)?;
                 return Ok(());
             }
         }
@@ -5922,6 +5928,26 @@ fn ensure_bundle_is_reachable_by_workload(_bundle: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The topology store is Idunn's *published* surface: every managed target
+/// reads it to verify its own Expected incarnation against the Idunn anchor.
+///
+/// Idunn runs with `UMask=027`, which is right for its private state and wrong
+/// for this one file -- it lands `0640 root:root`, and a `DynamicUser` workload
+/// gets EACCES. A chmod by hand does not hold, because each publish writes a
+/// new file. Integrity here comes from the signatures over the records, not
+/// from the mode, so the published copy is readable.
+fn publish_projection_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("publishing {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn build_machine_id(workspace: &Path) -> Result<String> {
     let text = workspace
         .to_str()
@@ -6550,6 +6576,21 @@ fn apply_identity(command: &mut Command, identity: Option<ProcessIdentity>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_published_projection_is_readable_by_a_workload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("topology.cc");
+        std::fs::write(&path, b"x").unwrap();
+        // What Idunn's UMask=027 leaves behind.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        publish_projection_mode(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "every target must be able to read the projection");
+    }
 
     #[cfg(unix)]
     #[test]
