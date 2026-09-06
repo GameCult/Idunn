@@ -349,37 +349,36 @@ targets.
 `/run/idunn/route-preflight`; the unit now declares `RuntimeDirectory=idunn`,
 which creates and removes `/run/idunn` with the service.
 
-## Blocker for every TypeScript target: the CultLib store formats diverged
+## Two `.cc` shapes, and a retracted claim about them
 
-Found 2026-09-06 while enrolling Heimdall's signer. **`cultcache-ts` cannot read
-a single-file store written by `cultcache-rs`.** Verified against a real
-`idunn-provision` enrolment on yggdrasil, not inferred:
+**Corrected 2026-09-06.** An earlier version of this section claimed the CultLib
+forks had diverged and that `cultcache-ts` could not read a `cultcache-rs`
+store. **That was wrong**, and it was wrong in the usual way: generalised from a
+single file.
+
+The forks agree. `cultcache-ts` reads Idunn's live control store on yggdrasil
+without complaint — 36 records — because ordinary CultCache stores use the same
+framing in both runtimes: `[formatVersion, catalog, records]`. That covers the
+control store, the runtime bundle's `expected.cc` and `activation.cc`, and the
+process write lease.
+
+The exception is narrow and deliberate. **Service identity private stores** are
+written by `cultnet-rs`'s `atomic_create_private_store`, a minimal container
+holding one bare positional envelope:
 
 ```
-cultcache-rs   [ [key, type, payload, stored_at, schema_id], ... ]
-cultcache-ts   [ formatVersion, catalog, records ]   envelopes as named objects
+[ [key, type, payload, stored_at, schema_id] ]
 ```
 
-Handing the Rust file to `SingleFileMessagePackBackingStore.pullAll()` throws
-`invalid_type: expected object, received array` at path `[0]`.
+That is a private-key container, not a record store, and `cultcache-ts` rejects
+it — `invalid_type: expected object, received array`. Heimdall reads that one
+shape in `src/idunn-store.ts`; everything else goes through the ordinary client.
 
-This matters because Idunn writes every store a target must read — the runtime
-presence identity, the process write lease, the expected incarnation in the
-runtime bundle. A Rust target consumes them with its own client. A TypeScript
-target cannot, and has to decode the Rust layout by hand. Heimdall does that in
-`src/idunn-store.ts`, which exists solely because the two forks disagree and
-should be deleted the moment they are reconciled.
-
-Two things follow. Every future TypeScript target hits this, so it is a
-per-runtime problem rather than a Heimdall quirk. And **the schemas are
-identical while the container formats are not** — the identity record itself
-uses the same `gamecult.provider_health_identity.private.v1` schema and the same
-`linux_file_mode_machine_id_binding` protector in both runtimes, which is why an
-`idunn-provision` enrolment is readable once the envelope is unwrapped
-correctly. The contracts held; the store framing drifted.
-
-Which format is canonical is a CultLib decision and is not made here. The C#
-implementation is the stated reference, so it is the tiebreaker.
+The cost of getting this wrong is worth naming, because it was nearly shipped. A
+consumer that hand-decodes the private-store framing and applies it to
+`expected.cc` and the write lease will fail on first deployment, and its unit
+tests will pass, because hand-built fixtures agree with the hand-built reader.
+Build fixtures with the CultCache client so a test can disagree with you.
 
 ## Cutting over the authority
 
