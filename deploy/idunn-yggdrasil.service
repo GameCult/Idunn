@@ -71,6 +71,10 @@ ReadWritePaths=/etc/nginx/idunn-stream-routes
 ReadWritePaths=/etc/systemd/system
 ReadWritePaths=/var/lib/gamecult/idunn /var/lib/gamecult/idunn-authority
 ReadWritePaths=/srv/build
+# One entry per managed target: its runtime root, state root and release root.
+# A target Idunn cannot write is a target it cannot deploy, so this list grows
+# by exactly three paths per migration and is the honest blast radius.
+ReadWritePaths=/etc/gamecult/heimdall /var/lib/gamecult/heimdall /srv/heimdall/app
 # Odin's directory is a managed target's, and is read-only on purpose: Idunn
 # consumes Odin's published topology correlation to gate *deployment* promotion
 # and nothing else. Continuity never consults it -- see

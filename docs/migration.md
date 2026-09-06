@@ -380,6 +380,26 @@ consumer that hand-decodes the private-store framing and applies it to
 tests will pass, because hand-built fixtures agree with the hand-built reader.
 Build fixtures with the CultCache client so a test can disagree with you.
 
+## Per-target host preprovisioning
+
+Idunn does not create a target.s roots; it refuses to deploy into paths that are
+not already shaped correctly. Each check exists so a compromised or careless
+binding cannot widen access, and each one cost a failed deployment to discover:
+
+| Path | Required shape | Check |
+|---|---|---|
+| `state_root` | `root:<state_group>`, mode `2770` | must be root-owned, group-owned by the state group, not world-writable, and setgid so the workload.s dynamic user inherits group access |
+| `cache_root` | owned by the runner.s container uid, mode `0700` | "dedicated exact-identity 0700 directory" -- the uid is the runner.s `user`, not the source identity |
+| `cache_root` parent | root-owned, not group- or world-writable | `/srv/build` is `idunn:idunn` and therefore fails; put caches under Idunn.s own root |
+| frozen source stage | root-owned, non-writable | source is frozen *as* `idunn`, then copied into a root-owned actuation stage |
+| runner network | must exist | the binding names a docker network; the operator provisions it |
+
+**The Idunn unit also needs the target.s roots.** `ProtectSystem=full` makes
+`/etc` read-only, so a target whose `runtime_root` is not in `ReadWritePaths`
+fails at "creating runtime bundle". Every migration adds exactly three paths --
+runtime root, state root, release root -- and that list is the honest blast
+radius of running Idunn as root.
+
 ## Cutting over the authority
 
 Idunn last, and not by deploying Idunn with Idunn.
