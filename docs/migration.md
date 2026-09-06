@@ -180,6 +180,20 @@ The binding must name every affordance the recipe's runners derive. Omitting one
 fails `admit()`. This is deliberate — a compromised target repository can change
 what gets built, but not what it may touch.
 
+### 3b. Validate the recipe *with* the binding
+
+```bash
+idunn validate --recipe <recipe> --binding <binding>
+```
+
+Validating a recipe alone parses it and stops. Every rule that relates the two
+documents lives in `OperatorBinding::admit`, and admit does not run without a
+binding. Odin's recipe passed the recipe-only check for months while being
+structurally unadmittable: it declared `[state]`, which forces the binding to
+carry a state root, which in turn requires the launch contract to carry a
+`state_root` argument -- and its arguments named an absolute `store_path`
+instead. A recipe-only "ok" is not evidence that a target can be deployed.
+
 ### 4. Dry-run, then admit
 
 ```bash
@@ -417,15 +431,15 @@ Build fixtures with the CultCache client so a test can disagree with you.
 
 ## Per-target host preprovisioning
 
-Idunn does not create a target.s roots; it refuses to deploy into paths that are
+Idunn does not create a target's roots; it refuses to deploy into paths that are
 not already shaped correctly. Each check exists so a compromised or careless
 binding cannot widen access, and each one cost a failed deployment to discover:
 
 | Path | Required shape | Check |
 |---|---|---|
-| `state_root` | `root:<state_group>`, mode `2770` | must be root-owned, group-owned by the state group, not world-writable, and setgid so the workload.s dynamic user inherits group access |
-| `cache_root` | owned by the runner.s container uid, mode `0700` | "dedicated exact-identity 0700 directory" -- the uid is the runner.s `user`, not the source identity |
-| `cache_root` parent | root-owned, not group- or world-writable | `/srv/build` is `idunn:idunn` and therefore fails; put caches under Idunn.s own root |
+| `state_root` | `root:<state_group>`, mode `2770` | must be root-owned, group-owned by the state group, not world-writable, and setgid so the workload's dynamic user inherits group access |
+| `cache_root` | owned by the runner's container uid, mode `0700` | "dedicated exact-identity 0700 directory" -- the uid is the runner's `user`, not the source identity |
+| `cache_root` parent | root-owned, not group- or world-writable | `/srv/build` is `idunn:idunn` and therefore fails; put caches under Idunn's own root |
 | frozen source stage | root-owned, non-writable | source is frozen *as* `idunn`, then copied into a root-owned actuation stage |
 | runner network | must exist | the binding names a docker network; the operator provisions it |
 | runtime presence identity | `root:root`, mode `0400`, `nlink` 1 | passed to the workload as a parent-only descriptor, so it must be unwritable and unaliased -- a second hard link would be a second path to the signing key |
@@ -441,11 +455,46 @@ path. Naming the entry after the variable the service already reads --
 change at all. Setting the same name in `[workload.environment]` as well is
 refused as a collision, which is the mechanism telling you there is one owner.
 
-**The Idunn unit also needs the target.s roots.** `ProtectSystem=full` makes
+**The Idunn unit also needs the target's roots.** `ProtectSystem=full` makes
 `/etc` read-only, so a target whose `runtime_root` is not in `ReadWritePaths`
 fails at "creating runtime bundle". Every migration adds exactly three paths --
 runtime root, state root, release root -- and that list is the honest blast
 radius of running Idunn as root.
+
+## What the Odin migration cost, and what it fixed
+
+Odin is the bootstrap target, so five things that had never been exercised all
+failed on the way through. Each one is now a test.
+
+**A routed RUDP target could be admitted but not projected.** `admit` accepts
+`(route_required, Rudp, nginx-stream-udp)` against an `rudp://` endpoint, and
+the nginx driver already wrote `listen ... udp reuseport` -- but
+`endpoint_scheme` lumped RUDP in with `Private` and refused to name a scheme,
+so `expected_projection` bailed. Odin is the only routed RUDP target, and
+nothing else can warm until Odin is admitted.
+
+**Only a step's declared `required_environment` reaches its container.** A
+runner's `[runners.<id>.environment]` is not ambient: names not listed on the
+step are dropped. Odin's steps declared none, so `CARGO_HOME` never arrived and
+cargo fell back to the image's read-only `/usr/local/cargo`.
+
+**A build container has no machine identity.** CultLib's Linux protector binds
+a service identity seed to `/etc/machine-id`; the build image carries none and
+the runner is `--read-only`, so any target whose tests enrol an identity failed
+every step. Idunn now derives a machine-id per frozen workspace and mounts it
+read-only. Do not "fix" this by mounting the host.s: that would let a build
+container protect a seed that unwraps on the host, which is the property the
+binding exists to deny.
+
+**The published projection was inside Idunn's private root.** Every managed
+target must read the topology store to verify its own Expected incarnation
+against the Idunn anchor, and it sat in a `0750 idunn:idunn` directory no
+workload could traverse. It now lives in `/var/lib/gamecult/idunn-projection`,
+world-readable, integrity protected by signature rather than by mode.
+
+**A target's signing identity does not belong in its state root.** `state_root`
+is writable by the workload, and a daemon that can rewrite its own signing
+identity does not have one. Odin's topology identity moved to the runtime root.
 
 ## Cutting over the authority
 
