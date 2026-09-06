@@ -496,6 +496,27 @@ world-readable, integrity protected by signature rather than by mode.
 is writable by the workload, and a daemon that can rewrite its own signing
 identity does not have one. Odin's topology identity moved to the runtime root.
 
+## A transaction past Fencing cannot be abandoned
+
+`begin_pre_fencing_abort` is gated on `phase < DeploymentPhase::Fencing`. After
+the fence, every error goes to `record_resumable_error` and the transaction
+retries forever. There is no operator verb to cancel one, and no server-side
+expiry -- `--timeout-seconds` bounds the `idunn up` client's wait, not the
+transaction.
+
+That is correct while a candidate can still recover. It is a trap when the
+candidate never can: a transient unit with `Restart=no` that has failed will not
+come back on its own, so the transaction holds the target and every later
+command for it stays `queued` indefinitely.
+
+Found the hard way during Odin's first deployment, and made unrecoverable by
+deleting the target's write-lease record to fix its mode while a transaction
+held it -- `observe_exact` then reports "physical write lease disappeared after
+Granted became durable", which is exactly the tamper it is there to catch. Do
+not remove a lease record, projection record or brake store belonging to a
+transaction that is not terminal; change the mode in place, or fix the shape
+that produced the mode and redeploy.
+
 ## Cutting over the authority
 
 Idunn last, and not by deploying Idunn with Idunn.
