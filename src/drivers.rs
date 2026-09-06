@@ -1810,6 +1810,7 @@ impl SystemdTransientWorkloadDriver {
             },
         )?;
         harden_runtime_bundle(&bundle)?;
+        ensure_bundle_is_reachable_by_workload(&bundle)?;
         Ok(bundle)
     }
 
@@ -5882,6 +5883,45 @@ fn remove_exact_root_owned_file(path: &Path, mode: u32) -> Result<()> {
 /// So each frozen workspace gets its own identity, derived from the workspace
 /// path. It is stable for the life of a build, and an identity enrolled inside
 /// one is unusable anywhere else, including on this host.
+/// Every directory above the runtime bundle must be traversable by the
+/// workload, which runs under `DynamicUser` and is in no group but the state
+/// group.
+///
+/// This is checked here rather than left to the operator because the failure is
+/// silent and expensive: CultLib's backing store reports an unreadable file as
+/// an *empty* store, so a workload that cannot traverse to its bundle sees zero
+/// records rather than a permission error. Odin reported "runtime authority
+/// store must contain exactly one record" and Heimdall simply decided it held
+/// no write lease and warmed forever. Neither names the actual fault.
+///
+/// `ReadOnlyPaths=` on the bundle does not help: it binds the leaf into the
+/// unit's namespace but grants no traversal on the path above it.
+#[cfg(unix)]
+fn ensure_bundle_is_reachable_by_workload(bundle: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for ancestor in bundle.ancestors().skip(1) {
+        if ancestor == Path::new("/") || ancestor.as_os_str().is_empty() {
+            break;
+        }
+        let mode = fs::metadata(ancestor)
+            .with_context(|| format!("reading {}", ancestor.display()))?
+            .permissions()
+            .mode();
+        ensure!(
+            mode & 0o001 != 0,
+            "{} is not traversable by the workload, so the runtime bundle cannot be read;              the runtime root and every directory above it need at least o+x (0711 is enough,              and leaks no names)",
+            ancestor.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_bundle_is_reachable_by_workload(_bundle: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn build_machine_id(workspace: &Path) -> Result<String> {
     let text = workspace
         .to_str()
@@ -6510,6 +6550,22 @@ fn apply_identity(command: &mut Command, identity: Option<ProcessIdentity>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_untraversable_runtime_root_is_refused_rather_than_silently_empty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("runtime");
+        let bundle = runtime_root.join("sha256-abc");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = ensure_bundle_is_reachable_by_workload(&bundle).unwrap_err();
+        assert!(error.to_string().contains("not traversable by the workload"));
+        std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o711)).unwrap();
+        ensure_bundle_is_reachable_by_workload(&bundle).unwrap();
+    }
 
     #[test]
     fn build_machine_id_is_well_formed_per_workspace_and_never_the_host() {
