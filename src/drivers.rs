@@ -1245,6 +1245,8 @@ impl DockerRunnerDriver {
                 "/tmp:rw,nosuid,nodev,noexec,size={}m",
                 runner.tmpfs_mebibytes
             )),
+            OsString::from("--mount"),
+            bind_mount(&build_machine_id_file(workspace)?, "/etc/machine-id", true)?,
         ];
         if let Some(cache_root) = &runner.cache_root {
             ensure_runner_cache_root(cache_root, identity)?;
@@ -5867,6 +5869,47 @@ fn remove_exact_root_owned_file(path: &Path, mode: u32) -> Result<()> {
     sync_parent_directory(path)
 }
 
+/// A build container's own machine identity, mounted read-only at
+/// `/etc/machine-id`.
+///
+/// The image carries no machine-id, and code that binds a service identity to
+/// the machine -- CultLib's Linux protector does exactly this -- cannot run
+/// without one, so a target whose tests enrol an identity cannot be built at
+/// all. The host's machine-id is not the answer: it would let a build container
+/// protect a seed that unwraps on the host, which is precisely the property the
+/// binding exists to deny.
+///
+/// So each frozen workspace gets its own identity, derived from the workspace
+/// path. It is stable for the life of a build, and an identity enrolled inside
+/// one is unusable anywhere else, including on this host.
+fn build_machine_id(workspace: &Path) -> Result<String> {
+    let text = workspace
+        .to_str()
+        .context("frozen workspace path is not UTF-8")?;
+    // systemd machine-id format: exactly 32 lowercase hex digits.
+    let digest = sha256_id(text.as_bytes());
+    Ok(digest
+        .strip_prefix("sha256-")
+        .unwrap_or(&digest)
+        .chars()
+        .take(32)
+        .collect())
+}
+
+fn build_machine_id_file(workspace: &Path) -> Result<PathBuf> {
+    let root = PathBuf::from("/run/idunn/build-machine-ids");
+    fs::create_dir_all(&root).context("creating the build machine-id root")?;
+    let id = build_machine_id(workspace)?;
+    let path = root.join(&id);
+    if !path.exists() {
+        fs::write(&path, format!("{id}
+")).context("writing the build machine-id")?;
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .context("sealing the build machine-id")?;
+    }
+    Ok(path)
+}
+
 fn bind_mount(source: &Path, destination: &str, read_only: bool) -> Result<OsString> {
     ensure!(source.is_absolute(), "Docker bind source is not absolute");
     let text = source.to_str().context("Docker bind source is not UTF-8")?;
@@ -6467,6 +6510,26 @@ fn apply_identity(command: &mut Command, identity: Option<ProcessIdentity>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_machine_id_is_well_formed_per_workspace_and_never_the_host() {
+        let first = build_machine_id(Path::new("/var/lib/gamecult/idunn/staging/tx-a")).unwrap();
+        let second = build_machine_id(Path::new("/var/lib/gamecult/idunn/staging/tx-b")).unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            build_machine_id(Path::new("/var/lib/gamecult/idunn/staging/tx-a")).unwrap(),
+            "a workspace's build identity must be stable for the life of the build"
+        );
+        // The point of the derived identity is that it is not this host's: an
+        // identity a build enrols must not unwrap anywhere but that build.
+        if let Ok(host) = std::fs::read_to_string("/etc/machine-id") {
+            assert_ne!(first, host.trim());
+        }
+    }
+
     use cultnet_rs::{
         GameCultProviderHealthIdentity, IDUNN_EXPECTED_INCARNATION_SCHEMA,
         IDUNN_PROCESS_WRITE_LEASE_SCHEMA, IdunnServiceIdentity,

@@ -40,9 +40,9 @@ ExecStart=/usr/local/bin/idunn serve \
   --bindings-dir /etc/gamecult/idunn/bindings \
   --source-root /var/lib/gamecult/idunn/sources \
   --staging-root /var/lib/gamecult/idunn/staging \
-  --topology-store /var/lib/gamecult/idunn/topology.cc \
+  --topology-store /var/lib/gamecult/idunn-projection/topology.cc \
   --idunn-identity-store /var/lib/gamecult/idunn/idunn-service-identity.cc \
-  --odin-correlation-store /var/lib/gamecult/odin/idunn-runtime-topology.cc \
+  --odin-correlation-store /var/lib/gamecult/odin/topology.cc \
   --odin-trust-anchor /etc/gamecult/idunn/odin-topology-anchor.cc \
   --deployment-brake-operator-anchor /etc/gamecult/idunn/deployment-brake-operator-anchor.cc \
   --source-uid 986 \
@@ -69,19 +69,26 @@ ProtectSystem=full
 ReadWritePaths=/etc/gamecult/idunn
 ReadWritePaths=/etc/nginx/idunn-stream-routes
 ReadWritePaths=/etc/systemd/system
-ReadWritePaths=/var/lib/gamecult/idunn /var/lib/gamecult/idunn-authority
+# idunn-projection is deliberately outside Idunn's own 0750 directory: the
+# topology store is Idunn's *published* surface, and every managed target must
+# read it to verify its own Expected incarnation against the Idunn anchor. It
+# was inside the private root, where no workload could traverse to it.
+ReadWritePaths=/var/lib/gamecult/idunn /var/lib/gamecult/idunn-authority /var/lib/gamecult/idunn-projection
 ReadWritePaths=/srv/build
 # One entry per managed target: its runtime root, state root and release root.
 # A target Idunn cannot write is a target it cannot deploy, so this list grows
 # by exactly three paths per migration and is the honest blast radius.
 ReadWritePaths=/etc/gamecult/heimdall /var/lib/gamecult/heimdall /srv/heimdall/app
-# Odin's directory is a managed target's, and is read-only on purpose: Idunn
-# consumes Odin's published topology correlation to gate *deployment* promotion
-# and nothing else. Continuity never consults it -- see
-# stale_odin_provider_receipt_cannot_gate_continuity_restart -- and an absent
+# Odin is a managed target like any other now, so its three roots are writable
+# on the same terms. This used to be ReadOnlyPaths, on the reasoning that Idunn
+# only *reads* Odin's correlation store to gate promotion. That remains true of
+# the correlation itself -- continuity never consults it, see
+# stale_odin_provider_receipt_cannot_gate_continuity_restart, and an absent
 # store yields None rather than an error, so Odin being down blocks promotions
-# and leaves daemon survival untouched.
-ReadOnlyPaths=/var/lib/gamecult/odin
+# and leaves daemon survival untouched. But a target Idunn cannot write is a
+# target it cannot deploy, and Odin has to be deployable: it is the bootstrap
+# target every other target's warming presence is observed through.
+ReadWritePaths=/etc/gamecult/odin /var/lib/gamecult/odin /srv/odin
 
 [Install]
 WantedBy=multi-user.target
