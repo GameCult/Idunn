@@ -1810,7 +1810,13 @@ impl SystemdTransientWorkloadDriver {
             },
         )?;
         harden_runtime_bundle(&bundle)?;
-        ensure_bundle_is_reachable_by_workload(&bundle)?;
+        let state_group_id = binding
+            .workload
+            .state_group
+            .as_deref()
+            .map(resolve_group_id)
+            .transpose()?;
+        ensure_bundle_is_reachable_by_workload(&bundle, state_group_id)?;
         Ok(bundle)
     }
 
@@ -5912,20 +5918,23 @@ fn remove_exact_root_owned_file(path: &Path, mode: u32) -> Result<()> {
 /// `ReadOnlyPaths=` on the bundle does not help: it binds the leaf into the
 /// unit's namespace but grants no traversal on the path above it.
 #[cfg(unix)]
-fn ensure_bundle_is_reachable_by_workload(bundle: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn ensure_bundle_is_reachable_by_workload(bundle: &Path, state_group_id: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     for ancestor in bundle.ancestors().skip(1) {
         if ancestor == Path::new("/") || ancestor.as_os_str().is_empty() {
             break;
         }
-        let mode = fs::metadata(ancestor)
-            .with_context(|| format!("reading {}", ancestor.display()))?
-            .permissions()
-            .mode();
+        let metadata =
+            fs::metadata(ancestor).with_context(|| format!("reading {}", ancestor.display()))?;
+        let mode = metadata.permissions().mode();
+        // The workload's uid is allocated by DynamicUser and owns nothing here,
+        // so traversal can only come from the state group or from other.
+        let by_group =
+            state_group_id == Some(metadata.gid()) && mode & 0o010 != 0;
         ensure!(
-            mode & 0o001 != 0,
-            "{} is not traversable by the workload, so the runtime bundle cannot be read;              the runtime root and every directory above it need at least o+x (0711 is enough,              and leaks no names)",
+            mode & 0o001 != 0 || by_group,
+            "{} is not traversable by the workload, so the runtime bundle cannot be read;              give it o+x (0711 leaks no names) or group-own it by the state group with g+x",
             ancestor.display()
         );
     }
@@ -5933,7 +5942,7 @@ fn ensure_bundle_is_reachable_by_workload(bundle: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn ensure_bundle_is_reachable_by_workload(_bundle: &Path) -> Result<()> {
+fn ensure_bundle_is_reachable_by_workload(_bundle: &Path, _state_group_id: Option<u32>) -> Result<()> {
     Ok(())
 }
 
@@ -6611,10 +6620,19 @@ mod tests {
         let bundle = runtime_root.join("sha256-abc");
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = ensure_bundle_is_reachable_by_workload(&bundle).unwrap_err();
+        let error = ensure_bundle_is_reachable_by_workload(&bundle, None).unwrap_err();
         assert!(error.to_string().contains("not traversable by the workload"));
         std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o711)).unwrap();
-        ensure_bundle_is_reachable_by_workload(&bundle).unwrap();
+        ensure_bundle_is_reachable_by_workload(&bundle, None).unwrap();
+        // A 0750 root group-owned by the state group is the other correct
+        // shape, and is what the write-lease hardening expects: it derives the
+        // record's group from this directory.
+        std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let owning_group = std::os::unix::fs::MetadataExt::gid(
+            &std::fs::metadata(&runtime_root).unwrap(),
+        );
+        ensure_bundle_is_reachable_by_workload(&bundle, Some(owning_group)).unwrap();
+        assert!(ensure_bundle_is_reachable_by_workload(&bundle, Some(owning_group + 1)).is_err());
     }
 
     #[test]
