@@ -1941,6 +1941,7 @@ impl SystemdTransientWorkloadDriver {
         let restart_policy = required_systemd_property(&values, "Restart")?.to_owned();
         let kill_mode = required_systemd_property(&values, "KillMode")?.to_owned();
         let dynamic_user = parse_systemd_boolean(&values, "DynamicUser")?;
+        // Recorded as evidence of which identity actually ran, not asserted on.
         let systemd_user = systemd_property(&values, "User")?.to_owned();
         let systemd_group = systemd_property(&values, "Group")?.to_owned();
         let supplementary_groups = systemd_property(&values, "SupplementaryGroups")?.to_owned();
@@ -1960,8 +1961,15 @@ impl SystemdTransientWorkloadDriver {
             service_type == "exec"
                 && restart_policy == "no"
                 && kill_mode == "mixed"
+                // `User` is deliberately not asserted here. Idunn never emits a
+                // User property, and systemd reports the identity it *allocated*
+                // for a DynamicUser unit -- the unit name, or a generated `_du…`
+                // when that is too long -- so the property is never empty for a
+                // running workload and cannot tell an allocated identity from a
+                // pinned one. The invariant it was reaching for, that the workload
+                // does not run as a persistent named account, is carried by
+                // `dynamic_user` below and by Idunn never passing User at all.
                 && dynamic_user
-                && systemd_user.is_empty()
                 && supplementary_groups.is_empty()
                 && capability_bounding_set.is_empty()
                 && ambient_capabilities.is_empty()
