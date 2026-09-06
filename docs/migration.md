@@ -297,6 +297,58 @@ Alarm, not resurrection. The distinction the old generation *can* draw is
 between failures it owns and failures it does not — not between a target that
 is broken and a target that is finished.
 
+## Host prerequisites for any routed target
+
+Done on yggdrasil 2026-09-06. These are shared, not per-target: the first routed
+migration needs them, every later one reuses them.
+
+**nginx stream context.** Debian ships `ngx_stream_module` as a dynamic module
+in a separate package, and it was not installed — `--with-stream=dynamic` in
+`nginx -V` with no `.so` present. Installed `libnginx-mod-stream` at
+`1.26.3-3+deb13u7`, exactly matching the running nginx, so nothing else moved.
+Added a top-level `stream` block to `/etc/nginx/nginx.conf` including
+`/etc/nginx/idunn-stream-routes/*.conf`, and created that directory `root:idunn
+0775`. `nginx -t` passed before the reload; after it, `gamecult.org` and
+`heimdall.gamecult.org/healthz` both still answered 200. Backup at
+`/root/nginx.conf.bak-20260906-stream`.
+
+Note the shape this locks in: **the vhost stays operator-owned and static.**
+nginx keeps TLS, `server_name` and path routing and proxies to a stable local
+endpoint; Idunn owns only the hop from that stable endpoint to whichever
+candidate is admitted. Writing into `/etc/nginx/idunn-stream-routes` is the
+whole of Idunn's nginx authority, and stream configuration cannot do the things
+an http-context injection could.
+
+**Idunn runs as root, and the unit says why.** This is the largest difference
+between the generations and it should not be discovered at install time.
+
+The previous generation ran `User=idunn` and reached root through a narrow
+sudoers grant onto `/usr/local/libexec/idunn-yggdrasil`, a shell actuator. The
+current generation has **no `sudo` anywhere in its source**: it calls
+`systemctl`, `systemd-run`, `nginx` and `docker` directly, and a confined
+`User=` cannot actuate anything at all. `docs/deployment-authority.md` states
+the intended model — *"Freeze the exact source and recipe as `idunn`, then copy
+and verify it into a root-owned actuation stage. The privileged driver never
+opens Git."* — and `--source-uid`/`--source-gid` are validated as non-zero,
+which only makes sense for a privileged daemon dropping down for source work.
+
+So the separation is internal rather than at the process boundary, and the
+protection is that Idunn accepts no imperative input: capability lives in the
+recipe, affordances in the binding, and `cli_exposes_only_declarative_commands`
+asserts there is no way to hand it a command string. The unit still runs under
+`ProtectSystem=full` with each actuated path re-opened individually, so the
+write set is enumerated even though the uid is root.
+
+That is a real increase in blast radius over a confined process, and worth a
+deliberate look before the cutover rather than a shrug. The counter-argument is
+that the old shape was confined in name only: the process was sandboxed and the
+thing it invoked was an unaudited root shell script with eleven hardcoded
+targets.
+
+**Still outstanding here:** the route driver stages preflight in
+`/run/idunn/route-preflight`; the unit now declares `RuntimeDirectory=idunn`,
+which creates and removes `/run/idunn` with the service.
+
 ## Cutting over the authority
 
 Idunn last, and not by deploying Idunn with Idunn.
