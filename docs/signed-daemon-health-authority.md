@@ -27,6 +27,34 @@ checkout or upstream cannot replace the daemon's liveness statement or block
 restart of an unhealthy admitted body. Continuity restart and deployment are
 separate authorities: only the latter is gated by the deployment brake.
 
+## Wire contract
+
+Idunn owns these constants. A publisher supplies them to a generic transport;
+they are not the transport's to choose, and this document is where they are
+defined.
+
+| Constant | Value |
+| --- | --- |
+| RUDP connection id | `0x1d0d0001` |
+| Signed statement schema | `idunn.signed_daemon_health.v1` |
+| Unsigned diagnostic schema | `idunn.daemon_health` |
+
+The signing purpose is the signed statement schema id, so a statement signed for
+Idunn cannot verify as another service's health. The signature and identity
+domains — `gamecult.provider-health.signature.v1` and
+`gamecult.provider-health.identity.v1` — are shared GameCult domains rather than
+Idunn's, and a publisher may not vary them.
+
+The publishing transport lives in CultLib as
+`cultnet-ts`'s `signed-daemon-health` module. It is generic: it binds, shakes
+hands, signs, puts the document, and waits for the ack, taking the three
+constants above as a contract. Consumers declare that contract against this
+document; they do not each reimplement the transport.
+
+Note that the unsigned schema is `idunn.daemon_health`, without a version
+suffix, while prose elsewhere in this repository says `idunn.daemon_health.v1`.
+The wire value is the one in the table.
+
 ## Inputs
 
 The daemon-authored statement binds:
