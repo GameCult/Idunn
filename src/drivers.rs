@@ -2414,55 +2414,112 @@ impl SystemdTransientWorkloadDriver {
             .iter()
             .map(|credential| credential.environment_name.clone())
             .collect::<Vec<_>>();
-        ensure!(
-            observation.unit_description == expected_description
-                && observation.service_type == "exec"
-                && observation.restart_policy == "no"
-                && observation.kill_mode == "mixed"
-                && observation.dynamic_user
-                && observation.systemd_user.is_empty()
-                && match expected_group {
+        // Checked one clause at a time so a mismatch names itself. As a single
+        // conjunction this reported only "the launch contract differs", leaving
+        // an operator to bisect thirty conditions by hand against a workload
+        // that has already exited.
+        //
+        // `systemd_user` is deliberately absent: systemd reports the identity it
+        // allocated for a DynamicUser unit, so it is never empty for a running
+        // workload. See the same note in `observe_unit`.
+        let expected_load_credential = if regular_credential_names.is_empty() {
+            ""
+        } else {
+            "[unprintable]"
+        };
+        let launch_contract: [(bool, &str); 28] = [
+            (
+                observation.unit_description == expected_description,
+                "unit description",
+            ),
+            (observation.service_type == "exec", "service type"),
+            (observation.restart_policy == "no", "restart policy"),
+            (observation.kill_mode == "mixed", "kill mode"),
+            (observation.dynamic_user, "dynamic user"),
+            (
+                match expected_group {
                     Some(group) => observation.systemd_group == group,
                     None => observation.systemd_group.is_empty(),
-                }
-                && observation.supplementary_groups.is_empty()
-                && observation.capability_bounding_set.is_empty()
-                && observation.ambient_capabilities.is_empty()
-                && observation.private_mounts
-                && observation.private_pids
-                && observation.protect_proc == "invisible"
-                && observation.proc_subset == "all"
-                && observation.no_new_privileges
-                && observation.umask == "0007"
-                && observation.inaccessible_paths == self.credential_root.display().to_string()
-                && observation.load_credential
-                    == if regular_credential_names.is_empty() {
-                        ""
-                    } else {
-                        "[unprintable]"
-                    }
-                && observation.working_directory == installed
-                && observation.runtime_bundle == bundle
-                && observation.credentials_directory == expected_credentials_directory
-                && observation.command_line_sha256 == sha256_id(&proc_command_line(&command))
-                && observation.environment_names == environment_names
-                && observation.environment_contract_sha256
-                    == sha256_id(&rmp_serde::to_vec(&environment)?)
-                && descriptor_properties.len() == 2
-                && observation.parent_only_file_descriptors[0].source_path == activation_source
-                && observation.parent_only_file_descriptors[0].size == 32
-                && observation.parent_only_file_descriptors[1].source_path == *presence_source
-                && observation.activation_signer_identity_id
+                },
+                "systemd group",
+            ),
+            (
+                observation.supplementary_groups.is_empty(),
+                "supplementary groups",
+            ),
+            (
+                observation.capability_bounding_set.is_empty(),
+                "capability bounding set",
+            ),
+            (
+                observation.ambient_capabilities.is_empty(),
+                "ambient capabilities",
+            ),
+            (observation.private_mounts, "private mounts"),
+            (observation.private_pids, "private PIDs"),
+            (observation.protect_proc == "invisible", "protect proc"),
+            (observation.proc_subset == "all", "proc subset"),
+            (observation.no_new_privileges, "no new privileges"),
+            (observation.umask == "0007", "umask"),
+            (
+                observation.inaccessible_paths == self.credential_root.display().to_string(),
+                "inaccessible paths",
+            ),
+            (
+                observation.load_credential == expected_load_credential,
+                "load credential",
+            ),
+            (observation.working_directory == installed, "working directory"),
+            (observation.runtime_bundle == bundle, "runtime bundle"),
+            (
+                observation.credentials_directory == expected_credentials_directory,
+                "credentials directory",
+            ),
+            (
+                observation.command_line_sha256 == sha256_id(&proc_command_line(&command)),
+                "command line",
+            ),
+            (
+                observation.environment_names == environment_names,
+                "environment names",
+            ),
+            (
+                observation.environment_contract_sha256
+                    == sha256_id(&rmp_serde::to_vec(&environment)?),
+                "environment contract",
+            ),
+            (descriptor_properties.len() == 2, "descriptor count"),
+            (
+                observation.parent_only_file_descriptors[0].source_path == activation_source
+                    && observation.parent_only_file_descriptors[0].size == 32
+                    && observation.parent_only_file_descriptors[1].source_path == *presence_source,
+                "parent-only descriptors",
+            ),
+            (
+                observation.activation_signer_identity_id
                     == activation.activation_signer_identity_id
-                && observation.activation_signer_public_key
-                    == activation.activation_signer_public_key
-                && observed_credential_names == regular_credential_names
-                && match expected_group_id {
+                    && observation.activation_signer_public_key
+                        == activation.activation_signer_public_key,
+                "activation signer",
+            ),
+            (
+                observed_credential_names == regular_credential_names,
+                "credential names",
+            ),
+            (
+                match expected_group_id {
                     Some(group_id) => observation.process_gids[0] == group_id,
                     None => observation.process_gids[0] == observation.process_uids[0],
                 },
-            "running workload launch contract differs from the admitted launch"
-        );
+                "process group id",
+            ),
+        ];
+        for (holds, clause) in launch_contract {
+            ensure!(
+                holds,
+                "running workload launch contract differs from the admitted launch: {clause}"
+            );
+        }
         ensure!(
             Path::new(&observation.control_group).file_name()
                 == Some(OsStr::new(&observation.unit)),
