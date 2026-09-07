@@ -40,7 +40,8 @@ use crate::drivers::{
 };
 
 const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
-const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v2";
+const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v3";
+const DEPLOYMENT_TRANSACTION_SCHEMA_V2: &str = "idunn.deployment_transaction.v2";
 const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v2";
 const DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS: u64 = 30_000;
 const DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS: u64 = 2_000;
@@ -708,7 +709,11 @@ struct DeploymentTransaction {
     pre_fencing_abort: Option<PreFencingAbort>,
     #[cultcache(key = 33)]
     post_commit_cleanup: Option<PostCommitCleanup>,
-    #[cultcache(key = 34)]
+    //  because every transaction already durable predates this field:
+    // an absent key 34 decodes as None, which is exactly "this transaction has
+    // no post-fencing abort". Without it the daemon refuses to read its own
+    // control store and crashloops.
+    #[cultcache(key = 34, default)]
     post_fencing_abort: Option<PostFencingAbort>,
 }
 
@@ -1687,12 +1692,7 @@ impl ControlSnapshot {
                     snapshot.commands.push(Stored { envelope, value });
                 }
                 DeploymentTransaction::TYPE => {
-                    ensure!(
-                        envelope.schema_id.as_deref() == Some(DEPLOYMENT_TRANSACTION_SCHEMA),
-                        "Idunn control store contains an unsupported transaction"
-                    );
-                    let value: DeploymentTransaction = decode_record(&envelope)?;
-                    value.validate()?;
+                    let value = read_transaction_record(&envelope)?;
                     ensure!(
                         envelope.key == value.transaction_id,
                         "deployment transaction key differs from its identity"
@@ -1906,6 +1906,87 @@ fn command_envelope(value: &DeploymentCommand, now: u64) -> Result<CultCacheEnve
         value,
         now,
     )
+}
+
+/// Read one stored transaction, lifting a v2 record to the current shape.
+///
+/// The control store refuses noncanonical bytes: a record must re-encode to
+/// exactly what is stored. That check is what makes tampering visible, and it
+/// also means adding a field is a schema change -- every transaction written
+/// before `post_fencing_abort` existed re-encodes with one extra key and would
+/// be read as tampered.
+///
+/// So a v2 record is decoded by key, which tolerates the absent key, and lifted
+/// with no post-fencing abort, because a transaction written before the field
+/// existed cannot have had one. Byte-exactness cannot apply across a version
+/// boundary -- the bytes are a different schema by definition -- so the lift
+/// leans on the full semantic `validate()` instead, and everything downstream
+/// sees only the current shape.
+fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTransaction> {
+    match envelope.schema_id.as_deref() {
+        Some(DEPLOYMENT_TRANSACTION_SCHEMA) => {
+            let value: DeploymentTransaction = decode_record(envelope)?;
+            value.validate()?;
+            Ok(value)
+        }
+        Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2) => {
+            let mut value: DeploymentTransaction = rmp_serde::from_slice(&envelope.payload)
+                .context("decoding a v2 deployment transaction")?;
+            ensure!(
+                value.schema_version == DEPLOYMENT_TRANSACTION_SCHEMA_V2,
+                "stored transaction schema differs from its envelope"
+            );
+            ensure!(
+                value.post_fencing_abort.is_none(),
+                "a v2 transaction cannot carry post-fencing abort evidence"
+            );
+            value.schema_version = DEPLOYMENT_TRANSACTION_SCHEMA.into();
+            value.validate()?;
+            Ok(value)
+        }
+        _ => bail!("Idunn control store contains an unsupported transaction"),
+    }
+}
+
+/// Rewrite every v2 transaction as v3, once, before the engine runs.
+///
+/// The read path lifts v2 records on its own, so this is convergence rather
+/// than correctness: without it the store keeps records in two shapes for as
+/// long as the oldest terminal transaction survives retention. Each rewrite is
+/// a compare-exchange against the exact stored envelope, so a record that
+/// changed underneath is left alone rather than clobbered.
+fn migrate_transactions_to_current_schema(store_path: &Path) -> Result<usize> {
+    if !store_path.exists() {
+        return Ok(0);
+    }
+    let store = SingleFileMessagePackBackingStore::new(store_path);
+    let stale = store
+        .pull_all_read_only_snapshot()
+        .context("reading Idunn control snapshot for migration")?
+        .into_iter()
+        .filter(|envelope| {
+            envelope.r#type == DeploymentTransaction::TYPE
+                && envelope.schema_id.as_deref() == Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2)
+        })
+        .collect::<Vec<_>>();
+    let mut migrated = 0;
+    for envelope in stale {
+        let value = read_transaction_record(&envelope)?;
+        let next = transaction_envelope(&value, value.updated_at_unix_millis)?;
+        ensure!(
+            store.compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: value.transaction_id.clone(),
+                    current: Some(envelope.clone()),
+                }],
+                &[next],
+            )?,
+            "deployment transaction changed during schema migration"
+        );
+        migrated += 1;
+    }
+    Ok(migrated)
 }
 
 fn transaction_envelope(value: &DeploymentTransaction, now: u64) -> Result<CultCacheEnvelope> {
@@ -2502,6 +2583,11 @@ fn serve(options: RuntimeOptions) -> Result<()> {
             .with_context(|| format!("creating Idunn directory {}", directory.display()))?;
     }
     let _lock = ProcessLock::acquire(&options.state_store)?;
+    let migrated = migrate_transactions_to_current_schema(&options.state_store)
+        .context("migrating Idunn transactions to the current schema")?;
+    if migrated > 0 {
+        println!("migrated {migrated} transaction(s) to {DEPLOYMENT_TRANSACTION_SCHEMA}");
+    }
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
     let engine = Engine::open(options)?;
     engine.validate_durable_authority(&ControlSnapshot::read(&engine.options.state_store)?)?;
