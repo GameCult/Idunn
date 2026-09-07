@@ -3373,6 +3373,60 @@ impl CultCacheTopologyDriver {
         bail!("topology projection changed repeatedly during admitted restoration")
     }
 
+    /// Whether the projection currently names any activation for this target.
+    ///
+    /// Continuity asks so it can tell a projection that still describes a dead
+    /// incarnation from one that has already been demoted to Expected-only.
+    pub fn projected_activation_is_present(&self, target: &str) -> Result<bool> {
+        if !self.projection_store.exists() {
+            return Ok(false);
+        }
+        let entries = SingleFileMessagePackBackingStore::new(&self.projection_store)
+            .pull_all_read_only_snapshot()?;
+        Ok(projection_entry(&entries, IdunnRuntimeActivationRecord::TYPE, target)?.is_some())
+    }
+
+    /// Whether the projection already carries this admitted Expected.
+    ///
+    /// Deliberately says nothing about the activation. Continuity restores the
+    /// Expected for a target whose process is gone, and at that moment there is
+    /// no activation to be exact about -- the next one is issued when the
+    /// workload starts.
+    pub fn admitted_expected_projection_is_exact(
+        &self,
+        expected: &IdunnExpectedIncarnationRecord,
+        provider_anchor: &ServiceIdentityTrustAnchor,
+    ) -> Result<bool> {
+        expected.validate()?;
+        if !self.projection_store.exists() {
+            return Ok(false);
+        }
+        let entries = SingleFileMessagePackBackingStore::new(&self.projection_store)
+            .pull_all_read_only_snapshot()?;
+        let anchor = runtime_presence_trust_anchor(expected, provider_anchor)?;
+        let expected_is_exact = match projection_entry(
+            &entries,
+            IdunnExpectedIncarnationRecord::TYPE,
+            &expected.target,
+        )? {
+            Some(envelope) => {
+                envelope.schema_id.as_deref() == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA)
+                    && IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)?
+                        == *expected
+            }
+            None => false,
+        };
+        let anchor_is_exact = match projection_entry(
+            &entries,
+            GameCultServiceTrustAnchorRecord::TYPE,
+            &anchor.trust_anchor_id,
+        )? {
+            Some(envelope) => service_trust_anchor_from_envelope(envelope)? == anchor,
+            None => false,
+        };
+        Ok(expected_is_exact && anchor_is_exact)
+    }
+
     pub fn admitted_runtime_projection_is_exact(
         &self,
         expected: &IdunnExpectedIncarnationRecord,

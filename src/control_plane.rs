@@ -926,8 +926,8 @@ impl DeploymentTransaction {
                     "Warming topology evidence exceeds the transaction replay cursor"
                 ),
                 WarmingEvidence::FirstOdinDirect { .. } => ensure!(
-                    self.target == "odin" && self.incumbent_generation_id.is_none(),
-                    "direct Warming evidence is reserved for first Odin bootstrap"
+                    self.target == "odin",
+                    "direct Warming evidence is reserved for Odin observing itself"
                 ),
             }
         }
@@ -2819,56 +2819,32 @@ impl Engine {
                     current.value.target
                 ),
             }
-            // Repair the projection before anything is asked of the workload.
+            // Restore the admitted Expected before anything is asked of the
+            // workload, and only the Expected.
             //
-            // This used to require a fresh observation, which cannot be had
-            // when the process is down -- and a demoted projection is one of
-            // the reasons it goes down: an abort restores the incumbent's
-            // Expected without its activation, and a target that cannot see its
-            // own activation cannot publish presence, so it exits and no
-            // observation is ever available to authorise the repair. Odin
-            // crashlooped exactly this way.
-            //
-            // Nothing here is inferred from the live process. Expected,
-            // activation and lease all come from the admitted generation, and
-            // the workload observation is the one Idunn recorded when it
-            // admitted them, so this republishes what Idunn already decided
-            // rather than ratifying whatever happens to be running.
+            // A target that cannot see its own Expected cannot start, and an
+            // aborted deployment leaves exactly that gap, so this cannot wait
+            // for an observation the dead process will never provide. The
+            // activation is deliberately not restored: it names one running
+            // incarnation, every restart issues a fresh one, and republishing
+            // the admitted one leaves the projection naming an incarnation that
+            // no longer exists -- which the workload rightly refuses to adopt.
+            // That record is published from observation once the process is up.
             if blocker.is_none()
                 || blocker.is_some_and(|stored| stored.value.phase == DeploymentPhase::Complete)
             {
                 let repair = (|| -> Result<()> {
                     let topology = self.topology();
                     let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
-                    if !topology.admitted_runtime_projection_is_exact(
+                    if !topology.admitted_expected_projection_is_exact(
                         &current.value.expected,
                         &provider_anchor,
-                        &current.value.activation,
-                        current.value.leasing.lease(),
                     )? {
                         ensure!(
                             topology.publish_expected(&current.value.expected, &provider_anchor)?
                                 == current.value.expected.canonical_sha256()?,
                             "admitted Expected projection repair differs"
                         );
-                        ensure!(
-                            topology.publish_observed_activation(
-                                &current.value.expected,
-                                &current.value.activation,
-                                &current.value.workload,
-                            )? == current.value.activation.canonical_sha256()?,
-                            "admitted activation projection repair differs"
-                        );
-                        if let Some(lease) = current.value.leasing.lease() {
-                            ensure!(
-                                topology.publish_process_write_lease(
-                                    &current.value.expected,
-                                    &current.value.activation,
-                                    lease,
-                                )? == lease.canonical_sha256()?,
-                                "admitted write-lease projection repair differs"
-                            );
-                        }
                     }
                     Ok(())
                 })();
@@ -2941,7 +2917,15 @@ impl Engine {
             let workload_error = operational_error
                 .context("admitted operational state has neither observation nor error")?;
             if let Some(blocker) = blocker {
-                if blocker.value.phase < DeploymentPhase::Fencing
+                // Yielding a *deployment* to continuity is right: the incumbent
+                // died, so changing it can wait. Doing the same to a continuity
+                // transaction is self-defeating -- that transaction exists to
+                // restart the very workload whose absence triggers the yield,
+                // so aborting it schedules another, which is aborted in turn.
+                // Odin sat in that loop, down, while Idunn cancelled its own
+                // recovery every few seconds.
+                if blocker.value.command_kind == CommandKind::Deploy
+                    && blocker.value.phase < DeploymentPhase::Fencing
                     && blocker.value.pre_fencing_abort.is_none()
                 {
                     self.begin_pre_fencing_abort(
@@ -2953,6 +2937,37 @@ impl Engine {
                     progressed = true;
                 }
                 continue;
+            }
+            // The projected activation names an incarnation that is gone. Every
+            // restart is issued a fresh one, so leaving the old record standing
+            // makes the projection describe a process that no longer exists --
+            // and a workload that reads it refuses to adopt an activation that
+            // is not its own, which is a restart loop rather than a recovery.
+            // Demote to Expected-only, the same shape an aborted deployment
+            // leaves, and let the restart publish its own activation once it is
+            // observed.
+            let demotion = (|| -> Result<()> {
+                let topology = self.topology();
+                let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
+                if !topology.projected_activation_is_present(&current.value.target)? {
+                    return Ok(());
+                }
+                topology.restore_admitted_expected_only(
+                    &current.value.expected,
+                    &provider_anchor,
+                    Some(&current.value.activation),
+                    &current.value.expected,
+                    &provider_anchor,
+                    &current.value.activation,
+                    current.value.leasing.lease(),
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = demotion {
+                eprintln!(
+                    "Idunn preserved admitted {} after refusing to demote its projection: {error:#}",
+                    current.value.target
+                );
             }
             let now = now_millis()?;
             let command = DeploymentCommand {
@@ -3382,11 +3397,28 @@ impl Engine {
         let incumbent_lease_sha256 =
             self.incumbent_lease_sha256_for_warming(&snapshot, &current.value)?;
         if current.value.warming.is_none() {
-            if current.value.target == "odin" && snapshot.admitted_for("odin").is_none() {
+            // Odin's warming is observed directly when nothing else can observe
+            // it. That is the first bootstrap, and it is also every continuity
+            // restart of Odin: the incumbent that would do the observing is the
+            // very process being restarted, so it cannot report on its own
+            // return. A deployment of Odin is not included -- there the healthy
+            // incumbent observes the candidate, which is the point.
+            // Odin's warming is observed directly exactly when no Odin can
+            // observe it: the first bootstrap, a continuity restart of Odin
+            // itself, or any moment the admitted Odin has no usable correlation
+            // to report through. The rule is the same one that justified the
+            // bootstrap case -- "observed through Odin" is not available -- and
+            // it stays scoped to this one target. Every other target keeps
+            // waiting for Odin, which is what makes Odin the root of the chain.
+            let odin_can_observe = current.value.target != "odin"
+                || (snapshot.admitted_for("odin").is_some()
+                    && current.value.command_kind != CommandKind::Continuity
+                    && self.admit_latest_topology(current, None)?.is_some());
+            let odin_observes_itself = current.value.target == "odin" && !odin_can_observe;
+            if odin_observes_itself {
                 ensure!(
-                    current.value.incumbent_generation_id.is_none()
-                        && expected.write_lease_required,
-                    "first Odin bootstrap must be a stateful first incarnation"
+                    expected.write_lease_required,
+                    "direct Odin warming must be a stateful incarnation"
                 );
                 let (evidence, present) = self.observe_first_odin_warming(&current.value)?;
                 let _token = SequenceAdmittedWarming::from_first_odin_presence(
