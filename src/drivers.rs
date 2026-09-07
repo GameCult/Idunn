@@ -5994,9 +5994,14 @@ fn publish_projection_mode(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if path.exists() {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o644))
-                .with_context(|| format!("publishing {}", path.display()))?;
+        // The lock sibling too: CultCache opens it alongside the store, so a
+        // 0640 lock denies the read just as surely as a 0640 store, and it is
+        // created fresh under Idunn's umask on every publish.
+        for path in [path.to_path_buf(), authority_lock_path(path)] {
+            if path.exists() {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+                    .with_context(|| format!("publishing {}", path.display()))?;
+            }
         }
     }
     Ok(())
@@ -6641,9 +6646,14 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         // What Idunn's UMask=027 leaves behind.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let lock = temp.path().join("topology.cc.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o640)).unwrap();
         publish_projection_mode(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644, "every target must be able to read the projection");
+        let lock_mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(lock_mode, 0o644, "the lock is opened alongside the store");
     }
 
     #[cfg(unix)]
