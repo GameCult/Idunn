@@ -2819,6 +2819,66 @@ impl Engine {
                     current.value.target
                 ),
             }
+            // Repair the projection before anything is asked of the workload.
+            //
+            // This used to require a fresh observation, which cannot be had
+            // when the process is down -- and a demoted projection is one of
+            // the reasons it goes down: an abort restores the incumbent's
+            // Expected without its activation, and a target that cannot see its
+            // own activation cannot publish presence, so it exits and no
+            // observation is ever available to authorise the repair. Odin
+            // crashlooped exactly this way.
+            //
+            // Nothing here is inferred from the live process. Expected,
+            // activation and lease all come from the admitted generation, and
+            // the workload observation is the one Idunn recorded when it
+            // admitted them, so this republishes what Idunn already decided
+            // rather than ratifying whatever happens to be running.
+            if blocker.is_none()
+                || blocker.is_some_and(|stored| stored.value.phase == DeploymentPhase::Complete)
+            {
+                let repair = (|| -> Result<()> {
+                    let topology = self.topology();
+                    let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
+                    if !topology.admitted_runtime_projection_is_exact(
+                        &current.value.expected,
+                        &provider_anchor,
+                        &current.value.activation,
+                        current.value.leasing.lease(),
+                    )? {
+                        ensure!(
+                            topology.publish_expected(&current.value.expected, &provider_anchor)?
+                                == current.value.expected.canonical_sha256()?,
+                            "admitted Expected projection repair differs"
+                        );
+                        ensure!(
+                            topology.publish_observed_activation(
+                                &current.value.expected,
+                                &current.value.activation,
+                                &current.value.workload,
+                            )? == current.value.activation.canonical_sha256()?,
+                            "admitted activation projection repair differs"
+                        );
+                        if let Some(lease) = current.value.leasing.lease() {
+                            ensure!(
+                                topology.publish_process_write_lease(
+                                    &current.value.expected,
+                                    &current.value.activation,
+                                    lease,
+                                )? == lease.canonical_sha256()?,
+                                "admitted write-lease projection repair differs"
+                            );
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = repair {
+                    eprintln!(
+                        "Idunn preserved admitted {} after refusing topology projection repair: {error:#}",
+                        current.value.target
+                    );
+                }
+            }
             let mut operational_error = None;
             let observation = match self.workload.observe(
                 &current.value.expected,
@@ -2875,53 +2935,7 @@ impl Engine {
                     None
                 }
             };
-            if let Some(observation) = observation {
-                if blocker.is_none()
-                    || blocker.is_some_and(|stored| stored.value.phase == DeploymentPhase::Complete)
-                {
-                    let repair = (|| -> Result<()> {
-                        let topology = self.topology();
-                        let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
-                        if !topology.admitted_runtime_projection_is_exact(
-                            &current.value.expected,
-                            &provider_anchor,
-                            &current.value.activation,
-                            current.value.leasing.lease(),
-                        )? {
-                            ensure!(
-                                topology
-                                    .publish_expected(&current.value.expected, &provider_anchor,)?
-                                    == current.value.expected.canonical_sha256()?,
-                                "admitted Expected projection repair differs"
-                            );
-                            ensure!(
-                                topology.publish_observed_activation(
-                                    &current.value.expected,
-                                    &current.value.activation,
-                                    &observation,
-                                )? == current.value.activation.canonical_sha256()?,
-                                "admitted activation projection repair differs"
-                            );
-                            if let Some(lease) = current.value.leasing.lease() {
-                                ensure!(
-                                    topology.publish_process_write_lease(
-                                        &current.value.expected,
-                                        &current.value.activation,
-                                        lease,
-                                    )? == lease.canonical_sha256()?,
-                                    "admitted write-lease projection repair differs"
-                                );
-                            }
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = repair {
-                        eprintln!(
-                            "Idunn preserved admitted {} after refusing topology projection repair: {error:#}",
-                            current.value.target
-                        );
-                    }
-                }
+            if observation.is_some() {
                 continue;
             }
             let workload_error = operational_error
