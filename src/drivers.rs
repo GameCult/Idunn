@@ -297,6 +297,15 @@ pub trait WorkloadPort {
     ) -> Result<WorkloadObservation>;
 
     fn stop(&self, observation: &WorkloadObservation) -> Result<()>;
+
+    /// True when this candidate can never run again without a new transaction.
+    ///
+    /// Idunn launches candidates as transient units with `Restart=no`, so a
+    /// unit that has failed, or that systemd no longer knows, will not come
+    /// back on its own. Past the fence every error is otherwise treated as
+    /// resumable and retried forever, which is right while a candidate can
+    /// still recover and a trap once it cannot.
+    fn is_permanently_stopped(&self, observation: &WorkloadObservation) -> Result<bool>;
 }
 
 pub trait TopologyPort {
@@ -2957,6 +2966,18 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
         Ok(after_unlink)
     }
 
+    fn is_permanently_stopped(&self, observation: &WorkloadObservation) -> Result<bool> {
+        ensure!(
+            observation.restart_policy == "no",
+            "candidate unit does not carry the admitted Restart=no policy"
+        );
+        let Some(unit) = self.show_unit(&observation.unit)? else {
+            // systemd has forgotten the unit entirely, so nothing will start it.
+            return Ok(true);
+        };
+        Ok(unit.properties.get("ActiveState").map(String::as_str) == Some("failed"))
+    }
+
     fn stop(&self, observation: &WorkloadObservation) -> Result<()> {
         let Some(unit_observation) = self.show_unit(&observation.unit)? else {
             return Ok(());
@@ -4256,6 +4277,21 @@ impl NginxRouteDriver {
     /// written fragment so the next continuity pass cannot mistake disk bytes
     /// for an adopted route. The caller must still challenge the stable
     /// listener to prove that nginx workers adopted this membership.
+    /// Put the route back exactly as the candidate found it.
+    ///
+    /// The preflight receipt captured the incumbent's configuration before this
+    /// candidate's membership was installed, so restoring it is precise whether
+    /// there was an incumbent (its bytes) or none (removal). Used when a
+    /// transaction is abandoned after the fence.
+    pub fn withdraw_candidate_membership(&self, preflight: &RoutePreflightReceipt) -> Result<()> {
+        preflight.validate()?;
+        ensure!(
+            preflight.route_id == self.binding.route_id,
+            "route preflight receipt describes another route"
+        );
+        self.restore(preflight.incumbent_configuration.as_deref())
+    }
+
     pub fn restore_admitted_membership(
         &self,
         expected: &IdunnExpectedIncarnationRecord,

@@ -518,6 +518,7 @@ struct IsolationEvidence {
 enum TransactionCompletion {
     Admitted { generation_id: String },
     FailedBeforeFencing { error: String },
+    FailedAfterFencing { error: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,6 +532,40 @@ enum CleanupEvidence {
 impl CleanupEvidence {
     fn is_complete(self) -> bool {
         matches!(self, Self::Skipped | Self::Complete)
+    }
+}
+
+/// Rollback of a transaction that has already fenced the incumbent.
+///
+/// Fencing stops the admitted incarnation and revokes its write lease, so a
+/// candidate that then dies for good leaves the target with nothing serving it.
+/// Retrying forever cannot fix that -- a transient unit with `Restart=no` will
+/// not come back -- and it holds the target, leaving every later command queued
+/// behind a transaction that can never finish.
+///
+/// So the candidate's own artifacts are withdrawn in the order that never
+/// leaves two writers: route first, then the write lease, then the process,
+/// then the projection. Reconciling the projection restores the incumbent's
+/// admitted Expected where there is one, which is what lets continuity bring
+/// the incumbent back; where there is none, the failed Expected is withdrawn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostFencingAbort {
+    error: String,
+    route_restoration: CleanupEvidence,
+    lease_withdrawal: CleanupEvidence,
+    candidate_cleanup: CleanupEvidence,
+    topology_reconciliation: CleanupEvidence,
+    source_cleanup: CleanupEvidence,
+}
+
+impl PostFencingAbort {
+    fn is_complete(&self) -> bool {
+        self.route_restoration.is_complete()
+            && self.lease_withdrawal.is_complete()
+            && self.candidate_cleanup.is_complete()
+            && self.topology_reconciliation.is_complete()
+            && self.source_cleanup.is_complete()
     }
 }
 
@@ -673,6 +708,8 @@ struct DeploymentTransaction {
     pre_fencing_abort: Option<PreFencingAbort>,
     #[cultcache(key = 33)]
     post_commit_cleanup: Option<PostCommitCleanup>,
+    #[cultcache(key = 34)]
+    post_fencing_abort: Option<PostFencingAbort>,
 }
 
 impl DeploymentTransaction {
@@ -718,6 +755,7 @@ impl DeploymentTransaction {
             last_error: None,
             completion: None,
             pre_fencing_abort: None,
+            post_fencing_abort: None,
             post_commit_cleanup: None,
         };
         transaction.validate()?;
@@ -765,6 +803,10 @@ impl DeploymentTransaction {
                 .pre_fencing_abort
                 .as_ref()
                 .is_some_and(PreFencingAbort::is_complete),
+            Some(TransactionCompletion::FailedAfterFencing { .. }) => self
+                .post_fencing_abort
+                .as_ref()
+                .is_some_and(PostFencingAbort::is_complete),
             Some(TransactionCompletion::Admitted { .. }) => self
                 .post_commit_cleanup
                 .as_ref()
@@ -982,6 +1024,40 @@ impl DeploymentTransaction {
                 self.phase < DeploymentPhase::Fencing || self.phase == DeploymentPhase::Complete,
                 "pre-fencing abort crossed the fencing boundary"
             );
+        }
+
+        if let Some(abort) = &self.post_fencing_abort {
+            require_detail(&abort.error, "post-fencing abort error")?;
+            ensure!(
+                self.pre_fencing_abort.is_none() && self.post_commit_cleanup.is_none(),
+                "post-fencing abort collides with another terminal path"
+            );
+            ensure!(
+                self.phase >= DeploymentPhase::Fencing,
+                "post-fencing abort exists before the fence"
+            );
+        }
+
+        let failed_after_fencing = matches!(
+            self.completion,
+            Some(TransactionCompletion::FailedAfterFencing { .. })
+        );
+        if failed_after_fencing {
+            ensure!(
+                self.phase == DeploymentPhase::Complete,
+                "terminal failure is not Complete"
+            );
+            let abort = required(&self.post_fencing_abort, "terminal post-fence abort evidence")?;
+            let TransactionCompletion::FailedAfterFencing { error } =
+                self.completion.as_ref().unwrap()
+            else {
+                unreachable!()
+            };
+            ensure!(
+                abort.is_complete() && abort.error == *error,
+                "terminal failure lacks complete matching abort evidence"
+            );
+            return Ok(());
         }
 
         let failed = matches!(
@@ -2083,7 +2159,8 @@ fn submit(
                 transactions
                     .iter()
                     .find_map(|transaction| match &transaction.completion {
-                        Some(TransactionCompletion::FailedBeforeFencing { error }) => {
+                        Some(TransactionCompletion::FailedBeforeFencing { error })
+                        | Some(TransactionCompletion::FailedAfterFencing { error }) => {
                             Some(error.as_str())
                         }
                         _ => None,
@@ -2117,6 +2194,25 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
             "{} {} {} {}",
             command.command_id, command.selector, state, detail
         );
+        // Naming one command asks about that command, so print what a stuck
+        // transaction is actually waiting on. A gate reason lives in
+        // `last_error` and was never rendered anywhere, which left "Sealing"
+        // looking identical whether the brake had not authorized the
+        // transaction or the phase was simply slow. The release and deployment
+        // ids are here because they are exactly what a brake release must name.
+        if command_id.is_some() {
+            for transaction in transactions {
+                println!("  transaction {}", transaction.transaction_id);
+                println!("    target {} phase {:?}", transaction.target, transaction.phase);
+                if let Some(expected) = &transaction.expected {
+                    println!("    runtime {}", expected.runtime_id);
+                    println!("    release {}", expected.sealed_release_id);
+                }
+                if let Some(reason) = &transaction.last_error {
+                    println!("    waiting on {reason}");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2128,7 +2224,8 @@ fn derived_command_status(transactions: &[&DeploymentTransaction]) -> (&'static 
     if let Some(error) = transactions
         .iter()
         .find_map(|transaction| match &transaction.completion {
-            Some(TransactionCompletion::FailedBeforeFencing { error }) => Some(error.clone()),
+            Some(TransactionCompletion::FailedBeforeFencing { error })
+            | Some(TransactionCompletion::FailedAfterFencing { error }) => Some(error.clone()),
             _ => None,
         })
     {
@@ -2456,6 +2553,15 @@ impl Engine {
                     && latest.value.pre_fencing_abort.is_none()
                 {
                     self.begin_pre_fencing_abort(latest, error)?;
+                } else if latest.value.post_fencing_abort.is_none()
+                    && self.candidate_is_permanently_stopped(&latest.value)?
+                {
+                    // Past the fence an error is resumable while the candidate
+                    // can still recover. This one cannot: its transient unit
+                    // has failed and carries Restart=no, so retrying would hold
+                    // the target forever behind a transaction that can never
+                    // finish.
+                    self.begin_post_fencing_abort(latest, error)?;
                 } else {
                     self.record_resumable_error(latest, &error)?;
                 }
@@ -2939,6 +3045,9 @@ impl Engine {
     }
 
     fn advance_transaction(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
+        if current.value.post_fencing_abort.is_some() && current.value.completion.is_none() {
+            return self.advance_post_fencing_abort(current);
+        }
         if current.value.pre_fencing_abort.is_some() && current.value.completion.is_none() {
             return self.advance_pre_fencing_abort(current);
         }
@@ -4786,6 +4895,217 @@ impl Engine {
         })
     }
 
+    /// Whether this transaction's candidate can no longer run at all.
+    ///
+    /// A transaction that has never started one has no candidate to be dead, so
+    /// it is not permanently stopped -- it is simply not there yet.
+    fn candidate_is_permanently_stopped(&self, transaction: &DeploymentTransaction) -> Result<bool> {
+        let Some(workload) = &transaction.workload else {
+            return Ok(false);
+        };
+        self.workload.is_permanently_stopped(workload)
+    }
+
+    fn begin_post_fencing_abort(
+        &self,
+        current: &Stored<DeploymentTransaction>,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        ensure!(
+            current.value.phase >= DeploymentPhase::Fencing,
+            "pre-fence transaction must abort through the pre-fencing path"
+        );
+        ensure!(
+            current.value.post_fencing_abort.is_none(),
+            "post-fencing abort intent is already durable"
+        );
+        let abort = PostFencingAbort {
+            error: truncate(&format!("{error:#}"), 2048),
+            route_restoration: if current.value.route_preflight.is_some() {
+                CleanupEvidence::Pending
+            } else {
+                CleanupEvidence::Skipped
+            },
+            lease_withdrawal: if current
+                .value
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::lease)
+                .is_some()
+            {
+                CleanupEvidence::Pending
+            } else {
+                CleanupEvidence::Skipped
+            },
+            candidate_cleanup: candidate_cleanup_requirement(
+                current.value.activation.is_some(),
+                current.value.workload.is_some(),
+            ),
+            topology_reconciliation: if current.value.command_kind == CommandKind::Deploy
+                && current.value.expected_publication_sha256.is_some()
+            {
+                CleanupEvidence::Pending
+            } else {
+                CleanupEvidence::Skipped
+            },
+            source_cleanup: if current.value.command_kind == CommandKind::Deploy {
+                CleanupEvidence::Pending
+            } else {
+                CleanupEvidence::Skipped
+            },
+        };
+        self.persist_same_phase(current, |next| {
+            next.post_fencing_abort = Some(abort);
+            Ok(())
+        })
+    }
+
+    /// Withdraw the candidate in the one order that never leaves two writers:
+    /// take away its route, then its write lease, then the process itself, and
+    /// only then reconcile the projection.
+    fn advance_post_fencing_abort(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
+        let abort = required(
+            &current.value.post_fencing_abort,
+            "post-fencing abort intent",
+        )?;
+        if abort.route_restoration == CleanupEvidence::Pending {
+            let preflight = required(&current.value.route_preflight, "route preflight receipt")?;
+            let binding = current.value.plan.as_ref().unwrap().parsed_inputs()?.1;
+            let driver =
+                NginxRouteDriver::new(binding.route.context("routed plan has no route binding")?);
+            driver
+                .withdraw_candidate_membership(preflight)
+                .context("restoring the route the candidate found")?;
+            return self.persist_same_phase(current, |next| {
+                next.post_fencing_abort.as_mut().unwrap().route_restoration =
+                    CleanupEvidence::Complete;
+                Ok(())
+            });
+        }
+        if abort.lease_withdrawal == CleanupEvidence::Pending {
+            let expected = required(&current.value.expected, "Expected projection")?;
+            let activation = required(&current.value.activation, "activation")?;
+            let lease = current
+                .value
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::lease)
+                .context("post-fencing abort lost the lease it must withdraw")?;
+            let binding = current.value.plan.as_ref().unwrap().parsed_inputs()?.1;
+            let lease_path = binding
+                .process_write_lease
+                .context("leased target has no write-lease binding")?
+                .record_path;
+            let driver = CultCacheWriteLeaseDriver::new(&current.value.target, lease_path);
+            driver
+                .revoke_exact(Some(lease))
+                .context("revoking the abandoned candidate write lease")?;
+            ensure!(
+                driver.observe_empty()?,
+                "candidate write lease remained after post-fencing withdrawal"
+            );
+            self.topology()
+                .withdraw_process_write_lease(expected, activation, Some(lease))
+                .context("withdrawing the abandoned candidate write-lease projection")?;
+            return self.persist_same_phase(current, |next| {
+                next.post_fencing_abort.as_mut().unwrap().lease_withdrawal =
+                    CleanupEvidence::Complete;
+                Ok(())
+            });
+        }
+        if abort.candidate_cleanup == CleanupEvidence::Pending {
+            if let Some(workload) = &current.value.workload {
+                self.workload
+                    .stop(workload)
+                    .context("stopping the abandoned candidate")?;
+            }
+            self.workload
+                .discard_prepared(
+                    required(&current.value.plan, "abandoned candidate plan")?,
+                    required(&current.value.expected, "abandoned Expected projection")?,
+                    required(&current.value.activation, "abandoned activation")?,
+                )
+                .context("discarding the abandoned activation material")?;
+            return self.persist_same_phase(current, |next| {
+                next.post_fencing_abort.as_mut().unwrap().candidate_cleanup =
+                    CleanupEvidence::Complete;
+                Ok(())
+            });
+        }
+        if abort.topology_reconciliation == CleanupEvidence::Pending {
+            let expected = required(&current.value.expected, "failed Expected projection")?;
+            let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+            if let Some(incumbent) = self.exact_incumbent(&snapshot, &current.value)? {
+                // Restoring the incumbent's admitted Expected is what lets
+                // continuity bring it back. Fencing stopped it and revoked its
+                // lease, and continuity is the organ that restarts an admitted
+                // incarnation; deployment does not restart it from here.
+                let topology = self.topology();
+                let failed_provider_anchor = self.provider_anchor_for_plan(required(
+                    &current.value.plan,
+                    "failed transaction plan",
+                )?)?;
+                let admitted_provider_anchor =
+                    self.provider_anchor_for_plan(&incumbent.value.plan)?;
+                let expected_sha256 = topology.restore_admitted_expected_only(
+                    expected,
+                    &failed_provider_anchor,
+                    current.value.activation.as_ref(),
+                    &incumbent.value.expected,
+                    &admitted_provider_anchor,
+                    &incumbent.value.activation,
+                    incumbent.value.leasing.lease(),
+                )?;
+                ensure!(
+                    expected_sha256 == incumbent.value.expected.canonical_sha256()?,
+                    "restored incumbent Expected receipt differs"
+                );
+            } else {
+                let plan = required(&current.value.plan, "failed transaction plan")?;
+                let provider_anchor = self.provider_anchor_for_plan(plan)?;
+                self.topology()
+                    .withdraw_expected(
+                        expected,
+                        &provider_anchor,
+                        current.value.activation.as_ref(),
+                        None,
+                    )
+                    .context("withdrawing the abandoned Expected projection")?;
+            }
+            return self.persist_same_phase(current, |next| {
+                next.post_fencing_abort
+                    .as_mut()
+                    .unwrap()
+                    .topology_reconciliation = CleanupEvidence::Complete;
+                Ok(())
+            });
+        }
+        if abort.source_cleanup == CleanupEvidence::Pending {
+            self.source
+                .cleanup(
+                    &current.value.transaction_id,
+                    current.value.frozen_source.as_ref(),
+                )
+                .context("cleaning the abandoned source")?;
+            return self.persist_same_phase(current, |next| {
+                next.post_fencing_abort.as_mut().unwrap().source_cleanup = CleanupEvidence::Complete;
+                Ok(())
+            });
+        }
+        ensure!(
+            abort.is_complete(),
+            "post-fencing abort cleanup is incomplete"
+        );
+        let mut next = current.value.clone();
+        next.phase = DeploymentPhase::Complete;
+        next.updated_at_unix_millis = now_millis()?;
+        next.last_error = Some(abort.error.clone());
+        next.completion = Some(TransactionCompletion::FailedAfterFencing {
+            error: abort.error.clone(),
+        });
+        replace_transaction(&self.options.state_store, current, &next)
+    }
+
     fn advance_pre_fencing_abort(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
         ensure!(
             current.value.phase < DeploymentPhase::Fencing,
@@ -5690,6 +6010,61 @@ mod tests {
         });
         transaction.validate()?;
         assert!(transaction.is_terminal());
+        Ok(())
+    }
+
+    #[test]
+    fn post_fencing_abort_is_terminal_only_when_every_cleanup_is_complete() -> Result<()> {
+        let command = command(CommandKind::Deploy);
+        let mut transaction =
+            DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        transaction.phase = DeploymentPhase::Complete;
+        transaction.post_fencing_abort = Some(PostFencingAbort {
+            error: "candidate died after the fence".into(),
+            route_restoration: CleanupEvidence::Skipped,
+            lease_withdrawal: CleanupEvidence::Pending,
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Pending,
+        });
+        transaction.last_error = Some("candidate died after the fence".into());
+        transaction.completion = Some(TransactionCompletion::FailedAfterFencing {
+            error: "candidate died after the fence".into(),
+        });
+        // The evidence exists so that a target is released only once the
+        // candidate's route, lease, process and projection are actually gone.
+        assert!(transaction.validate().is_err());
+        assert!(!transaction.is_terminal());
+
+        let abort = transaction.post_fencing_abort.as_mut().unwrap();
+        abort.lease_withdrawal = CleanupEvidence::Complete;
+        abort.source_cleanup = CleanupEvidence::Complete;
+        transaction.validate()?;
+        assert!(transaction.is_terminal());
+
+        // The recorded error and the completion must name the same failure.
+        transaction.completion = Some(TransactionCompletion::FailedAfterFencing {
+            error: "a different story".into(),
+        });
+        assert!(transaction.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_pre_fence_transaction_cannot_carry_a_post_fencing_abort() -> Result<()> {
+        let command = command(CommandKind::Deploy);
+        let mut transaction =
+            DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        assert!(transaction.phase < DeploymentPhase::Fencing);
+        transaction.post_fencing_abort = Some(PostFencingAbort {
+            error: "candidate died after the fence".into(),
+            route_restoration: CleanupEvidence::Skipped,
+            lease_withdrawal: CleanupEvidence::Skipped,
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Skipped,
+        });
+        assert!(transaction.validate().is_err());
         Ok(())
     }
 
