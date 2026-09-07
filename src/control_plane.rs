@@ -1854,6 +1854,15 @@ impl ControlSnapshot {
         })
     }
 
+    /// The highest Odin publisher sequence this target has ever *acted on*.
+    ///
+    /// A transaction that failed contributes nothing. Its observations were
+    /// never built upon -- the deployment was abandoned and its projection
+    /// withdrawn -- so treating them as admitted history only raises the bar
+    /// for the next attempt. Odin does not reuse a sequence, so nothing is
+    /// weakened by forgetting the readings of an attempt that came to nothing;
+    /// what would be weakened is refusing every retry after a failure, which is
+    /// how a target ends up unable to deploy at all.
     fn max_odin_sequence(&self, target: &str, signer_identity_id: &str) -> u64 {
         let transaction_max = self
             .transactions
@@ -1866,6 +1875,11 @@ impl ControlSnapshot {
                     .filter(|evidence| {
                         stored.value.target == target
                             && evidence.signer_identity_id == signer_identity_id
+                            && !matches!(
+                                stored.value.completion,
+                                Some(TransactionCompletion::FailedBeforeFencing { .. })
+                                    | Some(TransactionCompletion::FailedAfterFencing { .. })
+                            )
                     })
                     .map(|evidence| evidence.publisher_sequence)
             })
@@ -2288,6 +2302,16 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
                 if let Some(expected) = &transaction.expected {
                     println!("    runtime {}", expected.runtime_id);
                     println!("    release {}", expected.sealed_release_id);
+                }
+                println!(
+                    "    odin publisher cursor {}",
+                    transaction.odin_publisher_sequence_cursor
+                );
+                if let Some(evidence) = &transaction.latest_odin_observation {
+                    println!(
+                        "    latest odin observation sequence {}",
+                        evidence.publisher_sequence
+                    );
                 }
                 if let Some(reason) = &transaction.last_error {
                     println!("    waiting on {reason}");
@@ -6025,6 +6049,21 @@ mod tests {
         assert_eq!(snapshot.max_odin_sequence("ghostlight", "odin-signer"), 7);
         assert_eq!(snapshot.max_odin_sequence("odin", "odin-signer"), 41);
         assert_eq!(snapshot.max_odin_sequence("ghostlight", "other-signer"), 0);
+
+        // A transaction that failed was never built upon, so its readings must
+        // not raise the bar for the next attempt. Counting them is how a target
+        // that has failed once becomes a target that can never deploy.
+        let mut abandoned = snapshot;
+        abandoned.transactions[0].value.completion =
+            Some(TransactionCompletion::FailedBeforeFencing {
+                error: "sealed source was rejected".into(),
+            });
+        assert_eq!(abandoned.max_odin_sequence("ghostlight", "odin-signer"), 0);
+        abandoned.transactions[1].value.completion =
+            Some(TransactionCompletion::FailedAfterFencing {
+                error: "candidate died after the fence".into(),
+            });
+        assert_eq!(abandoned.max_odin_sequence("odin", "odin-signer"), 0);
         Ok(())
     }
 
