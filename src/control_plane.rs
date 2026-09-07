@@ -43,6 +43,12 @@ const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
 const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v3";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V2: &str = "idunn.deployment_transaction.v2";
 const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v2";
+/// How many times continuity will restart one admitted release before it
+/// concludes the release itself is the problem. More than one because a start
+/// can fail for a passing reason -- a port still held, a peer not yet up --
+/// and few because each attempt holds the target against any deployment.
+const CONTINUITY_RESTART_ATTEMPTS: usize = 3;
+
 const DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS: u64 = 30_000;
 const DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS: u64 = 2_000;
 
@@ -2916,6 +2922,32 @@ impl Engine {
             }
             let workload_error = operational_error
                 .context("admitted operational state has neither observation nor error")?;
+            // Continuity restarts a release; it cannot repair one. When the
+            // admitted release will not start, rescheduling it forever keeps
+            // the target permanently occupied -- and a target with a live
+            // transaction accepts no deployment, so the one action that could
+            // fix it is exactly the one that is locked out. Give up after a few
+            // attempts and leave the target free for a replacement.
+            //
+            // Counted against this generation id, so a successful restart --
+            // which admits a new generation -- starts the count over rather
+            // than carrying old failures forward.
+            let refused_restarts = snapshot
+                .transactions
+                .iter()
+                .filter(|stored| {
+                    stored.value.target == current.value.target
+                        && stored.value.command_kind == CommandKind::Continuity
+                        && stored.value.incumbent_generation_id.as_deref()
+                            == Some(current.value.generation_id.as_str())
+                        && matches!(
+                            stored.value.completion,
+                            Some(TransactionCompletion::FailedBeforeFencing { .. })
+                                | Some(TransactionCompletion::FailedAfterFencing { .. })
+                        )
+                })
+                .count();
+
             if let Some(blocker) = blocker {
                 // Yielding a *deployment* to continuity is right: the incumbent
                 // died, so changing it can wait. Doing the same to a continuity
@@ -2924,7 +2956,12 @@ impl Engine {
                 // so aborting it schedules another, which is aborted in turn.
                 // Odin sat in that loop, down, while Idunn cancelled its own
                 // recovery every few seconds.
+                // Only yield to a continuity that is still trying. Once it has
+                // given up on this release there is nothing to yield to, and
+                // the deployment is the only thing left that can fix the
+                // target -- aborting it would close the last door.
                 if blocker.value.command_kind == CommandKind::Deploy
+                    && refused_restarts < CONTINUITY_RESTART_ATTEMPTS
                     && blocker.value.phase < DeploymentPhase::Fencing
                     && blocker.value.pre_fencing_abort.is_none()
                 {
@@ -2938,6 +2975,14 @@ impl Engine {
                 }
                 continue;
             }
+            if refused_restarts >= CONTINUITY_RESTART_ATTEMPTS {
+                eprintln!(
+                    "Idunn stopped restarting admitted {}: its release failed to start {} times.                      The target is free for a deployment to replace it: {workload_error:#}",
+                    current.value.target, refused_restarts
+                );
+                continue;
+            }
+
             // The projected activation names an incarnation that is gone. Every
             // restart is issued a fresh one, so leaving the old record standing
             // makes the projection describe a process that no longer exists --
@@ -6236,6 +6281,56 @@ mod tests {
             source_cleanup: CleanupEvidence::Skipped,
         });
         assert!(transaction.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn continuity_gives_up_on_a_release_that_will_not_start() -> Result<()> {
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "continuity-1".into(),
+            kind: CommandKind::Continuity,
+            selector: "odin".into(),
+            requested_by: "idunn-continuity".into(),
+            requested_at_unix_millis: 100,
+        };
+        let failed_restart = |generation: &str, ordinal: u32| -> Result<DeploymentTransaction> {
+            let mut transaction =
+                DeploymentTransaction::new(&command, "odin".into(), ordinal, None, 100)?;
+            transaction.incumbent_generation_id = Some(generation.into());
+            transaction.completion = Some(TransactionCompletion::FailedBeforeFencing {
+                error: "systemd unit is not running".into(),
+            });
+            Ok(transaction)
+        };
+
+        let refused = |transactions: &[DeploymentTransaction], generation: &str| -> usize {
+            transactions
+                .iter()
+                .filter(|value| {
+                    value.target == "odin"
+                        && value.command_kind == CommandKind::Continuity
+                        && value.incumbent_generation_id.as_deref() == Some(generation)
+                        && matches!(
+                            value.completion,
+                            Some(TransactionCompletion::FailedBeforeFencing { .. })
+                                | Some(TransactionCompletion::FailedAfterFencing { .. })
+                        )
+                })
+                .count()
+        };
+
+        let attempts = vec![
+            failed_restart("generation-1", 0)?,
+            failed_restart("generation-1", 1)?,
+            failed_restart("generation-1", 2)?,
+        ];
+        assert!(refused(&attempts, "generation-1") >= CONTINUITY_RESTART_ATTEMPTS);
+
+        // A restart that succeeds admits a new generation, and the count is
+        // kept against the generation id, so the next release is not condemned
+        // by the failures of the one it replaced.
+        assert_eq!(refused(&attempts, "generation-2"), 0);
         Ok(())
     }
 
