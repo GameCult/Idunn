@@ -496,18 +496,44 @@ world-readable, integrity protected by signature rather than by mode.
 is writable by the workload, and a daemon that can rewrite its own signing
 identity does not have one. Odin's topology identity moved to the runtime root.
 
-## A transaction past Fencing cannot be abandoned
+The Odin bootstrap added five more, every one of which cost a candidate that
+started, ran, and then died on a file it could not open:
+
+| Path | Required shape | Why |
+| --- | --- | --- |
+| `runtime_root` and every directory above it | traversable by the workload: `o+x`, or group-owned by the state group with `g+x` | the workload is a `DynamicUser` and owns nothing, and `ReadOnlyPaths=` binds the bundle's leaf into the namespace without granting traversal above it. Idunn now checks the whole chain and names the closed directory |
+| `runtime_root` | setgid, group-owned by the state group (`2750 root:<state_group>`) | `harden_root_authority_file` requires the write-lease record's group to equal its parent's, and only setgid makes a newly created record inherit it. Without it the record lands `root:root` and the workload cannot read its own lease |
+| the write-lease record | `root:<state_group>`, mode `0640` | follows from the setgid parent; the workload reads it through the state group. Idunn writes it, so fixing an existing wrong-group record means deleting it, and that is safe only when no transaction is live |
+| `/var/lib/gamecult/idunn-projection` | default ACL `u::rw-,g::r--,o::r--` | Idunn runs with `UMask=027`, so each publish creates the store and its `.lock` at `0640`. The code re-opens them after every write, but that leaves a window; a default ACL sets the mode at creation and closes it |
+| `/etc/nginx/idunn-stream-routes` | `root:root`, not group-writable | "route authority parent is not canonical root-owned and nonwritable". It was `root:idunn 0775` from the generation where Idunn ran unprivileged and needed to write it as a group member |
+
+Two shapes are worth stating plainly because they are easy to get backwards.
+A store's `.lock` sibling is opened whenever the store is, so a `0640` lock
+denies a read exactly as a `0640` store does. And CultLib's backing store
+reports an unreadable file as an **empty** store rather than an error, so every
+one of these permission faults arrives wearing a different costume: "runtime
+authority store must contain exactly one record", or a candidate that decides it
+holds no write lease and warms forever. When a store looks empty or a record
+looks missing, check whether the reader can open it before believing the
+content.
+
+## Abandoning a transaction past Fencing
 
 `begin_pre_fencing_abort` is gated on `phase < DeploymentPhase::Fencing`. After
-the fence, every error goes to `record_resumable_error` and the transaction
-retries forever. There is no operator verb to cancel one, and no server-side
-expiry -- `--timeout-seconds` bounds the `idunn up` client's wait, not the
-transaction.
+the fence, every error went to `record_resumable_error` and the transaction
+retried forever; there is still no operator verb to cancel one, and no
+server-side expiry -- `--timeout-seconds` bounds the `idunn up` client's wait,
+not the transaction.
 
 That is correct while a candidate can still recover. It is a trap when the
 candidate never can: a transient unit with `Restart=no` that has failed will not
 come back on its own, so the transaction holds the target and every later
 command for it stays `queued` indefinitely.
+
+A candidate that is permanently stopped -- its transient unit failed, or gone
+from systemd entirely -- now aborts instead, withdrawing its route, write lease,
+process and projection in that order, and restoring the incumbent's admitted
+Expected so continuity can bring it back.
 
 Found the hard way during Odin's first deployment, and made unrecoverable by
 deleting the target's write-lease record to fix its mode while a transaction
