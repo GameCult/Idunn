@@ -18,7 +18,8 @@ use cultnet_rs::{
     IdunnRuntimeActivationRecord, IdunnServiceIdentity, OdinTopologyAuthenticationContext,
     OdinTopologyDisagreement, OdinTopologyIdentity, RuntimePresenceAuthenticationContext,
     ServiceIdentityProfile, ServiceIdentitySigner, ServiceIdentityTrustAnchor,
-    authenticate_odin_runtime_topology_correlation, authenticate_runtime_presence_claim,
+    OdinRuntimeTopologyCorrelationRecord, authenticate_odin_runtime_topology_correlation,
+    authenticate_runtime_presence_claim,
     correlate_runtime_presence_claim, derive_service_identity_id,
     evaluate_idunn_continuity_restart, evaluate_idunn_deployment_brake, open_service_identity_at,
     verify_idunn_deployment_brake_authorization, verify_runtime_authority,
@@ -4211,11 +4212,15 @@ impl Engine {
         let prior = self.rehydrate_warming_token(&current.value, now, false)?;
         match required(&current.value.warming, "pre-fence Warming evidence")?.clone() {
             WarmingEvidence::FirstOdinDirect { .. } => {
-                let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+                // Whether this transaction may observe Odin directly was
+                // settled when the Warming evidence was recorded, and that
+                // decision is durable in the transaction. Re-deciding it here
+                // with the narrower "no admitted Odin" test contradicted the
+                // caller and failed the refresh. What the refresh owes is
+                // freshness, and the replay check below is what provides it.
                 ensure!(
-                    snapshot.admitted_for("odin").is_none()
-                        && self.exact_incumbent(&snapshot, &current.value)?.is_none(),
-                    "direct first-Odin Warming refresh found an admitted Odin"
+                    current.value.target == "odin",
+                    "direct Warming refresh is reserved for Odin"
                 );
                 let (evidence, present) = self.observe_first_odin_warming(&current.value)?;
                 let token = SequenceAdmittedWarming::from_first_odin_presence(
@@ -4542,11 +4547,16 @@ impl Engine {
         received_at_unix_millis: u64,
         canonical_presence: &[u8],
     ) -> Result<cultnet_rs::VerifiedRuntimePresence> {
+        // Whether direct observation is warranted at all is decided in
+        // advance_warming, which asks the question that matters: can any Odin
+        // report on this one. Re-deciding it here with the narrower "has an
+        // Odin ever been admitted" test only contradicted that caller. What is
+        // still checked is what this function itself depends on -- the target
+        // is Odin, and the incarnation is stateful.
         ensure!(
             transaction.target == "odin"
-                && transaction.incumbent_generation_id.is_none()
-                && required(&transaction.expected, "first Odin Expected")?.write_lease_required,
-            "direct Warming presence is reserved for stateful first Odin bootstrap"
+                && required(&transaction.expected, "Odin Expected")?.write_lease_required,
+            "direct Warming presence is reserved for a stateful Odin incarnation"
         );
         ensure!(
             received_at_unix_millis >= challenged_at_unix_millis,
@@ -4755,6 +4765,29 @@ impl Engine {
             live.envelope == current.envelope,
             "transaction changed before topology admission"
         );
+        // A correlation that describes another incarnation is not evidence
+        // about this one, and it is not a fault either. Odin's stored
+        // correlation outlives the incarnation that wrote it, so a target being
+        // replaced -- Odin above all, which writes its own -- routinely finds
+        // one describing the Expected it is superseding. Treating that as an
+        // error failed the deployment that would have replaced it, and only the
+        // superseded process could have refreshed it.
+        //
+        // Read as absence instead. This says nothing about trust: the record is
+        // unauthenticated here and is used only to decide it is about something
+        // else, which is the same conclusion an attacker would get for free by
+        // publishing nothing. Everything that follows is fully authenticated.
+        let describes_this_incarnation = (|| -> Result<bool> {
+            let expected = required(&live.value.expected, "Expected projection")?;
+            let (record, _) = OdinRuntimeTopologyCorrelationRecord::decode_canonical_signed_payload(
+                &received.canonical_bytes,
+            )?;
+            Ok(record.expected_projection_sha256 == expected.canonical_sha256()?)
+        })()
+        .unwrap_or(false);
+        if !describes_this_incarnation {
+            return Ok(None);
+        }
         let authenticated = self.authenticate_topology_bytes(
             &snapshot,
             &live.value,
