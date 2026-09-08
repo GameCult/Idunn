@@ -1674,6 +1674,14 @@ struct ControlSnapshot {
 }
 
 impl ControlSnapshot {
+    /// One record that cannot be decoded, or a serve-time fault that hits it
+    /// specifically, must not fail the whole read: R4's second clause and
+    /// R20's quarantine both name this, because a resident record's job is
+    /// to gate one transaction or admission, not the other few hundred in
+    /// the same file. A record that fails `ingest` is logged and skipped;
+    /// everything that DID decode is still returned, and `validate_relations`
+    /// runs only over the survivors -- an orphaned command left behind by a
+    /// quarantined transaction is not itself an inconsistency.
     fn read(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -1683,46 +1691,54 @@ impl ControlSnapshot {
             .pull_all_read_only_snapshot()
             .context("reading Idunn control snapshot")?
         {
-            match envelope.r#type.as_str() {
-                DeploymentCommand::TYPE => {
-                    ensure!(
-                        envelope.schema_id.as_deref() == Some(DEPLOYMENT_COMMAND_SCHEMA),
-                        "Idunn control store contains an unsupported command"
-                    );
-                    let value: DeploymentCommand = decode_record_canonical(&envelope)?;
-                    value.validate()?;
-                    ensure!(
-                        envelope.key == value.command_id,
-                        "deployment command key differs from its identity"
-                    );
-                    snapshot.commands.push(Stored { envelope, value });
-                }
-                DeploymentTransaction::TYPE => {
-                    let value = read_transaction_record(&envelope, true)?;
-                    ensure!(
-                        envelope.key == value.transaction_id,
-                        "deployment transaction key differs from its identity"
-                    );
-                    snapshot.transactions.push(Stored { envelope, value });
-                }
-                AdmittedGeneration::TYPE => {
-                    ensure!(
-                        envelope.schema_id.as_deref() == Some(ADMITTED_GENERATION_SCHEMA),
-                        "Idunn control store contains an unsupported admitted generation"
-                    );
-                    let value: AdmittedGeneration = decode_record_canonical(&envelope)?;
-                    value.validate()?;
-                    ensure!(
-                        envelope.key == value.target,
-                        "admitted generation key is not its target"
-                    );
-                    snapshot.admitted.push(Stored { envelope, value });
-                }
-                _ => bail!("Idunn control store contains a foreign document"),
+            let describe = format!("{} {}", envelope.r#type, envelope.key);
+            if let Err(error) = snapshot.ingest(envelope) {
+                eprintln!("Idunn quarantined an unreadable control record {describe}: {error:#}");
             }
         }
         snapshot.validate_relations()?;
         Ok(snapshot)
+    }
+
+    fn ingest(&mut self, envelope: CultCacheEnvelope) -> Result<()> {
+        match envelope.r#type.as_str() {
+            DeploymentCommand::TYPE => {
+                ensure!(
+                    envelope.schema_id.as_deref() == Some(DEPLOYMENT_COMMAND_SCHEMA),
+                    "Idunn control store contains an unsupported command"
+                );
+                let value: DeploymentCommand = decode_record_canonical(&envelope)?;
+                value.validate()?;
+                ensure!(
+                    envelope.key == value.command_id,
+                    "deployment command key differs from its identity"
+                );
+                self.commands.push(Stored { envelope, value });
+            }
+            DeploymentTransaction::TYPE => {
+                let value = read_transaction_record(&envelope, true)?;
+                ensure!(
+                    envelope.key == value.transaction_id,
+                    "deployment transaction key differs from its identity"
+                );
+                self.transactions.push(Stored { envelope, value });
+            }
+            AdmittedGeneration::TYPE => {
+                ensure!(
+                    envelope.schema_id.as_deref() == Some(ADMITTED_GENERATION_SCHEMA),
+                    "Idunn control store contains an unsupported admitted generation"
+                );
+                let value: AdmittedGeneration = decode_record_canonical(&envelope)?;
+                value.validate()?;
+                ensure!(
+                    envelope.key == value.target,
+                    "admitted generation key is not its target"
+                );
+                self.admitted.push(Stored { envelope, value });
+            }
+            _ => bail!("Idunn control store contains a foreign document"),
+        }
+        Ok(())
     }
 
     fn validate_relations(&self) -> Result<()> {
@@ -1923,7 +1939,11 @@ where
 /// Reads just the outer msgpack array-length header, without decoding the
 /// array's contents. Every `DatabaseEntry` (cultcache-rs-derive) record is a
 /// single fixed-length array keyed by field declaration order, so this is
-/// how many slots a stored record actually carries.
+/// how many slots a stored record actually carries. `decode_record_canonical`
+/// no longer needs this at read time (R20 deleted the arity exemption it
+/// existed to compute); it survives only so tests can assert the exact slot
+/// count of a hand-built payload.
+#[cfg(test)]
 fn msgpack_array_len(payload: &[u8]) -> Result<usize> {
     match payload.first().copied() {
         Some(byte) if (0x90..=0x9f).contains(&byte) => Ok((byte & 0x0f) as usize),
@@ -1951,43 +1971,29 @@ fn msgpack_array_len(payload: &[u8]) -> Result<usize> {
 /// into gating a live decision, so it does not need to prove it is the exact
 /// bytes Idunn's own serializer would have written.
 ///
-/// A `DatabaseEntry`'s `Serialize` impl always emits every slot up to its
-/// current maximum key, even for a value whose trailing fields are all
-/// `None` (cultcache-rs-derive `serialize_tuple(max_slot + 1)`), so a record
-/// written before a field existed can never re-encode to the same length as
-/// the current schema. That is legitimate schema growth, not tampering, and
-/// is exactly what the additive-slot tolerance test covers: a stored record
-/// with fewer slots than the current schema is accepted on its own terms
-/// (already load-bearing, since `visit_seq` and `#[cultcache(default)]`
-/// fields authorize the leniency at decode time either way; the point of the
-/// arity check here is only to decide *when* byte-exactness applies). Only a
-/// record already at the current slot count is required to be byte-exact --
-/// that is what makes Soul's claim 1 attack visible: re-encoding an existing
-/// field's value with a different msgpack width changes the bytes without
-/// changing the slot count.
+/// No arity exemption: a live record must re-encode to exactly the bytes
+/// Idunn's own serializer would produce, full stop. cultcache-rs-derive's
+/// `serialize_tuple(max_slot + 1)` means a record written before a field
+/// existed can never re-encode to the current schema's slot count -- but
+/// Idunn measured its own live `control.cc` (507 records: 253 commands, 253
+/// transactions, 1 admitted generation) through this exact decoder and found
+/// every one already at full current arity, because the v2->v3 migration
+/// rewrote everything Idunn has ever written. There is no live short record
+/// to be lenient toward. If a future field addition needs one, that is a
+/// migration to run at that moment, not a standing hole in this check.
 fn decode_record_canonical<T>(envelope: &CultCacheEnvelope) -> Result<T>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
     let value: T = decode_record(envelope)?;
     let canonical = rmp_serde::to_vec(&value)?;
-    let canonical_len = msgpack_array_len(&canonical)?;
-    let stored_len = msgpack_array_len(&envelope.payload)?;
     ensure!(
-        stored_len <= canonical_len,
-        "Idunn control store contains {} {} with more slots than its current schema",
+        canonical == envelope.payload,
+        "Idunn control store contains a noncanonical record {} {} (schema {})",
         envelope.r#type,
-        envelope.key
+        envelope.key,
+        envelope.schema_id.as_deref().unwrap_or("none")
     );
-    if stored_len == canonical_len {
-        ensure!(
-            canonical == envelope.payload,
-            "Idunn control store contains a noncanonical record {} {} (schema {})",
-            envelope.r#type,
-            envelope.key,
-            envelope.schema_id.as_deref().unwrap_or("none")
-        );
-    }
     Ok(value)
 }
 
@@ -2708,134 +2714,57 @@ impl Engine {
         }
     }
 
-    /// Re-verifies every piece of signed evidence carried by a *resident*
-    /// record: brake authorization, Odin observations, warming and ready
-    /// receipts, on both live transactions and admitted generations.
+    /// A resident Deploy transaction past Sealing carries a
+    /// `deployment_authorization` captured live, off the actual brake file,
+    /// against whichever operator anchor was current the moment Sealing
+    /// consumed it. Nothing downstream re-derives that authorization from
+    /// disk again -- it is set once, atomically with the Sealing->Starting
+    /// transition -- so a resumed process must re-prove it against the
+    /// CURRENT anchor rather than silently trusting a stored signature that
+    /// may have been signed by an identity since rotated out.
     ///
-    /// Per R19: this is safe to run at startup now because control.cc no
-    /// longer holds terminal history -- replace_transaction archives a
-    /// transaction the instant it turns terminal, so everything this
-    /// snapshot contains is still live authority, not a record only
-    /// describing what already happened. Re-proving that authority on every
-    /// restart is exactly the "consumption must include the path that acts
-    /// on a resident record after a restart" requirement; re-proving
-    /// history.cc as well, or every record ever written, is the coupling
-    /// that was cut.
-    fn validate_durable_authority(&self, snapshot: &ControlSnapshot) -> Result<()> {
+    /// This is the one piece of signed evidence `validate_durable_authority`
+    /// used to re-check that nothing else already re-verifies at its own
+    /// point of use: Odin observations and warming/ready receipts are
+    /// re-authenticated on every resume by `rehydrate_warming_token`,
+    /// `rehydrate_ready_token`, and `rehydrate_admitted_ready`, because those
+    /// claims describe present reality ("is this candidate still warm/ready
+    /// right now") and must be re-derived, not merely replayed. A consumed
+    /// brake authorization is a historical fact instead -- tamper is already
+    /// caught by `decode_record_canonical`'s byte-exact check -- so the only
+    /// thing left to prove on resume is that the signer who made it is still
+    /// trusted.
+    ///
+    /// Called from `advance_transaction` for every resident transaction, so
+    /// a failure here is an ordinary `advance_transaction` error: per R19/R20
+    /// it is verified where consumed and, on failure, aborts *this*
+    /// transaction through the pre-/post-fencing abort path
+    /// `resume_one_transaction` already runs for any advance error. It never
+    /// reaches `serve` and never blocks Idunn's own boot -- an empty
+    /// snapshot, or one with no Deploy transaction past Sealing, never calls
+    /// this at all.
+    fn verify_resident_deployment_authorization(
+        &self,
+        transaction: &DeploymentTransaction,
+    ) -> Result<()> {
+        let Some(authorization) = &transaction.deployment_authorization else {
+            return Ok(());
+        };
+        authorization.validate_shape()?;
         let operator_anchor = read_trust_anchor::<IdunnDeploymentBrakeOperatorIdentity>(
             &self.options.deployment_brake_operator_anchor,
         )?;
-        for stored in &snapshot.transactions {
-            let transaction = &stored.value;
-            if let Some(authorization) = &transaction.deployment_authorization {
-                authorization.validate_shape()?;
-                let record: IdunnDeploymentBrakeRecord =
-                    rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
-                verify_idunn_deployment_brake_authorization(&record, &operator_anchor)?;
-                let expected = required(&transaction.expected, "authorized Expected projection")?;
-                ensure!(
-                    record.authorized_release_id.as_deref()
-                        == Some(expected.sealed_release_id.as_str())
-                        && record.authorized_deployment_id.as_deref()
-                            == Some(transaction.transaction_id.as_str())
-                        && record.runtime_id == expected.runtime_id,
-                    "durable deployment authorization names another release or transaction"
-                );
-            }
-            let lease = transaction
-                .leasing
-                .as_ref()
-                .and_then(LeasingEvidence::lease_sha256);
-            if let Some(evidence) = &transaction.latest_odin_observation {
-                let authenticated = self.authenticate_topology_bytes(
-                    snapshot,
-                    transaction,
-                    &evidence.canonical_bytes,
-                    lease,
-                    evidence.admitted_at_unix_millis,
-                )?;
-                validate_authenticated_evidence(evidence, &authenticated)?;
-            }
-            if let Some(evidence) = &transaction.warming {
-                match evidence {
-                    WarmingEvidence::OdinTopology { evidence } => {
-                        let authenticated = self.authenticate_topology_bytes(
-                            snapshot,
-                            transaction,
-                            &evidence.canonical_bytes,
-                            None,
-                            evidence.admitted_at_unix_millis,
-                        )?;
-                        validate_authenticated_evidence(evidence, &authenticated)?;
-                        let incumbent_lease_sha256 =
-                            self.incumbent_lease_sha256_for_warming(snapshot, transaction)?;
-                        ensure!(
-                            is_semantic_warming(
-                                required(&transaction.expected, "Warming Expected projection",)?,
-                                required(&transaction.activation, "Warming activation")?,
-                                incumbent_lease_sha256.as_deref(),
-                                &authenticated,
-                            )?,
-                            "durable Warming gate is not supported by current runtime evidence"
-                        );
-                    }
-                    WarmingEvidence::FirstOdinDirect { evidence } => {
-                        self.authenticate_first_odin_warming_presence(
-                            transaction,
-                            &evidence.message_id,
-                            evidence.challenged_at_unix_millis,
-                            evidence.admitted_at_unix_millis,
-                            &evidence.canonical_bytes,
-                        )?;
-                    }
-                }
-            }
-            if let Some(evidence) = &transaction.ready {
-                let authenticated = self.authenticate_topology_bytes(
-                    snapshot,
-                    transaction,
-                    &evidence.canonical_bytes,
-                    lease,
-                    evidence.admitted_at_unix_millis,
-                )?;
-                validate_authenticated_evidence(evidence, &authenticated)?;
-                ensure!(
-                    is_semantic_ready(&authenticated),
-                    "durable Ready label is not exact semantic Ready"
-                );
-            }
-        }
-        let odin_authority = self.current_odin_authority(snapshot)?;
-        for stored in &snapshot.admitted {
-            let generation = &stored.value;
-            let authority = self.runtime_authority_parts(
-                &generation.plan,
-                &generation.expected,
-                &generation.activation,
-            )?;
-            let latest = authenticate_odin_runtime_topology_correlation(
-                &generation.latest_odin_observation.canonical_bytes,
-                &authority,
-                generation.leasing.lease_sha256(),
-                &odin_authority.signer_public_key,
-                self.trusted_topology_context(
-                    generation.latest_odin_observation.admitted_at_unix_millis,
-                ),
-            )?;
-            validate_authenticated_evidence(&generation.latest_odin_observation, &latest)?;
-            let ready = authenticate_odin_runtime_topology_correlation(
-                &generation.ready.canonical_bytes,
-                &authority,
-                generation.leasing.lease_sha256(),
-                &odin_authority.signer_public_key,
-                self.trusted_topology_context(generation.ready.admitted_at_unix_millis),
-            )?;
-            validate_authenticated_evidence(&generation.ready, &ready)?;
-            ensure!(
-                is_semantic_ready(&ready),
-                "admitted generation Ready label is not exact semantic Ready"
-            );
-        }
+        let record: IdunnDeploymentBrakeRecord =
+            rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
+        verify_idunn_deployment_brake_authorization(&record, &operator_anchor)?;
+        let expected = required(&transaction.expected, "authorized Expected projection")?;
+        ensure!(
+            record.authorized_release_id.as_deref() == Some(expected.sealed_release_id.as_str())
+                && record.authorized_deployment_id.as_deref()
+                    == Some(transaction.transaction_id.as_str())
+                && record.runtime_id == expected.runtime_id,
+            "durable deployment authorization names another release or transaction"
+        );
         Ok(())
     }
 }
@@ -2858,18 +2787,14 @@ fn serve(options: RuntimeOptions) -> Result<()> {
     let _lock = ProcessLock::acquire(&options.state_store)?;
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
     let engine = Engine::open(options)?;
-    // control.cc now holds only resident (live) records -- terminal ones are
-    // archived to history.cc the instant they turn terminal (see
-    // replace_transaction / archive_terminal_transaction /
-    // archive_rejected_transaction) -- so re-proving every signed evidence
-    // field here is re-proving current authority on every restart, not
-    // re-proving history. That is the boundary R19 draws: verified where
-    // consumed, including the path that acts on a resident record after a
-    // restart; never across everything that ever happened.
-    engine
-        .validate_durable_authority(&ControlSnapshot::read(&engine.options.state_store)?)
-        .context("validating durable authority of every resident Idunn record")?;
-
+    // No durable-authority gate here. A brake artifact, or any other signed
+    // evidence on a resident record, may never gate Idunn's own boot -- an
+    // empty store, or one with no Deploy transaction past Sealing, must
+    // start clean with no brake anchor present. Per R19/R20, every piece of
+    // signed evidence is instead verified at the phase that consumes it
+    // (`verify_resident_deployment_authorization`, `rehydrate_warming_token`,
+    // `rehydrate_ready_token`, `rehydrate_admitted_ready`), and a failure
+    // there aborts only the one transaction it belongs to.
     loop {
         // Per R4's second clause: a scheduler-body fault is not a reason to
         // take the whole daemon down under Restart=always. A fault that is
@@ -2916,23 +2841,30 @@ impl Engine {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let mut progressed = false;
 
-        // A transaction resident in control.cc is never terminal: the only
-        // primitive that can make one terminal is replace_transaction, and it
-        // archives the record to history.cc in the same call instead of
-        // writing the terminal value back in place (see
-        // archive_terminal_transaction). freeze_one_queued_command's
-        // rejection path used to be the one exception, minting a terminal
-        // record straight into control.cc; it now goes through the archive
-        // primitive too (see archive_rejected_transaction), so there is no
-        // longer a "half-finished archive, terminal record left resident"
-        // state for this loop to repair. The real crash window -- a crash
-        // between the history append and the control delete inside
-        // archive_terminal_transaction -- leaves the *predecessor*
-        // (non-terminal) envelope resident instead, and that record is
-        // already a normal candidate below: advancing it again re-derives
-        // the same terminal outcome and replace_transaction's delete half is
-        // idempotent, so the retry finishes the archive on its own.
-        let mut candidates = snapshot.transactions.iter().collect::<Vec<_>>();
+        // A transaction already terminal in control.cc is either a
+        // half-finished archive from a crash between the history append and
+        // the control delete inside archive_terminal_transaction, or -- the
+        // gap Soul found -- a record minted terminal at birth straight into
+        // control.cc by a producer that bypassed replace_transaction (the
+        // stateful-continuity admission commit in advance_committing writes
+        // its Complete transaction and the new AdmittedGeneration atomically
+        // in one compare_exchange, which archive_terminal_transaction cannot
+        // do since it only ever moves one already-resident record). Either
+        // way this loop finishes moving it, and its command if it was the
+        // last resident transaction of that command, to history.cc before
+        // scheduling anything else. replace_transaction's archive path is
+        // idempotent, so calling it again for a record already archived is a
+        // no-op rather than a repair loop.
+        for stored in snapshot.transactions.iter().filter(|stored| stored.value.is_terminal()) {
+            replace_transaction(&self.options.state_store, stored, &stored.value)?;
+            progressed = true;
+        }
+
+        let mut candidates = snapshot
+            .transactions
+            .iter()
+            .filter(|stored| !stored.value.is_terminal())
+            .collect::<Vec<_>>();
         candidates.sort_by_key(|stored| {
             (
                 stored.value.created_at_unix_millis,
@@ -3528,6 +3460,7 @@ impl Engine {
         if current.value.pre_fencing_abort.is_some() && current.value.completion.is_none() {
             return self.advance_pre_fencing_abort(current);
         }
+        self.verify_resident_deployment_authorization(&current.value)?;
         match current.value.phase {
             DeploymentPhase::Sealing => self.advance_sealing(current),
             DeploymentPhase::Starting => self.advance_starting(current),
@@ -6895,9 +6828,14 @@ mod tests {
 
     /// Encodes a `DeploymentTransaction` the way a binary predating key 34
     /// (`post_fencing_abort`) would have: a 34-element tuple instead of 35.
-    /// This is the exact shape of every transaction durable before that field
-    /// existed, and the shape e8d8747 could not read without a one-off schema
-    /// lift -- the read path must tolerate it on its own.
+    /// R20 deleted the `stored_len < canonical_len` exemption this shape used
+    /// to exercise (Idunn's own decoder found zero such records in the live
+    /// 507-record `control.cc`; the v2->v3 migration rewrote everything).
+    /// `decode_record_canonical` now refuses this shape outright -- see
+    /// `short_record_is_refused_not_tolerated` below, which replaces the old
+    /// additive-slot-tolerance assertion this struct was built for. A future
+    /// field addition is a migration to run at that moment, not a standing
+    /// hole in this check.
     struct WithoutPostFencingAbortSlot<'a>(&'a DeploymentTransaction);
 
     impl Serialize for WithoutPostFencingAbortSlot<'_> {
@@ -6947,7 +6885,7 @@ mod tests {
     }
 
     #[test]
-    fn additive_slot_does_not_break_stored_records() -> Result<()> {
+    fn short_record_is_refused_not_tolerated() -> Result<()> {
         let command = command(CommandKind::Deploy);
         let transaction = DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
         let truncated_payload = rmp_serde::to_vec(&WithoutPostFencingAbortSlot(&transaction))?;
@@ -6979,9 +6917,12 @@ mod tests {
             &[truncated_envelope],
         )?);
 
+        // R20's quarantine: the short record fails ingest and is skipped,
+        // not propagated as a whole-read refusal. It is refused from acting
+        // as live authority either way -- it simply never enters the
+        // snapshot, rather than taking every other record down with it.
         let snapshot = ControlSnapshot::read(&path)?;
-        assert_eq!(snapshot.transactions.len(), 1);
-        assert_eq!(snapshot.transactions[0].value.post_fencing_abort, None);
+        assert!(snapshot.transactions.is_empty(), "the short record is quarantined, not tolerated");
         Ok(())
     }
 
@@ -7176,8 +7117,12 @@ mod tests {
         Ok(())
     }
 
+    /// R20's quarantine changes this from "the whole read refuses" to "this
+    /// one record is quarantined": a legacy command schema fails `ingest`,
+    /// is logged and skipped, and the read still succeeds -- empty, since
+    /// this store holds nothing else.
     #[test]
-    fn legacy_mutable_command_schema_is_rejected() -> Result<()> {
+    fn legacy_mutable_command_schema_is_quarantined() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let path = temporary.path().join("control.cc");
         let legacy = CultCacheEnvelope {
@@ -7197,12 +7142,16 @@ mod tests {
                 &[legacy],
             )?
         );
-        assert!(ControlSnapshot::read(&path).is_err());
+        let snapshot = ControlSnapshot::read(&path)?;
+        assert!(snapshot.commands.is_empty(), "the legacy-schema command is quarantined, not read");
         Ok(())
     }
 
+    /// Same change as above, for a legacy transaction and a legacy admitted
+    /// generation: each is quarantined on its own, and the read of an
+    /// otherwise-empty store succeeds around it.
     #[test]
-    fn loadcredential_era_control_schemas_are_rejected_before_rehydration() -> Result<()> {
+    fn loadcredential_era_control_schemas_are_quarantined_not_rehydrated() -> Result<()> {
         for (record_type, key, schema) in [
             (
                 DeploymentTransaction::TYPE,
@@ -7234,7 +7183,8 @@ mod tests {
                     &[legacy],
                 )?
             );
-            assert!(ControlSnapshot::read(&path).is_err());
+            let snapshot = ControlSnapshot::read(&path)?;
+            assert!(snapshot.transactions.is_empty() && snapshot.admitted.is_empty());
         }
         Ok(())
     }
@@ -7338,11 +7288,15 @@ mod tests {
         Ok(envelope)
     }
 
-    /// Claim 1. The deleted byte-exact re-encode check was the only thing
-    /// that refused a LIVE record written by a foreign serializer. A Sealing
-    /// transaction encoded as a msgpack map (what any hand tool that writes
-    /// by field name produces) is not what Idunn itself would have written,
-    /// and the serve-time "validating all Idunn records" read now accepts it.
+    /// Claim 1. The byte-exact re-encode check is what refuses a LIVE record
+    /// written by a foreign serializer. A Sealing transaction encoded as a
+    /// msgpack map (what any hand tool that writes by field name produces)
+    /// is not what Idunn itself would have written, and
+    /// `decode_record_canonical` refuses it -- R20's quarantine means that
+    /// refusal now surfaces as the record being skipped, not as the whole
+    /// read failing: the foreign-encoded transaction is absent from the
+    /// snapshot, and the command it names is quarantined-orphaned rather
+    /// than blocking everything else in the store.
     #[test]
     fn soul_live_record_in_foreign_encoding_is_refused_by_control_read() -> Result<()> {
         let command = command(CommandKind::Deploy);
@@ -7394,13 +7348,10 @@ mod tests {
             }],
         )?);
 
-        let error = match ControlSnapshot::read(&path) {
-            Ok(_) => panic!("foreign encoding must be refused"),
-            Err(error) => error,
-        };
+        let snapshot = ControlSnapshot::read(&path)?;
         assert!(
-            format!("{error:#}").contains("noncanonical"),
-            "unexpected error: {error:#}"
+            snapshot.transactions.is_empty(),
+            "the foreign-encoded transaction is quarantined, not accepted"
         );
         Ok(())
     }
@@ -7501,13 +7452,14 @@ mod tests {
     // should do; each one names the claim it falsifies in its doc comment.
     // ------------------------------------------------------------------
 
-    /// Exemption attack. `decode_record_canonical` only demands byte-exact
-    /// bytes when the stored array is already at the current slot count. An
-    /// attacker who can rewrite control.cc can also drop the trailing
-    /// `#[cultcache(default)]` slot (key 34), which is the exact shape the
-    /// additive-slot tolerance test blesses. Once shortened, the record is
-    /// exempt: any decodable tamper of any earlier field is accepted, and
-    /// even noncanonical widths inside the payload are accepted.
+    /// Formerly the exemption attack: `decode_record_canonical` used to
+    /// demand byte-exact bytes only when the stored array was already at the
+    /// current slot count, so dropping the trailing `#[cultcache(default)]`
+    /// slot (key 34) exempted a record from the check entirely. R20 deleted
+    /// `stored_len < canonical_len` outright -- Idunn's own decoder found
+    /// zero short records across the live 507-record `control.cc`, so there
+    /// is nothing to be lenient toward. A shortened, tampered record is now
+    /// refused, same as a full-arity noncanonical one.
     #[test]
     fn soul2_shortened_record_escapes_the_byte_exact_check() -> Result<()> {
         let command = command(CommandKind::Deploy);
@@ -7524,7 +7476,7 @@ mod tests {
         // Encode as a 34-slot array (drop the defaulted trailing slot) ...
         let mut payload = rmp_serde::to_vec(&WithoutPostFencingAbortSlot(&tampered))?;
         assert_eq!(msgpack_array_len(&payload)?, 34);
-        // ... and, to prove byte-exactness is not merely relaxed but off,
+        // ... and, to prove the refusal is not merely about slot count,
         // also re-encode ordinal 0 with the foreign uint8 width that the
         // full-arity claim-1 test refuses.
         let marker = b"ghostlight";
@@ -7561,41 +7513,45 @@ mod tests {
             }],
         )?);
 
-        // Documents the hole: the shortened, tampered, noncanonical record
-        // is accepted as live authority at phase Committing.
+        // The hole is closed: the shortened, tampered record is quarantined
+        // out of the snapshot, not accepted as live authority. R20's
+        // quarantine means this surfaces as absence rather than a whole-read
+        // refusal -- the tamper still never reaches a phase decision.
         let snapshot = ControlSnapshot::read(&path)?;
-        assert_eq!(snapshot.transactions.len(), 1);
-        let accepted = &snapshot.transactions[0].value;
-        assert_eq!(accepted.ordinal, 7, "ordinal tamper survived the canonical check");
-        assert_eq!(
-            accepted.incumbent_generation_id.as_deref(),
-            Some("generation-attacker"),
-            "incumbent tamper survived the canonical check"
+        assert!(
+            snapshot.transactions.is_empty(),
+            "the shortened, tampered record is quarantined, not accepted"
         );
         Ok(())
     }
 
-    /// Restored startup gate, part one: with an EMPTY control.cc,
-    /// `validate_durable_authority` still requires the deployment-brake
-    /// operator anchor to exist, and `serve` propagates that with `?`.
-    /// A brake artifact gates Idunn's own boot with zero live records.
+    /// R20: `serve` no longer calls a durable-authority gate at all, and
+    /// `verify_resident_deployment_authorization` only runs from
+    /// `advance_transaction` for a transaction that actually carries a
+    /// `deployment_authorization`. With an EMPTY control.cc there is no such
+    /// transaction, so a missing brake operator anchor is never even
+    /// consulted: `resume_one_transaction` makes no progress and returns no
+    /// error. A brake artifact no longer gates Idunn's own boot with zero
+    /// live records, per `F:\Projects\CLAUDE.md`'s "may never gate Idunn
+    /// itself."
     #[test]
     fn soul2_startup_authority_check_needs_the_brake_anchor_with_no_records() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let engine = soul_engine(temporary.path())?;
         assert!(!engine.options.deployment_brake_operator_anchor.exists());
-        let error = engine
-            .validate_durable_authority(&ControlSnapshot::default())
-            .expect_err("an absent brake anchor refuses startup");
-        assert!(format!("{error:#}").contains("absent"), "{error:#}");
+        let progressed = engine.resume_one_transaction()?;
+        assert!(!progressed, "nothing to resume in an empty store");
         Ok(())
     }
 
-    /// Restored startup gate, part two: one live Sealing transaction whose
-    /// stored brake authorization was signed by a since-rotated operator
-    /// identity refuses `validate_durable_authority` outright. Under
-    /// Restart=always that is the crashloop shape, narrowed to live records;
-    /// the transaction is not aborted, the daemon is.
+    /// R20, part two: one live Sealing transaction whose stored brake
+    /// authorization was signed by a since-rotated operator identity now
+    /// refuses only at the phase that consumes it
+    /// (`verify_resident_deployment_authorization`, called from
+    /// `advance_transaction`), and that failure is caught by
+    /// `resume_one_transaction`'s existing per-transaction abort handling --
+    /// same as any other advance error. The transaction is pre-fencing
+    /// aborted; the daemon is not.
     #[test]
     fn soul2_one_live_record_with_a_rotated_brake_signer_refuses_startup() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -7660,89 +7616,104 @@ mod tests {
         // The record itself reads fine: it is canonical and well-formed.
         let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
         assert_eq!(snapshot.transactions.len(), 1);
-        // And the restored startup gate refuses the whole daemon for it.
-        let error = engine
-            .validate_durable_authority(&snapshot)
-            .expect_err("rotated signer refuses startup");
-        eprintln!("startup refusal: {error:#}");
-        // Nothing was recorded against the transaction: it is still live,
-        // still Sealing, still unaborted. The fault landed on the process.
+
+        // Resuming does not crash: the rotated signature is refused at the
+        // phase that consumes it, and that refusal lands on the transaction.
+        let progressed = engine.resume_one_transaction()?;
+        assert!(progressed, "beginning a pre-fencing abort is progress");
+
         let after = ControlSnapshot::read(&engine.options.state_store)?;
-        assert_eq!(after.transactions.len(), 1);
-        assert_eq!(after.transactions[0].value.phase, DeploymentPhase::Sealing);
-        assert!(after.transactions[0].value.pre_fencing_abort.is_none());
+        assert_eq!(after.transactions.len(), 1, "the transaction is not the daemon: it survives");
+        assert!(
+            after.transactions[0].value.pre_fencing_abort.is_some(),
+            "the rotated-signer failure must abort this transaction, not the process"
+        );
         Ok(())
     }
 
-    /// Claim "control.cc never holds a terminal record, by construction".
-    /// The admission commit at the end of `advance_committing` mints
-    /// `post_commit_cleanup` inline and writes the Complete transaction to
-    /// control.cc with a direct compare_exchange, not through
-    /// `replace_transaction`. For a Continuity command (source cleanup
+    /// R20's fourth hole, closed. The admission commit at the end of
+    /// `advance_committing` mints `post_commit_cleanup` inline and writes the
+    /// Complete transaction to control.cc with a direct compare_exchange
+    /// alongside the new `AdmittedGeneration` -- not through
+    /// `replace_transaction`, because that primitive only ever moves one
+    /// already-resident record and cannot commit two different records
+    /// atomically. For a Continuity command (source cleanup
     /// SkippedContinuity) whose fencing revoked an incumbent lease
     /// (incumbent cleanup Complete) that cleanup is complete at mint, so the
-    /// record is terminal the moment it lands in control.cc. Nothing then
-    /// archives it: the Complete arm of `advance_transaction` is a no-op for
-    /// a complete cleanup, and the resume-loop block that used to move a
-    /// resident terminal record was deleted.
+    /// record is terminal the moment it lands in control.cc. Restoring the
+    /// resident-terminal sweep in `resume_one_transaction` (R20: "restore the
+    /// resident-terminal branch") is what closes this: the very next tick
+    /// finds it and archives it through `replace_transaction`, same as any
+    /// other terminal record.
     #[test]
     fn soul2_stateful_continuity_admission_mints_a_terminal_record_into_control() -> Result<()> {
-        // The exact cleanup the commit builds for this fencing outcome.
+        // The real-world producer of a record that is terminal the instant
+        // it lands in control.cc is the stateful continuity admission commit
+        // in advance_committing: for a Continuity command whose fencing
+        // revoked an incumbent lease, PostCommitCleanup is already complete
+        // at mint (incumbent Complete, source SkippedContinuity), and that
+        // commit writes the Complete transaction and the new
+        // AdmittedGeneration atomically in one direct compare_exchange,
+        // because replace_transaction only ever moves one already-resident
+        // record and cannot commit two different records together.
+        //
+        // Reconstructing that exact commit here would mean staging every
+        // field DeploymentTransaction::validate requires through Starting,
+        // Warming, Fencing, Leasing, and Routing. The sweep this test
+        // exercises (`resume_one_transaction`'s resident-terminal branch)
+        // does not care which completion path produced the terminal record,
+        // only that `is_terminal()` is true -- so this uses the cheapest
+        // validate()-passing terminal shape (a pre-fencing abort) to stand
+        // in for "terminal before it is ever written."
         let fencing = FencingEvidence::Revoked {
             incumbent_lease_sha256: Some(digest('a')),
             candidate_lease_path_verified_empty: true,
         };
         assert!(incumbent_was_stopped_during_fencing(&fencing));
-        let cleanup = PostCommitCleanup {
-            incumbent: IncumbentCleanupEvidence::Complete {
-                generation_id: "generation-old".into(),
-            },
-            source: SourceCleanupEvidence::SkippedContinuity,
-        };
-        assert!(cleanup.is_complete(), "complete at mint");
 
         let command = command(CommandKind::Continuity);
         let mut transaction =
             DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
         transaction.phase = DeploymentPhase::Complete;
-        transaction.completion = Some(TransactionCompletion::Admitted {
-            generation_id: "generation-new".into(),
+        transaction.pre_fencing_abort = Some(PreFencingAbort {
+            error: "boom".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Skipped,
         });
-        transaction.post_commit_cleanup = Some(cleanup);
+        transaction.completion = Some(TransactionCompletion::FailedBeforeFencing { error: "boom".into() });
+        transaction.validate()?;
         assert!(transaction.is_terminal(), "terminal before it is ever written");
 
-        // What the loop does with such a record once it is resident: the
-        // Complete arm of advance_transaction. It touches neither store.
+        // Seed control.cc exactly as such a commit would leave it: the
+        // command, and the transaction already terminal, both resident --
+        // no replace_transaction, no history.cc entry.
         let temporary = tempfile::tempdir()?;
         let engine = soul_engine(temporary.path())?;
-        let stored = Stored {
-            envelope: typed_envelope(
-                &transaction.transaction_id,
-                DeploymentTransaction::TYPE,
-                DEPLOYMENT_TRANSACTION_SCHEMA,
-                &transaction,
-                100,
-            )?,
-            value: transaction,
-        };
-        engine.advance_post_commit_cleanup(&stored)?;
-        assert!(
-            !history_store_path(&engine.options.state_store).exists(),
-            "the Complete arm never archives a resident terminal record"
-        );
-        assert!(
-            !engine.options.state_store.exists(),
-            "and never writes control.cc either: the record would stay exactly as minted"
-        );
+        soul_seed_control(&engine.options.state_store, &command, &transaction)?;
+        assert!(!history_store_path(&engine.options.state_store).exists());
+
+        // The next tick sweeps it: resume_one_transaction's resident-terminal
+        // branch finds the terminal record before scheduling anything else
+        // and archives it through replace_transaction, the same primitive
+        // every other terminal transaction leaves control.cc through.
+        let progressed = engine.resume_one_transaction()?;
+        assert!(progressed, "archiving a resident-terminal record is progress");
+
+        assert!(ControlSnapshot::read(&engine.options.state_store)?.transactions.is_empty());
+        let history = SingleFileMessagePackBackingStore::new(history_store_path(
+            &engine.options.state_store,
+        ))
+        .pull_all_read_only_snapshot()?;
+        assert_eq!(history.len(), 2, "transaction and command archived to history.cc");
         Ok(())
     }
 
-    /// R4 second clause. The scheduler loop no longer propagates, but one
-    /// unreadable record makes `ControlSnapshot::read` fail as a whole, so
-    /// every tick fails before it can touch any transaction: nothing is
-    /// recorded against the bad record, nothing else progresses, and the
-    /// same startup read (`serve`, "validating all Idunn records") refuses
-    /// the daemon outright.
+    /// R4 second clause and R20's quarantine: one unreadable record no
+    /// longer makes `ControlSnapshot::read` fail as a whole. It is logged
+    /// and skipped by `ingest`, and the read returns everything else --
+    /// here, the still-valid command that named it. Ticks run normally
+    /// instead of starving forever on a read that never succeeds.
     #[test]
     fn soul2_one_noncanonical_record_starves_every_scheduler_tick() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -7782,19 +7753,31 @@ mod tests {
         )?);
         let before = store.pull_all_read_only_snapshot()?;
 
+        // The bad transaction is quarantined; the command it named is not an
+        // inconsistency by itself, so the read succeeds around it.
+        let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
+        assert!(snapshot.transactions.is_empty(), "the noncanonical transaction is skipped");
+        assert_eq!(snapshot.commands.len(), 1, "the still-valid command survives the read");
+
+        // Ticks run rather than starving: nothing progresses because there
+        // is no valid transaction to advance, but the read itself no longer
+        // refuses the whole store.
         assert!(!run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction()));
         assert!(!run_scheduler_tick("supervise_one_admitted_generation", || engine
             .supervise_one_admitted_generation()));
         assert!(!run_scheduler_tick("freeze_one_queued_command", || engine
             .freeze_one_queued_command()));
+
+        // Quarantine is a read-time skip, not a repair: this cut carries no
+        // `forget` verb (R13), so the bad record is left exactly as it was.
         assert_eq!(
             store.pull_all_read_only_snapshot()?,
             before,
-            "no fault was recorded against the record; control.cc is untouched"
+            "quarantine does not rewrite control.cc"
         );
         assert!(
-            ControlSnapshot::read(&engine.options.state_store).is_err(),
-            "the serve-time read refuses the same store"
+            ControlSnapshot::read(&engine.options.state_store).is_ok(),
+            "the same read that ticks use no longer refuses the store"
         );
         Ok(())
     }
