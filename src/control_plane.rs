@@ -1689,7 +1689,7 @@ impl ControlSnapshot {
                         envelope.schema_id.as_deref() == Some(DEPLOYMENT_COMMAND_SCHEMA),
                         "Idunn control store contains an unsupported command"
                     );
-                    let value: DeploymentCommand = decode_record(&envelope)?;
+                    let value: DeploymentCommand = decode_record_canonical(&envelope)?;
                     value.validate()?;
                     ensure!(
                         envelope.key == value.command_id,
@@ -1698,7 +1698,7 @@ impl ControlSnapshot {
                     snapshot.commands.push(Stored { envelope, value });
                 }
                 DeploymentTransaction::TYPE => {
-                    let value = read_transaction_record(&envelope)?;
+                    let value = read_transaction_record(&envelope, true)?;
                     ensure!(
                         envelope.key == value.transaction_id,
                         "deployment transaction key differs from its identity"
@@ -1710,7 +1710,7 @@ impl ControlSnapshot {
                         envelope.schema_id.as_deref() == Some(ADMITTED_GENERATION_SCHEMA),
                         "Idunn control store contains an unsupported admitted generation"
                     );
-                    let value: AdmittedGeneration = decode_record(&envelope)?;
+                    let value: AdmittedGeneration = decode_record_canonical(&envelope)?;
                     value.validate()?;
                     ensure!(
                         envelope.key == value.target,
@@ -1920,6 +1920,77 @@ where
     Ok(value)
 }
 
+/// Reads just the outer msgpack array-length header, without decoding the
+/// array's contents. Every `DatabaseEntry` (cultcache-rs-derive) record is a
+/// single fixed-length array keyed by field declaration order, so this is
+/// how many slots a stored record actually carries.
+fn msgpack_array_len(payload: &[u8]) -> Result<usize> {
+    match payload.first().copied() {
+        Some(byte) if (0x90..=0x9f).contains(&byte) => Ok((byte & 0x0f) as usize),
+        Some(0xdc) => {
+            let header = payload
+                .get(1..3)
+                .and_then(|slice| <[u8; 2]>::try_from(slice).ok())
+                .context("truncated msgpack array16 header")?;
+            Ok(u16::from_be_bytes(header) as usize)
+        }
+        Some(0xdd) => {
+            let header = payload
+                .get(1..5)
+                .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+                .context("truncated msgpack array32 header")?;
+            Ok(u32::from_be_bytes(header) as usize)
+        }
+        _ => bail!("Idunn control store record is not a msgpack array"),
+    }
+}
+
+/// `decode_record`, plus the byte-exact canonical check -- for `control.cc`
+/// reads only. `history.cc` stays on plain `decode_record`: a terminal
+/// record only describes what already happened and cannot be re-tampered
+/// into gating a live decision, so it does not need to prove it is the exact
+/// bytes Idunn's own serializer would have written.
+///
+/// A `DatabaseEntry`'s `Serialize` impl always emits every slot up to its
+/// current maximum key, even for a value whose trailing fields are all
+/// `None` (cultcache-rs-derive `serialize_tuple(max_slot + 1)`), so a record
+/// written before a field existed can never re-encode to the same length as
+/// the current schema. That is legitimate schema growth, not tampering, and
+/// is exactly what the additive-slot tolerance test covers: a stored record
+/// with fewer slots than the current schema is accepted on its own terms
+/// (already load-bearing, since `visit_seq` and `#[cultcache(default)]`
+/// fields authorize the leniency at decode time either way; the point of the
+/// arity check here is only to decide *when* byte-exactness applies). Only a
+/// record already at the current slot count is required to be byte-exact --
+/// that is what makes Soul's claim 1 attack visible: re-encoding an existing
+/// field's value with a different msgpack width changes the bytes without
+/// changing the slot count.
+fn decode_record_canonical<T>(envelope: &CultCacheEnvelope) -> Result<T>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    let value: T = decode_record(envelope)?;
+    let canonical = rmp_serde::to_vec(&value)?;
+    let canonical_len = msgpack_array_len(&canonical)?;
+    let stored_len = msgpack_array_len(&envelope.payload)?;
+    ensure!(
+        stored_len <= canonical_len,
+        "Idunn control store contains {} {} with more slots than its current schema",
+        envelope.r#type,
+        envelope.key
+    );
+    if stored_len == canonical_len {
+        ensure!(
+            canonical == envelope.payload,
+            "Idunn control store contains a noncanonical record {} {} (schema {})",
+            envelope.r#type,
+            envelope.key,
+            envelope.schema_id.as_deref().unwrap_or("none")
+        );
+    }
+    Ok(value)
+}
+
 fn command_envelope(value: &DeploymentCommand, now: u64) -> Result<CultCacheEnvelope> {
     value.validate()?;
     typed_envelope(
@@ -1931,14 +2002,24 @@ fn command_envelope(value: &DeploymentCommand, now: u64) -> Result<CultCacheEnve
     )
 }
 
-fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTransaction> {
+/// `canonical` is true for `control.cc` reads (a resident transaction is
+/// live authority and must be byte-exact) and false for `history.cc` reads
+/// (a terminal record is display-only; see `decode_record_canonical`).
+fn read_transaction_record(
+    envelope: &CultCacheEnvelope,
+    canonical: bool,
+) -> Result<DeploymentTransaction> {
     ensure!(
         envelope.schema_id.as_deref() == Some(DEPLOYMENT_TRANSACTION_SCHEMA),
         "Idunn control store contains an unsupported transaction {} (schema {})",
         envelope.key,
         envelope.schema_id.as_deref().unwrap_or("none")
     );
-    let value: DeploymentTransaction = decode_record(envelope)?;
+    let value: DeploymentTransaction = if canonical {
+        decode_record_canonical(envelope)?
+    } else {
+        decode_record(envelope)?
+    };
     value
         .validate()
         .with_context(|| format!("validating transaction {}", envelope.key))?;
@@ -2378,7 +2459,7 @@ fn read_history_for_command(
                     }),
                 }
             }
-            DeploymentTransaction::TYPE => match read_transaction_record(&envelope) {
+            DeploymentTransaction::TYPE => match read_transaction_record(&envelope, false) {
                 Ok(value) if value.command_id == command_id => transactions.push(value),
                 Ok(_) => {}
                 Err(_) => unreadable.push(UnreadableHistoryRecord {
@@ -6968,7 +7049,7 @@ mod tests {
             .iter()
             .find(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
             .context("archived transaction missing from history.cc")?;
-        let archived = read_transaction_record(archived_transaction_envelope)?;
+        let archived = read_transaction_record(archived_transaction_envelope, false)?;
         assert_eq!(archived.transaction_id, next.transaction_id);
         assert!(archived.is_terminal());
 
@@ -7263,14 +7344,15 @@ mod tests {
     /// by field name produces) is not what Idunn itself would have written,
     /// and the serve-time "validating all Idunn records" read now accepts it.
     #[test]
-    fn soul_live_record_in_foreign_encoding_is_accepted_by_control_read() -> Result<()> {
+    fn soul_live_record_in_foreign_encoding_is_refused_by_control_read() -> Result<()> {
         let command = command(CommandKind::Deploy);
         let transaction = DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
         assert!(!transaction.is_terminal(), "this is a live record");
         // Idunn's canonical bytes encode `ordinal == 0` as a positive fixint
         // (0x00). msgpack also allows uint8 (0xcc 0x00): same value, different
-        // bytes -- exactly what the deleted `to_vec(&value) == payload` check
-        // refused as "a noncanonical record".
+        // bytes, same slot count -- exactly what `decode_record_canonical`
+        // refuses as "a noncanonical record" for a full-arity control.cc
+        // record (R19 item 1).
         let canonical = rmp_serde::to_vec(&transaction)?;
         let marker = b"ghostlight ";
         let at = canonical
@@ -7312,9 +7394,11 @@ mod tests {
             }],
         )?);
 
-        let snapshot = ControlSnapshot::read(&path)?;
-        assert_eq!(snapshot.transactions.len(), 1);
-        assert_eq!(snapshot.transactions[0].value, transaction);
+        let error = ControlSnapshot::read(&path).expect_err("foreign encoding must be refused");
+        assert!(
+            format!("{error:#}").contains("noncanonical"),
+            "unexpected error: {error:#}"
+        );
         Ok(())
     }
 
