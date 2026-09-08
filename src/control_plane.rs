@@ -1973,6 +1973,12 @@ fn typed_envelope<T: Serialize>(
     })
 }
 
+/// The single commit primitive for every transaction write. Every phase
+/// transition, same-phase persist, and abort completion funnels through this
+/// function, which makes it the one place a transaction leaves control.cc:
+/// when `next` has just become terminal, this archives it (and, if it was the
+/// last resident transaction of its command, the command too) to the sibling
+/// `history.cc` instead of writing it back in place.
 fn replace_transaction(
     store_path: &Path,
     current: &Stored<DeploymentTransaction>,
@@ -1983,6 +1989,10 @@ fn replace_transaction(
         current.value.transaction_id == next.transaction_id,
         "transaction replacement changes identity"
     );
+    let next_envelope = transaction_envelope(next, next.updated_at_unix_millis)?;
+    if next.is_terminal() {
+        return archive_terminal_transaction(store_path, current, next_envelope);
+    }
     ensure!(
         SingleFileMessagePackBackingStore::new(store_path).compare_exchange(
             &[CultCacheExpectedEnvelope {
@@ -1990,11 +2000,63 @@ fn replace_transaction(
                 key: current.value.transaction_id.clone(),
                 current: Some(current.envelope.clone()),
             }],
-            &[transaction_envelope(next, next.updated_at_unix_millis)?],
+            &[next_envelope],
         )?,
         "deployment transaction changed before its compare-exchange"
     );
     Ok(())
+}
+
+/// Moves one terminal transaction from `store_path` into its sibling
+/// `history.cc`, the only path a record leaves the live set. Idempotent: a
+/// crash between the history append and the control delete leaves the record
+/// resident but already archived, and the next call finds it already present
+/// in history and only needs to finish the delete.
+fn archive_terminal_transaction(
+    store_path: &Path,
+    current: &Stored<DeploymentTransaction>,
+    next_envelope: CultCacheEnvelope,
+) -> Result<()> {
+    let history = SingleFileMessagePackBackingStore::new(history_store_path(store_path));
+    history
+        .insert_entry_if_absent(next_envelope)
+        .context("archiving a terminal Idunn transaction to history")?;
+
+    let live = ControlSnapshot::read(store_path)
+        .context("reading Idunn control snapshot before archival delete")?;
+    let other_transaction_resident = live.transactions.iter().any(|stored| {
+        stored.value.transaction_id != current.value.transaction_id
+            && stored.value.command_id == current.value.command_id
+    });
+    let store = SingleFileMessagePackBackingStore::new(store_path);
+    if other_transaction_resident {
+        ensure!(
+            store.delete_batch_if_unchanged(&[current.envelope.clone()])?,
+            "deployment transaction changed before archival delete"
+        );
+        return Ok(());
+    }
+
+    let command = live
+        .commands
+        .iter()
+        .find(|stored| stored.value.command_id == current.value.command_id)
+        .context("terminal transaction has no immutable command to archive with")?;
+    history
+        .insert_entry_if_absent(command.envelope.clone())
+        .context("archiving a fully-terminal Idunn command to history")?;
+    ensure!(
+        store.delete_batch_if_unchanged(&[current.envelope.clone(), command.envelope.clone()])?,
+        "deployment transaction or its command changed before archival delete"
+    );
+    Ok(())
+}
+
+/// `history.cc` lives beside `control.cc` in the same directory. This is not
+/// a new configuration surface: every path that already knows the control
+/// store (the systemd unit, the CLI defaults) derives this one implicitly.
+fn history_store_path(store_path: &Path) -> PathBuf {
+    store_path.with_file_name("history.cc")
 }
 
 #[derive(Clone)]
@@ -2443,6 +2505,22 @@ impl Engine {
     fn resume_one_transaction(&self) -> Result<bool> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let mut progressed = false;
+
+        // A transaction already terminal in control.cc is a half-finished
+        // archive from a crash between the history append and the control
+        // delete. Finish moving it (and, if it was the last one, its command)
+        // to history.cc before scheduling anything else. The primitive is
+        // idempotent, so calling it again for a record already archived is a
+        // no-op rather than a repair loop.
+        for stored in snapshot
+            .transactions
+            .iter()
+            .filter(|stored| stored.value.is_terminal())
+        {
+            replace_transaction(&self.options.state_store, stored, &stored.value)?;
+            progressed = true;
+        }
+
         let mut candidates = snapshot
             .transactions
             .iter()
