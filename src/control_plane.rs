@@ -2841,25 +2841,17 @@ impl Engine {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let mut progressed = false;
 
-        // A transaction already terminal in control.cc is either a
-        // half-finished archive from a crash between the history append and
-        // the control delete inside archive_terminal_transaction, or -- the
-        // gap Soul found -- a record minted terminal at birth straight into
-        // control.cc by a producer that bypassed replace_transaction (the
-        // stateful-continuity admission commit in advance_committing writes
-        // its Complete transaction and the new AdmittedGeneration atomically
-        // in one compare_exchange, which archive_terminal_transaction cannot
-        // do since it only ever moves one already-resident record). Either
-        // way this loop finishes moving it, and its command if it was the
-        // last resident transaction of that command, to history.cc before
-        // scheduling anything else. replace_transaction's archive path is
-        // idempotent, so calling it again for a record already archived is a
-        // no-op rather than a repair loop.
-        for stored in snapshot.transactions.iter().filter(|stored| stored.value.is_terminal()) {
-            replace_transaction(&self.options.state_store, stored, &stored.value)?;
-            progressed = true;
-        }
-
+        // No resident-terminal sweep here (R23.2): scanning every terminal
+        // record in control.cc before touching a single live one starved
+        // every other target the moment history.cc became unwritable, and
+        // it existed only to catch a record minted terminal at birth by
+        // advance_committing's admission commit. That commit now archives
+        // such a record itself, in the same call, through the same
+        // archive_terminal_transaction primitive replace_transaction already
+        // uses below -- so control.cc holds a terminal record only for the
+        // instant between that commit's write and its own archive call, an
+        // ordinary consequence of writing its own record, not a residue
+        // this loop needs to go looking for.
         let mut candidates = snapshot
             .transactions
             .iter()
@@ -4368,6 +4360,7 @@ impl Engine {
             key: generation.target.clone(),
             current: incumbent.map(|stored| stored.envelope.clone()),
         };
+        let complete_envelope = transaction_envelope(&complete, now)?;
         ensure!(
             SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
                 &[
@@ -4378,13 +4371,30 @@ impl Engine {
                     },
                     admitted_expected,
                 ],
-                &[
-                    transaction_envelope(&complete, now)?,
-                    admitted_envelope(&generation, now)?,
-                ],
+                &[complete_envelope.clone(), admitted_envelope(&generation, now)?],
             )?,
             "incumbent or transaction changed before atomic admission commit"
         );
+        // A stateful Continuity admission with no pending incumbent cleanup
+        // (or one already retired during fencing) mints `complete` terminal
+        // at birth. The compare_exchange above is where the transaction and
+        // its AdmittedGeneration become consistent with each other -- that
+        // is the one atomic step this commit owns -- and archival is the
+        // very next thing this same call does with the record it just wrote,
+        // through the one primitive that already knows how to move a
+        // terminal transaction (and its command, if it was the last resident
+        // one) out to history.cc. `replace_transaction` calls the same
+        // primitive for a transaction that turns terminal while it was
+        // already resident from an earlier phase; this is its other caller,
+        // for the transaction that is terminal from its first write. Neither
+        // caller leaves a resident-terminal backlog for a sweep to find.
+        if complete.is_terminal() {
+            let written = Stored {
+                envelope: complete_envelope.clone(),
+                value: complete.clone(),
+            };
+            archive_terminal_transaction(&self.options.state_store, &written, complete_envelope)?;
+        }
         Ok(())
     }
 
@@ -8000,13 +8010,20 @@ nodes = ["yggdrasil"]
         Ok(())
     }
 
-    /// Claim 4 (the restored sweep is a new starvation point). The resident
-    /// terminal sweep runs `replace_transaction(..)?` BEFORE the candidate
-    /// loop and propagates its error. A terminal record whose archival
-    /// cannot complete -- here history.cc is unwritable -- fails every tick
-    /// at the sweep, and every live transaction behind it is never advanced.
-    /// This is the same shape as the whole-read starvation R20's quarantine
-    /// was introduced to fix, one function later.
+    /// Claim 4, flipped by R23.2's deletion of the resident-terminal sweep.
+    /// A terminal record already resident in control.cc -- the shape the
+    /// sweep used to scan for -- is no longer visited by
+    /// `resume_one_transaction` at all: the candidate loop filters it out by
+    /// `is_terminal()`, same as ever, and there is no sweep ahead of that
+    /// loop to fail when history.cc is unwritable. An unarchivable resident
+    /// terminal record therefore no longer starves anything behind it.
+    ///
+    /// (The primitive-level idempotency claim the deleted
+    /// `soul3_sweep_is_idempotent_and_never_double_archives` made lives on
+    /// as `archive_terminal_transaction_tolerates_a_pre_existing_history_entry`,
+    /// which already drives `archive_terminal_transaction`/`replace_transaction`
+    /// directly -- the surviving path, now that there is no sweep to drive it
+    /// through.)
     #[test]
     fn soul3_unarchivable_terminal_record_starves_every_live_transaction() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -8032,67 +8049,29 @@ nodes = ["yggdrasil"]
             2
         );
 
-        for _ in 0..3 {
-            let progressed =
-                run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction());
-            assert!(!progressed, "the sweep fails before any candidate is advanced");
-            let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
-            let live_now = snapshot
-                .transactions
-                .iter()
-                .find(|stored| stored.value.transaction_id == live.transaction_id)
-                .context("live transaction vanished")?;
-            assert!(
-                !live_now.value.is_terminal(),
-                "the abort-ready live transaction was never finalized: starved behind the sweep"
-            );
-        }
-        Ok(())
-    }
-
-    /// Claim 4 (sweep + `archive_rejected_transaction` are not double
-    /// archival). Both end in `insert_entry_if_absent` on history.cc keyed
-    /// by transaction id, and a rejected transaction never lands in
-    /// control.cc, so the sweep can never pick one up. Sweeping a terminal
-    /// record that is already in history leaves exactly one history entry
-    /// and no resident copy, and a second sweep is a no-op.
-    #[test]
-    fn soul3_sweep_is_idempotent_and_never_double_archives() -> Result<()> {
-        let temporary = tempfile::tempdir()?;
-        let engine = soul_engine(temporary.path())?;
-        let command = command(CommandKind::Continuity);
-        let terminal = soul3_terminal(&command)?;
-        let stored_envelope = soul_seed_control(&engine.options.state_store, &command, &terminal)?;
-        // Pre-seed history with the same record, as a crash between the
-        // history append and the control delete would leave it.
-        let history = SingleFileMessagePackBackingStore::new(history_store_path(
-            &engine.options.state_store,
-        ));
-        assert!(history.insert_entry_if_absent(stored_envelope)?);
-
-        assert!(engine.resume_one_transaction()?);
-        assert!(!engine.resume_one_transaction()?, "second tick has nothing left to sweep");
+        let progressed =
+            run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction());
+        assert!(progressed, "the live transaction advances; there is no sweep ahead of it to fail");
+        let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
+        let live_now = snapshot
+            .transactions
+            .iter()
+            .find(|stored| stored.value.transaction_id == live.transaction_id)
+            .context("live transaction vanished")?;
         assert!(
-            ControlSnapshot::read(&engine.options.state_store)?
-                .transactions
-                .is_empty()
+            live_now.value.is_terminal(),
+            "the abort-ready live transaction finalized on its own tick"
         );
-        let archived = history.pull_all_read_only_snapshot()?;
-        assert_eq!(
-            archived
-                .iter()
-                .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
-                .count(),
-            1,
-            "one history entry for the transaction, not two"
-        );
-        assert_eq!(
-            archived
-                .iter()
-                .filter(|envelope| envelope.r#type == DeploymentCommand::TYPE)
-                .count(),
-            1
-        );
+        // The unrelated resident terminal record is untouched: still there,
+        // still unarchived, and that is not this loop's problem any more.
+        let still_resident = SingleFileMessagePackBackingStore::new(&engine.options.state_store)
+            .pull_all_read_only_snapshot()?
+            .into_iter()
+            .any(|envelope| {
+                envelope.r#type == DeploymentTransaction::TYPE
+                    && envelope.key == terminal.transaction_id
+            });
+        assert!(still_resident, "the sweep is gone; nobody archives a pre-existing resident terminal record");
         Ok(())
     }
 
