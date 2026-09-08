@@ -527,6 +527,11 @@ impl CompiledDeploymentPlan {
         Ok(())
     }
 
+    /// Parse-only: admission was already decided at freeze time by
+    /// `compile_deployment_plan`. A frozen plan's recipe/binding pair is not
+    /// re-admitted on every read -- admission rules may change after a plan
+    /// was compiled and admitted, and a plan already committed to disk is
+    /// history, not a fresh proposal to gate.
     pub(crate) fn parsed_inputs(&self) -> Result<(TargetDeclaration, OperatorBinding)> {
         let recipe_text = std::str::from_utf8(&self.recipe_blob)
             .context("stored deployment recipe is not UTF-8")?;
@@ -534,7 +539,6 @@ impl CompiledDeploymentPlan {
             .context("stored operator binding is not UTF-8")?;
         let declaration = TargetDeclaration::parse(recipe_text)?;
         let binding = OperatorBinding::parse(binding_text)?;
-        binding.admit(&declaration)?;
         Ok((declaration, binding))
     }
 

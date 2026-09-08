@@ -42,7 +42,6 @@ use crate::drivers::{
 
 const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
 const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v3";
-const DEPLOYMENT_TRANSACTION_SCHEMA_V2: &str = "idunn.deployment_transaction.v2";
 const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v2";
 /// How many times continuity will restart one admitted release before it
 /// concludes the release itself is the problem. More than one because a start
@@ -1910,11 +1909,8 @@ fn decode_record<T>(envelope: &CultCacheEnvelope) -> Result<T>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
-    let value: T = rmp_serde::from_slice(&envelope.payload)?;
-    ensure!(
-        rmp_serde::to_vec(&value)? == envelope.payload,
-        "Idunn control store contains a noncanonical record"
-    );
+    let value: T = rmp_serde::from_slice(&envelope.payload)
+        .with_context(|| format!("decoding {} {}", envelope.r#type, envelope.key))?;
     Ok(value)
 }
 
@@ -1929,85 +1925,14 @@ fn command_envelope(value: &DeploymentCommand, now: u64) -> Result<CultCacheEnve
     )
 }
 
-/// Read one stored transaction, lifting a v2 record to the current shape.
-///
-/// The control store refuses noncanonical bytes: a record must re-encode to
-/// exactly what is stored. That check is what makes tampering visible, and it
-/// also means adding a field is a schema change -- every transaction written
-/// before `post_fencing_abort` existed re-encodes with one extra key and would
-/// be read as tampered.
-///
-/// So a v2 record is decoded by key, which tolerates the absent key, and lifted
-/// with no post-fencing abort, because a transaction written before the field
-/// existed cannot have had one. Byte-exactness cannot apply across a version
-/// boundary -- the bytes are a different schema by definition -- so the lift
-/// leans on the full semantic `validate()` instead, and everything downstream
-/// sees only the current shape.
 fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTransaction> {
-    match envelope.schema_id.as_deref() {
-        Some(DEPLOYMENT_TRANSACTION_SCHEMA) => {
-            let value: DeploymentTransaction = decode_record(envelope)?;
-            value.validate()?;
-            Ok(value)
-        }
-        Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2) => {
-            let mut value: DeploymentTransaction = rmp_serde::from_slice(&envelope.payload)
-                .context("decoding a v2 deployment transaction")?;
-            ensure!(
-                value.schema_version == DEPLOYMENT_TRANSACTION_SCHEMA_V2,
-                "stored transaction schema differs from its envelope"
-            );
-            ensure!(
-                value.post_fencing_abort.is_none(),
-                "a v2 transaction cannot carry post-fencing abort evidence"
-            );
-            value.schema_version = DEPLOYMENT_TRANSACTION_SCHEMA.into();
-            value.validate()?;
-            Ok(value)
-        }
-        _ => bail!("Idunn control store contains an unsupported transaction"),
-    }
-}
-
-/// Rewrite every v2 transaction as v3, once, before the engine runs.
-///
-/// The read path lifts v2 records on its own, so this is convergence rather
-/// than correctness: without it the store keeps records in two shapes for as
-/// long as the oldest terminal transaction survives retention. Each rewrite is
-/// a compare-exchange against the exact stored envelope, so a record that
-/// changed underneath is left alone rather than clobbered.
-fn migrate_transactions_to_current_schema(store_path: &Path) -> Result<usize> {
-    if !store_path.exists() {
-        return Ok(0);
-    }
-    let store = SingleFileMessagePackBackingStore::new(store_path);
-    let stale = store
-        .pull_all_read_only_snapshot()
-        .context("reading Idunn control snapshot for migration")?
-        .into_iter()
-        .filter(|envelope| {
-            envelope.r#type == DeploymentTransaction::TYPE
-                && envelope.schema_id.as_deref() == Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2)
-        })
-        .collect::<Vec<_>>();
-    let mut migrated = 0;
-    for envelope in stale {
-        let value = read_transaction_record(&envelope)?;
-        let next = transaction_envelope(&value, value.updated_at_unix_millis)?;
-        ensure!(
-            store.compare_exchange(
-                &[CultCacheExpectedEnvelope {
-                    r#type: DeploymentTransaction::TYPE.into(),
-                    key: value.transaction_id.clone(),
-                    current: Some(envelope.clone()),
-                }],
-                &[next],
-            )?,
-            "deployment transaction changed during schema migration"
-        );
-        migrated += 1;
-    }
-    Ok(migrated)
+    ensure!(
+        envelope.schema_id.as_deref() == Some(DEPLOYMENT_TRANSACTION_SCHEMA),
+        "Idunn control store contains an unsupported transaction"
+    );
+    let value: DeploymentTransaction = decode_record(envelope)?;
+    value.validate()?;
+    Ok(value)
 }
 
 fn transaction_envelope(value: &DeploymentTransaction, now: u64) -> Result<CultCacheEnvelope> {
@@ -2479,123 +2404,6 @@ impl Engine {
         }
     }
 
-    fn validate_durable_authority(&self, snapshot: &ControlSnapshot) -> Result<()> {
-        let operator_anchor = read_trust_anchor::<IdunnDeploymentBrakeOperatorIdentity>(
-            &self.options.deployment_brake_operator_anchor,
-        )?;
-        for stored in &snapshot.transactions {
-            let transaction = &stored.value;
-            if let Some(authorization) = &transaction.deployment_authorization {
-                authorization.validate_shape()?;
-                let record: IdunnDeploymentBrakeRecord =
-                    rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
-                verify_idunn_deployment_brake_authorization(&record, &operator_anchor)?;
-                let expected = required(&transaction.expected, "authorized Expected projection")?;
-                ensure!(
-                    record.authorized_release_id.as_deref()
-                        == Some(expected.sealed_release_id.as_str())
-                        && record.authorized_deployment_id.as_deref()
-                            == Some(transaction.transaction_id.as_str())
-                        && record.runtime_id == expected.runtime_id,
-                    "durable deployment authorization names another release or transaction"
-                );
-            }
-            let lease = transaction
-                .leasing
-                .as_ref()
-                .and_then(LeasingEvidence::lease_sha256);
-            if let Some(evidence) = &transaction.latest_odin_observation {
-                let authenticated = self.authenticate_topology_bytes(
-                    snapshot,
-                    transaction,
-                    &evidence.canonical_bytes,
-                    lease,
-                    evidence.admitted_at_unix_millis,
-                )?;
-                validate_authenticated_evidence(evidence, &authenticated)?;
-            }
-            if let Some(evidence) = &transaction.warming {
-                match evidence {
-                    WarmingEvidence::OdinTopology { evidence } => {
-                        let authenticated = self.authenticate_topology_bytes(
-                            snapshot,
-                            transaction,
-                            &evidence.canonical_bytes,
-                            None,
-                            evidence.admitted_at_unix_millis,
-                        )?;
-                        validate_authenticated_evidence(evidence, &authenticated)?;
-                        let incumbent_lease_sha256 =
-                            self.incumbent_lease_sha256_for_warming(snapshot, transaction)?;
-                        ensure!(
-                            is_semantic_warming(
-                                required(&transaction.expected, "Warming Expected projection",)?,
-                                required(&transaction.activation, "Warming activation")?,
-                                incumbent_lease_sha256.as_deref(),
-                                &authenticated,
-                            )?,
-                            "durable Warming gate is not supported by current runtime evidence"
-                        );
-                    }
-                    WarmingEvidence::FirstOdinDirect { evidence } => {
-                        self.authenticate_first_odin_warming_presence(
-                            transaction,
-                            &evidence.message_id,
-                            evidence.challenged_at_unix_millis,
-                            evidence.admitted_at_unix_millis,
-                            &evidence.canonical_bytes,
-                        )?;
-                    }
-                }
-            }
-            if let Some(evidence) = &transaction.ready {
-                let authenticated = self.authenticate_topology_bytes(
-                    snapshot,
-                    transaction,
-                    &evidence.canonical_bytes,
-                    lease,
-                    evidence.admitted_at_unix_millis,
-                )?;
-                validate_authenticated_evidence(evidence, &authenticated)?;
-                ensure!(
-                    is_semantic_ready(&authenticated),
-                    "durable Ready label is not exact semantic Ready"
-                );
-            }
-        }
-        let odin_authority = self.current_odin_authority(snapshot)?;
-        for stored in &snapshot.admitted {
-            let generation = &stored.value;
-            let authority = self.runtime_authority_parts(
-                &generation.plan,
-                &generation.expected,
-                &generation.activation,
-            )?;
-            let latest = authenticate_odin_runtime_topology_correlation(
-                &generation.latest_odin_observation.canonical_bytes,
-                &authority,
-                generation.leasing.lease_sha256(),
-                &odin_authority.signer_public_key,
-                self.trusted_topology_context(
-                    generation.latest_odin_observation.admitted_at_unix_millis,
-                ),
-            )?;
-            validate_authenticated_evidence(&generation.latest_odin_observation, &latest)?;
-            let ready = authenticate_odin_runtime_topology_correlation(
-                &generation.ready.canonical_bytes,
-                &authority,
-                generation.leasing.lease_sha256(),
-                &odin_authority.signer_public_key,
-                self.trusted_topology_context(generation.ready.admitted_at_unix_millis),
-            )?;
-            validate_authenticated_evidence(&generation.ready, &ready)?;
-            ensure!(
-                is_semantic_ready(&ready),
-                "admitted generation Ready label is not exact semantic Ready"
-            );
-        }
-        Ok(())
-    }
 }
 
 fn serve(options: RuntimeOptions) -> Result<()> {
@@ -2614,14 +2422,8 @@ fn serve(options: RuntimeOptions) -> Result<()> {
             .with_context(|| format!("creating Idunn directory {}", directory.display()))?;
     }
     let _lock = ProcessLock::acquire(&options.state_store)?;
-    let migrated = migrate_transactions_to_current_schema(&options.state_store)
-        .context("migrating Idunn transactions to the current schema")?;
-    if migrated > 0 {
-        println!("migrated {migrated} transaction(s) to {DEPLOYMENT_TRANSACTION_SCHEMA}");
-    }
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
     let engine = Engine::open(options)?;
-    engine.validate_durable_authority(&ControlSnapshot::read(&engine.options.state_store)?)?;
 
     loop {
         let transaction_progress = engine.resume_one_transaction()?;
