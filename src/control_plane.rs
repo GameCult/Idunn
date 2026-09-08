@@ -22,7 +22,7 @@ use cultnet_rs::{
     authenticate_runtime_presence_claim,
     correlate_runtime_presence_claim, derive_service_identity_id,
     evaluate_idunn_continuity_restart, evaluate_idunn_deployment_brake, open_service_identity_at,
-    verify_idunn_deployment_brake_authorization, verify_runtime_authority,
+    verify_runtime_authority,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
