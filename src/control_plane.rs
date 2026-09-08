@@ -6964,4 +6964,226 @@ mod tests {
             })
         );
     }
+
+    // ---- Soul falsification tests (epiphany/idunn-store-history) ----
+
+    /// A control-plane Engine over temporary stores. Identity enrollment is
+    /// real (needs /etc/machine-id); drivers are the defaults and are never
+    /// reached by the transactions these tests schedule.
+    fn soul_engine(root: &Path) -> Result<Engine> {
+        let idunn_identity_store = root.join("idunn-identity.cc");
+        cultnet_rs::enroll_service_identity_at::<IdunnServiceIdentity>(&idunn_identity_store)?;
+        let odin_signer = cultnet_rs::enroll_service_identity_at::<OdinTopologyIdentity>(
+            &root.join("odin-identity.cc"),
+        )?;
+        let odin_trust_anchor = root.join("odin-anchor.cc");
+        cultnet_rs::export_service_identity_trust_anchor(&odin_signer, &odin_trust_anchor)?;
+        Engine::open(RuntimeOptions {
+            state_store: root.join("control.cc"),
+            bindings_dir: root.join("bindings"),
+            source_root: root.join("sources"),
+            staging_root: root.join("staging"),
+            topology_store: root.join("topology.cc"),
+            odin_correlation_store: root.join("odin-correlation.cc"),
+            odin_trust_anchor,
+            idunn_identity_store,
+            deployment_brake_operator_anchor: root.join("brake-anchor.cc"),
+            source_identity: None,
+            ..RuntimeOptions::default()
+        })
+    }
+
+    /// A Deploy transaction whose pre-fencing abort has finished every
+    /// cleanup step but has not yet been finalized: the exact state
+    /// `advance_pre_fencing_abort` turns terminal on its next tick, with no
+    /// driver involvement.
+    fn soul_abort_ready_to_finalize(command: &DeploymentCommand) -> Result<DeploymentTransaction> {
+        let mut transaction =
+            DeploymentTransaction::new(command, "ghostlight".into(), 0, None, 100)?;
+        transaction.pre_fencing_abort = Some(PreFencingAbort {
+            error: "boom".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Complete,
+        });
+        transaction.validate()?;
+        assert!(!transaction.is_terminal());
+        Ok(transaction)
+    }
+
+    fn soul_seed_control(
+        control_path: &Path,
+        command: &DeploymentCommand,
+        transaction: &DeploymentTransaction,
+    ) -> Result<CultCacheEnvelope> {
+        let control = SingleFileMessagePackBackingStore::new(control_path);
+        assert!(control.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentCommand::TYPE.into(),
+                key: command.command_id.clone(),
+                current: None,
+            }],
+            &[command_envelope(command, 100)?],
+        )?);
+        let envelope = transaction_envelope(transaction, 100)?;
+        assert!(control.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: transaction.transaction_id.clone(),
+                current: None,
+            }],
+            &[envelope.clone()],
+        )?);
+        Ok(envelope)
+    }
+
+    /// Claim 1. The deleted byte-exact re-encode check was the only thing
+    /// that refused a LIVE record written by a foreign serializer. A Sealing
+    /// transaction encoded as a msgpack map (what any hand tool that writes
+    /// by field name produces) is not what Idunn itself would have written,
+    /// and the serve-time "validating all Idunn records" read now accepts it.
+    #[test]
+    fn soul_live_record_in_foreign_encoding_is_accepted_by_control_read() -> Result<()> {
+        let command = command(CommandKind::Deploy);
+        let transaction = DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        assert!(!transaction.is_terminal(), "this is a live record");
+        // Idunn's canonical bytes encode `ordinal == 0` as a positive fixint
+        // (0x00). msgpack also allows uint8 (0xcc 0x00): same value, different
+        // bytes -- exactly what the deleted `to_vec(&value) == payload` check
+        // refused as "a noncanonical record".
+        let canonical = rmp_serde::to_vec(&transaction)?;
+        let marker = b"ghostlight ";
+        let at = canonical
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .context("canonical encoding lost its target/ordinal slots")?;
+        let mut foreign_payload = canonical.clone();
+        foreign_payload.splice(at + marker.len() - 1..at + marker.len(), [0xcc, 0x00]);
+        assert_ne!(foreign_payload, canonical);
+        assert_eq!(
+            rmp_serde::from_slice::<DeploymentTransaction>(&foreign_payload)?,
+            transaction,
+            "same value, foreign bytes"
+        );
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("control.cc");
+        let store = SingleFileMessagePackBackingStore::new(&path);
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentCommand::TYPE.into(),
+                key: command.command_id.clone(),
+                current: None,
+            }],
+            &[command_envelope(&command, 100)?],
+        )?);
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: transaction.transaction_id.clone(),
+                current: None,
+            }],
+            &[CultCacheEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: transaction.transaction_id.clone(),
+                payload: foreign_payload,
+                stored_at: rfc3339_millis(100)?,
+                schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
+            }],
+        )?);
+
+        let snapshot = ControlSnapshot::read(&path)?;
+        assert_eq!(snapshot.transactions.len(), 1);
+        assert_eq!(snapshot.transactions[0].value, transaction);
+        Ok(())
+    }
+
+    /// Claim 3. A transaction that goes terminal inside `advance_transaction`
+    /// is archived out of control.cc by `replace_transaction`; the scheduler
+    /// then re-reads control.cc to measure progress and cannot find it. That
+    /// error propagates through `resume_one_transaction` and `serve`'s `?`,
+    /// so every ordinary completion ends the daemon process once.
+    #[test]
+    fn soul_terminal_completion_inside_resume_returns_an_error_serve_propagates() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        let command = command(CommandKind::Deploy);
+        let transaction = soul_abort_ready_to_finalize(&command)?;
+        soul_seed_control(&engine.options.state_store, &command, &transaction)?;
+
+        let outcome = engine.resume_one_transaction();
+
+        // The work itself succeeded: the record is archived.
+        let history = SingleFileMessagePackBackingStore::new(history_store_path(
+            &engine.options.state_store,
+        ))
+        .pull_all_read_only_snapshot()?;
+        assert_eq!(history.len(), 2, "transaction and command archived to history.cc");
+        assert!(ControlSnapshot::read(&engine.options.state_store)?.transactions.is_empty());
+
+        // And the scheduler tick reports it as a fatal error anyway.
+        let error = outcome.expect_err("resume tick must fail for this claim to be falsified");
+        assert!(
+            format!("{error:#}").contains("transaction disappeared while checking scheduler progress"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
+
+    /// Claim 4. `archive_terminal_transaction` appends the TERMINAL `next`
+    /// to history.cc and then deletes the NON-TERMINAL `current` from
+    /// control.cc. A crash between those two steps therefore leaves a
+    /// non-terminal record resident -- not the terminal one that
+    /// `resume_one_transaction`'s "half-finished archive" filter looks for.
+    /// The record is re-executed as live work instead, and the tick then
+    /// fails the same way as any completion.
+    #[test]
+    fn soul_real_crash_window_leaves_a_live_record_that_the_archive_filter_cannot_see() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        let command = command(CommandKind::Deploy);
+        let current = soul_abort_ready_to_finalize(&command)?;
+        soul_seed_control(&engine.options.state_store, &command, &current)?;
+
+        // Step one of the archive as the primitive performs it: the terminal
+        // successor is appended to history.cc. Then "crash" before the
+        // control delete.
+        let mut terminal = current.clone();
+        terminal.phase = DeploymentPhase::Complete;
+        terminal.updated_at_unix_millis = 150;
+        terminal.last_error = Some("boom".into());
+        terminal.completion = Some(TransactionCompletion::FailedBeforeFencing { error: "boom".into() });
+        terminal.validate()?;
+        assert!(terminal.is_terminal());
+        let history_path = history_store_path(&engine.options.state_store);
+        assert!(SingleFileMessagePackBackingStore::new(&history_path)
+            .insert_entry_if_absent(transaction_envelope(&terminal, 150)?)?);
+
+        // What the restart actually sees in control.cc.
+        let resident = ControlSnapshot::read(&engine.options.state_store)?;
+        assert_eq!(resident.transactions.len(), 1);
+        assert!(
+            !resident.transactions[0].value.is_terminal(),
+            "the crash window leaves the live predecessor resident, so the \
+             `is_terminal()` archive-completion filter in resume_one_transaction never matches it"
+        );
+
+        let outcome = engine.resume_one_transaction();
+        let history = SingleFileMessagePackBackingStore::new(&history_path)
+            .pull_all_read_only_snapshot()?;
+        assert_eq!(history.len(), 2);
+        let archived = history
+            .iter()
+            .find(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
+            .unwrap();
+        // insert_entry_if_absent is keyed by identity, so the record the
+        // first attempt wrote is what history keeps, whatever the retry produced.
+        assert_eq!(archived.stored_at, rfc3339_millis(150)?);
+        let error = outcome.expect_err("retry completes the archive and still fails the tick");
+        assert!(
+            format!("{error:#}").contains("transaction disappeared while checking scheduler progress"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
 }

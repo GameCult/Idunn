@@ -1598,4 +1598,37 @@ nodes = ["yggdrasil"]
         changed.external_inputs[0].size_bytes = 18;
         assert!(changed.validate_against(&plan).is_err());
     }
+
+    /// Soul, claim 2. `parsed_inputs` no longer admits the stored binding
+    /// against the stored recipe, and nothing else on the read path does. A
+    /// plan whose frozen `binding_blob` was rewritten after freeze -- here to
+    /// allow-list a program the recipe's step does not name -- passes
+    /// `validate()` and `parsed_inputs()` once its content digest is
+    /// recomputed, even though `admit` refuses that exact pair.
+    #[test]
+    fn soul_stored_plan_with_inadmissible_binding_passes_every_read_check() {
+        let smuggled = BINDING.replace(
+            "allowed_programs = [\"cargo\"]",
+            "allowed_programs = [\"sh\"]",
+        );
+        assert_ne!(smuggled, BINDING);
+        let declaration = TargetDeclaration::parse(RECIPE).unwrap();
+        let binding = OperatorBinding::parse(&smuggled).unwrap();
+        let refused = binding.admit(&declaration).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("does not admit program"),
+            "admission must refuse this binding: {refused:#}"
+        );
+
+        let mut plan = plan();
+        plan.binding_blob = smuggled.into_bytes();
+        plan.plan_id = plan.recomputed_plan_id().unwrap();
+
+        plan.validate().expect("read-time validation accepts the inadmissible binding");
+        let (_, parsed) = plan
+            .parsed_inputs()
+            .expect("parsed_inputs hands the inadmissible binding to the phase engine");
+        assert!(parsed.runners["rust"].allowed_programs.contains("sh"));
+        assert!(!parsed.runners["rust"].allowed_programs.contains("cargo"));
+    }
 }
