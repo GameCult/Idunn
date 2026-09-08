@@ -7394,7 +7394,10 @@ mod tests {
             }],
         )?);
 
-        let error = ControlSnapshot::read(&path).expect_err("foreign encoding must be refused");
+        let error = match ControlSnapshot::read(&path) {
+            Ok(_) => panic!("foreign encoding must be refused"),
+            Err(error) => error,
+        };
         assert!(
             format!("{error:#}").contains("noncanonical"),
             "unexpected error: {error:#}"
