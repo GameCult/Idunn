@@ -7781,4 +7781,428 @@ mod tests {
         );
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Soul, third pass (R20 surface). Every test below is a falsification
+    // attempt against the quarantine, the sweep, and the live-store read.
+    // ------------------------------------------------------------------
+
+    /// One operator binding for target `ghostlight`, enough for
+    /// `load_bindings` + `resolve_selector` to admit a Deploy command.
+    const SOUL3_GHOSTLIGHT_BINDING: &str = r#"
+schema = "gamecult.idunn.operator_binding.v2"
+target = "ghostlight"
+
+[repository]
+origin = "https://github.com/GameCult/Ghostlight.git"
+admitted_ref = "refs/heads/main"
+minimum_revision = "1111111111111111111111111111111111111111"
+selection = "ref-head"
+checkout = "/srv/build/Ghostlight"
+recipe_path = "deployment/idunn/recipe.toml"
+
+[runners.rust]
+driver = "docker"
+image = "rust@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+user = "1000:1000"
+affordances = ["source-read", "artifact-write"]
+allowed_programs = ["cargo"]
+network_profile = "build-dependency-egress"
+memory_mebibytes = 2048
+cpu_quota_percent = 200
+pids_limit = 512
+tmpfs_mebibytes = 512
+
+[workload]
+driver = "systemd-transient"
+state_group = "ghostlight"
+unit_prefix = "idunn-ghostlight"
+release_root = "/srv/ghostlight/releases"
+state_root = "/var/lib/gamecult/ghostlight"
+runtime_root = "/run/gamecult/idunn/ghostlight"
+network = "host-private"
+hardening = "strict"
+memory_mebibytes = 1024
+cpu_quota_percent = 100
+
+[workload.argument_bindings]
+state_root = "/var/lib/gamecult/ghostlight"
+
+[workload.secret_files]
+GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/ghostlight/runtime-presence-identity.cc"
+
+[runtime_identity]
+runtime_id = "ghostlight-yggdrasil"
+expected_signer_identity_id = "ghostlight-runtime-signer"
+trust_anchor_store = "/etc/gamecult/trust/ghostlight.cc"
+
+[brakes]
+deployment_store = "/var/lib/gamecult/idunn/ghostlight-deployment-brake.cc"
+lifecycle_store = "/var/lib/gamecult/idunn/ghostlight-lifecycle-brake.cc"
+
+[rollout]
+strategy = "candidate-then-promote"
+drain_seconds = 30
+retain_releases = 2
+
+[placement]
+desired_replicas = 1
+nodes = ["yggdrasil"]
+"#;
+
+    /// A Sealing transaction for `command`, encoded with one non-canonical
+    /// byte so `decode_record_canonical` refuses it (the same splice
+    /// `soul2_one_noncanonical_record_starves_every_scheduler_tick` uses).
+    fn soul3_noncanonical_sealing(
+        command: &DeploymentCommand,
+    ) -> Result<(DeploymentTransaction, CultCacheEnvelope)> {
+        let transaction = DeploymentTransaction::new(command, "ghostlight".into(), 0, None, 100)?;
+        let canonical = rmp_serde::to_vec(&transaction)?;
+        // Re-encode the `target` fixstr header (0xaa "ghostlight") as an
+        // equivalent str8 header (0xd9 0x0a): identical decoded value, one
+        // byte longer, and not what Idunn's serializer writes.
+        let marker = b"\xaaghostlight";
+        let at = canonical
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .context("lost target slot")?;
+        let mut foreign = canonical.clone();
+        foreign.splice(at..at + 1, [0xd9, 0x0a]);
+        assert_ne!(foreign, canonical);
+        let decoded: DeploymentTransaction = rmp_serde::from_slice(&foreign)?;
+        assert_eq!(decoded.transaction_id, transaction.transaction_id);
+        let envelope = CultCacheEnvelope {
+            r#type: DeploymentTransaction::TYPE.into(),
+            key: transaction.transaction_id.clone(),
+            payload: foreign,
+            stored_at: rfc3339_millis(100)?,
+            schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
+        };
+        Ok((transaction, envelope))
+    }
+
+    fn soul3_insert(
+        store: &SingleFileMessagePackBackingStore,
+        envelope: CultCacheEnvelope,
+    ) -> Result<()> {
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: envelope.r#type.clone(),
+                key: envelope.key.clone(),
+                current: None,
+            }],
+            &[envelope],
+        )?);
+        Ok(())
+    }
+
+    fn soul3_terminal(command: &DeploymentCommand) -> Result<DeploymentTransaction> {
+        let mut terminal = DeploymentTransaction::new(command, "ghostlight".into(), 0, None, 100)?;
+        terminal.phase = DeploymentPhase::Complete;
+        terminal.pre_fencing_abort = Some(PreFencingAbort {
+            error: "boom".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Skipped,
+        });
+        terminal.completion =
+            Some(TransactionCompletion::FailedBeforeFencing { error: "boom".into() });
+        terminal.validate()?;
+        assert!(terminal.is_terminal());
+        Ok(terminal)
+    }
+
+    /// Claim 1 (quarantine fails OPEN for target ownership). A live Sealing
+    /// transaction that fails `ingest` is absent from the snapshot. Its
+    /// command therefore has no visible transaction, `freeze_one_queued_command`
+    /// treats the command as still queued, and mints a SECOND transaction
+    /// for the same command and target. control.cc then holds two
+    /// transactions claiming `ghostlight` -- the exact state
+    /// `validate_relations` exists to forbid, unenforced because one of the
+    /// two is invisible to it. A one-byte write to control.cc selects which
+    /// live transaction Idunn stops seeing.
+    #[test]
+    fn soul3_quarantined_live_transaction_lets_freeze_mint_a_second_owner_for_its_target()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        fs::create_dir_all(&engine.options.bindings_dir)?;
+        fs::write(
+            engine.options.bindings_dir.join("ghostlight.toml"),
+            SOUL3_GHOSTLIGHT_BINDING,
+        )?;
+        load_bindings(&engine.options.bindings_dir)?;
+
+        let command = command(CommandKind::Deploy);
+        let (hidden, hidden_envelope) = soul3_noncanonical_sealing(&command)?;
+        let store = SingleFileMessagePackBackingStore::new(&engine.options.state_store);
+        soul3_insert(&store, command_envelope(&command, 100)?)?;
+        soul3_insert(&store, hidden_envelope)?;
+
+        // The live transaction is gone from the snapshot; its command is
+        // visible and, from the scheduler's point of view, still queued.
+        let before = ControlSnapshot::read(&engine.options.state_store)?;
+        assert!(before.transactions.is_empty(), "the live transaction is quarantined");
+        assert_eq!(before.commands.len(), 1);
+
+        // Freeze admits a NEW transaction for the same command and target.
+        let froze = engine.freeze_one_queued_command()?;
+        assert!(froze, "freeze re-froze the command whose owner it cannot see");
+
+        let after = ControlSnapshot::read(&engine.options.state_store)?;
+        assert_eq!(after.transactions.len(), 1, "the new owner is the only visible one");
+        let minted = &after.transactions[0].value;
+        assert_ne!(minted.transaction_id, hidden.transaction_id);
+        assert_eq!(minted.command_id, hidden.command_id);
+        assert_eq!(minted.target, hidden.target);
+        assert!(minted.owns_target_authority());
+
+        // control.cc itself now carries BOTH owners of ghostlight for the
+        // same command. validate_relations passed because it only ever saw
+        // one of them.
+        let raw = store.pull_all_read_only_snapshot()?;
+        let raw_transactions = raw
+            .iter()
+            .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
+            .count();
+        assert_eq!(
+            raw_transactions, 2,
+            "two live transactions for one command and one target are now durable in control.cc"
+        );
+        Ok(())
+    }
+
+    /// Claim 1 (quarantine fails OPEN for admission). An `AdmittedGeneration`
+    /// record for `odin` that fails `ingest` vanishes from the snapshot:
+    /// `admitted_for("odin")` is None, so (a) the current Odin topology
+    /// authority silently falls back to the BOOTSTRAP anchor instead of the
+    /// admitted one, (b) the continuity supervisor has nothing to supervise
+    /// and reports no progress, and (c) a fresh transaction for the target
+    /// would be minted with `incumbent_generation_id = None`, i.e. as if the
+    /// target had never been deployed. None of these is a refusal; on main
+    /// the same bytes refused the whole read.
+    #[test]
+    fn soul3_quarantined_admitted_generation_reads_as_never_deployed() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        let store = SingleFileMessagePackBackingStore::new(&engine.options.state_store);
+        // Correct type, correct schema id, correct key -- one byte of
+        // payload that is not what Idunn's serializer would write.
+        soul3_insert(
+            &store,
+            CultCacheEnvelope {
+                r#type: AdmittedGeneration::TYPE.into(),
+                key: "odin".into(),
+                payload: vec![0x90],
+                stored_at: rfc3339_millis(100)?,
+                schema_id: Some(ADMITTED_GENERATION_SCHEMA.into()),
+            },
+        )?;
+
+        let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
+        assert!(snapshot.admitted.is_empty(), "the admitted generation is quarantined");
+        assert!(snapshot.admitted_for("odin").is_none());
+
+        // (a) Odin authority rolls back to bootstrap.
+        let authority = engine.current_odin_authority(&snapshot)?;
+        assert_eq!(
+            authority.signer_public_key, engine.bootstrap_odin_authority.signer_public_key,
+            "a quarantined admitted generation silently reverts Odin authority to the bootstrap anchor"
+        );
+
+        // (b) Nothing is supervised; the tick reports "nothing to do".
+        assert!(!engine.supervise_one_admitted_generation()?);
+
+        // (c) A new transaction for the target would treat it as undeployed.
+        let command = command(CommandKind::Deploy);
+        let fresh = DeploymentTransaction::new(
+            &command,
+            "odin".into(),
+            0,
+            snapshot.admitted_for("odin").map(|stored| &stored.value),
+            100,
+        )?;
+        assert!(fresh.incumbent_generation_id.is_none());
+        assert_eq!(fresh.odin_publisher_sequence_cursor, 0);
+        Ok(())
+    }
+
+    /// Claim 4 (the restored sweep is a new starvation point). The resident
+    /// terminal sweep runs `replace_transaction(..)?` BEFORE the candidate
+    /// loop and propagates its error. A terminal record whose archival
+    /// cannot complete -- here history.cc is unwritable -- fails every tick
+    /// at the sweep, and every live transaction behind it is never advanced.
+    /// This is the same shape as the whole-read starvation R20's quarantine
+    /// was introduced to fix, one function later.
+    #[test]
+    fn soul3_unarchivable_terminal_record_starves_every_live_transaction() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        // Make history.cc impossible to open as a file.
+        fs::create_dir_all(history_store_path(&engine.options.state_store))?;
+
+        let terminal_command = command(CommandKind::Continuity);
+        let terminal = soul3_terminal(&terminal_command)?;
+
+        let live_command = command(CommandKind::Deploy);
+        let mut live = soul_abort_ready_to_finalize(&live_command)?;
+        // Different target so the two never contend for ownership.
+        live.target = "huginn".into();
+        live.validate()?;
+
+        soul_seed_control(&engine.options.state_store, &terminal_command, &terminal)?;
+        soul_seed_control(&engine.options.state_store, &live_command, &live)?;
+        assert_eq!(
+            ControlSnapshot::read(&engine.options.state_store)?
+                .transactions
+                .len(),
+            2
+        );
+
+        for _ in 0..3 {
+            let progressed =
+                run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction());
+            assert!(!progressed, "the sweep fails before any candidate is advanced");
+            let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
+            let live_now = snapshot
+                .transactions
+                .iter()
+                .find(|stored| stored.value.transaction_id == live.transaction_id)
+                .context("live transaction vanished")?;
+            assert!(
+                !live_now.value.is_terminal(),
+                "the abort-ready live transaction was never finalized: starved behind the sweep"
+            );
+        }
+        Ok(())
+    }
+
+    /// Claim 4 (sweep + `archive_rejected_transaction` are not double
+    /// archival). Both end in `insert_entry_if_absent` on history.cc keyed
+    /// by transaction id, and a rejected transaction never lands in
+    /// control.cc, so the sweep can never pick one up. Sweeping a terminal
+    /// record that is already in history leaves exactly one history entry
+    /// and no resident copy, and a second sweep is a no-op.
+    #[test]
+    fn soul3_sweep_is_idempotent_and_never_double_archives() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        let command = command(CommandKind::Continuity);
+        let terminal = soul3_terminal(&command)?;
+        let stored_envelope = soul_seed_control(&engine.options.state_store, &command, &terminal)?;
+        // Pre-seed history with the same record, as a crash between the
+        // history append and the control delete would leave it.
+        let history = SingleFileMessagePackBackingStore::new(history_store_path(
+            &engine.options.state_store,
+        ));
+        assert!(history.insert_entry_if_absent(stored_envelope)?);
+
+        assert!(engine.resume_one_transaction()?);
+        assert!(!engine.resume_one_transaction()?, "second tick has nothing left to sweep");
+        assert!(
+            ControlSnapshot::read(&engine.options.state_store)?
+                .transactions
+                .is_empty()
+        );
+        let archived = history.pull_all_read_only_snapshot()?;
+        assert_eq!(
+            archived
+                .iter()
+                .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
+                .count(),
+            1,
+            "one history entry for the transaction, not two"
+        );
+        assert_eq!(
+            archived
+                .iter()
+                .filter(|envelope| envelope.r#type == DeploymentCommand::TYPE)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    /// Claim 3 (live store). Drives the real `ControlSnapshot::read` over a
+    /// copy of yggdrasil's control.cc named by `SOUL3_CONTROL_CC` and prints
+    /// the literal raw record count per type, the ingested count per type,
+    /// and the number quarantined (raw minus ingested). Ignored unless the
+    /// env var is set; run with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn soul3_live_control_store_reads_under_unconditional_byte_exactness() -> Result<()> {
+        let path = PathBuf::from(
+            std::env::var("SOUL3_CONTROL_CC").context("SOUL3_CONTROL_CC is not set")?,
+        );
+        let raw = SingleFileMessagePackBackingStore::new(&path).pull_all_read_only_snapshot()?;
+        let count = |record_type: &str| {
+            raw.iter()
+                .filter(|envelope| envelope.r#type == record_type)
+                .count()
+        };
+        let raw_commands = count(DeploymentCommand::TYPE);
+        let raw_transactions = count(DeploymentTransaction::TYPE);
+        let raw_admitted = count(AdmittedGeneration::TYPE);
+        let raw_other = raw.len() - raw_commands - raw_transactions - raw_admitted;
+        println!(
+            "SOUL3 raw records={} commands={raw_commands} transactions={raw_transactions} admitted={raw_admitted} other={raw_other}",
+            raw.len()
+        );
+        let mut quarantined = Vec::new();
+        let mut ingested = ControlSnapshot::default();
+        for envelope in raw.iter().cloned() {
+            let describe = format!("{} {}", envelope.r#type, envelope.key);
+            if let Err(error) = ingested.ingest(envelope) {
+                quarantined.push(format!("{describe}: {error:#}"));
+            }
+        }
+        println!(
+            "SOUL3 ingested commands={} transactions={} admitted={} quarantined={}",
+            ingested.commands.len(),
+            ingested.transactions.len(),
+            ingested.admitted.len(),
+            quarantined.len()
+        );
+        for line in &quarantined {
+            println!("SOUL3 quarantined {line}");
+        }
+        let terminal_resident = ingested
+            .transactions
+            .iter()
+            .filter(|stored| stored.value.is_terminal())
+            .count();
+        let live_resident = ingested.transactions.len() - terminal_resident;
+        println!("SOUL3 resident terminal={terminal_resident} live={live_resident}");
+        for stored in ingested
+            .transactions
+            .iter()
+            .filter(|stored| !stored.value.is_terminal())
+        {
+            println!(
+                "SOUL3 live transaction {} command={} target={} phase={:?} authorization={} pre_abort={} post_abort={} last_error={:?}",
+                stored.value.transaction_id,
+                stored.value.command_id,
+                stored.value.target,
+                stored.value.phase,
+                stored.value.deployment_authorization.is_some(),
+                stored.value.pre_fencing_abort.is_some(),
+                stored.value.post_fencing_abort.is_some(),
+                stored.value.last_error
+            );
+        }
+        let read = ControlSnapshot::read(&path);
+        println!(
+            "SOUL3 ControlSnapshot::read => {}",
+            match &read {
+                Ok(snapshot) => format!(
+                    "Ok(commands={} transactions={} admitted={})",
+                    snapshot.commands.len(),
+                    snapshot.transactions.len(),
+                    snapshot.admitted.len()
+                ),
+                Err(error) => format!("Err({error:#})"),
+            }
+        );
+        read.map(|_| ())
+    }
 }
