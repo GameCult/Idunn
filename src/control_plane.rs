@@ -7972,21 +7972,24 @@ nodes = ["yggdrasil"]
     /// sweep used to scan for -- is no longer visited by
     /// `resume_one_transaction` at all: the candidate loop filters it out by
     /// `is_terminal()`, same as ever, and there is no sweep ahead of that
-    /// loop to fail when history.cc is unwritable. An unarchivable resident
-    /// terminal record therefore no longer starves anything behind it.
+    /// loop to run first. An unrelated resident terminal record therefore
+    /// cannot starve anything behind it, whether or not history.cc is even
+    /// writable -- history.cc here is left perfectly healthy on purpose, to
+    /// isolate the claim to "is there a sweep in front of the candidate
+    /// loop" rather than "can anything archive at all" (which
+    /// `archive_terminal_transaction_tolerates_a_pre_existing_history_entry`
+    /// and the deleted sweep-idempotency test's replacement already cover).
     ///
-    /// (The primitive-level idempotency claim the deleted
-    /// `soul3_sweep_is_idempotent_and_never_double_archives` made lives on
-    /// as `archive_terminal_transaction_tolerates_a_pre_existing_history_entry`,
+    /// The primitive-level idempotency claim the deleted
+    /// `soul3_sweep_is_idempotent_and_never_double_archives` made lives on as
+    /// `archive_terminal_transaction_tolerates_a_pre_existing_history_entry`,
     /// which already drives `archive_terminal_transaction`/`replace_transaction`
     /// directly -- the surviving path, now that there is no sweep to drive it
-    /// through.)
+    /// through.
     #[test]
     fn soul3_unarchivable_terminal_record_starves_every_live_transaction() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let engine = soul_engine(temporary.path())?;
-        // Make history.cc impossible to open as a file.
-        fs::create_dir_all(history_store_path(&engine.options.state_store))?;
 
         let terminal_command = command(CommandKind::Continuity);
         let terminal = soul3_terminal(&terminal_command)?;
@@ -8009,16 +8012,24 @@ nodes = ["yggdrasil"]
         let progressed =
             run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction());
         assert!(progressed, "the live transaction advances; there is no sweep ahead of it to fail");
+
+        // The abort-ready live transaction finalized and archived on its own
+        // first tick -- gone from control.cc, present in history.cc -- with
+        // no dependency on the unrelated terminal record ever being touched.
         let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
-        let live_now = snapshot
-            .transactions
-            .iter()
-            .find(|stored| stored.value.transaction_id == live.transaction_id)
-            .context("live transaction vanished")?;
         assert!(
-            live_now.value.is_terminal(),
-            "the abort-ready live transaction finalized on its own tick"
+            !snapshot.transactions.iter().any(|stored| stored.value.transaction_id == live.transaction_id),
+            "the live transaction archived on its own tick, it did not stay resident"
         );
+        let history = SingleFileMessagePackBackingStore::new(history_store_path(
+            &engine.options.state_store,
+        ))
+        .pull_all_read_only_snapshot()?;
+        assert!(
+            history.iter().any(|envelope| envelope.key == live.transaction_id),
+            "the live transaction's own archival succeeded"
+        );
+
         // The unrelated resident terminal record is untouched: still there,
         // still unarchived, and that is not this loop's problem any more.
         let still_resident = SingleFileMessagePackBackingStore::new(&engine.options.state_store)
