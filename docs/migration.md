@@ -1,13 +1,24 @@
 # Migrating a target onto the current Idunn
 
-Status as of 2026-09-08: yggdrasil runs the declarative binary, and **no target
-is Idunn-managed.** `heimdall.service` and `odin.service` are hand-written units
-in `/etc/systemd/system/`, both active; every `idunn-heimdall-*` and
-`idunn-odin-*` unit on the host is failed.
+Status as of 2026-09-08 on yggdrasil, verified against systemd:
+
+- **odin is migrated.** `idunn-odin-25f32a8d...service` is active and running
+  release `928da3ef`. This is the live Odin; the `odin.service` unit still
+  present in `/etc/systemd/system/` is active with `MainPID 0` and owns no
+  process.
+- **heimdall is not.** It runs under a hand-written `heimdall.service`; every
+  `idunn-heimdall-*` unit is inactive or failed.
+- 76 `idunn-*` units exist on the host; 2 are active.
+
+Odin's deployment transaction is nonetheless **stuck in `Committing`**, so Idunn
+does not consider it admitted even though the candidate it deployed is the
+process serving traffic. The gate is `advance_committing`'s requirement that the
+latest Odin observation equal the Ready receipt, which cannot hold for a target
+whose observer keeps publishing. Deployment succeeded; the bookkeeping did not.
 
 Read the "Correction: Odin is migrated first, not last" section below as an
-ordering decision, not as a completion record. It changed which target goes
-first. It did not migrate one.
+ordering decision. It changed which target goes first; the migration record is
+this header.
 
 The previous generation was driven by `--swarm-profile` and a root shell
 actuator. That invocation is rejected by the installed binary, which is the
