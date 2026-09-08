@@ -2852,7 +2852,9 @@ impl Engine {
                     && latest.value.pre_fencing_abort.is_none()
                 {
                     self.begin_pre_fencing_abort(latest, error)?;
-                } else if latest.value.post_fencing_abort.is_none() {
+                } else if latest.value.phase >= DeploymentPhase::Fencing
+                    && latest.value.post_fencing_abort.is_none()
+                {
                     // R23.3: an advance error at or after Fencing aborts,
                     // same as one before it -- this function's own doc
                     // comment already promised that (see
@@ -2868,6 +2870,11 @@ impl Engine {
                     // taking traffic when it was fenced.
                     self.begin_post_fencing_abort(latest, error)?;
                 } else {
+                    // Either a pre-fencing abort is already in progress and
+                    // one of its own cleanup steps just failed (retry it next
+                    // tick), or a post-fencing abort is already durable and
+                    // one of ITS steps failed (same). Neither is a fresh
+                    // failure to abort from.
                     self.record_resumable_error(latest, &error)?;
                 }
             }
@@ -6893,12 +6900,12 @@ mod tests {
             &[truncated_envelope],
         )?);
 
-        // R20's quarantine: the short record fails ingest and is skipped,
-        // not propagated as a whole-read refusal. It is refused from acting
-        // as live authority either way -- it simply never enters the
-        // snapshot, rather than taking every other record down with it.
-        let snapshot = ControlSnapshot::read(&path)?;
-        assert!(snapshot.transactions.is_empty(), "the short record is quarantined, not tolerated");
+        // R23.1 deleted the quarantine: the short record fails ingest, and
+        // that now fails the whole read instead of being skipped.
+        assert!(
+            ControlSnapshot::read(&path).is_err(),
+            "the short record refuses the read, it is not silently tolerated"
+        );
         Ok(())
     }
 
@@ -7271,11 +7278,9 @@ mod tests {
     /// written by a foreign serializer. A Sealing transaction encoded as a
     /// msgpack map (what any hand tool that writes by field name produces)
     /// is not what Idunn itself would have written, and
-    /// `decode_record_canonical` refuses it -- R20's quarantine means that
-    /// refusal now surfaces as the record being skipped, not as the whole
-    /// read failing: the foreign-encoded transaction is absent from the
-    /// snapshot, and the command it names is quarantined-orphaned rather
-    /// than blocking everything else in the store.
+    /// `decode_record_canonical` refuses it -- and per R23.1 that refusal
+    /// fails the whole read, rather than the record being quarantined out of
+    /// an otherwise-successful one.
     #[test]
     fn soul_live_record_in_foreign_encoding_is_refused_by_control_read() -> Result<()> {
         let command = command(CommandKind::Deploy);
@@ -7327,10 +7332,9 @@ mod tests {
             }],
         )?);
 
-        let snapshot = ControlSnapshot::read(&path)?;
         assert!(
-            snapshot.transactions.is_empty(),
-            "the foreign-encoded transaction is quarantined, not accepted"
+            ControlSnapshot::read(&path).is_err(),
+            "the foreign-encoded transaction refuses the read, it is not quarantined"
         );
         Ok(())
     }
@@ -7491,14 +7495,13 @@ mod tests {
             }],
         )?);
 
-        // The hole is closed: the shortened, tampered record is quarantined
-        // out of the snapshot, not accepted as live authority. R20's
-        // quarantine means this surfaces as absence rather than a whole-read
-        // refusal -- the tamper still never reaches a phase decision.
-        let snapshot = ControlSnapshot::read(&path)?;
+        // The hole is closed: the shortened, tampered record refuses the
+        // whole read (R23.1 deleted the quarantine that would have absorbed
+        // this as a silent absence) -- the tamper never reaches a phase
+        // decision.
         assert!(
-            snapshot.transactions.is_empty(),
-            "the shortened, tampered record is quarantined, not accepted"
+            ControlSnapshot::read(&path).is_err(),
+            "the shortened, tampered record refuses the read, it is not quarantined"
         );
         Ok(())
     }
@@ -7609,40 +7612,25 @@ mod tests {
         Ok(())
     }
 
-    /// R20's fourth hole, closed. The admission commit at the end of
-    /// `advance_committing` mints `post_commit_cleanup` inline and writes the
-    /// Complete transaction to control.cc with a direct compare_exchange
-    /// alongside the new `AdmittedGeneration` -- not through
-    /// `replace_transaction`, because that primitive only ever moves one
-    /// already-resident record and cannot commit two different records
-    /// atomically. For a Continuity command (source cleanup
-    /// SkippedContinuity) whose fencing revoked an incumbent lease
-    /// (incumbent cleanup Complete) that cleanup is complete at mint, so the
-    /// record is terminal the moment it lands in control.cc. Restoring the
-    /// resident-terminal sweep in `resume_one_transaction` (R20: "restore the
-    /// resident-terminal branch") is what closes this: the very next tick
-    /// finds it and archives it through `replace_transaction`, same as any
-    /// other terminal record.
+    /// R20's fourth hole was closed by a resident-terminal sweep in
+    /// `resume_one_transaction`; R23.2 deleted that sweep, because it scanned
+    /// every terminal record resident in control.cc before touching a single
+    /// live one, and an unwritable history.cc turned that scan into
+    /// whole-tick starvation for every other target. The real producer of a
+    /// record that is terminal the instant it lands in control.cc -- the
+    /// stateful continuity admission commit in `advance_committing`, for a
+    /// Continuity command whose fencing revoked an incumbent lease -- now
+    /// archives that record itself, in the same call that writes it and its
+    /// `AdmittedGeneration`, through `archive_terminal_transaction`. There is
+    /// no longer a sweep to catch a record that reached control.cc terminal
+    /// by some OTHER path, and this test's fixture is exactly that: a
+    /// terminal record seeded directly, standing in for a commit this
+    /// harness cannot cheaply reconstruct (see the file-level comment on
+    /// `soul3_unarchivable_terminal_record_starves_every_live_transaction`).
+    /// It now proves the sweep is gone: the record stays resident, and
+    /// `resume_one_transaction` does not touch it.
     #[test]
     fn soul2_stateful_continuity_admission_mints_a_terminal_record_into_control() -> Result<()> {
-        // The real-world producer of a record that is terminal the instant
-        // it lands in control.cc is the stateful continuity admission commit
-        // in advance_committing: for a Continuity command whose fencing
-        // revoked an incumbent lease, PostCommitCleanup is already complete
-        // at mint (incumbent Complete, source SkippedContinuity), and that
-        // commit writes the Complete transaction and the new
-        // AdmittedGeneration atomically in one direct compare_exchange,
-        // because replace_transaction only ever moves one already-resident
-        // record and cannot commit two different records together.
-        //
-        // Reconstructing that exact commit here would mean staging every
-        // field DeploymentTransaction::validate requires through Starting,
-        // Warming, Fencing, Leasing, and Routing. The sweep this test
-        // exercises (`resume_one_transaction`'s resident-terminal branch)
-        // does not care which completion path produced the terminal record,
-        // only that `is_terminal()` is true -- so this uses the cheapest
-        // validate()-passing terminal shape (a pre-fencing abort) to stand
-        // in for "terminal before it is ever written."
         let fencing = FencingEvidence::Revoked {
             incumbent_lease_sha256: Some(digest('a')),
             candidate_lease_path_verified_empty: true,
@@ -7663,7 +7651,7 @@ mod tests {
         transaction.validate()?;
         assert!(transaction.is_terminal(), "terminal before it is ever written");
 
-        // Seed control.cc exactly as such a commit would leave it: the
+        // Seed control.cc exactly as a bypassing commit would leave it: the
         // command, and the transaction already terminal, both resident --
         // no replace_transaction, no history.cc entry.
         let temporary = tempfile::tempdir()?;
@@ -7671,27 +7659,30 @@ mod tests {
         soul_seed_control(&engine.options.state_store, &command, &transaction)?;
         assert!(!history_store_path(&engine.options.state_store).exists());
 
-        // The next tick sweeps it: resume_one_transaction's resident-terminal
-        // branch finds the terminal record before scheduling anything else
-        // and archives it through replace_transaction, the same primitive
-        // every other terminal transaction leaves control.cc through.
+        // There is no sweep left to find it: no candidates, nothing to
+        // freeze, resume_one_transaction reports no progress and leaves the
+        // record exactly where it was.
         let progressed = engine.resume_one_transaction()?;
-        assert!(progressed, "archiving a resident-terminal record is progress");
+        assert!(!progressed, "there is no sweep to archive a pre-existing resident terminal record");
 
-        assert!(ControlSnapshot::read(&engine.options.state_store)?.transactions.is_empty());
-        let history = SingleFileMessagePackBackingStore::new(history_store_path(
-            &engine.options.state_store,
-        ))
-        .pull_all_read_only_snapshot()?;
-        assert_eq!(history.len(), 2, "transaction and command archived to history.cc");
+        assert_eq!(
+            ControlSnapshot::read(&engine.options.state_store)?.transactions.len(),
+            1,
+            "the record is untouched, still resident"
+        );
+        assert!(
+            !history_store_path(&engine.options.state_store).exists(),
+            "nothing archived it, so history.cc was never even created"
+        );
         Ok(())
     }
 
-    /// R4 second clause and R20's quarantine: one unreadable record no
-    /// longer makes `ControlSnapshot::read` fail as a whole. It is logged
-    /// and skipped by `ingest`, and the read returns everything else --
-    /// here, the still-valid command that named it. Ticks run normally
-    /// instead of starving forever on a read that never succeeds.
+    /// R23.1 deleted the quarantine: one unreadable record makes
+    /// `ControlSnapshot::read` fail as a whole again, loudly and repeatedly.
+    /// R4's second clause is what keeps the daemon itself alive across that:
+    /// `run_scheduler_tick` catches the refusal and reports no progress,
+    /// instead of the failure propagating into `serve`'s loop and taking the
+    /// process down under `Restart=always`.
     #[test]
     fn soul2_one_noncanonical_record_starves_every_scheduler_tick() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -7731,31 +7722,32 @@ mod tests {
         )?);
         let before = store.pull_all_read_only_snapshot()?;
 
-        // The bad transaction is quarantined; the command it named is not an
-        // inconsistency by itself, so the read succeeds around it.
-        let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
-        assert!(snapshot.transactions.is_empty(), "the noncanonical transaction is skipped");
-        assert_eq!(snapshot.commands.len(), 1, "the still-valid command survives the read");
+        // R23.1: the noncanonical transaction refuses the whole read, loudly
+        // and repeatedly, rather than being quarantined out of it.
+        assert!(
+            ControlSnapshot::read(&engine.options.state_store).is_err(),
+            "the noncanonical transaction refuses the read"
+        );
 
-        // Ticks run rather than starving: nothing progresses because there
-        // is no valid transaction to advance, but the read itself no longer
-        // refuses the whole store.
+        // Ticks do not starve the daemon itself: run_scheduler_tick catches
+        // the refusal (R4's second clause), logs it, and reports no
+        // progress instead of propagating into serve's loop.
         assert!(!run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction()));
         assert!(!run_scheduler_tick("supervise_one_admitted_generation", || engine
             .supervise_one_admitted_generation()));
         assert!(!run_scheduler_tick("freeze_one_queued_command", || engine
             .freeze_one_queued_command()));
 
-        // Quarantine is a read-time skip, not a repair: this cut carries no
-        // `forget` verb (R13), so the bad record is left exactly as it was.
+        // This cut carries no `forget` verb (R13): a refused read is not a
+        // repair, and the bad record is left exactly as it was.
         assert_eq!(
             store.pull_all_read_only_snapshot()?,
             before,
-            "quarantine does not rewrite control.cc"
+            "a refused read does not rewrite control.cc"
         );
         assert!(
-            ControlSnapshot::read(&engine.options.state_store).is_ok(),
-            "the same read that ticks use no longer refuses the store"
+            ControlSnapshot::read(&engine.options.state_store).is_err(),
+            "the same read that ticks use still refuses the store on the next attempt"
         );
         Ok(())
     }
