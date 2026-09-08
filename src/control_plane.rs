@@ -7494,4 +7494,308 @@ mod tests {
         assert!(ControlSnapshot::read(&engine.options.state_store)?.transactions.is_empty());
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Soul, second pass: attacking the surface the d2dbfe3..2d65785 fixes
+    // introduced. These tests document what the branch DOES, not what it
+    // should do; each one names the claim it falsifies in its doc comment.
+    // ------------------------------------------------------------------
+
+    /// Exemption attack. `decode_record_canonical` only demands byte-exact
+    /// bytes when the stored array is already at the current slot count. An
+    /// attacker who can rewrite control.cc can also drop the trailing
+    /// `#[cultcache(default)]` slot (key 34), which is the exact shape the
+    /// additive-slot tolerance test blesses. Once shortened, the record is
+    /// exempt: any decodable tamper of any earlier field is accepted, and
+    /// even noncanonical widths inside the payload are accepted.
+    #[test]
+    fn soul2_shortened_record_escapes_the_byte_exact_check() -> Result<()> {
+        let command = command(CommandKind::Deploy);
+        let live = DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        assert_eq!(live.phase, DeploymentPhase::Sealing);
+
+        // Semantic tampers that still decode and validate at Sealing: the
+        // ordinal (scheduling order inside the command) and the incumbent
+        // this transaction will later be fenced against.
+        let mut tampered = live.clone();
+        tampered.ordinal = 7;
+        tampered.incumbent_generation_id = Some("generation-attacker".into());
+        tampered.validate()?;
+        // Encode as a 34-slot array (drop the defaulted trailing slot) ...
+        let mut payload = rmp_serde::to_vec(&WithoutPostFencingAbortSlot(&tampered))?;
+        assert_eq!(msgpack_array_len(&payload)?, 34);
+        // ... and, to prove byte-exactness is not merely relaxed but off,
+        // also re-encode ordinal 0 with the foreign uint8 width that the
+        // full-arity claim-1 test refuses.
+        let marker = b"ghostlight";
+        let at = payload
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .context("lost target/ordinal slots")?;
+        payload.splice(at + marker.len() - 1..at + marker.len(), [0xcc, 0x07]);
+        assert_ne!(payload, rmp_serde::to_vec(&WithoutPostFencingAbortSlot(&tampered))?);
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("control.cc");
+        let store = SingleFileMessagePackBackingStore::new(&path);
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentCommand::TYPE.into(),
+                key: command.command_id.clone(),
+                current: None,
+            }],
+            &[command_envelope(&command, 100)?],
+        )?);
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: live.transaction_id.clone(),
+                current: None,
+            }],
+            &[CultCacheEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: live.transaction_id.clone(),
+                payload,
+                stored_at: rfc3339_millis(100)?,
+                schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
+            }],
+        )?);
+
+        // Documents the hole: the shortened, tampered, noncanonical record
+        // is accepted as live authority at phase Committing.
+        let snapshot = ControlSnapshot::read(&path)?;
+        assert_eq!(snapshot.transactions.len(), 1);
+        let accepted = &snapshot.transactions[0].value;
+        assert_eq!(accepted.ordinal, 7, "ordinal tamper survived the canonical check");
+        assert_eq!(
+            accepted.incumbent_generation_id.as_deref(),
+            Some("generation-attacker"),
+            "incumbent tamper survived the canonical check"
+        );
+        Ok(())
+    }
+
+    /// Restored startup gate, part one: with an EMPTY control.cc,
+    /// `validate_durable_authority` still requires the deployment-brake
+    /// operator anchor to exist, and `serve` propagates that with `?`.
+    /// A brake artifact gates Idunn's own boot with zero live records.
+    #[test]
+    fn soul2_startup_authority_check_needs_the_brake_anchor_with_no_records() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        assert!(!engine.options.deployment_brake_operator_anchor.exists());
+        let error = engine
+            .validate_durable_authority(&ControlSnapshot::default())
+            .expect_err("an absent brake anchor refuses startup");
+        assert!(format!("{error:#}").contains("absent"), "{error:#}");
+        Ok(())
+    }
+
+    /// Restored startup gate, part two: one live Sealing transaction whose
+    /// stored brake authorization was signed by a since-rotated operator
+    /// identity refuses `validate_durable_authority` outright. Under
+    /// Restart=always that is the crashloop shape, narrowed to live records;
+    /// the transaction is not aborted, the daemon is.
+    #[test]
+    fn soul2_one_live_record_with_a_rotated_brake_signer_refuses_startup() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path();
+        let engine = soul_engine(root)?;
+        let current_operator =
+            cultnet_rs::enroll_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(
+                &root.join("operator-current.cc"),
+            )?;
+        cultnet_rs::export_service_identity_trust_anchor(
+            &current_operator,
+            &engine.options.deployment_brake_operator_anchor,
+        )?;
+        let rotated_operator =
+            cultnet_rs::enroll_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(
+                &root.join("operator-rotated.cc"),
+            )?;
+
+        let command = command(CommandKind::Deploy);
+        let mut transaction =
+            DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        let mut record = IdunnDeploymentBrakeRecord {
+            schema_version: IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into(),
+            brake_id: cultnet_rs::IDUNN_DEPLOYMENT_BRAKE_ID.into(),
+            authority: cultnet_rs::IDUNN_DEPLOYMENT_BRAKE_AUTHORITY.into(),
+            runtime_id: "ghostlight".into(),
+            status: "released".into(),
+            scope: cultnet_rs::IDUNN_DEPLOYMENT_BRAKE_SCOPE.into(),
+            reason: "operator authorized one attempt".into(),
+            observed_at_unix_millis: 100,
+            expires_at_unix_millis: Some(1_000),
+            authorization_id: Some("auth/soul2".into()),
+            authorization_purpose: Some(cultnet_rs::IDUNN_DEPLOYMENT_RELEASE_PURPOSE.into()),
+            authorized_release_id: Some("release-soul2".into()),
+            authorized_deployment_id: Some(transaction.transaction_id.clone()),
+            authorized_by: Some(rotated_operator.trust_anchor()?.identity_id),
+            authorization_issued_at_unix_millis: Some(100),
+            authorization_expires_at_unix_millis: Some(900),
+            signature_algorithm: Some("ed25519".into()),
+            signature: None,
+            private_state_exposed: false,
+            updated_by: "operator".into(),
+        };
+        record.signature = Some(
+            rotated_operator
+                .sign::<cultnet_rs::IdunnDeploymentBrakeReleasePurpose>(&rmp_serde::to_vec(
+                    &record,
+                )?)
+                .signature,
+        );
+        record.validate()?;
+        let canonical_brake_bytes = rmp_serde::to_vec(&record)?;
+        transaction.deployment_authorization = Some(DeploymentAuthorization {
+            authorization_id: "auth/soul2".into(),
+            brake_sha256: sha256_id(&canonical_brake_bytes),
+            canonical_brake_bytes,
+            authorized_at_unix_millis: 100,
+        });
+        transaction.validate()?;
+        soul_seed_control(&engine.options.state_store, &command, &transaction)?;
+
+        // The record itself reads fine: it is canonical and well-formed.
+        let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
+        assert_eq!(snapshot.transactions.len(), 1);
+        // And the restored startup gate refuses the whole daemon for it.
+        let error = engine
+            .validate_durable_authority(&snapshot)
+            .expect_err("rotated signer refuses startup");
+        eprintln!("startup refusal: {error:#}");
+        // Nothing was recorded against the transaction: it is still live,
+        // still Sealing, still unaborted. The fault landed on the process.
+        let after = ControlSnapshot::read(&engine.options.state_store)?;
+        assert_eq!(after.transactions.len(), 1);
+        assert_eq!(after.transactions[0].value.phase, DeploymentPhase::Sealing);
+        assert!(after.transactions[0].value.pre_fencing_abort.is_none());
+        Ok(())
+    }
+
+    /// Claim "control.cc never holds a terminal record, by construction".
+    /// The admission commit at the end of `advance_committing` mints
+    /// `post_commit_cleanup` inline and writes the Complete transaction to
+    /// control.cc with a direct compare_exchange, not through
+    /// `replace_transaction`. For a Continuity command (source cleanup
+    /// SkippedContinuity) whose fencing revoked an incumbent lease
+    /// (incumbent cleanup Complete) that cleanup is complete at mint, so the
+    /// record is terminal the moment it lands in control.cc. Nothing then
+    /// archives it: the Complete arm of `advance_transaction` is a no-op for
+    /// a complete cleanup, and the resume-loop block that used to move a
+    /// resident terminal record was deleted.
+    #[test]
+    fn soul2_stateful_continuity_admission_mints_a_terminal_record_into_control() -> Result<()> {
+        // The exact cleanup the commit builds for this fencing outcome.
+        let fencing = FencingEvidence::Revoked {
+            incumbent_lease_sha256: Some(digest('a')),
+            candidate_lease_path_verified_empty: true,
+        };
+        assert!(incumbent_was_stopped_during_fencing(&fencing));
+        let cleanup = PostCommitCleanup {
+            incumbent: IncumbentCleanupEvidence::Complete {
+                generation_id: "generation-old".into(),
+            },
+            source: SourceCleanupEvidence::SkippedContinuity,
+        };
+        assert!(cleanup.is_complete(), "complete at mint");
+
+        let command = command(CommandKind::Continuity);
+        let mut transaction =
+            DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        transaction.phase = DeploymentPhase::Complete;
+        transaction.completion = Some(TransactionCompletion::Admitted {
+            generation_id: "generation-new".into(),
+        });
+        transaction.post_commit_cleanup = Some(cleanup);
+        assert!(transaction.is_terminal(), "terminal before it is ever written");
+
+        // What the loop does with such a record once it is resident: the
+        // Complete arm of advance_transaction. It touches neither store.
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        let stored = Stored {
+            envelope: typed_envelope(
+                &transaction.transaction_id,
+                DeploymentTransaction::TYPE,
+                DEPLOYMENT_TRANSACTION_SCHEMA,
+                &transaction,
+                100,
+            )?,
+            value: transaction,
+        };
+        engine.advance_post_commit_cleanup(&stored)?;
+        assert!(
+            !history_store_path(&engine.options.state_store).exists(),
+            "the Complete arm never archives a resident terminal record"
+        );
+        assert!(
+            !engine.options.state_store.exists(),
+            "and never writes control.cc either: the record would stay exactly as minted"
+        );
+        Ok(())
+    }
+
+    /// R4 second clause. The scheduler loop no longer propagates, but one
+    /// unreadable record makes `ControlSnapshot::read` fail as a whole, so
+    /// every tick fails before it can touch any transaction: nothing is
+    /// recorded against the bad record, nothing else progresses, and the
+    /// same startup read (`serve`, "validating all Idunn records") refuses
+    /// the daemon outright.
+    #[test]
+    fn soul2_one_noncanonical_record_starves_every_scheduler_tick() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        let command = command(CommandKind::Deploy);
+        let transaction = DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        let canonical = rmp_serde::to_vec(&transaction)?;
+        let marker = b"ghostlight ";
+        let at = canonical
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .context("lost target/ordinal slots")?;
+        let mut foreign = canonical.clone();
+        foreign.splice(at + marker.len() - 1..at + marker.len(), [0xcc, 0x00]);
+        let store = SingleFileMessagePackBackingStore::new(&engine.options.state_store);
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentCommand::TYPE.into(),
+                key: command.command_id.clone(),
+                current: None,
+            }],
+            &[command_envelope(&command, 100)?],
+        )?);
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: transaction.transaction_id.clone(),
+                current: None,
+            }],
+            &[CultCacheEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: transaction.transaction_id.clone(),
+                payload: foreign.clone(),
+                stored_at: rfc3339_millis(100)?,
+                schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
+            }],
+        )?);
+        let before = store.pull_all_read_only_snapshot()?;
+
+        assert!(!run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction()));
+        assert!(!run_scheduler_tick("supervise_one_admitted_generation", || engine
+            .supervise_one_admitted_generation()));
+        assert!(!run_scheduler_tick("freeze_one_queued_command", || engine
+            .freeze_one_queued_command()));
+        assert_eq!(
+            store.pull_all_read_only_snapshot()?,
+            before,
+            "no fault was recorded against the record; control.cc is untouched"
+        );
+        assert!(
+            ControlSnapshot::read(&engine.options.state_store).is_err(),
+            "the serve-time read refuses the same store"
+        );
+        Ok(())
+    }
 }
