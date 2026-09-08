@@ -527,11 +527,17 @@ impl CompiledDeploymentPlan {
         Ok(())
     }
 
-    /// Parse-only: admission was already decided at freeze time by
-    /// `compile_deployment_plan`. A frozen plan's recipe/binding pair is not
-    /// re-admitted on every read -- admission rules may change after a plan
-    /// was compiled and admitted, and a plan already committed to disk is
-    /// history, not a fresh proposal to gate.
+    /// Re-admits the stored recipe/binding pair on every call, including
+    /// reads of an already-frozen plan.
+    ///
+    /// Per R19: `plan_id` is a content digest, not a signature, so a plan
+    /// blob edited after freeze (and re-digested) carries no evidence of
+    /// that edit. `admit` is the only check that ever refused a binding
+    /// naming a program its recipe step does not allow-list, and this is not
+    /// the terminal-history coupling that cut R11/R12/R4 -- it is the
+    /// recipe/binding admission boundary, which is why Idunn is allowed to
+    /// run as root at all. A resident plan is re-admitted every time it is
+    /// consumed, restart included, exactly like every other live decision.
     pub(crate) fn parsed_inputs(&self) -> Result<(TargetDeclaration, OperatorBinding)> {
         let recipe_text = std::str::from_utf8(&self.recipe_blob)
             .context("stored deployment recipe is not UTF-8")?;
@@ -539,6 +545,7 @@ impl CompiledDeploymentPlan {
             .context("stored operator binding is not UTF-8")?;
         let declaration = TargetDeclaration::parse(recipe_text)?;
         let binding = OperatorBinding::parse(binding_text)?;
+        binding.admit(&declaration)?;
         Ok((declaration, binding))
     }
 
@@ -1599,14 +1606,15 @@ nodes = ["yggdrasil"]
         assert!(changed.validate_against(&plan).is_err());
     }
 
-    /// Soul, claim 2. `parsed_inputs` no longer admits the stored binding
-    /// against the stored recipe, and nothing else on the read path does. A
-    /// plan whose frozen `binding_blob` was rewritten after freeze -- here to
-    /// allow-list a program the recipe's step does not name -- passes
-    /// `validate()` and `parsed_inputs()` once its content digest is
-    /// recomputed, even though `admit` refuses that exact pair.
+    /// Soul, claim 2 -- corrected per R19 item 3. `parsed_inputs` re-admits
+    /// the stored binding against the stored recipe on every call, including
+    /// reads. A plan whose frozen `binding_blob` was rewritten after freeze
+    /// -- here to allow-list a program the recipe's step does not name --
+    /// recomputes a valid content digest (`plan_id` is a digest, not a
+    /// signature, so `validate()` alone cannot catch this), but `admit` is
+    /// consulted again on read and refuses it there.
     #[test]
-    fn soul_stored_plan_with_inadmissible_binding_passes_every_read_check() {
+    fn soul_stored_plan_with_inadmissible_binding_is_refused_on_every_read() {
         let smuggled = BINDING.replace(
             "allowed_programs = [\"cargo\"]",
             "allowed_programs = [\"sh\"]",
@@ -1624,11 +1632,21 @@ nodes = ["yggdrasil"]
         plan.binding_blob = smuggled.into_bytes();
         plan.plan_id = plan.recomputed_plan_id().unwrap();
 
-        plan.validate().expect("read-time validation accepts the inadmissible binding");
-        let (_, parsed) = plan
+        // validate() alone re-derives plan_id from content and therefore
+        // cannot see the smuggled binding; parsed_inputs() is what re-admits
+        // it, and validate() calls parsed_inputs() internally, so both must
+        // refuse.
+        let validate_error = plan.validate().expect_err("validate() must re-admit the stored binding");
+        assert!(
+            format!("{validate_error:#}").contains("does not admit program"),
+            "unexpected validate() error: {validate_error:#}"
+        );
+        let parsed_error = plan
             .parsed_inputs()
-            .expect("parsed_inputs hands the inadmissible binding to the phase engine");
-        assert!(parsed.runners["rust"].allowed_programs.contains("sh"));
-        assert!(!parsed.runners["rust"].allowed_programs.contains("cargo"));
+            .expect_err("parsed_inputs() must refuse the inadmissible binding");
+        assert!(
+            format!("{parsed_error:#}").contains("does not admit program"),
+            "unexpected parsed_inputs() error: {parsed_error:#}"
+        );
     }
 }
