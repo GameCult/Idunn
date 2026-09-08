@@ -6604,6 +6604,277 @@ mod tests {
         Ok(())
     }
 
+    /// Encodes a `DeploymentTransaction` the way a binary predating key 34
+    /// (`post_fencing_abort`) would have: a 34-element tuple instead of 35.
+    /// This is the exact shape of every transaction durable before that field
+    /// existed, and the shape e8d8747 could not read without a one-off schema
+    /// lift -- the read path must tolerate it on its own.
+    struct WithoutPostFencingAbortSlot<'a>(&'a DeploymentTransaction);
+
+    impl Serialize for WithoutPostFencingAbortSlot<'_> {
+        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeTuple;
+            let value = self.0;
+            let mut tuple = serializer.serialize_tuple(34)?;
+            tuple.serialize_element(&value.schema_version)?;
+            tuple.serialize_element(&value.transaction_id)?;
+            tuple.serialize_element(&value.command_id)?;
+            tuple.serialize_element(&value.command_kind)?;
+            tuple.serialize_element(&value.target)?;
+            tuple.serialize_element(&value.ordinal)?;
+            tuple.serialize_element(&value.phase)?;
+            tuple.serialize_element(&value.created_at_unix_millis)?;
+            tuple.serialize_element(&value.updated_at_unix_millis)?;
+            tuple.serialize_element(&value.incumbent_generation_id)?;
+            tuple.serialize_element(&value.plan)?;
+            tuple.serialize_element(&value.frozen_source)?;
+            tuple.serialize_element(&value.sealed_release)?;
+            tuple.serialize_element(&value.installed_release)?;
+            tuple.serialize_element(&value.expected)?;
+            tuple.serialize_element(&value.expected_publication_sha256)?;
+            tuple.serialize_element(&value.deployment_authorization)?;
+            tuple.serialize_element(&value.lifecycle_authorized_at_unix_millis)?;
+            tuple.serialize_element(&value.activation)?;
+            tuple.serialize_element(&value.workload)?;
+            tuple.serialize_element(&value.activation_publication_sha256)?;
+            tuple.serialize_element(&value.latest_odin_observation)?;
+            tuple.serialize_element(&value.warming)?;
+            tuple.serialize_element(&value.route_preflight)?;
+            tuple.serialize_element(&value.isolation)?;
+            tuple.serialize_element(&value.fencing)?;
+            tuple.serialize_element(&value.leasing)?;
+            tuple.serialize_element(&value.ready)?;
+            tuple.serialize_element(&value.routing)?;
+            tuple.serialize_element(&value.odin_publisher_sequence_cursor)?;
+            tuple.serialize_element(&value.last_error)?;
+            tuple.serialize_element(&value.completion)?;
+            tuple.serialize_element(&value.pre_fencing_abort)?;
+            tuple.serialize_element(&value.post_commit_cleanup)?;
+            tuple.end()
+        }
+    }
+
+    #[test]
+    fn additive_slot_does_not_break_stored_records() -> Result<()> {
+        let command = command(CommandKind::Deploy);
+        let transaction = DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        let truncated_payload = rmp_serde::to_vec(&WithoutPostFencingAbortSlot(&transaction))?;
+        let truncated_envelope = CultCacheEnvelope {
+            r#type: DeploymentTransaction::TYPE.into(),
+            key: transaction.transaction_id.clone(),
+            payload: truncated_payload,
+            stored_at: rfc3339_millis(100)?,
+            schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
+        };
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("control.cc");
+        let store = SingleFileMessagePackBackingStore::new(&path);
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentCommand::TYPE.into(),
+                key: command.command_id.clone(),
+                current: None,
+            }],
+            &[command_envelope(&command, 100)?],
+        )?);
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: transaction.transaction_id.clone(),
+                current: None,
+            }],
+            &[truncated_envelope],
+        )?);
+
+        let snapshot = ControlSnapshot::read(&path)?;
+        assert_eq!(snapshot.transactions.len(), 1);
+        assert_eq!(snapshot.transactions[0].value.post_fencing_abort, None);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_write_archives_in_the_same_primitive_and_moves_its_command() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let control_path = temporary.path().join("control.cc");
+        let history_path = temporary.path().join("history.cc");
+
+        let command = command(CommandKind::Deploy);
+        let current_value = DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        assert!(!current_value.is_terminal());
+
+        let control = SingleFileMessagePackBackingStore::new(&control_path);
+        assert!(control.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentCommand::TYPE.into(),
+                key: command.command_id.clone(),
+                current: None,
+            }],
+            &[command_envelope(&command, 100)?],
+        )?);
+        let current_envelope = transaction_envelope(&current_value, 100)?;
+        assert!(control.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: current_value.transaction_id.clone(),
+                current: None,
+            }],
+            &[current_envelope.clone()],
+        )?);
+        let current = Stored {
+            envelope: current_envelope,
+            value: current_value.clone(),
+        };
+
+        let mut next = current_value.clone();
+        next.phase = DeploymentPhase::Complete;
+        next.updated_at_unix_millis = 200;
+        next.pre_fencing_abort = Some(PreFencingAbort {
+            error: "boom".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Skipped,
+        });
+        next.completion = Some(TransactionCompletion::FailedBeforeFencing { error: "boom".into() });
+        assert!(next.is_terminal());
+
+        replace_transaction(&control_path, &current, &next)?;
+
+        let control_snapshot = ControlSnapshot::read(&control_path)?;
+        assert!(
+            control_snapshot.transactions.is_empty(),
+            "terminal transaction stayed resident in control.cc"
+        );
+        assert!(
+            control_snapshot.commands.is_empty(),
+            "command was not archived alongside its last resident transaction"
+        );
+
+        let history_entries =
+            SingleFileMessagePackBackingStore::new(&history_path).pull_all_read_only_snapshot()?;
+        assert_eq!(history_entries.len(), 2, "expected one archived command and one transaction");
+        let archived_transaction_envelope = history_entries
+            .iter()
+            .find(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
+            .context("archived transaction missing from history.cc")?;
+        let archived = read_transaction_record(archived_transaction_envelope)?;
+        assert_eq!(archived.transaction_id, next.transaction_id);
+        assert!(archived.is_terminal());
+
+        // Once fully archived, the daemon's own resume tick never sees this
+        // transaction again: it only iterates transactions still resident in
+        // a fresh ControlSnapshot::read, and this one no longer is. The
+        // idempotent-retry shape that *can* happen -- a crash between the
+        // history append and the control delete, leaving the record
+        // resident-but-archived -- is covered by
+        // archive_resume_completes_a_crash_between_append_and_delete.
+        let resident_after_archive = ControlSnapshot::read(&control_path)?;
+        assert!(
+            !resident_after_archive
+                .transactions
+                .iter()
+                .any(|stored| stored.value.transaction_id == next.transaction_id)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn archive_resume_completes_a_crash_between_append_and_delete() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let control_path = temporary.path().join("control.cc");
+        let history_path = temporary.path().join("history.cc");
+
+        let command = command(CommandKind::Deploy);
+        let transaction = DeploymentTransaction::rejected(&command, anyhow!("boom"), 100)?;
+        assert!(transaction.is_terminal());
+
+        let control = SingleFileMessagePackBackingStore::new(&control_path);
+        assert!(control.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentCommand::TYPE.into(),
+                key: command.command_id.clone(),
+                current: None,
+            }],
+            &[command_envelope(&command, 100)?],
+        )?);
+        let transaction_envelope_value = transaction_envelope(&transaction, 100)?;
+        assert!(control.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: transaction.transaction_id.clone(),
+                current: None,
+            }],
+            &[transaction_envelope_value.clone()],
+        )?);
+
+        // Simulate a crash after the history append half of a previous
+        // archive attempt but before the control delete: both records are
+        // still resident in control.cc, and the transaction is already
+        // present in history.cc too.
+        let history = SingleFileMessagePackBackingStore::new(&history_path);
+        assert!(history.insert_entry_if_absent(transaction_envelope_value.clone())?);
+
+        let stored = Stored {
+            envelope: transaction_envelope_value,
+            value: transaction.clone(),
+        };
+        replace_transaction(&control_path, &stored, &transaction)?;
+
+        let control_snapshot = ControlSnapshot::read(&control_path)?;
+        assert!(control_snapshot.transactions.is_empty());
+        assert!(control_snapshot.commands.is_empty());
+
+        let history_entries =
+            SingleFileMessagePackBackingStore::new(&history_path).pull_all_read_only_snapshot()?;
+        assert_eq!(history_entries.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn read_history_for_command_is_lenient_about_unreadable_records() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let control_path = temporary.path().join("control.cc");
+        let history_path = temporary.path().join("history.cc");
+
+        let command = command(CommandKind::Deploy);
+        let transaction = DeploymentTransaction::rejected(&command, anyhow!("boom"), 100)?;
+
+        let history = SingleFileMessagePackBackingStore::new(&history_path);
+        assert!(history.insert_entry_if_absent(command_envelope(&command, 100)?)?);
+        assert!(history.insert_entry_if_absent(transaction_envelope(&transaction, 100)?)?);
+
+        // A transaction record that fails to decode and one with a foreign
+        // schema id: neither may prevent reading the command asked about.
+        assert!(history.insert_entry_if_absent(CultCacheEnvelope {
+            r#type: DeploymentTransaction::TYPE.into(),
+            key: "tx-corrupt".into(),
+            payload: vec![0xc1],
+            stored_at: rfc3339_millis(100)?,
+            schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
+        })?);
+        assert!(history.insert_entry_if_absent(CultCacheEnvelope {
+            r#type: DeploymentTransaction::TYPE.into(),
+            key: "tx-foreign-schema".into(),
+            payload: Vec::new(),
+            stored_at: rfc3339_millis(100)?,
+            schema_id: Some("idunn.deployment_transaction.v1".into()),
+        })?);
+
+        let (found_command, transactions, unreadable) =
+            read_history_for_command(&control_path, &command.command_id)?;
+        assert_eq!(found_command.map(|value| value.command_id), Some(command.command_id));
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].transaction_id, transaction.transaction_id);
+        assert_eq!(unreadable.len(), 2);
+        assert!(unreadable.iter().any(|record| record.key == "tx-corrupt"));
+        assert!(unreadable.iter().any(|record| record.key == "tx-foreign-schema"));
+        Ok(())
+    }
+
     #[test]
     fn legacy_mutable_command_schema_is_rejected() -> Result<()> {
         let temporary = tempfile::tempdir()?;
