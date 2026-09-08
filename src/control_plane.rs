@@ -2881,14 +2881,20 @@ impl Engine {
                     && latest.value.pre_fencing_abort.is_none()
                 {
                     self.begin_pre_fencing_abort(latest, error)?;
-                } else if latest.value.post_fencing_abort.is_none()
-                    && self.candidate_is_permanently_stopped(&latest.value)?
-                {
-                    // Past the fence an error is resumable while the candidate
-                    // can still recover. This one cannot: its transient unit
-                    // has failed and carries Restart=no, so retrying would hold
-                    // the target forever behind a transaction that can never
-                    // finish.
+                } else if latest.value.post_fencing_abort.is_none() {
+                    // R23.3: an advance error at or after Fencing aborts,
+                    // same as one before it -- this function's own doc
+                    // comment already promised that (see
+                    // verify_resident_deployment_authorization). Gating the
+                    // abort on "is the candidate permanently stopped" left
+                    // every other post-fencing failure, including a rotated
+                    // brake operator identity or a Complete record whose
+                    // post-commit cleanup can never re-authorize, retrying
+                    // record_resumable_error forever: the target wedged with
+                    // its incumbent fenced (or its cleanup pending) and no
+                    // path off that state. There is no cheaper fence-side
+                    // candidate to recover than the one that already stopped
+                    // taking traffic when it was fenced.
                     self.begin_post_fencing_abort(latest, error)?;
                 } else {
                     self.record_resumable_error(latest, &error)?;
@@ -5362,17 +5368,6 @@ impl Engine {
             next.pre_fencing_abort = Some(abort);
             Ok(())
         })
-    }
-
-    /// Whether this transaction's candidate can no longer run at all.
-    ///
-    /// A transaction that has never started one has no candidate to be dead, so
-    /// it is not permanently stopped -- it is simply not there yet.
-    fn candidate_is_permanently_stopped(&self, transaction: &DeploymentTransaction) -> Result<bool> {
-        let Some(workload) = &transaction.workload else {
-            return Ok(false);
-        };
-        self.workload.is_permanently_stopped(workload)
     }
 
     fn begin_post_fencing_abort(
