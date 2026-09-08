@@ -1,9 +1,17 @@
 # Migrating a target onto the current Idunn
 
-Status as of 2026-09-05: **no target has been migrated.** The binary installed
-on yggdrasil (`/usr/local/bin/idunn`, 2026-09-02) is the previous generation,
-driven by `--swarm-profile` and a root shell actuator. The current binary
-rejects that invocation outright:
+Status as of 2026-09-08: yggdrasil runs the declarative binary, and **no target
+is Idunn-managed.** `heimdall.service` and `odin.service` are hand-written units
+in `/etc/systemd/system/`, both active; every `idunn-heimdall-*` and
+`idunn-odin-*` unit on the host is failed.
+
+Read the "Correction: Odin is migrated first, not last" section below as an
+ordering decision, not as a completion record. It changed which target goes
+first. It did not migrate one.
+
+The previous generation was driven by `--swarm-profile` and a root shell
+actuator. That invocation is rejected by the installed binary, which is the
+clearest way to tell which generation a host is running:
 
 ```
 $ idunn --swarm-profile yggdrasil-local --store ...
