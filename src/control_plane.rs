@@ -8125,4 +8125,286 @@ nodes = ["yggdrasil"]
         );
         read.map(|_| ())
     }
+
+    /// SOUL pass 4, Deviation A. `advance_committing` writes a born-terminal
+    /// Continuity record and its `AdmittedGeneration` in one compare_exchange
+    /// and only THEN calls `archive_terminal_transaction`. A crash between
+    /// those two calls leaves a terminal record resident in control.cc, and
+    /// R23.2 deleted the sweep that used to move such a record. This seeds
+    /// exactly that residue and runs every scheduler body three times:
+    /// nothing moves it, history.cc is never created, the documented history
+    /// reader never sees it, and it does not block new mutation of its
+    /// target -- the loss is an unbounded leak into the byte-exact live set,
+    /// not a wedge. The Failed shape stands in because this harness cannot
+    /// cheaply build a validating Admitted record; every predicate consulted
+    /// here (`is_terminal`, `owns_target_authority`,
+    /// `blocks_new_target_mutation`) evaluates identically for an Admitted
+    /// record whose post-commit cleanup is complete.
+    #[test]
+    fn soul4_terminal_record_left_by_a_crashed_admission_commit_is_never_moved_and_never_blocks()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let engine = soul_engine(temporary.path())?;
+        let command = command(CommandKind::Continuity);
+        let terminal = soul3_terminal(&command)?;
+        soul_seed_control(&engine.options.state_store, &command, &terminal)?;
+
+        for tick in 0..3 {
+            assert!(
+                !engine.resume_one_transaction()?,
+                "tick {tick}: no scheduler body visits a resident terminal record"
+            );
+            assert!(!engine.supervise_one_admitted_generation()?, "tick {tick}");
+            assert!(!engine.freeze_one_queued_command()?, "tick {tick}");
+        }
+
+        let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
+        assert_eq!(
+            snapshot.transactions.len(),
+            1,
+            "still resident after three full scheduler passes"
+        );
+        assert!(
+            !history_store_path(&engine.options.state_store).exists(),
+            "nothing ever archives it"
+        );
+        assert!(
+            !snapshot.transactions[0].value.blocks_new_target_mutation(),
+            "it does not block its target: the loss is a leak, not a wedge"
+        );
+        let (found, transactions, unreadable) =
+            read_history_for_command(&engine.options.state_store, &command.command_id)?;
+        assert!(
+            found.is_none() && transactions.is_empty() && unreadable.is_empty(),
+            "the documented history reader only reads history.cc, so this completion is unobservable there"
+        );
+        Ok(())
+    }
+
+    /// SOUL pass 4, Deviation B, the case R23.3's commit message names: "a
+    /// Complete record whose post-commit cleanup can never re-authorize".
+    /// `resume_one_transaction` now routes any advance error at phase >=
+    /// Fencing into `begin_post_fencing_abort`, which persists through
+    /// `persist_same_phase` -> `replace_transaction` -> `validate`, and
+    /// `validate` refuses a post-fencing abort on any record carrying
+    /// post-commit cleanup. So for exactly the Complete-with-pending-cleanup
+    /// record the change claims to unwedge, the abort can never become
+    /// durable: the tick returns this validate error instead,
+    /// `record_resumable_error` is no longer reached so `last_error` never
+    /// carries the real fault, and the next tick retries the cleanup exactly
+    /// as before. The wedge is unchanged; it now logs a second, misleading
+    /// error on top of the real one every tick.
+    #[test]
+    fn soul4_complete_record_with_pending_cleanup_cannot_take_the_abort_r23_3_routes_it_to()
+    -> Result<()> {
+        let command = command(CommandKind::Deploy);
+        let mut transaction =
+            DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
+        transaction.phase = DeploymentPhase::Complete;
+        transaction.completion = Some(TransactionCompletion::Admitted {
+            generation_id: format!("generation-{}", transaction.transaction_id),
+        });
+        transaction.post_commit_cleanup = Some(PostCommitCleanup {
+            incumbent: IncumbentCleanupEvidence::SkippedNoIncumbent,
+            source: SourceCleanupEvidence::Pending,
+        });
+        assert!(!transaction.is_terminal());
+        assert!(
+            transaction.blocks_new_target_mutation(),
+            "this is the wedge shape R23.3 names"
+        );
+        assert!(
+            transaction.phase >= DeploymentPhase::Fencing
+                && transaction.post_fencing_abort.is_none(),
+            "so resume_one_transaction takes the begin_post_fencing_abort branch on any advance error"
+        );
+
+        // Exactly what begin_post_fencing_abort builds for this record.
+        transaction.post_fencing_abort = Some(PostFencingAbort {
+            error: "cleaning committed deployment source: transient".into(),
+            route_restoration: CleanupEvidence::Skipped,
+            lease_withdrawal: CleanupEvidence::Skipped,
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Pending,
+        });
+        let error = transaction
+            .validate()
+            .expect_err("validate refuses the abort begin_post_fencing_abort would persist");
+        assert!(
+            format!("{error:#}").contains("post-fencing abort collides with another terminal path"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    /// SOUL pass 4, live trace. Reads a copy of yggdrasil's control.cc and
+    /// Odin's topology.cc from `SOUL4_ROOT` plus the two public trust
+    /// anchors beside them, seeds a sandbox control.cc with the live odin
+    /// command, transaction and AdmittedGeneration verbatim, and runs the
+    /// real `resume_one_transaction` against it -- once under the default
+    /// 30 s observation window and once with the window unbounded so the
+    /// trace reaches the commit-time comparison rather than stopping at
+    /// staleness -- to show what pass 4 does to the stuck Committing record
+    /// on first boot. The sandbox has a fresh Idunn identity, no bindings,
+    /// no systemd and no Docker: any error it reports past the abort intent
+    /// is the sandbox's, but the intent itself is the daemon's decision.
+    /// Ignored unless SOUL4_ROOT is set; run with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn soul4_live_odin_committing_record_fate_on_first_boot() -> Result<()> {
+        let root = PathBuf::from(std::env::var("SOUL4_ROOT").context("SOUL4_ROOT is not set")?);
+        let raw = SingleFileMessagePackBackingStore::new(&root.join("soul4-control.cc"))
+            .pull_all_read_only_snapshot()?;
+        let mut live = ControlSnapshot::default();
+        for envelope in raw.iter().cloned() {
+            live.ingest(envelope)?;
+        }
+        live.validate_relations()?;
+        println!(
+            "SOUL4 live commands={} transactions={} admitted={} resident_terminal={}",
+            live.commands.len(),
+            live.transactions.len(),
+            live.admitted.len(),
+            live.transactions.iter().filter(|s| s.value.is_terminal()).count()
+        );
+        let stuck = live
+            .transactions
+            .iter()
+            .find(|stored| !stored.value.is_terminal())
+            .context("no live transaction in the copy")?;
+        let stuck_command = live
+            .commands
+            .iter()
+            .find(|stored| stored.value.command_id == stuck.value.command_id)
+            .context("live transaction has no command")?;
+        let admitted = live
+            .admitted_for(&stuck.value.target)
+            .context("live target has no admitted generation")?;
+        let tx = &stuck.value;
+        let expected = required(&tx.expected, "live Expected projection")?;
+        let expected_sha = expected.canonical_sha256()?;
+        let admitted_sha = admitted.value.expected.canonical_sha256()?;
+        println!(
+            "SOUL4 stuck {} command={} target={} phase={:?} deploy={} incumbent_generation_id={:?} authorization={}",
+            tx.transaction_id,
+            tx.command_id,
+            tx.target,
+            tx.phase,
+            matches!(tx.command_kind, CommandKind::Deploy),
+            tx.incumbent_generation_id,
+            tx.deployment_authorization.is_some()
+        );
+        println!(
+            "SOUL4 candidate unit={} release={} expected_sha={expected_sha}",
+            tx.workload.as_ref().map(|w| w.unit.as_str()).unwrap_or("-"),
+            expected.sealed_release_id
+        );
+        println!(
+            "SOUL4 incumbent generation={} unit={} release={} expected_sha={admitted_sha}",
+            admitted.value.generation_id,
+            admitted.value.workload.unit,
+            admitted.value.expected.sealed_release_id
+        );
+        println!("SOUL4 fencing={:?}", tx.fencing);
+        println!(
+            "SOUL4 candidate_holds_lease={} route_preflight={} routing={} ready_seq={:?} latest_seq={:?} latest_equals_ready={}",
+            tx.leasing.as_ref().and_then(LeasingEvidence::lease).is_some(),
+            tx.route_preflight.is_some(),
+            tx.routing.is_some(),
+            tx.ready.as_ref().map(|e| e.publisher_sequence),
+            tx.latest_odin_observation.as_ref().map(|e| e.publisher_sequence),
+            tx.latest_odin_observation == tx.ready
+        );
+        println!("SOUL4 last_error={:?}", tx.last_error);
+
+        let now = now_millis()?;
+        let correlation = SingleFileMessagePackBackingStore::new(&root.join("soul4-odin-topology.cc"))
+            .pull_all_read_only_snapshot()?;
+        for envelope in correlation
+            .iter()
+            .filter(|e| e.r#type == OdinRuntimeTopologyCorrelationRecord::TYPE)
+        {
+            match OdinRuntimeTopologyCorrelationRecord::decode_canonical_signed_payload(&envelope.payload) {
+                Ok((record, _)) => println!(
+                    "SOUL4 correlation key={} describes={} expected_projection_sha256={} seq={} observed_at={} age_s={} present={} ready={} runtime_instance_id={:?}",
+                    envelope.key,
+                    if record.expected_projection_sha256 == expected_sha {
+                        "CANDIDATE"
+                    } else if record.expected_projection_sha256 == admitted_sha {
+                        "INCUMBENT"
+                    } else {
+                        "NEITHER"
+                    },
+                    record.expected_projection_sha256,
+                    record.publisher_sequence,
+                    record.observed_at_unix_millis,
+                    now.saturating_sub(record.observed_at_unix_millis) / 1000,
+                    record.present,
+                    record.ready,
+                    record.runtime_instance_id
+                ),
+                Err(error) => println!("SOUL4 correlation key={} undecodable: {error:#}", envelope.key),
+            }
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path();
+        let idunn_identity_store = sandbox.join("idunn-identity.cc");
+        cultnet_rs::enroll_service_identity_at::<IdunnServiceIdentity>(&idunn_identity_store)?;
+        for (label, maximum_age) in [
+            ("default-window", DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS),
+            ("unbounded-window", u64::MAX / 4),
+        ] {
+            let state_store = sandbox.join(format!("control-{label}.cc"));
+            let store = SingleFileMessagePackBackingStore::new(&state_store);
+            soul3_insert(&store, stuck_command.envelope.clone())?;
+            soul3_insert(&store, stuck.envelope.clone())?;
+            soul3_insert(&store, admitted.envelope.clone())?;
+            let engine = Engine::open(RuntimeOptions {
+                state_store: state_store.clone(),
+                bindings_dir: sandbox.join("bindings"),
+                source_root: sandbox.join("sources"),
+                staging_root: sandbox.join("staging"),
+                topology_store: sandbox.join(format!("topology-{label}.cc")),
+                odin_correlation_store: root.join("soul4-odin-topology.cc"),
+                odin_trust_anchor: root.join("odin-topology-anchor.cc"),
+                idunn_identity_store: idunn_identity_store.clone(),
+                deployment_brake_operator_anchor: root.join("deployment-brake-operator-anchor.cc"),
+                source_identity: None,
+                topology_maximum_age_millis: maximum_age,
+                ..RuntimeOptions::default()
+            })?;
+            let resident = ControlSnapshot::read(&state_store)?;
+            let resident = resident
+                .transactions
+                .iter()
+                .find(|s| s.value.transaction_id == tx.transaction_id)
+                .context("sandbox lost the record")?;
+            println!(
+                "SOUL4 [{label}] verify_resident_deployment_authorization => {:?}",
+                engine
+                    .verify_resident_deployment_authorization(&resident.value)
+                    .map_err(|e| format!("{e:#}"))
+            );
+            for tick in 1..=3 {
+                let progressed =
+                    run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction());
+                let after = ControlSnapshot::read(&state_store)?;
+                let record = after
+                    .transactions
+                    .iter()
+                    .find(|s| s.value.transaction_id == tx.transaction_id);
+                println!(
+                    "SOUL4 [{label}] tick{tick} progressed={progressed} resident={} phase={:?} completion={} post_fencing_abort={:?} last_error={:?}",
+                    record.is_some(),
+                    record.map(|s| s.value.phase),
+                    record.map(|s| s.value.completion.is_some()).unwrap_or(false),
+                    record.and_then(|s| s.value.post_fencing_abort.clone()),
+                    record.and_then(|s| s.value.last_error.clone())
+                );
+            }
+        }
+        Ok(())
+    }
 }
