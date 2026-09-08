@@ -1909,8 +1909,14 @@ fn decode_record<T>(envelope: &CultCacheEnvelope) -> Result<T>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
-    let value: T = rmp_serde::from_slice(&envelope.payload)
-        .with_context(|| format!("decoding {} {}", envelope.r#type, envelope.key))?;
+    let value: T = rmp_serde::from_slice(&envelope.payload).with_context(|| {
+        format!(
+            "decoding {} {} (schema {})",
+            envelope.r#type,
+            envelope.key,
+            envelope.schema_id.as_deref().unwrap_or("none")
+        )
+    })?;
     Ok(value)
 }
 
@@ -1928,10 +1934,14 @@ fn command_envelope(value: &DeploymentCommand, now: u64) -> Result<CultCacheEnve
 fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTransaction> {
     ensure!(
         envelope.schema_id.as_deref() == Some(DEPLOYMENT_TRANSACTION_SCHEMA),
-        "Idunn control store contains an unsupported transaction"
+        "Idunn control store contains an unsupported transaction {} (schema {})",
+        envelope.key,
+        envelope.schema_id.as_deref().unwrap_or("none")
     );
     let value: DeploymentTransaction = decode_record(envelope)?;
-    value.validate()?;
+    value
+        .validate()
+        .with_context(|| format!("validating transaction {}", envelope.key))?;
     Ok(value)
 }
 
@@ -2235,15 +2245,28 @@ fn submit(
     let deadline = now.saturating_add(timeout_seconds.saturating_mul(1000));
     loop {
         let snapshot = ControlSnapshot::read(store_path)?;
-        ensure!(
+        let transactions = if snapshot
+            .commands
+            .iter()
+            .any(|stored| stored.value.command_id == command.command_id)
+        {
             snapshot
-                .commands
-                .iter()
-                .any(|stored| stored.value.command_id == command.command_id),
-            "submitted deployment command disappeared"
-        );
-        let transactions = snapshot.transaction_for_command(&command.command_id);
-        if !transactions.is_empty() && transactions.iter().all(|value| value.is_terminal()) {
+                .transaction_for_command(&command.command_id)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            // Gone from control.cc: it either never landed (impossible, we
+            // just wrote it) or it already ran to completion and was
+            // archived. history.cc is the only place left to look; a command
+            // that is in neither store really did disappear.
+            let (archived_command, archived_transactions, _) =
+                read_history_for_command(store_path, &command.command_id)?;
+            ensure!(archived_command.is_some(), "submitted deployment command disappeared");
+            archived_transactions
+        };
+        if !transactions.is_empty() && transactions.iter().all(DeploymentTransaction::is_terminal)
+        {
             if let Some(error) =
                 transactions
                     .iter()
@@ -2267,53 +2290,153 @@ fn submit(
     }
 }
 
+/// A record from `history.cc` that could not be decoded. Terminal-ness is
+/// display-only, so an unreadable archived record is reported, never treated
+/// as a fault -- it names no live decision.
+struct UnreadableHistoryRecord {
+    r#type: String,
+    key: String,
+    schema_id: String,
+}
+
+fn read_history_envelopes(history_path: &Path) -> Result<Vec<CultCacheEnvelope>> {
+    if !history_path.exists() {
+        return Ok(Vec::new());
+    }
+    SingleFileMessagePackBackingStore::new(history_path)
+        .pull_all_read_only_snapshot()
+        .context("reading Idunn history store")
+}
+
+/// Leniently reads every history.cc record belonging to `command_id`: the
+/// command itself if archived, and every transaction that decodes and names
+/// it. A record of either type that fails to decode is reported separately
+/// rather than failing the read -- history is display-only, so a foreign or
+/// corrupted archived record can never gate an operator's ability to see the
+/// outcome of everything that *did* archive cleanly.
+fn read_history_for_command(
+    store_path: &Path,
+    command_id: &str,
+) -> Result<(
+    Option<DeploymentCommand>,
+    Vec<DeploymentTransaction>,
+    Vec<UnreadableHistoryRecord>,
+)> {
+    let mut command = None;
+    let mut transactions = Vec::new();
+    let mut unreadable = Vec::new();
+    for envelope in read_history_envelopes(&history_store_path(store_path))? {
+        match envelope.r#type.as_str() {
+            DeploymentCommand::TYPE if envelope.key == command_id => {
+                match decode_record::<DeploymentCommand>(&envelope).and_then(|value| {
+                    value.validate()?;
+                    Ok(value)
+                }) {
+                    Ok(value) => command = Some(value),
+                    Err(_) => unreadable.push(UnreadableHistoryRecord {
+                        r#type: envelope.r#type.clone(),
+                        key: envelope.key.clone(),
+                        schema_id: envelope.schema_id.clone().unwrap_or_default(),
+                    }),
+                }
+            }
+            DeploymentTransaction::TYPE => match read_transaction_record(&envelope) {
+                Ok(value) if value.command_id == command_id => transactions.push(value),
+                Ok(_) => {}
+                Err(_) => unreadable.push(UnreadableHistoryRecord {
+                    r#type: envelope.r#type.clone(),
+                    key: envelope.key.clone(),
+                    schema_id: envelope.schema_id.clone().unwrap_or_default(),
+                }),
+            },
+            _ => {}
+        }
+    }
+    Ok((command, transactions, unreadable))
+}
+
 fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
     let snapshot = ControlSnapshot::read(store_path)?;
     let mut commands = snapshot.commands.iter().collect::<Vec<_>>();
     commands.sort_by_key(|stored| stored.value.requested_at_unix_millis);
     if let Some(command_id) = command_id {
         commands.retain(|stored| stored.value.command_id == command_id);
-        ensure!(!commands.is_empty(), "deployment command is unknown");
+    }
+    let mut archived_command = None;
+    let mut archived_transactions = Vec::new();
+    let mut unreadable = Vec::new();
+    if let Some(command_id) = command_id
+        && !commands.iter().any(|stored| stored.value.command_id == command_id)
+    {
+        let found = read_history_for_command(store_path, command_id)?;
+        ensure!(found.0.is_some(), "deployment command is unknown");
+        archived_command = found.0;
+        archived_transactions = found.1;
+        unreadable = found.2;
     }
     for stored in commands {
         let command = &stored.value;
-        let transactions = snapshot.transaction_for_command(&command.command_id);
+        let transactions = snapshot
+            .transaction_for_command(&command.command_id)
+            .into_iter()
+            .collect::<Vec<_>>();
         let (state, detail) = derived_command_status(&transactions);
         println!(
             "{} {} {} {}",
             command.command_id, command.selector, state, detail
         );
-        // Naming one command asks about that command, so print what a stuck
-        // transaction is actually waiting on. A gate reason lives in
-        // `last_error` and was never rendered anywhere, which left "Sealing"
-        // looking identical whether the brake had not authorized the
-        // transaction or the phase was simply slow. The release and deployment
-        // ids are here because they are exactly what a brake release must name.
         if command_id.is_some() {
             for transaction in transactions {
-                println!("  transaction {}", transaction.transaction_id);
-                println!("    target {} phase {:?}", transaction.target, transaction.phase);
-                if let Some(expected) = &transaction.expected {
-                    println!("    runtime {}", expected.runtime_id);
-                    println!("    release {}", expected.sealed_release_id);
-                }
-                println!(
-                    "    odin publisher cursor {}",
-                    transaction.odin_publisher_sequence_cursor
-                );
-                if let Some(evidence) = &transaction.latest_odin_observation {
-                    println!(
-                        "    latest odin observation sequence {}",
-                        evidence.publisher_sequence
-                    );
-                }
-                if let Some(reason) = &transaction.last_error {
-                    println!("    waiting on {reason}");
-                }
+                print_transaction_detail(transaction);
             }
         }
     }
+    if let Some(command) = &archived_command {
+        let transaction_refs = archived_transactions.iter().collect::<Vec<_>>();
+        let (state, detail) = derived_command_status(&transaction_refs);
+        println!(
+            "{} {} {} {}",
+            command.command_id, command.selector, state, detail
+        );
+        for transaction in &archived_transactions {
+            print_transaction_detail(transaction);
+        }
+    }
+    for record in &unreadable {
+        println!(
+            "  unreadable history record {} {} (schema {})",
+            record.r#type, record.key, record.schema_id
+        );
+    }
     Ok(())
+}
+
+// Naming one command asks about that command, so print what a stuck
+// transaction is actually waiting on. A gate reason lives in `last_error` and
+// was never rendered anywhere, which left "Sealing" looking identical whether
+// the brake had not authorized the transaction or the phase was simply slow.
+// The release and deployment ids are here because they are exactly what a
+// brake release must name.
+fn print_transaction_detail(transaction: &DeploymentTransaction) {
+    println!("  transaction {}", transaction.transaction_id);
+    println!("    target {} phase {:?}", transaction.target, transaction.phase);
+    if let Some(expected) = &transaction.expected {
+        println!("    runtime {}", expected.runtime_id);
+        println!("    release {}", expected.sealed_release_id);
+    }
+    println!(
+        "    odin publisher cursor {}",
+        transaction.odin_publisher_sequence_cursor
+    );
+    if let Some(evidence) = &transaction.latest_odin_observation {
+        println!(
+            "    latest odin observation sequence {}",
+            evidence.publisher_sequence
+        );
+    }
+    if let Some(reason) = &transaction.last_error {
+        println!("    waiting on {reason}");
+    }
 }
 
 fn derived_command_status(transactions: &[&DeploymentTransaction]) -> (&'static str, String) {
