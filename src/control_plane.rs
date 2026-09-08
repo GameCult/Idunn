@@ -1674,14 +1674,14 @@ struct ControlSnapshot {
 }
 
 impl ControlSnapshot {
-    /// One record that cannot be decoded, or a serve-time fault that hits it
-    /// specifically, must not fail the whole read: R4's second clause and
-    /// R20's quarantine both name this, because a resident record's job is
-    /// to gate one transaction or admission, not the other few hundred in
-    /// the same file. A record that fails `ingest` is logged and skipped;
-    /// everything that DID decode is still returned, and `validate_relations`
-    /// runs only over the survivors -- an orphaned command left behind by a
-    /// quarantined transaction is not itself an inconsistency.
+    /// A record that fails to decode fails the whole read (R23.1). Silently
+    /// dropping it would let `validate_relations` see only "true for the
+    /// records we could see", and would make Idunn blind to exactly the
+    /// records worth being suspicious of -- a flipped byte in a live
+    /// transaction must not become invisible to it. `run_scheduler_tick`
+    /// already keeps the daemon alive across a failed read (R4's second
+    /// clause); refusing here gives the operator a loud, repeated error
+    /// instead of silence.
     fn read(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -1692,9 +1692,9 @@ impl ControlSnapshot {
             .context("reading Idunn control snapshot")?
         {
             let describe = format!("{} {}", envelope.r#type, envelope.key);
-            if let Err(error) = snapshot.ingest(envelope) {
-                eprintln!("Idunn quarantined an unreadable control record {describe}: {error:#}");
-            }
+            snapshot
+                .ingest(envelope)
+                .with_context(|| format!("Idunn control record {describe} failed to decode"))?;
         }
         snapshot.validate_relations()?;
         Ok(snapshot)
@@ -7117,12 +7117,11 @@ mod tests {
         Ok(())
     }
 
-    /// R20's quarantine changes this from "the whole read refuses" to "this
-    /// one record is quarantined": a legacy command schema fails `ingest`,
-    /// is logged and skipped, and the read still succeeds -- empty, since
-    /// this store holds nothing else.
+    /// R23.1 deleted the quarantine: a legacy command schema fails `ingest`,
+    /// and that now fails the whole read, loudly, instead of the store
+    /// silently reading back as if the record were never written.
     #[test]
-    fn legacy_mutable_command_schema_is_quarantined() -> Result<()> {
+    fn legacy_mutable_command_schema_is_refused() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let path = temporary.path().join("control.cc");
         let legacy = CultCacheEnvelope {
@@ -7142,16 +7141,18 @@ mod tests {
                 &[legacy],
             )?
         );
-        let snapshot = ControlSnapshot::read(&path)?;
-        assert!(snapshot.commands.is_empty(), "the legacy-schema command is quarantined, not read");
+        assert!(
+            ControlSnapshot::read(&path).is_err(),
+            "the legacy-schema command refuses the whole read, it is not silently dropped"
+        );
         Ok(())
     }
 
     /// Same change as above, for a legacy transaction and a legacy admitted
-    /// generation: each is quarantined on its own, and the read of an
-    /// otherwise-empty store succeeds around it.
+    /// generation: each on its own now refuses the whole read instead of
+    /// being quarantined out of an otherwise-successful one.
     #[test]
-    fn loadcredential_era_control_schemas_are_quarantined_not_rehydrated() -> Result<()> {
+    fn loadcredential_era_control_schemas_are_refused_not_rehydrated() -> Result<()> {
         for (record_type, key, schema) in [
             (
                 DeploymentTransaction::TYPE,
@@ -7183,8 +7184,10 @@ mod tests {
                     &[legacy],
                 )?
             );
-            let snapshot = ControlSnapshot::read(&path)?;
-            assert!(snapshot.transactions.is_empty() && snapshot.admitted.is_empty());
+            assert!(
+                ControlSnapshot::read(&path).is_err(),
+                "a loadcredential-era {record_type} record refuses the read, it is not rehydrated"
+            );
         }
         Ok(())
     }
@@ -7912,15 +7915,12 @@ nodes = ["yggdrasil"]
         Ok(terminal)
     }
 
-    /// Claim 1 (quarantine fails OPEN for target ownership). A live Sealing
-    /// transaction that fails `ingest` is absent from the snapshot. Its
-    /// command therefore has no visible transaction, `freeze_one_queued_command`
-    /// treats the command as still queued, and mints a SECOND transaction
-    /// for the same command and target. control.cc then holds two
-    /// transactions claiming `ghostlight` -- the exact state
-    /// `validate_relations` exists to forbid, unenforced because one of the
-    /// two is invisible to it. A one-byte write to control.cc selects which
-    /// live transaction Idunn stops seeing.
+    /// Claim 1, flipped by R23.1's deletion of the quarantine. A live
+    /// Sealing transaction that fails `ingest` now fails the whole read: it
+    /// cannot become invisible to `freeze_one_queued_command`, so it cannot
+    /// be minted a second owner for its target. `run_scheduler_tick` is what
+    /// keeps the daemon alive across this refusal; this test only proves the
+    /// refusal itself.
     #[test]
     fn soul3_quarantined_live_transaction_lets_freeze_mint_a_second_owner_for_its_target()
     -> Result<()> {
@@ -7934,41 +7934,30 @@ nodes = ["yggdrasil"]
         load_bindings(&engine.options.bindings_dir)?;
 
         let command = command(CommandKind::Deploy);
-        let (hidden, hidden_envelope) = soul3_noncanonical_sealing(&command)?;
+        let (_hidden, hidden_envelope) = soul3_noncanonical_sealing(&command)?;
         let store = SingleFileMessagePackBackingStore::new(&engine.options.state_store);
         soul3_insert(&store, command_envelope(&command, 100)?)?;
         soul3_insert(&store, hidden_envelope)?;
 
-        // The live transaction is gone from the snapshot; its command is
-        // visible and, from the scheduler's point of view, still queued.
-        let before = ControlSnapshot::read(&engine.options.state_store)?;
-        assert!(before.transactions.is_empty(), "the live transaction is quarantined");
-        assert_eq!(before.commands.len(), 1);
+        // The whole read refuses; freeze never gets a snapshot in which the
+        // live transaction could look queued.
+        assert!(
+            ControlSnapshot::read(&engine.options.state_store).is_err(),
+            "a noncanonical live transaction refuses the read, it is not quarantined"
+        );
+        assert!(
+            engine.freeze_one_queued_command().is_err(),
+            "freeze must not mint a second owner from a read it cannot even complete"
+        );
 
-        // Freeze admits a NEW transaction for the same command and target.
-        let froze = engine.freeze_one_queued_command()?;
-        assert!(froze, "freeze re-froze the command whose owner it cannot see");
-
-        let after = ControlSnapshot::read(&engine.options.state_store)?;
-        assert_eq!(after.transactions.len(), 1, "the new owner is the only visible one");
-        let minted = &after.transactions[0].value;
-        assert_ne!(minted.transaction_id, hidden.transaction_id);
-        assert_eq!(minted.command_id, hidden.command_id);
-        assert_eq!(minted.target, hidden.target);
-        assert!(minted.owns_target_authority());
-
-        // control.cc itself now carries BOTH owners of ghostlight for the
-        // same command. validate_relations passed because it only ever saw
-        // one of them.
+        // control.cc still holds exactly the one transaction that was
+        // written -- no second owner was ever minted.
         let raw = store.pull_all_read_only_snapshot()?;
         let raw_transactions = raw
             .iter()
             .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
             .count();
-        assert_eq!(
-            raw_transactions, 2,
-            "two live transactions for one command and one target are now durable in control.cc"
-        );
+        assert_eq!(raw_transactions, 1, "no second owner was minted for ghostlight");
         Ok(())
     }
 
@@ -7976,11 +7965,11 @@ nodes = ["yggdrasil"]
     /// record for `odin` that fails `ingest` vanishes from the snapshot:
     /// `admitted_for("odin")` is None, so (a) the current Odin topology
     /// authority silently falls back to the BOOTSTRAP anchor instead of the
-    /// admitted one, (b) the continuity supervisor has nothing to supervise
-    /// and reports no progress, and (c) a fresh transaction for the target
-    /// would be minted with `incumbent_generation_id = None`, i.e. as if the
-    /// target had never been deployed. None of these is a refusal; on main
-    /// the same bytes refused the whole read.
+    /// admitted one, (b) the continuity supervisor would have nothing to
+    /// supervise, and (c) a fresh transaction for the target would be minted
+    /// as if it had never been deployed. R23.1 deleted the quarantine that
+    /// let any of that happen: the same bytes now refuse the whole read, the
+    /// same as they did on main before the quarantine existed.
     #[test]
     fn soul3_quarantined_admitted_generation_reads_as_never_deployed() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -7999,31 +7988,15 @@ nodes = ["yggdrasil"]
             },
         )?;
 
-        let snapshot = ControlSnapshot::read(&engine.options.state_store)?;
-        assert!(snapshot.admitted.is_empty(), "the admitted generation is quarantined");
-        assert!(snapshot.admitted_for("odin").is_none());
-
-        // (a) Odin authority rolls back to bootstrap.
-        let authority = engine.current_odin_authority(&snapshot)?;
-        assert_eq!(
-            authority.signer_public_key, engine.bootstrap_odin_authority.signer_public_key,
-            "a quarantined admitted generation silently reverts Odin authority to the bootstrap anchor"
+        assert!(
+            ControlSnapshot::read(&engine.options.state_store).is_err(),
+            "a noncanonical admitted generation refuses the read, it is not quarantined"
         );
 
-        // (b) Nothing is supervised; the tick reports "nothing to do".
-        assert!(!engine.supervise_one_admitted_generation()?);
-
-        // (c) A new transaction for the target would treat it as undeployed.
-        let command = command(CommandKind::Deploy);
-        let fresh = DeploymentTransaction::new(
-            &command,
-            "odin".into(),
-            0,
-            snapshot.admitted_for("odin").map(|stored| &stored.value),
-            100,
-        )?;
-        assert!(fresh.incumbent_generation_id.is_none());
-        assert_eq!(fresh.odin_publisher_sequence_cursor, 0);
+        // Nothing downstream of the read ever runs against a snapshot that
+        // silently dropped the record, because there is no such snapshot:
+        // supervise_one_admitted_generation reads for itself and refuses too.
+        assert!(engine.supervise_one_admitted_generation().is_err());
         Ok(())
     }
 
