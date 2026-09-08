@@ -22,7 +22,7 @@ use cultnet_rs::{
     authenticate_runtime_presence_claim,
     correlate_runtime_presence_claim, derive_service_identity_id,
     evaluate_idunn_continuity_restart, evaluate_idunn_deployment_brake, open_service_identity_at,
-    verify_runtime_authority,
+    verify_idunn_deployment_brake_authorization, verify_runtime_authority,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2062,6 +2062,44 @@ fn archive_terminal_transaction(
     Ok(())
 }
 
+/// Archives a transaction that is terminal from the moment it is minted --
+/// currently only `freeze_one_queued_command`'s selector-rejection path --
+/// straight to `history.cc`, without ever writing it to `control.cc`.
+///
+/// This is what keeps `control.cc` free of terminal records by construction:
+/// `archive_terminal_transaction` only ever has to move a record that was
+/// *previously* resident and non-terminal, never one born terminal. `command`
+/// is archived alongside it on the assumption the caller has already checked
+/// this is the command's only transaction; if another transaction for the
+/// same command turns up resident, that is a scheduling bug the CAS below
+/// will catch by refusing to delete a command envelope that changed
+/// underneath it, not something this function tries to detect on its own.
+fn archive_rejected_transaction(
+    store_path: &Path,
+    command: &Stored<DeploymentCommand>,
+    transaction: &DeploymentTransaction,
+    now: u64,
+) -> Result<()> {
+    ensure!(
+        transaction.is_terminal(),
+        "archive_rejected_transaction requires an already-terminal transaction"
+    );
+    let envelope = transaction_envelope(transaction, now)?;
+    let history = SingleFileMessagePackBackingStore::new(history_store_path(store_path));
+    history
+        .insert_entry_if_absent(envelope)
+        .context("archiving a rejected Idunn transaction to history")?;
+    history
+        .insert_entry_if_absent(command.envelope.clone())
+        .context("archiving a rejected Idunn transaction's command to history")?;
+    ensure!(
+        SingleFileMessagePackBackingStore::new(store_path)
+            .delete_batch_if_unchanged(&[command.envelope.clone()])?,
+        "deployment command changed before its rejected transaction was archived"
+    );
+    Ok(())
+}
+
 /// `history.cc` lives beside `control.cc` in the same directory. This is not
 /// a new configuration surface: every path that already knows the control
 /// store (the systemd unit, the CLI defaults) derives this one implicitly.
@@ -2589,6 +2627,136 @@ impl Engine {
         }
     }
 
+    /// Re-verifies every piece of signed evidence carried by a *resident*
+    /// record: brake authorization, Odin observations, warming and ready
+    /// receipts, on both live transactions and admitted generations.
+    ///
+    /// Per R19: this is safe to run at startup now because control.cc no
+    /// longer holds terminal history -- replace_transaction archives a
+    /// transaction the instant it turns terminal, so everything this
+    /// snapshot contains is still live authority, not a record only
+    /// describing what already happened. Re-proving that authority on every
+    /// restart is exactly the "consumption must include the path that acts
+    /// on a resident record after a restart" requirement; re-proving
+    /// history.cc as well, or every record ever written, is the coupling
+    /// that was cut.
+    fn validate_durable_authority(&self, snapshot: &ControlSnapshot) -> Result<()> {
+        let operator_anchor = read_trust_anchor::<IdunnDeploymentBrakeOperatorIdentity>(
+            &self.options.deployment_brake_operator_anchor,
+        )?;
+        for stored in &snapshot.transactions {
+            let transaction = &stored.value;
+            if let Some(authorization) = &transaction.deployment_authorization {
+                authorization.validate_shape()?;
+                let record: IdunnDeploymentBrakeRecord =
+                    rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
+                verify_idunn_deployment_brake_authorization(&record, &operator_anchor)?;
+                let expected = required(&transaction.expected, "authorized Expected projection")?;
+                ensure!(
+                    record.authorized_release_id.as_deref()
+                        == Some(expected.sealed_release_id.as_str())
+                        && record.authorized_deployment_id.as_deref()
+                            == Some(transaction.transaction_id.as_str())
+                        && record.runtime_id == expected.runtime_id,
+                    "durable deployment authorization names another release or transaction"
+                );
+            }
+            let lease = transaction
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::lease_sha256);
+            if let Some(evidence) = &transaction.latest_odin_observation {
+                let authenticated = self.authenticate_topology_bytes(
+                    snapshot,
+                    transaction,
+                    &evidence.canonical_bytes,
+                    lease,
+                    evidence.admitted_at_unix_millis,
+                )?;
+                validate_authenticated_evidence(evidence, &authenticated)?;
+            }
+            if let Some(evidence) = &transaction.warming {
+                match evidence {
+                    WarmingEvidence::OdinTopology { evidence } => {
+                        let authenticated = self.authenticate_topology_bytes(
+                            snapshot,
+                            transaction,
+                            &evidence.canonical_bytes,
+                            None,
+                            evidence.admitted_at_unix_millis,
+                        )?;
+                        validate_authenticated_evidence(evidence, &authenticated)?;
+                        let incumbent_lease_sha256 =
+                            self.incumbent_lease_sha256_for_warming(snapshot, transaction)?;
+                        ensure!(
+                            is_semantic_warming(
+                                required(&transaction.expected, "Warming Expected projection",)?,
+                                required(&transaction.activation, "Warming activation")?,
+                                incumbent_lease_sha256.as_deref(),
+                                &authenticated,
+                            )?,
+                            "durable Warming gate is not supported by current runtime evidence"
+                        );
+                    }
+                    WarmingEvidence::FirstOdinDirect { evidence } => {
+                        self.authenticate_first_odin_warming_presence(
+                            transaction,
+                            &evidence.message_id,
+                            evidence.challenged_at_unix_millis,
+                            evidence.admitted_at_unix_millis,
+                            &evidence.canonical_bytes,
+                        )?;
+                    }
+                }
+            }
+            if let Some(evidence) = &transaction.ready {
+                let authenticated = self.authenticate_topology_bytes(
+                    snapshot,
+                    transaction,
+                    &evidence.canonical_bytes,
+                    lease,
+                    evidence.admitted_at_unix_millis,
+                )?;
+                validate_authenticated_evidence(evidence, &authenticated)?;
+                ensure!(
+                    is_semantic_ready(&authenticated),
+                    "durable Ready label is not exact semantic Ready"
+                );
+            }
+        }
+        let odin_authority = self.current_odin_authority(snapshot)?;
+        for stored in &snapshot.admitted {
+            let generation = &stored.value;
+            let authority = self.runtime_authority_parts(
+                &generation.plan,
+                &generation.expected,
+                &generation.activation,
+            )?;
+            let latest = authenticate_odin_runtime_topology_correlation(
+                &generation.latest_odin_observation.canonical_bytes,
+                &authority,
+                generation.leasing.lease_sha256(),
+                &odin_authority.signer_public_key,
+                self.trusted_topology_context(
+                    generation.latest_odin_observation.admitted_at_unix_millis,
+                ),
+            )?;
+            validate_authenticated_evidence(&generation.latest_odin_observation, &latest)?;
+            let ready = authenticate_odin_runtime_topology_correlation(
+                &generation.ready.canonical_bytes,
+                &authority,
+                generation.leasing.lease_sha256(),
+                &odin_authority.signer_public_key,
+                self.trusted_topology_context(generation.ready.admitted_at_unix_millis),
+            )?;
+            validate_authenticated_evidence(&generation.ready, &ready)?;
+            ensure!(
+                is_semantic_ready(&ready),
+                "admitted generation Ready label is not exact semantic Ready"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn serve(options: RuntimeOptions) -> Result<()> {
@@ -2609,14 +2777,52 @@ fn serve(options: RuntimeOptions) -> Result<()> {
     let _lock = ProcessLock::acquire(&options.state_store)?;
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
     let engine = Engine::open(options)?;
+    // control.cc now holds only resident (live) records -- terminal ones are
+    // archived to history.cc the instant they turn terminal (see
+    // replace_transaction / archive_terminal_transaction /
+    // archive_rejected_transaction) -- so re-proving every signed evidence
+    // field here is re-proving current authority on every restart, not
+    // re-proving history. That is the boundary R19 draws: verified where
+    // consumed, including the path that acts on a resident record after a
+    // restart; never across everything that ever happened.
+    engine
+        .validate_durable_authority(&ControlSnapshot::read(&engine.options.state_store)?)
+        .context("validating durable authority of every resident Idunn record")?;
 
     loop {
-        let transaction_progress = engine.resume_one_transaction()?;
-        let continuity_progress = engine.supervise_one_admitted_generation()?;
-        if !transaction_progress && !continuity_progress && engine.freeze_one_queued_command()? {
+        // Per R4's second clause: a scheduler-body fault is not a reason to
+        // take the whole daemon down under Restart=always. A fault that is
+        // specific to one transaction is already recorded against that
+        // transaction and logged from inside resume_one_transaction
+        // (begin_pre_fencing_abort / begin_post_fencing_abort /
+        // record_resumable_error); what reaches here is everything else --
+        // a transient I/O error, a corrupt-but-not-yet-diagnosed record --
+        // and for those the tick is simply retried, not fatal.
+        let transaction_progress =
+            run_scheduler_tick("resume_one_transaction", || engine.resume_one_transaction());
+        let continuity_progress = run_scheduler_tick("supervise_one_admitted_generation", || {
+            engine.supervise_one_admitted_generation()
+        });
+        let froze =
+            run_scheduler_tick("freeze_one_queued_command", || engine.freeze_one_queued_command());
+        if !transaction_progress && !continuity_progress && froze {
             continue;
         }
         thread::sleep(Duration::from_millis(engine.options.poll_millis));
+    }
+}
+
+/// Runs one scheduler-loop body, logging (not propagating) any error it
+/// returns. `serve`'s loop must survive a single bad tick: propagating turns
+/// every scheduler-body fault into a process exit under Restart=always,
+/// which is strictly worse than the incident this cut exists to fix.
+fn run_scheduler_tick(name: &str, body: impl FnOnce() -> Result<bool>) -> bool {
+    match body() {
+        Ok(progressed) => progressed,
+        Err(error) => {
+            eprintln!("Idunn scheduler tick {name} failed and will retry next tick: {error:#}");
+            false
+        }
     }
 }
 
@@ -2629,26 +2835,23 @@ impl Engine {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let mut progressed = false;
 
-        // A transaction already terminal in control.cc is a half-finished
-        // archive from a crash between the history append and the control
-        // delete. Finish moving it (and, if it was the last one, its command)
-        // to history.cc before scheduling anything else. The primitive is
-        // idempotent, so calling it again for a record already archived is a
-        // no-op rather than a repair loop.
-        for stored in snapshot
-            .transactions
-            .iter()
-            .filter(|stored| stored.value.is_terminal())
-        {
-            replace_transaction(&self.options.state_store, stored, &stored.value)?;
-            progressed = true;
-        }
-
-        let mut candidates = snapshot
-            .transactions
-            .iter()
-            .filter(|stored| !stored.value.is_terminal())
-            .collect::<Vec<_>>();
+        // A transaction resident in control.cc is never terminal: the only
+        // primitive that can make one terminal is replace_transaction, and it
+        // archives the record to history.cc in the same call instead of
+        // writing the terminal value back in place (see
+        // archive_terminal_transaction). freeze_one_queued_command's
+        // rejection path used to be the one exception, minting a terminal
+        // record straight into control.cc; it now goes through the archive
+        // primitive too (see archive_rejected_transaction), so there is no
+        // longer a "half-finished archive, terminal record left resident"
+        // state for this loop to repair. The real crash window -- a crash
+        // between the history append and the control delete inside
+        // archive_terminal_transaction -- leaves the *predecessor*
+        // (non-terminal) envelope resident instead, and that record is
+        // already a normal candidate below: advancing it again re-derives
+        // the same terminal outcome and replace_transaction's delete half is
+        // idempotent, so the retry finishes the archive on its own.
+        let mut candidates = snapshot.transactions.iter().collect::<Vec<_>>();
         candidates.sort_by_key(|stored| {
             (
                 stored.value.created_at_unix_millis,
@@ -2687,13 +2890,24 @@ impl Engine {
                 }
             }
             let after = ControlSnapshot::read(&self.options.state_store)?;
-            let live = after
+            match after
                 .transactions
                 .iter()
                 .find(|stored| stored.value.transaction_id == current.value.transaction_id)
-                .context("transaction disappeared while checking scheduler progress")?;
-            if live.envelope != current.envelope {
-                progressed = true;
+            {
+                Some(live) => {
+                    if live.envelope != current.envelope {
+                        progressed = true;
+                    }
+                }
+                None => {
+                    // replace_transaction archives a transaction to
+                    // history.cc the instant it turns terminal instead of
+                    // writing the terminal value back to control.cc.
+                    // Disappearing from this snapshot is what an ordinary
+                    // successful completion looks like, not a fault.
+                    progressed = true;
+                }
             }
         }
         Ok(progressed)
@@ -2733,18 +2947,12 @@ impl Engine {
             Err(error) => {
                 let now = now_millis()?;
                 let rejected = DeploymentTransaction::rejected(&command.value, error, now)?;
-                ensure!(
-                    SingleFileMessagePackBackingStore::new(&self.options.state_store)
-                        .compare_exchange(
-                            &[CultCacheExpectedEnvelope {
-                                r#type: DeploymentTransaction::TYPE.into(),
-                                key: rejected.transaction_id.clone(),
-                                current: None,
-                            }],
-                            &[transaction_envelope(&rejected, now)?],
-                        )?,
-                    "bad selector changed before refusal was recorded"
-                );
+                // rejected is born terminal: it must never land in
+                // control.cc, or the record would need a second, dead path
+                // to leave it again. Archive straight to history.cc, taking
+                // the command with it since a queued command with no other
+                // transaction is this rejection's only resident sibling.
+                archive_rejected_transaction(&self.options.state_store, command, &rejected, now)?;
                 return Ok(true);
             }
         };
@@ -6782,8 +6990,20 @@ mod tests {
         Ok(())
     }
 
+    /// This is a primitive-level idempotency test of `archive_terminal_transaction`
+    /// itself, not a reproduction of the real crash window (see
+    /// `soul_real_crash_window_is_completed_by_the_ordinary_resume_path` for
+    /// that: it leaves the non-terminal *predecessor* resident, never a
+    /// terminal value). No production path writes a terminal transaction
+    /// directly into control.cc any more -- `freeze_one_queued_command`'s
+    /// rejection now goes through `archive_rejected_transaction`, which never
+    /// touches control.cc for a stillborn transaction -- so this fixture is
+    /// synthetic: it constructs the state by hand to prove the primitive
+    /// tolerates being handed an already-terminal `current`/`next` pair
+    /// whose history half is already written, belt-and-suspenders for a
+    /// state nothing currently produces.
     #[test]
-    fn archive_resume_completes_a_crash_between_append_and_delete() -> Result<()> {
+    fn archive_terminal_transaction_tolerates_a_pre_existing_history_entry() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let control_path = temporary.path().join("control.cc");
         let history_path = temporary.path().join("history.cc");
@@ -6811,10 +7031,10 @@ mod tests {
             &[transaction_envelope_value.clone()],
         )?);
 
-        // Simulate a crash after the history append half of a previous
-        // archive attempt but before the control delete: both records are
-        // still resident in control.cc, and the transaction is already
-        // present in history.cc too.
+        // Hand-seed the state a crash between the history append and the
+        // control delete would leave *if* a terminal value were ever
+        // resident: both records still in control.cc, and the transaction
+        // already present in history.cc too.
         let history = SingleFileMessagePackBackingStore::new(&history_path);
         assert!(history.insert_entry_if_absent(transaction_envelope_value.clone())?);
 
@@ -7098,20 +7318,24 @@ mod tests {
         Ok(())
     }
 
-    /// Claim 3. A transaction that goes terminal inside `advance_transaction`
-    /// is archived out of control.cc by `replace_transaction`; the scheduler
-    /// then re-reads control.cc to measure progress and cannot find it. That
-    /// error propagates through `resume_one_transaction` and `serve`'s `?`,
-    /// so every ordinary completion ends the daemon process once.
+    /// Claim 3, corrected. A transaction that goes terminal inside
+    /// `advance_transaction` is archived out of control.cc by
+    /// `replace_transaction`. The scheduler's post-advance progress check
+    /// used to re-read control.cc and treat that disappearance as a fatal
+    /// "transaction disappeared" error, propagated all the way through
+    /// `serve`'s `?` -- so every ordinary completion ended the daemon
+    /// process once. Absence from control.cc following a terminal write is
+    /// now read as progress, not a fault.
     #[test]
-    fn soul_terminal_completion_inside_resume_returns_an_error_serve_propagates() -> Result<()> {
+    fn soul_terminal_completion_inside_resume_is_ordinary_progress() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let engine = soul_engine(temporary.path())?;
         let command = command(CommandKind::Deploy);
         let transaction = soul_abort_ready_to_finalize(&command)?;
         soul_seed_control(&engine.options.state_store, &command, &transaction)?;
 
-        let outcome = engine.resume_one_transaction();
+        let progressed = engine.resume_one_transaction()?;
+        assert!(progressed, "archiving a terminal transaction is progress");
 
         // The work itself succeeded: the record is archived.
         let history = SingleFileMessagePackBackingStore::new(history_store_path(
@@ -7120,25 +7344,24 @@ mod tests {
         .pull_all_read_only_snapshot()?;
         assert_eq!(history.len(), 2, "transaction and command archived to history.cc");
         assert!(ControlSnapshot::read(&engine.options.state_store)?.transactions.is_empty());
-
-        // And the scheduler tick reports it as a fatal error anyway.
-        let error = outcome.expect_err("resume tick must fail for this claim to be falsified");
-        assert!(
-            format!("{error:#}").contains("transaction disappeared while checking scheduler progress"),
-            "unexpected error: {error:#}"
-        );
         Ok(())
     }
 
-    /// Claim 4. `archive_terminal_transaction` appends the TERMINAL `next`
-    /// to history.cc and then deletes the NON-TERMINAL `current` from
-    /// control.cc. A crash between those two steps therefore leaves a
-    /// non-terminal record resident -- not the terminal one that
-    /// `resume_one_transaction`'s "half-finished archive" filter looks for.
-    /// The record is re-executed as live work instead, and the tick then
-    /// fails the same way as any completion.
+    /// Claim 4, corrected. The real crash window inside
+    /// `archive_terminal_transaction` is between the history append and the
+    /// control delete: history already has the terminal successor, but
+    /// control.cc still holds the NON-TERMINAL predecessor, because
+    /// `replace_transaction` never writes a terminal value back to
+    /// control.cc in place. `resume_one_transaction` no longer special-cases
+    /// this (that block filtered for a terminal record resident in
+    /// control.cc, which no producer -- after this pass -- ever leaves
+    /// there); the resident non-terminal record is just an ordinary
+    /// candidate. Advancing it again re-derives the same terminal outcome,
+    /// `archive_terminal_transaction`'s history append is a no-op the second
+    /// time (`insert_entry_if_absent`), and the control delete finishes the
+    /// archive that the "crash" interrupted.
     #[test]
-    fn soul_real_crash_window_leaves_a_live_record_that_the_archive_filter_cannot_see() -> Result<()> {
+    fn soul_real_crash_window_is_completed_by_the_ordinary_resume_path() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let engine = soul_engine(temporary.path())?;
         let command = command(CommandKind::Deploy);
@@ -7159,19 +7382,21 @@ mod tests {
         assert!(SingleFileMessagePackBackingStore::new(&history_path)
             .insert_entry_if_absent(transaction_envelope(&terminal, 150)?)?);
 
-        // What the restart actually sees in control.cc.
+        // What the restart actually sees in control.cc: the live
+        // predecessor, not the terminal record history already has.
         let resident = ControlSnapshot::read(&engine.options.state_store)?;
         assert_eq!(resident.transactions.len(), 1);
         assert!(
             !resident.transactions[0].value.is_terminal(),
-            "the crash window leaves the live predecessor resident, so the \
-             `is_terminal()` archive-completion filter in resume_one_transaction never matches it"
+            "the crash window leaves the non-terminal predecessor resident"
         );
 
-        let outcome = engine.resume_one_transaction();
+        let progressed = engine.resume_one_transaction()?;
+        assert!(progressed, "finishing the interrupted archive is progress");
+
         let history = SingleFileMessagePackBackingStore::new(&history_path)
             .pull_all_read_only_snapshot()?;
-        assert_eq!(history.len(), 2);
+        assert_eq!(history.len(), 2, "transaction and command archived to history.cc");
         let archived = history
             .iter()
             .find(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
@@ -7179,11 +7404,7 @@ mod tests {
         // insert_entry_if_absent is keyed by identity, so the record the
         // first attempt wrote is what history keeps, whatever the retry produced.
         assert_eq!(archived.stored_at, rfc3339_millis(150)?);
-        let error = outcome.expect_err("retry completes the archive and still fails the tick");
-        assert!(
-            format!("{error:#}").contains("transaction disappeared while checking scheduler progress"),
-            "unexpected error: {error:#}"
-        );
+        assert!(ControlSnapshot::read(&engine.options.state_store)?.transactions.is_empty());
         Ok(())
     }
 }
