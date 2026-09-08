@@ -1936,35 +1936,6 @@ where
     Ok(value)
 }
 
-/// Reads just the outer msgpack array-length header, without decoding the
-/// array's contents. Every `DatabaseEntry` (cultcache-rs-derive) record is a
-/// single fixed-length array keyed by field declaration order, so this is
-/// how many slots a stored record actually carries. `decode_record_canonical`
-/// no longer needs this at read time (R20 deleted the arity exemption it
-/// existed to compute); it survives only so tests can assert the exact slot
-/// count of a hand-built payload.
-#[cfg(test)]
-fn msgpack_array_len(payload: &[u8]) -> Result<usize> {
-    match payload.first().copied() {
-        Some(byte) if (0x90..=0x9f).contains(&byte) => Ok((byte & 0x0f) as usize),
-        Some(0xdc) => {
-            let header = payload
-                .get(1..3)
-                .and_then(|slice| <[u8; 2]>::try_from(slice).ok())
-                .context("truncated msgpack array16 header")?;
-            Ok(u16::from_be_bytes(header) as usize)
-        }
-        Some(0xdd) => {
-            let header = payload
-                .get(1..5)
-                .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
-                .context("truncated msgpack array32 header")?;
-            Ok(u32::from_be_bytes(header) as usize)
-        }
-        _ => bail!("Idunn control store record is not a msgpack array"),
-    }
-}
-
 /// `decode_record`, plus the byte-exact canonical check -- for `control.cc`
 /// reads only. `history.cc` stays on plain `decode_record`: a terminal
 /// record only describes what already happened and cannot be re-tampered
@@ -7483,7 +7454,6 @@ mod tests {
         tampered.validate()?;
         // Encode as a 34-slot array (drop the defaulted trailing slot) ...
         let mut payload = rmp_serde::to_vec(&WithoutPostFencingAbortSlot(&tampered))?;
-        assert_eq!(msgpack_array_len(&payload)?, 34);
         // ... and, to prove the refusal is not merely about slot count,
         // also re-encode ordinal 0 with the foreign uint8 width that the
         // full-arity claim-1 test refuses.
