@@ -2479,17 +2479,39 @@ impl Engine {
         }
     }
 
+    /// Re-prove the evidence that still gates a decision.
+    ///
+    /// Terminal transactions are skipped: they describe what already happened
+    /// and authorize nothing further, so re-proving them only creates ways for
+    /// history to refuse a boot. On yggdrasil that is 259 of 260 records.
+    ///
+    /// The operator anchor is read on demand rather than up front. Reading it
+    /// unconditionally meant an absent brake artifact refused startup against
+    /// an *empty* store -- a deployment brake gating Idunn itself, which
+    /// `F:\Projects\CLAUDE.md` forbids outright: a target brake "may never gate
+    /// Idunn itself or unrelated service lifecycle".
     fn validate_durable_authority(&self, snapshot: &ControlSnapshot) -> Result<()> {
-        let operator_anchor = read_trust_anchor::<IdunnDeploymentBrakeOperatorIdentity>(
-            &self.options.deployment_brake_operator_anchor,
-        )?;
+        let mut operator_anchor = None;
         for stored in &snapshot.transactions {
             let transaction = &stored.value;
+            if transaction.is_terminal() {
+                continue;
+            }
             if let Some(authorization) = &transaction.deployment_authorization {
                 authorization.validate_shape()?;
                 let record: IdunnDeploymentBrakeRecord =
                     rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
-                verify_idunn_deployment_brake_authorization(&record, &operator_anchor)?;
+                if operator_anchor.is_none() {
+                    operator_anchor = Some(read_trust_anchor::<
+                        IdunnDeploymentBrakeOperatorIdentity,
+                    >(
+                        &self.options.deployment_brake_operator_anchor
+                    )?);
+                }
+                verify_idunn_deployment_brake_authorization(
+                    &record,
+                    operator_anchor.as_ref().expect("read directly above"),
+                )?;
                 let expected = required(&transaction.expected, "authorized Expected projection")?;
                 ensure!(
                     record.authorized_release_id.as_deref()
@@ -6054,6 +6076,23 @@ mod tests {
                 state_store,
             })
         }
+    }
+
+    #[test]
+    fn an_absent_brake_anchor_does_not_gate_an_empty_store() -> Result<()> {
+        // `F:\Projects\CLAUDE.md`: a target brake "may never gate Idunn itself
+        // or unrelated service lifecycle". Reading the operator anchor up front
+        // meant a missing brake artifact refused startup against a store with
+        // nothing in it -- the deployment authority held hostage by an artifact
+        // describing one target's consent.
+        let world = EngineFixture::new()?;
+        assert!(
+            !world.engine.options.deployment_brake_operator_anchor.exists(),
+            "fixture must not have written a brake anchor"
+        );
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        world.engine.validate_durable_authority(&snapshot)?;
+        Ok(())
     }
 
     #[test]
