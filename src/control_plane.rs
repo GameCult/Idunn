@@ -6306,20 +6306,32 @@ mod tests {
             "{error:#}"
         );
 
+        // A Present record with no activation cannot even be encoded: the
+        // schema refuses it upstream of authentication ("Present topology
+        // state lacks an authenticated runtime session"). Either refusal is
+        // the right answer; what must not happen is an absent field reading as
+        // a match for ours.
         let mut anonymous = world.correlation(501_714, true)?;
         anonymous.current_activation_sha256 = None;
-        let canonical = world.sign(&mut anonymous)?;
+        let error = world
+            .sign(&mut anonymous)
+            .and_then(|canonical| world.authenticate(&canonical))
+            .expect_err("absent activation must not read as ours");
         assert!(
-            world.authenticate(&canonical).is_err(),
-            "absent activation must not read as ours"
+            format!("{error:#}").contains("lacks an authenticated runtime session"),
+            "{error:#}"
         );
 
         let mut nameless = world.correlation(501_715, true)?;
         nameless.runtime_instance_id = None;
-        let canonical = world.sign(&mut nameless)?;
+        let error = world
+            .sign(&mut nameless)
+            .and_then(|canonical| world.authenticate(&canonical))
+            .expect_err("absent instance id must not read as ours");
         assert!(
-            world.authenticate(&canonical).is_err(),
-            "absent instance id must not read as ours"
+            format!("{error:#}").contains("lacks an authenticated runtime session")
+                || format!("{error:#}").contains("does not bind the current activation"),
+            "{error:#}"
         );
         Ok(())
     }
@@ -6384,8 +6396,10 @@ mod tests {
             "a foreign provider key was accepted as the Expected signer"
         );
 
-        // Odin link: a correlation signed by another Odin identity.
+        // Odin link: a correlation honestly signed by another Odin identity
+        // (its own id, its own signature) is refused against our admitted key.
         let mut record = ours.correlation(501_713, true)?;
+        record.signer_identity_id = theirs.odin_signer.entry().identity_id.clone();
         let canonical = theirs.sign(&mut record)?;
         let error = ours
             .authenticate(&canonical)
