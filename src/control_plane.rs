@@ -3551,8 +3551,17 @@ impl Engine {
             let now = now_millis()?;
             let snapshot = ControlSnapshot::read(&self.options.state_store)?;
             let incumbent = self.exact_incumbent(&snapshot, &current.value)?;
-            let isolation =
-                prove_isolation(workload, incumbent.map(|value| &value.value.workload))?;
+            // Isolation is a property of two processes running at once. A
+            // stopped incumbent has already released its DynamicUser UID, and
+            // systemd is free to hand that same UID to the candidate -- so
+            // comparing the candidate against the incumbent's *recorded*
+            // identity turns ordinary UID reuse into a permanent refusal to
+            // fence. There is nothing left to be isolated from.
+            let incumbent_workload = match incumbent {
+                Some(value) if self.workload.is_permanently_stopped(&value.value.workload)? => None,
+                other => other.map(|value| &value.value.workload),
+            };
+            let isolation = prove_isolation(workload, incumbent_workload)?;
             return self.persist_same_phase(current, |next| {
                 next.isolation = Some(isolation);
                 next.updated_at_unix_millis = now;
