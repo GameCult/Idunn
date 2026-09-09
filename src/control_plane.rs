@@ -4008,13 +4008,10 @@ impl Engine {
             is_semantic_ready(&authenticated),
             "latest Odin observation is not Ready at admission commit"
         );
-        latest_still_confirms_ready(
-            required(&ready_current.value.ready, "Ready receipt")?,
-            required(
-                &ready_current.value.latest_odin_observation,
-                "latest Odin receipt",
-            )?,
-            &authenticated,
+        observation_describes_declared_incarnation(
+            authenticated.record(),
+            required(&ready_current.value.expected, "Expected projection")?,
+            required(&ready_current.value.activation, "activation")?,
         )
         .context("at admission commit")?;
         self.rehydrate_ready_token(&ready_current.value, now_millis()?, true)?;
@@ -4084,13 +4081,10 @@ impl Engine {
             is_semantic_ready(&authenticated),
             "latest Odin observation is not Ready after the final admission challenge"
         );
-        latest_still_confirms_ready(
-            required(&commit_current.value.ready, "Ready receipt")?,
-            required(
-                &commit_current.value.latest_odin_observation,
-                "latest Odin receipt",
-            )?,
-            &authenticated,
+        observation_describes_declared_incarnation(
+            authenticated.record(),
+            required(&commit_current.value.expected, "Expected projection")?,
+            required(&commit_current.value.activation, "activation")?,
         )
         .context("after the final admission challenge")?;
         let now = now_millis()?;
@@ -4972,10 +4966,11 @@ impl Engine {
             is_semantic_ready(&authenticated),
             "admitted provider no longer has current exact Ready evidence"
         );
-        // A provider that has published since it went ready is the ordinary
-        // case, not a stale one. Authenticate what it last said and require
-        // that it still describes this incarnation and still says ready --
-        // the Ready receipt above remains the evidence a dependant cites.
+        // A provider that published after going ready is the ordinary case, not
+        // a stale one, so the cursor is checked on its own terms rather than
+        // against the receipt. Note this is the cursor as frozen at admission,
+        // not a live read of Odin -- dependency evidence is stored, and making
+        // it current is a separate question this does not answer.
         let authenticated_latest = authenticate_odin_runtime_topology_correlation(
             &generation.latest_odin_observation.canonical_bytes,
             &authority,
@@ -4988,10 +4983,10 @@ impl Engine {
             is_semantic_ready(&authenticated_latest),
             "admitted provider's latest Odin observation is no longer Ready"
         );
-        latest_still_confirms_ready(
-            &generation.ready,
-            &generation.latest_odin_observation,
-            &authenticated_latest,
+        observation_describes_declared_incarnation(
+            authenticated_latest.record(),
+            &generation.expected,
+            &generation.activation,
         )?;
         Ok(SequenceAdmittedReady {
             transaction_id: generation.transaction_id.clone(),
@@ -5713,64 +5708,39 @@ fn warming_disagreements_match_incumbent(
     }
 }
 
-/// Odin republishes a correlation whenever any fact it observes changes: a
-/// dependency becoming ready, a presence sequence advancing, a capability set
-/// widening. Requiring the latest observation to equal the Ready receipt
-/// therefore requires the observer to have stopped observing, which is
-/// unsatisfiable for any live target. An admission that reached Committing
-/// could never leave it: on yggdrasil, odin sat there with `ready` at sequence
-/// 3841 and `latest` at 210313, while the candidate it deployed was serving.
+/// `latest_odin_observation` is a replay cursor, not a receipt. It is written
+/// in lockstep with `odin_publisher_sequence_cursor` in both places it is set,
+/// and `AdmittedGeneration::validate` requires the two to agree -- the field's
+/// own validator says what it is for. Comparing it to the Ready receipt
+/// conflated a high-water mark with a proof, and because `TopologyEvidence`
+/// derives `PartialEq` over five fields the comparison also demanded the two
+/// records agree on `admitted_at_unix_millis`: Idunn's own wall clock. On
+/// yggdrasil that gate held tx-65574579 in Committing with ready at sequence
+/// 3841 against a cursor at 297765 and rising, while the candidate it deployed
+/// served traffic.
 ///
-/// The gate was standing in for something true and narrower -- the newest thing
-/// Odin says about this target still describes the incarnation we proved ready.
-/// That is identity of the subject, not equality of the statement. Callers pair
-/// this with `is_semantic_ready` on the same authenticated record, which is what
-/// establishes that the newer statement still says ready.
-fn latest_still_confirms_ready(
-    ready: &TopologyEvidence,
-    latest: &TopologyEvidence,
-    authenticated_latest: &AuthenticatedOdinRuntimeTopologyCorrelation,
-) -> Result<()> {
-    latest_is_not_older(ready, latest)?;
-    // The Ready receipt was authenticated when it was admitted and is read back
-    // here only to name the incarnation it described. A forged receipt cannot
-    // reach this function: it would have failed admission, and the record it is
-    // compared against is the authenticated one.
-    let (ready_record, _) = OdinRuntimeTopologyCorrelationRecord::decode_canonical_signed_payload(
-        &ready.canonical_bytes,
-    )?;
-    same_incarnation(&ready_record, authenticated_latest.record())
-}
-
-/// Split out so the ordering guard is testable without a signed correlation:
-/// Idunn's tests cannot construct one, which is a large part of why the gate
-/// this replaces was never covered.
-fn latest_is_not_older(ready: &TopologyEvidence, latest: &TopologyEvidence) -> Result<()> {
-    ensure!(
-        latest.publisher_sequence >= ready.publisher_sequence,
-        "latest Odin observation is older than the Ready receipt"
-    );
-    ensure!(
-        latest.signer_identity_id == ready.signer_identity_id,
-        "latest Odin observation carries a different publisher than the Ready receipt"
-    );
-    Ok(())
-}
-
-/// Identity of the subject: same target, same Expected projection, same running
-/// instance. A newer statement about *this* incarnation is Odin working. A
-/// statement about a different one means the thing we proved ready is not the
-/// thing now running, which is the failure the old equality gate was reaching
-/// for and the only one it should have caught.
-fn same_incarnation(
-    ready: &OdinRuntimeTopologyCorrelationRecord,
-    latest: &OdinRuntimeTopologyCorrelationRecord,
+/// Admission does not need a second observation to compare against. It needs
+/// one question answered: does Odin, right now, say that the incarnation this
+/// transaction declared it was deploying is ready? The declaration is the
+/// transaction's own Expected projection and prepared activation -- not another
+/// observation of them. Callers pair this with `is_semantic_ready` on the same
+/// authenticated record, which supplies the "is ready" half.
+fn observation_describes_declared_incarnation(
+    observed: &OdinRuntimeTopologyCorrelationRecord,
+    expected: &IdunnExpectedIncarnationRecord,
+    activation: &IdunnRuntimeActivationRecord,
 ) -> Result<()> {
     ensure!(
-        latest.target == ready.target
-            && latest.expected_projection_sha256 == ready.expected_projection_sha256
-            && latest.runtime_instance_id == ready.runtime_instance_id,
-        "latest Odin observation describes a different incarnation than the Ready receipt"
+        observed.target == expected.target,
+        "Odin observation describes another target"
+    );
+    ensure!(
+        observed.expected_projection_sha256 == expected.canonical_sha256()?,
+        "Odin observation describes another Expected projection"
+    );
+    ensure!(
+        observed.runtime_instance_id.as_deref() == Some(activation.runtime_instance_id.as_str()),
+        "Odin observation describes another runtime instance"
     );
     Ok(())
 }
@@ -6022,33 +5992,84 @@ mod tests {
                 value.transaction_id, value.target, value.phase, ready.publisher_sequence,
                 latest.publisher_sequence
             );
-            println!("  old gate (byte equality): {}", if ready == latest { "PASS" } else { "REFUSE" });
-            let order = latest_is_not_older(ready, latest);
-            println!("  new gate, ordering: {:?}", order.as_ref().map(|_| "PASS"));
-            let (ready_record, _) =
-                OdinRuntimeTopologyCorrelationRecord::decode_canonical_signed_payload(
-                    &ready.canonical_bytes,
-                )?;
+            println!("  old gate (receipt == cursor): {}", if ready == latest { "PASS" } else { "REFUSE" });
             let (latest_record, _) =
                 OdinRuntimeTopologyCorrelationRecord::decode_canonical_signed_payload(
                     &latest.canonical_bytes,
                 )?;
             println!(
-                "  ready: projection={} instance={:?} ready_flag={}",
-                ready_record.expected_projection_sha256, ready_record.runtime_instance_id,
-                ready_record.ready
-            );
-            println!(
-                "  latest: projection={} instance={:?} ready_flag={} present={} disagreements={}",
+                "  cursor says: projection={} instance={:?} ready={} present={} disagreements={}",
                 latest_record.expected_projection_sha256, latest_record.runtime_instance_id,
                 latest_record.ready, latest_record.present, latest_record.disagreements.len()
             );
+            let (Some(expected), Some(activation)) = (&value.expected, &value.activation) else {
+                println!("  transaction has not declared an incarnation yet");
+                continue;
+            };
             println!(
-                "  new gate, incarnation: {:?}",
-                same_incarnation(&ready_record, &latest_record).map(|_| "PASS")
+                "  declared:   projection={} instance={}",
+                expected.canonical_sha256()?, activation.runtime_instance_id
+            );
+            println!(
+                "  new gate:   {:?}",
+                observation_describes_declared_incarnation(&latest_record, expected, activation)
+                    .map(|_| "PASS")
             );
         }
         Ok(())
+    }
+
+    fn declared_incarnation() -> (IdunnExpectedIncarnationRecord, IdunnRuntimeActivationRecord) {
+        let expected = IdunnExpectedIncarnationRecord {
+            schema_version: cultnet_rs::IDUNN_EXPECTED_INCARNATION_SCHEMA.into(),
+            target: "odin".into(),
+            plan_id: sha256_id(b"plan"),
+            incarnation_id: "incarnation-1".into(),
+            sealed_release_id: sha256_id(b"release"),
+            source_repository: "github.com/GameCult/Odin".into(),
+            source_revision: "0".repeat(40),
+            recipe_sha256: sha256_id(b"recipe"),
+            runtime_id: "odin-daemon".into(),
+            expected_signer_identity_id: "odin-provider".into(),
+            health_contract: "runtime-presence-health-v2".into(),
+            artifact_sha256: sha256_id(b"artifact"),
+            state_schema_generation: None,
+            state_contract_sha256: None,
+            write_lease_required: false,
+            route: None,
+            capabilities: Vec::new(),
+            dependencies: Vec::new(),
+        };
+        let activation = IdunnRuntimeActivationRecord {
+            schema_version: cultnet_rs::IDUNN_RUNTIME_ACTIVATION_SCHEMA.into(),
+            expected_projection_sha256: expected
+                .canonical_sha256()
+                .expect("Expected projection digests"),
+            runtime_id: "odin-daemon".into(),
+            runtime_instance_id: "instance-1".into(),
+            activation_signer_identity_id: "odin-activation".into(),
+            activation_signer_public_key: vec![1; 32],
+            issued_at_unix_millis: 100,
+            idunn_signer_identity_id: "idunn".into(),
+            signature_algorithm: "ed25519".into(),
+            signature: Vec::new(),
+        };
+        (expected, activation)
+    }
+
+    fn correlation_for(
+        expected: &IdunnExpectedIncarnationRecord,
+        activation: &IdunnRuntimeActivationRecord,
+        sequence: u64,
+    ) -> OdinRuntimeTopologyCorrelationRecord {
+        let mut record = correlation(
+            &expected.target,
+            &expected.canonical_sha256().expect("Expected projection digests"),
+            Some(&activation.runtime_instance_id),
+            sequence,
+        );
+        record.runtime_id = expected.runtime_id.clone();
+        record
     }
 
     fn correlation(
@@ -6083,53 +6104,42 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_that_keeps_publishing_after_ready_is_still_ready() -> Result<()> {
-        // The shape that wedged odin on yggdrasil: ready at sequence 3841,
-        // latest at 210313, same incarnation, candidate serving. Equality of
-        // the two statements required Odin to have stopped observing.
-        let ready = correlation("odin", "projection-a", Some("instance-1"), 3841);
-        let latest = correlation("odin", "projection-a", Some("instance-1"), 210_313);
-        same_incarnation(&ready, &latest)?;
-        latest_is_not_older(&topology(3841, 1), &topology(210_313, 2))?;
+    fn a_provider_that_keeps_publishing_after_ready_is_admitted() -> Result<()> {
+        // The shape that wedged odin on yggdrasil: the receipt sat at sequence
+        // 3841 while the cursor ran to 297765, same incarnation, candidate
+        // serving. Admission asks about the declared incarnation, so the
+        // cursor's distance from the receipt is not a question it can fail.
+        let (expected, activation) = declared_incarnation();
+        let observed = correlation_for(&expected, &activation, 297_765);
+        observation_describes_declared_incarnation(&observed, &expected, &activation)?;
         Ok(())
     }
 
     #[test]
-    fn a_newer_observation_of_another_incarnation_is_refused() -> Result<()> {
-        let ready = correlation("odin", "projection-a", Some("instance-1"), 3841);
+    fn an_observation_of_another_incarnation_is_refused() -> Result<()> {
+        let (expected, activation) = declared_incarnation();
 
-        // Redeployed underneath us: same target, new Expected projection.
-        let reprojected = correlation("odin", "projection-b", Some("instance-1"), 210_313);
-        assert!(same_incarnation(&ready, &reprojected).is_err());
+        // Restarted underneath us: the projection still matches, the process
+        // does not. This is the failure the old gate caught by accident and
+        // the replacement must catch on purpose.
+        let mut restarted = correlation_for(&expected, &activation, 297_765);
+        restarted.runtime_instance_id = Some("another-instance".into());
+        assert!(observation_describes_declared_incarnation(&restarted, &expected, &activation).is_err());
 
-        // Restarted underneath us: same projection, new running instance. This
-        // is the case the equality gate genuinely caught and the replacement
-        // must keep catching.
-        let restarted = correlation("odin", "projection-a", Some("instance-2"), 210_313);
-        assert!(same_incarnation(&ready, &restarted).is_err());
+        // Redeployed underneath us: a different Expected projection entirely.
+        let mut reprojected = correlation_for(&expected, &activation, 297_765);
+        reprojected.expected_projection_sha256 = "sha256-something-else".into();
+        assert!(observation_describes_declared_incarnation(&reprojected, &expected, &activation).is_err());
 
-        // A different target's correlation is never this target's evidence.
-        let stranger = correlation("ghostlight", "projection-a", Some("instance-1"), 210_313);
-        assert!(same_incarnation(&ready, &stranger).is_err());
+        // Another target's correlation is never this target's evidence.
+        let mut stranger = correlation_for(&expected, &activation, 297_765);
+        stranger.target = "ghostlight".into();
+        assert!(observation_describes_declared_incarnation(&stranger, &expected, &activation).is_err());
 
         // An absent instance id must not read as a match for a present one.
-        let anonymous = correlation("odin", "projection-a", None, 210_313);
-        assert!(same_incarnation(&ready, &anonymous).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn an_observation_older_than_the_ready_receipt_is_refused() -> Result<()> {
-        // Freshness still matters: a replayed older correlation must not be
-        // able to stand in for the current one.
-        assert!(latest_is_not_older(&topology(3841, 1), &topology(3840, 2)).is_err());
-        // Equal is fine -- a target that has published nothing since going
-        // ready is the case the old gate handled, and it must keep working.
-        latest_is_not_older(&topology(3841, 1), &topology(3841, 1))?;
-
-        let mut foreign = topology(210_313, 2);
-        foreign.signer_identity_id = "someone-else".into();
-        assert!(latest_is_not_older(&topology(3841, 1), &foreign).is_err());
+        let mut anonymous = correlation_for(&expected, &activation, 297_765);
+        anonymous.runtime_instance_id = None;
+        assert!(observation_describes_declared_incarnation(&anonymous, &expected, &activation).is_err());
         Ok(())
     }
 
