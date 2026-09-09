@@ -2969,7 +2969,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
     fn is_permanently_stopped(&self, observation: &WorkloadObservation) -> Result<bool> {
         ensure!(
             observation.restart_policy == "no",
-            "candidate unit does not carry the admitted Restart=no policy"
+            "workload unit does not carry the admitted Restart=no policy"
         );
         let Some(unit) = self.show_unit(&observation.unit)? else {
             // systemd has forgotten the unit entirely, so nothing will start it.
