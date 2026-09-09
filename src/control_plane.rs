@@ -2624,16 +2624,34 @@ fn serve(options: RuntimeOptions) -> Result<()> {
     engine.validate_durable_authority(&ControlSnapshot::read(&engine.options.state_store)?)?;
 
     loop {
-        let transaction_progress = engine.resume_one_transaction()?;
-        let continuity_progress = engine.supervise_one_admitted_generation()?;
-        if !transaction_progress && !continuity_progress && engine.freeze_one_queued_command()? {
-            continue;
+        match engine.run_scheduler_tick() {
+            Ok(true) => continue,
+            Ok(false) => {}
+            // A fault in one transaction is that transaction's problem. Idunn
+            // runs under Restart=always, so propagating it here turns a single
+            // unreadable record into a crashloop that takes every unrelated
+            // target's continuity down with it -- the daemon-survival organ
+            // killed by the thing it exists to survive. Log against the tick
+            // and keep going; the fault recurs every poll until it is fixed,
+            // which is louder than a restart loop and cheaper than an outage.
+            Err(error) => eprintln!("Idunn scheduler tick failed: {error:#}"),
         }
         thread::sleep(Duration::from_millis(engine.options.poll_millis));
     }
 }
 
 impl Engine {
+    /// One pass of the scheduler, with the loop's ordering preserved exactly:
+    /// `Ok(true)` means "went round again immediately", which is what the
+    /// caller's `continue` did.
+    fn run_scheduler_tick(&self) -> Result<bool> {
+        let transaction_progress = self.resume_one_transaction()?;
+        let continuity_progress = self.supervise_one_admitted_generation()?;
+        Ok(!transaction_progress
+            && !continuity_progress
+            && self.freeze_one_queued_command()?)
+    }
+
     /// Startup and every later loop use the same order: unfinished ownership
     /// work first, admitted-body continuity second, new commands last. A
     /// waiting transaction yields without relaxing ordinal order inside its
@@ -5896,7 +5914,7 @@ fn usage() -> &'static str {
 mod tests {
     use cultnet_rs::{
         GameCultProviderHealthIdentity, OdinRuntimeTopologyCorrelationPurpose,
-        enroll_service_identity_at,
+        enroll_service_identity_at, export_service_identity_trust_anchor,
     };
     use tempfile::TempDir;
 
@@ -5992,6 +6010,96 @@ mod tests {
                 "  binds declared incarnation (what authentication enforces): {binds}"
             );
         }
+        Ok(())
+    }
+
+    /// The smallest real `Engine` the scheduler needs. Idunn had no
+    /// Engine-level test at all, which is why "does one bad record kill the
+    /// daemon" was arguable rather than measurable.
+    struct EngineFixture {
+        _temp: TempDir,
+        engine: Engine,
+        state_store: PathBuf,
+    }
+
+    impl EngineFixture {
+        fn new() -> Result<Self> {
+            let temp = TempDir::new()?;
+            let root = temp.path();
+            std::fs::create_dir_all(root.join("identities"))?;
+            let idunn = root.join("identities/idunn.cc");
+            enroll_service_identity_at::<IdunnServiceIdentity>(&idunn)?;
+            let odin_private = root.join("identities/odin.cc");
+            let odin_signer = enroll_service_identity_at::<OdinTopologyIdentity>(&odin_private)?;
+            let odin_anchor = root.join("identities/odin-anchor.cc");
+            export_service_identity_trust_anchor(&odin_signer, &odin_anchor)?;
+
+            let state_store = root.join("control.cc");
+            let options = RuntimeOptions {
+                state_store: state_store.clone(),
+                bindings_dir: root.join("bindings"),
+                source_root: root.join("sources"),
+                staging_root: root.join("staging"),
+                topology_store: root.join("topology.cc"),
+                odin_correlation_store: root.join("odin-correlation.cc"),
+                odin_trust_anchor: odin_anchor,
+                idunn_identity_store: idunn,
+                deployment_brake_operator_anchor: root.join("brake-anchor.cc"),
+                ..RuntimeOptions::default()
+            };
+            let engine = Engine::open(options)?;
+            Ok(Self {
+                _temp: temp,
+                engine,
+                state_store,
+            })
+        }
+    }
+
+    #[test]
+    fn one_unreadable_record_faults_its_tick_without_touching_the_store() -> Result<()> {
+        let world = EngineFixture::new()?;
+
+        // An empty store schedules nothing and must not fault.
+        assert!(!world.engine.run_scheduler_tick()?);
+
+        // A record the control store cannot read. Idunn runs under
+        // Restart=always, so before run_scheduler_tick existed this
+        // propagated out of the loop and crashlooped the daemon -- taking
+        // every unrelated target's continuity with it.
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: "tx-unreadable".into(),
+                    current: None,
+                }],
+                &[CultCacheEnvelope {
+                    key: "tx-unreadable".into(),
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    // 0xc1 is msgpack's never-used byte: decodable by nothing.
+                    payload: vec![0xc1],
+                    stored_at: rfc3339_millis(1)?,
+                    schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
+                }],
+            )?
+        );
+        let poisoned = std::fs::read(&world.state_store)?;
+
+        for _ in 0..3 {
+            assert!(
+                world.engine.run_scheduler_tick().is_err(),
+                "the tick must report the fault rather than swallow it"
+            );
+        }
+
+        // Faulting is not the same as flailing: a tick that cannot read must
+        // not rewrite, truncate or repair the store behind the operator.
+        assert_eq!(
+            std::fs::read(&world.state_store)?,
+            poisoned,
+            "a faulting tick rewrote the control store"
+        );
         Ok(())
     }
 
