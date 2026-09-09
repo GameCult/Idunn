@@ -6328,9 +6328,11 @@ mod tests {
             .sign(&mut nameless)
             .and_then(|canonical| world.authenticate(&canonical))
             .expect_err("absent instance id must not read as ours");
+        // Likewise refused at encoding: a Present record must carry its
+        // instance id ("runtime instance identity and observation evidence are
+        // partial").
         assert!(
-            format!("{error:#}").contains("lacks an authenticated runtime session")
-                || format!("{error:#}").contains("does not bind the current activation"),
+            format!("{error:#}").contains("are partial"),
             "{error:#}"
         );
         Ok(())
