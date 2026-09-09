@@ -4008,7 +4008,14 @@ impl Engine {
             is_semantic_ready(&authenticated),
             "latest Odin observation is not Ready at admission commit"
         );
-        self.rehydrate_ready_token(&ready_current.value, now_millis()?, true)?;
+        // Not require_current: the Ready receipt is durable evidence, so
+        // authenticating it against `now` asks a stored record to be live and
+        // refuses it once it ages past the 30s observation window. Route
+        // admission (:3906) refreshes the receipt to the latest observation and
+        // can therefore demand currency; by Committing the receipt is history.
+        // Currency here is answered by the latest observation, authenticated
+        // and checked for semantic readiness immediately above.
+        self.rehydrate_ready_token(&ready_current.value, now_millis()?, false)?;
         validate_live_providers_for_deploy(ready_current.value.command_kind, || {
             self.validate_selected_providers_current(
                 required(&ready_current.value.plan, "transaction plan")?,
@@ -4076,7 +4083,7 @@ impl Engine {
             "latest Odin observation is not Ready after the final admission challenge"
         );
         let now = now_millis()?;
-        self.rehydrate_ready_token(&commit_current.value, now, true)?;
+        self.rehydrate_ready_token(&commit_current.value, now, false)?;
         validate_live_providers_for_deploy(commit_current.value.command_kind, || {
             self.validate_selected_providers_current(
                 required(&commit_current.value.plan, "transaction plan")?,
