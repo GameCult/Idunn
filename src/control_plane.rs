@@ -4008,12 +4008,6 @@ impl Engine {
             is_semantic_ready(&authenticated),
             "latest Odin observation is not Ready at admission commit"
         );
-        observation_describes_declared_incarnation(
-            authenticated.record(),
-            required(&ready_current.value.expected, "Expected projection")?,
-            required(&ready_current.value.activation, "activation")?,
-        )
-        .context("at admission commit")?;
         self.rehydrate_ready_token(&ready_current.value, now_millis()?, true)?;
         validate_live_providers_for_deploy(ready_current.value.command_kind, || {
             self.validate_selected_providers_current(
@@ -4081,12 +4075,6 @@ impl Engine {
             is_semantic_ready(&authenticated),
             "latest Odin observation is not Ready after the final admission challenge"
         );
-        observation_describes_declared_incarnation(
-            authenticated.record(),
-            required(&commit_current.value.expected, "Expected projection")?,
-            required(&commit_current.value.activation, "activation")?,
-        )
-        .context("after the final admission challenge")?;
         let now = now_millis()?;
         self.rehydrate_ready_token(&commit_current.value, now, true)?;
         validate_live_providers_for_deploy(commit_current.value.command_kind, || {
@@ -4967,10 +4955,13 @@ impl Engine {
             "admitted provider no longer has current exact Ready evidence"
         );
         // A provider that published after going ready is the ordinary case, not
-        // a stale one, so the cursor is checked on its own terms rather than
-        // against the receipt. Note this is the cursor as frozen at admission,
-        // not a live read of Odin -- dependency evidence is stored, and making
-        // it current is a separate question this does not answer.
+        // a stale one, so the cursor is authenticated on its own terms rather
+        // than compared to the receipt. Authentication is what binds it to this
+        // incarnation -- it requires the record's current_activation_sha256 and
+        // runtime_instance_id to match this generation's activation -- so a
+        // separate identity check here would only restate it more weakly.
+        // Note this is the cursor as frozen at admission, not a live read of
+        // Odin; making dependency evidence current is a separate question.
         let authenticated_latest = authenticate_odin_runtime_topology_correlation(
             &generation.latest_odin_observation.canonical_bytes,
             &authority,
@@ -4983,11 +4974,6 @@ impl Engine {
             is_semantic_ready(&authenticated_latest),
             "admitted provider's latest Odin observation is no longer Ready"
         );
-        observation_describes_declared_incarnation(
-            authenticated_latest.record(),
-            &generation.expected,
-            &generation.activation,
-        )?;
         Ok(SequenceAdmittedReady {
             transaction_id: generation.transaction_id.clone(),
             evidence: generation.ready.clone(),
@@ -5708,43 +5694,6 @@ fn warming_disagreements_match_incumbent(
     }
 }
 
-/// `latest_odin_observation` is a replay cursor, not a receipt. It is written
-/// in lockstep with `odin_publisher_sequence_cursor` in both places it is set,
-/// and `AdmittedGeneration::validate` requires the two to agree -- the field's
-/// own validator says what it is for. Comparing it to the Ready receipt
-/// conflated a high-water mark with a proof, and because `TopologyEvidence`
-/// derives `PartialEq` over five fields the comparison also demanded the two
-/// records agree on `admitted_at_unix_millis`: Idunn's own wall clock. On
-/// yggdrasil that gate held tx-65574579 in Committing with ready at sequence
-/// 3841 against a cursor at 297765 and rising, while the candidate it deployed
-/// served traffic.
-///
-/// Admission does not need a second observation to compare against. It needs
-/// one question answered: does Odin, right now, say that the incarnation this
-/// transaction declared it was deploying is ready? The declaration is the
-/// transaction's own Expected projection and prepared activation -- not another
-/// observation of them. Callers pair this with `is_semantic_ready` on the same
-/// authenticated record, which supplies the "is ready" half.
-fn observation_describes_declared_incarnation(
-    observed: &OdinRuntimeTopologyCorrelationRecord,
-    expected: &IdunnExpectedIncarnationRecord,
-    activation: &IdunnRuntimeActivationRecord,
-) -> Result<()> {
-    ensure!(
-        observed.target == expected.target,
-        "Odin observation describes another target"
-    );
-    ensure!(
-        observed.expected_projection_sha256 == expected.canonical_sha256()?,
-        "Odin observation describes another Expected projection"
-    );
-    ensure!(
-        observed.runtime_instance_id.as_deref() == Some(activation.runtime_instance_id.as_str()),
-        "Odin observation describes another runtime instance"
-    );
-    Ok(())
-}
-
 fn is_semantic_ready(authenticated: &AuthenticatedOdinRuntimeTopologyCorrelation) -> bool {
     let record = authenticated.record();
     record.present
@@ -5929,7 +5878,17 @@ fn usage() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use cultnet_rs::{
+        GameCultProviderHealthIdentity, OdinRuntimeTopologyCorrelationPurpose,
+        enroll_service_identity_at,
+    };
+    use tempfile::TempDir;
+
     use super::*;
+
+    /// Fixed clock for the signing fixture; correlations must land inside
+    /// DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS of it to authenticate.
+    const NOW: u64 = 1_700_000_000_000;
 
     fn digest(byte: char) -> String {
         byte.to_string().repeat(64)
@@ -6010,136 +5969,243 @@ mod tests {
                 "  declared:   projection={} instance={}",
                 expected.canonical_sha256()?, activation.runtime_instance_id
             );
+            let binds = latest_record.expected_projection_sha256 == expected.canonical_sha256()?
+                && latest_record.runtime_instance_id.as_deref()
+                    == Some(activation.runtime_instance_id.as_str());
             println!(
-                "  new gate:   {:?}",
-                observation_describes_declared_incarnation(&latest_record, expected, activation)
-                    .map(|_| "PASS")
+                "  binds declared incarnation (what authentication enforces): {binds}"
             );
         }
         Ok(())
     }
 
-    fn declared_incarnation() -> (IdunnExpectedIncarnationRecord, IdunnRuntimeActivationRecord) {
-        let expected = IdunnExpectedIncarnationRecord {
-            schema_version: cultnet_rs::IDUNN_EXPECTED_INCARNATION_SCHEMA.into(),
-            target: "odin".into(),
-            plan_id: sha256_id(b"plan"),
-            incarnation_id: "incarnation-1".into(),
-            sealed_release_id: sha256_id(b"release"),
-            source_repository: "github.com/GameCult/Odin".into(),
-            source_revision: "0".repeat(40),
-            recipe_sha256: sha256_id(b"recipe"),
-            runtime_id: "odin-daemon".into(),
-            expected_signer_identity_id: "odin-provider".into(),
-            health_contract: "runtime-presence-health-v2".into(),
-            artifact_sha256: sha256_id(b"artifact"),
-            state_schema_generation: None,
-            state_contract_sha256: None,
-            write_lease_required: false,
-            route: None,
-            capabilities: Vec::new(),
-            dependencies: Vec::new(),
-        };
-        let activation = IdunnRuntimeActivationRecord {
-            schema_version: cultnet_rs::IDUNN_RUNTIME_ACTIVATION_SCHEMA.into(),
-            expected_projection_sha256: expected
-                .canonical_sha256()
-                .expect("Expected projection digests"),
-            runtime_id: "odin-daemon".into(),
-            runtime_instance_id: "instance-1".into(),
-            activation_signer_identity_id: "odin-activation".into(),
-            activation_signer_public_key: vec![1; 32],
-            issued_at_unix_millis: 100,
-            idunn_signer_identity_id: "idunn".into(),
-            signature_algorithm: "ed25519".into(),
-            signature: Vec::new(),
-        };
-        (expected, activation)
+    /// A real signing chain for topology gates. Until this existed no test in
+    /// this file could construct a signed Odin correlation -- every topology
+    /// fixture was `vec![byte]` -- so every gate between Idunn and Odin was
+    /// asserted against bytes that could not be authenticated. That is how a
+    /// comparison against Idunn's own wall clock survived in the admission
+    /// path. Modelled on `odin-daemon`'s TestWorld, which already had to build
+    /// this chain to test the other side of the same contract.
+    struct TopologyFixture {
+        _temp: TempDir,
+        idunn_anchor: ServiceIdentityTrustAnchor,
+        odin_signer: ServiceIdentitySigner<OdinTopologyIdentity>,
+        provider_public_key: Vec<u8>,
+        expected: IdunnExpectedIncarnationRecord,
+        activation: IdunnRuntimeActivationRecord,
     }
 
-    fn correlation_for(
-        expected: &IdunnExpectedIncarnationRecord,
-        activation: &IdunnRuntimeActivationRecord,
-        sequence: u64,
-    ) -> OdinRuntimeTopologyCorrelationRecord {
-        let mut record = correlation(
-            &expected.target,
-            &expected.canonical_sha256().expect("Expected projection digests"),
-            Some(&activation.runtime_instance_id),
-            sequence,
-        );
-        record.runtime_id = expected.runtime_id.clone();
-        record
-    }
+    impl TopologyFixture {
+        fn new(target: &str) -> Result<Self> {
+            let temp = TempDir::new()?;
+            let root = temp.path().join("identities");
+            std::fs::create_dir_all(&root)?;
+            let idunn_signer =
+                enroll_service_identity_at::<IdunnServiceIdentity>(&root.join("idunn.cc"))?;
+            let idunn_anchor = idunn_signer.trust_anchor()?;
+            let odin_signer =
+                enroll_service_identity_at::<OdinTopologyIdentity>(&root.join("odin.cc"))?;
+            let provider_signer = enroll_service_identity_at::<GameCultProviderHealthIdentity>(
+                &root.join("provider.cc"),
+            )?;
 
-    fn correlation(
-        target: &str,
-        projection_sha256: &str,
-        instance: Option<&str>,
-        sequence: u64,
-    ) -> OdinRuntimeTopologyCorrelationRecord {
-        OdinRuntimeTopologyCorrelationRecord {
-            schema_version: cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into(),
-            target: target.into(),
-            expected_projection_sha256: projection_sha256.into(),
-            expected: true,
-            current_activation_sha256: None,
-            signed_presence_sha256: None,
-            observed_presence_state: Some("active".into()),
-            observed_presence_publisher_sequence: Some(sequence),
-            observed_write_lease_sha256: None,
-            observed_capabilities: Vec::new(),
-            runtime_id: "runtime".into(),
-            runtime_instance_id: instance.map(str::to_owned),
-            present: true,
-            ready: true,
-            dependencies: Vec::new(),
-            disagreements: Vec::new(),
-            signer_identity_id: "odin-signer".into(),
-            publisher_sequence: sequence,
-            observed_at_unix_millis: 100,
-            signature_algorithm: "ed25519".into(),
-            signature: Vec::new(),
+            let expected = IdunnExpectedIncarnationRecord {
+                schema_version: cultnet_rs::IDUNN_EXPECTED_INCARNATION_SCHEMA.into(),
+                target: target.into(),
+                plan_id: sha256_id(b"plan"),
+                incarnation_id: format!("{target}/generation-1"),
+                sealed_release_id: sha256_id(b"release"),
+                source_repository: format!("github.com/GameCult/{target}"),
+                source_revision: "3".repeat(40),
+                recipe_sha256: sha256_id(b"recipe"),
+                runtime_id: format!("{target}-runtime"),
+                expected_signer_identity_id: provider_signer.entry().identity_id.clone(),
+                health_contract: format!("{target}.runtime-health.v1"),
+                artifact_sha256: sha256_id(b"artifact"),
+                state_schema_generation: None,
+                state_contract_sha256: None,
+                write_lease_required: false,
+                route: None,
+                capabilities: Vec::new(),
+                dependencies: Vec::new(),
+            };
+            expected.validate()?;
+
+            // Idunn-signed, exactly as the real activation path issues it: the
+            // authority chain is what makes a correlation authenticable at all.
+            let launch = IdunnRuntimeActivationLaunch::issue(
+                &expected,
+                sha256_id(b"artifact-witness"),
+                NOW - 20,
+                &idunn_signer,
+            )?;
+            let activation = launch.activation().clone();
+
+            Ok(Self {
+                _temp: temp,
+                idunn_anchor,
+                odin_signer,
+                provider_public_key: provider_signer.entry().public_key.clone(),
+                expected,
+                activation,
+            })
+        }
+
+        fn authority(&self) -> Result<cultnet_rs::VerifiedRuntimeAuthority> {
+            verify_runtime_authority(
+                &self.expected,
+                &self.activation,
+                &self.idunn_anchor,
+                &self.provider_public_key,
+            )
+        }
+
+        fn correlation(&self, sequence: u64, ready: bool) -> Result<OdinRuntimeTopologyCorrelationRecord> {
+            Ok(OdinRuntimeTopologyCorrelationRecord {
+                schema_version: cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into(),
+                target: self.expected.target.clone(),
+                expected_projection_sha256: self.expected.canonical_sha256()?,
+                expected: true,
+                current_activation_sha256: Some(self.activation.canonical_sha256()?),
+                signed_presence_sha256: Some(sha256_id(b"presence")),
+                observed_presence_state: Some("active".into()),
+                observed_presence_publisher_sequence: Some(sequence),
+                observed_write_lease_sha256: None,
+                observed_capabilities: Vec::new(),
+                runtime_id: self.expected.runtime_id.clone(),
+                runtime_instance_id: Some(self.activation.runtime_instance_id.clone()),
+                present: true,
+                ready,
+                dependencies: Vec::new(),
+                disagreements: Vec::new(),
+                signer_identity_id: self.odin_signer.entry().identity_id.clone(),
+                publisher_sequence: sequence,
+                observed_at_unix_millis: NOW,
+                signature_algorithm: "ed25519".into(),
+                signature: Vec::new(),
+            })
+        }
+
+        fn sign(&self, record: &mut OdinRuntimeTopologyCorrelationRecord) -> Result<Vec<u8>> {
+            record.signature = self
+                .odin_signer
+                .sign::<OdinRuntimeTopologyCorrelationPurpose>(&record.unsigned_signature_payload()?)
+                .signature;
+            record.canonical_bytes()
+        }
+
+        fn authenticate(
+            &self,
+            canonical: &[u8],
+        ) -> Result<cultnet_rs::AuthenticatedOdinRuntimeTopologyCorrelation> {
+            authenticate_odin_runtime_topology_correlation(
+                canonical,
+                &self.authority()?,
+                None,
+                &self.odin_signer.entry().public_key,
+                OdinTopologyAuthenticationContext {
+                    trusted_received_at_unix_millis: NOW,
+                    maximum_age_millis: DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS,
+                    maximum_future_skew_millis: DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS,
+                },
+            )
         }
     }
 
     #[test]
-    fn a_provider_that_keeps_publishing_after_ready_is_admitted() -> Result<()> {
-        // The shape that wedged odin on yggdrasil: the receipt sat at sequence
-        // 3841 while the cursor ran to 297765, same incarnation, candidate
-        // serving. Admission asks about the declared incarnation, so the
-        // cursor's distance from the receipt is not a question it can fail.
-        let (expected, activation) = declared_incarnation();
-        let observed = correlation_for(&expected, &activation, 297_765);
-        observation_describes_declared_incarnation(&observed, &expected, &activation)?;
+    fn the_fixture_actually_authenticates() -> Result<()> {
+        // First: prove the chain can REFUSE. Without this the tests below
+        // establish nothing -- a fixture that authenticates anything would
+        // make every gate look satisfied.
+        let world = TopologyFixture::new("odin")?;
+        let mut record = world.correlation(297_765, true)?;
+        let canonical = world.sign(&mut record)?;
+        world.authenticate(&canonical)?;
+
+        // Re-encoded with the old signature over changed content.
+        let mut forged = record.clone();
+        forged.publisher_sequence = 297_766;
+        assert!(world.authenticate(&forged.canonical_bytes()?).is_err());
+
+        let mut unsigned = world.correlation(297_765, true)?;
+        unsigned.signature = vec![0; 64];
+        assert!(world.authenticate(&unsigned.canonical_bytes()?).is_err());
+
+        // Stale beyond the trusted observation window.
+        let mut old = world.correlation(297_765, true)?;
+        old.observed_at_unix_millis = NOW - DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS - 1;
+        let old_canonical = world.sign(&mut old)?;
+        assert!(world.authenticate(&old_canonical).is_err());
         Ok(())
     }
 
     #[test]
-    fn an_observation_of_another_incarnation_is_refused() -> Result<()> {
-        let (expected, activation) = declared_incarnation();
+    fn a_signed_observation_far_past_the_receipt_admits_this_incarnation() -> Result<()> {
+        // The yggdrasil wedge, with a real signature rather than vec![byte]:
+        // the cursor has run hundreds of thousands of sequences past the Ready
+        // receipt and still describes the incarnation the transaction declared.
+        let world = TopologyFixture::new("odin")?;
+        let mut record = world.correlation(501_713, true)?;
+        let canonical = world.sign(&mut record)?;
+        let authenticated = world.authenticate(&canonical)?;
 
-        // Restarted underneath us: the projection still matches, the process
-        // does not. This is the failure the old gate caught by accident and
-        // the replacement must catch on purpose.
-        let mut restarted = correlation_for(&expected, &activation, 297_765);
-        restarted.runtime_instance_id = Some("another-instance".into());
-        assert!(observation_describes_declared_incarnation(&restarted, &expected, &activation).is_err());
+        // Authenticating at all is the incarnation check: the authority is
+        // built from the declared expected and activation, and the correlation
+        // had to bind both to get here. Nothing further to compare.
+        assert!(is_semantic_ready(&authenticated));
+        assert_eq!(authenticated.record().publisher_sequence, 501_713);
+        Ok(())
+    }
 
-        // Redeployed underneath us: a different Expected projection entirely.
-        let mut reprojected = correlation_for(&expected, &activation, 297_765);
-        reprojected.expected_projection_sha256 = "sha256-something-else".into();
-        assert!(observation_describes_declared_incarnation(&reprojected, &expected, &activation).is_err());
+    #[test]
+    fn authentication_binds_a_correlation_to_the_declared_incarnation() -> Result<()> {
+        // The failure that matters: Odin's signature is valid and the record is
+        // fresh, but the process it describes is not the one we activated.
+        // Authentication already refuses this -- the authority is built from
+        // this transaction's own expected and activation, and the correlation
+        // must bind both. Pinned here because a redundant identity gate sat on
+        // top of this for want of a test that could reach it.
+        let world = TopologyFixture::new("odin")?;
+        let mut restarted = world.correlation(501_713, true)?;
+        restarted.runtime_instance_id = Some(sha256_id(b"another-instance"));
+        let canonical = world.sign(&mut restarted)?;
+        let error = world
+            .authenticate(&canonical)
+            .expect_err("correlation must bind the current activation");
+        assert!(
+            format!("{error:#}").contains("does not bind the current activation"),
+            "{error:#}"
+        );
 
-        // Another target's correlation is never this target's evidence.
-        let mut stranger = correlation_for(&expected, &activation, 297_765);
-        stranger.target = "ghostlight".into();
-        assert!(observation_describes_declared_incarnation(&stranger, &expected, &activation).is_err());
+        // Same for a correlation about another Expected projection: the
+        // authority carries this transaction's declaration, so a correlation
+        // that is not about it cannot authenticate against it.
+        let mut reprojected = world.correlation(501_714, true)?;
+        reprojected.expected_projection_sha256 = sha256_id(b"another-projection");
+        let canonical = world.sign(&mut reprojected)?;
+        assert!(world.authenticate(&canonical).is_err());
+        Ok(())
+    }
 
-        // An absent instance id must not read as a match for a present one.
-        let mut anonymous = correlation_for(&expected, &activation, 297_765);
-        anonymous.runtime_instance_id = None;
-        assert!(observation_describes_declared_incarnation(&anonymous, &expected, &activation).is_err());
+    #[test]
+    fn a_signed_observation_that_is_not_ready_does_not_admit() -> Result<()> {
+        let world = TopologyFixture::new("odin")?;
+        let mut degraded = world.correlation(501_713, false)?;
+        let canonical = world.sign(&mut degraded)?;
+        assert!(!is_semantic_ready(&world.authenticate(&canonical)?));
+
+        // Ready alongside a disagreement is not merely "not ready" -- the
+        // correlation contract refuses to encode it at all, so a publisher
+        // cannot assert readiness over its own dissent. Worth pinning: it is
+        // why is_semantic_ready's disagreement clause is belt to the schema's
+        // braces rather than the only thing standing there.
+        let mut disputed = world.correlation(501_714, true)?;
+        disputed.disagreements.push(OdinTopologyDisagreement {
+            code: "route-membership-differs".into(),
+            expected: Some("a".into()),
+            observed: Some("b".into()),
+        });
+        assert!(world.sign(&mut disputed).is_err());
         Ok(())
     }
 
