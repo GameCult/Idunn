@@ -6690,6 +6690,144 @@ fn apply_identity(command: &mut Command, identity: Option<ProcessIdentity>) -> R
 mod tests {
     use super::*;
 
+    /// Admission audit, claim 3: `is_permanently_stopped` now lets the
+    /// Isolation gate skip `prove_isolation` against the incumbent. Enumerate
+    /// what it answers `true` for, using a fake `systemctl show` that replays
+    /// whatever unit state the test writes. The states that matter are the
+    /// transitional ones -- a restarting, activating, or briefly inactive unit
+    /// must read as NOT permanently stopped -- and a systemctl failure must be
+    /// an error, never a quiet "stopped".
+    #[cfg(unix)]
+    #[test]
+    fn is_permanently_stopped_only_for_failed_or_forgotten_units() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let systemctl = temp.path().join("systemctl");
+        let state = temp.path().join("systemctl.state");
+        let fail = temp.path().join("systemctl.fail");
+        std::fs::write(
+            &systemctl,
+            "#!/bin/sh\nif [ \"$1\" != \"show\" ]; then exit 64; fi\ncat \"$0.state\"\nif [ -e \"$0.fail\" ]; then exit 1; fi\nexit 0\n",
+        )?;
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))?;
+        let driver = SystemdTransientWorkloadDriver {
+            systemctl_program: systemctl,
+            ..Default::default()
+        };
+        let observation = audit_workload_observation("no");
+
+        let show = |load: &str, active: &str, sub: &str| -> String {
+            format!("LoadState={load}\nActiveState={active}\nSubState={sub}\nInvocationID=inv\nDescription=Idunn test\n")
+        };
+        for (active, sub) in [
+            ("active", "running"),
+            ("activating", "start"),
+            ("activating", "auto-restart"),
+            ("deactivating", "stop-sigterm"),
+            ("deactivating", "final-sigterm"),
+            ("inactive", "dead"),
+            ("reloading", "reload"),
+        ] {
+            std::fs::write(&state, show("loaded", active, sub))?;
+            assert!(
+                !driver.is_permanently_stopped(&observation)?,
+                "ActiveState={active} SubState={sub} must not read as permanently stopped"
+            );
+        }
+
+        std::fs::write(&state, show("loaded", "failed", "failed"))?;
+        assert!(driver.is_permanently_stopped(&observation)?, "failed is permanent under Restart=no");
+
+        // systemd has no such unit: `systemctl show` exits 0 with not-found.
+        std::fs::write(&state, show("not-found", "inactive", "dead"))?;
+        assert!(driver.is_permanently_stopped(&observation)?, "a forgotten unit cannot restart");
+
+        // A systemctl failure with no properties is an error, not "stopped".
+        std::fs::write(&state, "")?;
+        std::fs::write(&fail, "")?;
+        assert!(
+            driver.is_permanently_stopped(&observation).is_err(),
+            "a systemctl failure must not be read as a stopped incumbent"
+        );
+        std::fs::remove_file(&fail)?;
+
+        // A failure that still printed properties (systemctl exited non-zero
+        // after output) is also an error.
+        std::fs::write(&state, show("loaded", "failed", "failed"))?;
+        std::fs::write(&fail, "")?;
+        assert!(driver.is_permanently_stopped(&observation).is_err());
+        std::fs::remove_file(&fail)?;
+
+        // The recorded policy is asked before systemd is: any incumbent whose
+        // observation carries another Restart policy makes the Isolation gate
+        // error out (pre-fencing abort), whatever systemd says.
+        std::fs::write(&state, show("loaded", "failed", "failed"))?;
+        let restarting = audit_workload_observation("always");
+        let error = driver
+            .is_permanently_stopped(&restarting)
+            .expect_err("Restart=always incumbent must not be judged stopped");
+        assert!(format!("{error:#}").contains("Restart=no"), "{error:#}");
+        Ok(())
+    }
+
+    fn audit_workload_observation(restart_policy: &str) -> WorkloadObservation {
+        let uid = 61_000u32;
+        WorkloadObservation {
+            unit: format!("idunn-{}.service", "a".repeat(64)),
+            unit_description: "Idunn test".into(),
+            invocation_id: "inv".into(),
+            exec_main_start_timestamp_monotonic: 1,
+            service_type: "exec".into(),
+            restart_policy: restart_policy.into(),
+            kill_mode: "mixed".into(),
+            dynamic_user: true,
+            systemd_user: format!("u{uid}"),
+            systemd_group: format!("u{uid}"),
+            supplementary_groups: String::new(),
+            capability_bounding_set: String::new(),
+            ambient_capabilities: String::new(),
+            private_mounts: true,
+            private_pids: true,
+            protect_proc: "invisible".into(),
+            proc_subset: "all".into(),
+            no_new_privileges: true,
+            umask: "0007".into(),
+            inaccessible_paths: String::new(),
+            load_credential: String::new(),
+            main_pid: 4242,
+            process_start_time: 1,
+            process_uids: [uid; 4],
+            process_gids: [uid; 4],
+            process_groups: vec![uid],
+            process_cap_inheritable: 0,
+            process_cap_permitted: 0,
+            process_cap_effective: 0,
+            process_cap_bounding: 0,
+            process_cap_ambient: 0,
+            process_no_new_privileges: true,
+            process_namespace_pids: vec![1],
+            mount_namespace_id: 7,
+            pid_namespace_id: 8,
+            executable: PathBuf::from("/opt/test/bin/service"),
+            executable_device: 1,
+            executable_inode: 1,
+            executable_sha256: format!("sha256-{}", "1".repeat(64)),
+            runtime_instance_id: format!("sha256-{}", "a".repeat(64)),
+            working_directory: PathBuf::from("/opt/test"),
+            runtime_bundle: PathBuf::from("/run/test"),
+            command_line_sha256: format!("sha256-{}", "2".repeat(64)),
+            environment_names: Vec::new(),
+            environment_contract_sha256: format!("sha256-{}", "3".repeat(64)),
+            control_group: "/system.slice/idunn-test.service".into(),
+            credentials_directory: None,
+            parent_only_file_descriptors: Vec::new(),
+            activation_signer_identity_id: "activation".into(),
+            activation_signer_public_key: vec![1; 32],
+            service_credentials: Vec::new(),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_published_projection_is_readable_by_a_workload() {

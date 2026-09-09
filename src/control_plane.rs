@@ -6225,6 +6225,276 @@ mod tests {
         Ok(())
     }
 
+    // ---------------------------------------------------------------------
+    // Admission audit (soul/admission-audit). Each test below is a negative
+    // check on one claim made by c09993c..8448f83; none asserts that the
+    // happy path works, the tests above already do that.
+    // ---------------------------------------------------------------------
+
+    impl TopologyFixture {
+        /// Authenticate with an explicit trusted time, against this fixture's
+        /// own authority and Odin key. Mirrors `rehydrate_ready_token`'s two
+        /// callers: `now` when require_current, `admitted_at` otherwise.
+        fn authenticate_at(
+            &self,
+            canonical: &[u8],
+            trusted_received_at_unix_millis: u64,
+        ) -> Result<cultnet_rs::AuthenticatedOdinRuntimeTopologyCorrelation> {
+            authenticate_odin_runtime_topology_correlation(
+                canonical,
+                &self.authority()?,
+                None,
+                &self.odin_signer.entry().public_key,
+                OdinTopologyAuthenticationContext {
+                    trusted_received_at_unix_millis,
+                    maximum_age_millis: DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS,
+                    maximum_future_skew_millis: DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS,
+                },
+            )
+        }
+    }
+
+    /// Claim 1: deleting `observation_describes_declared_incarnation` opened
+    /// nothing because authentication binds the same identity. The strongest
+    /// attack is a correlation that is internally perfect for ANOTHER
+    /// incarnation of the same target -- its own projection, its own activation
+    /// digest, its own instance id -- signed by OUR admitted Odin, so the only
+    /// thing left to refuse it is the incarnation binding itself.
+    #[test]
+    fn a_perfect_correlation_about_another_incarnation_of_this_target_is_refused() -> Result<()> {
+        let ours = TopologyFixture::new("odin")?;
+        let theirs = TopologyFixture::new("odin")?;
+        assert_ne!(
+            ours.expected.canonical_sha256()?,
+            theirs.expected.canonical_sha256()?,
+            "fixtures must declare distinct incarnations for this test to mean anything"
+        );
+        // Sanity: it is a real, Ready correlation for the other incarnation.
+        let mut genuine = theirs.correlation(501_713, true)?;
+        let genuine = theirs.sign(&mut genuine)?;
+        assert!(is_semantic_ready(&theirs.authenticate(&genuine)?));
+
+        let mut record = theirs.correlation(501_713, true)?;
+        let canonical = ours.sign(&mut record)?;
+        let error = ours
+            .authenticate(&canonical)
+            .expect_err("another incarnation's correlation must not authenticate against ours");
+        assert!(
+            format!("{error:#}").contains("substitutes or omits Expected authority"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    /// Claim 1, second face: same Expected, different activation. This is the
+    /// case the deleted gate could not see at all -- it compared instance ids
+    /// only -- and the one that matters when a process is re-activated under
+    /// the same projection. Authentication compares the activation digest.
+    #[test]
+    fn a_correlation_bound_to_another_activation_of_the_same_expected_is_refused() -> Result<()> {
+        let world = TopologyFixture::new("odin")?;
+        let other = TopologyFixture::new("odin")?;
+
+        let mut reactivated = world.correlation(501_713, true)?;
+        reactivated.current_activation_sha256 = Some(other.activation.canonical_sha256()?);
+        let canonical = world.sign(&mut reactivated)?;
+        let error = world
+            .authenticate(&canonical)
+            .expect_err("activation digest must bind");
+        assert!(
+            format!("{error:#}").contains("does not bind the current activation"),
+            "{error:#}"
+        );
+
+        let mut anonymous = world.correlation(501_714, true)?;
+        anonymous.current_activation_sha256 = None;
+        let canonical = world.sign(&mut anonymous)?;
+        assert!(
+            world.authenticate(&canonical).is_err(),
+            "absent activation must not read as ours"
+        );
+
+        let mut nameless = world.correlation(501_715, true)?;
+        nameless.runtime_instance_id = None;
+        let canonical = world.sign(&mut nameless)?;
+        assert!(
+            world.authenticate(&canonical).is_err(),
+            "absent instance id must not read as ours"
+        );
+        Ok(())
+    }
+
+    /// Claim 1, third face: the deleted gate also compared `target`. The
+    /// projection digest already covers the target, but a record can carry a
+    /// foreign `target` field beside our projection digest; prove
+    /// `validate_against_expected` refuses that on its own.
+    #[test]
+    fn a_correlation_naming_another_target_beside_our_projection_is_refused() -> Result<()> {
+        let world = TopologyFixture::new("odin")?;
+        let mut stranger = world.correlation(501_713, true)?;
+        stranger.target = "ghostlight".into();
+        let canonical = world.sign(&mut stranger)?;
+        let error = world.authenticate(&canonical).expect_err("target must bind");
+        assert!(
+            format!("{error:#}").contains("substitutes or omits Expected authority"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    /// Claim 4: the fixture's chain can refuse at every link, not only at the
+    /// correlation signature. If any of these passed, the tests above would be
+    /// asserting against a rubber stamp.
+    #[test]
+    fn the_fixture_chain_refuses_at_every_link() -> Result<()> {
+        let ours = TopologyFixture::new("odin")?;
+        let theirs = TopologyFixture::new("odin")?;
+
+        // Authority link: activation must bind this Expected ...
+        assert!(
+            verify_runtime_authority(
+                &ours.expected,
+                &theirs.activation,
+                &ours.idunn_anchor,
+                &ours.provider_public_key
+            )
+            .is_err(),
+            "another incarnation's activation verified against our Expected"
+        );
+        // ... be signed by the Idunn we trust ...
+        assert!(
+            verify_runtime_authority(
+                &ours.expected,
+                &ours.activation,
+                &theirs.idunn_anchor,
+                &ours.provider_public_key
+            )
+            .is_err(),
+            "activation verified against a foreign Idunn anchor"
+        );
+        // ... and name the provider key the Expected selected.
+        assert!(
+            verify_runtime_authority(
+                &ours.expected,
+                &ours.activation,
+                &ours.idunn_anchor,
+                &theirs.provider_public_key
+            )
+            .is_err(),
+            "a foreign provider key was accepted as the Expected signer"
+        );
+
+        // Odin link: a correlation signed by another Odin identity.
+        let mut record = ours.correlation(501_713, true)?;
+        let canonical = theirs.sign(&mut record)?;
+        let error = ours
+            .authenticate(&canonical)
+            .expect_err("foreign Odin signer accepted");
+        assert!(
+            format!("{error:#}").contains("names a different identity"),
+            "{error:#}"
+        );
+
+        // Odin link: our identity id, their signature bytes.
+        let mut record = ours.correlation(501_713, true)?;
+        record.signature = theirs
+            .odin_signer
+            .sign::<OdinRuntimeTopologyCorrelationPurpose>(&record.unsigned_signature_payload()?)
+            .signature;
+        let error = ours
+            .authenticate(&record.canonical_bytes()?)
+            .expect_err("forged signature accepted");
+        assert!(
+            format!("{error:#}").contains("signature verification failed"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    /// Claim 2: `rehydrate_ready_token(.., require_current = false)` replays the
+    /// receipt's authentication at its own `admitted_at`, so the window it
+    /// widens is exactly the one the receipt already passed at admission. Pin
+    /// both halves: at `admitted_at` the receipt authenticates however old it
+    /// is now; at `now` past the window it does not. An `admitted_at` earlier
+    /// than the observation is refused by the future-skew bound, so the field
+    /// cannot be pulled backwards to launder a later observation either.
+    #[test]
+    fn a_durable_receipt_replays_at_its_admission_time_and_not_at_now() -> Result<()> {
+        let world = TopologyFixture::new("odin")?;
+        let mut record = world.correlation(3_841, true)?;
+        let canonical = world.sign(&mut record)?;
+        let admitted_at = NOW + 5;
+
+        world.authenticate_at(&canonical, admitted_at)?;
+        let much_later = admitted_at + DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS + 1;
+        assert!(
+            world.authenticate_at(&canonical, much_later).is_err(),
+            "require_current would refuse"
+        );
+        world.authenticate_at(&canonical, admitted_at)?;
+
+        let before_observation = NOW - DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS - 1;
+        assert!(
+            world.authenticate_at(&canonical, before_observation).is_err(),
+            "an admitted_at earlier than the observation must not authenticate"
+        );
+        Ok(())
+    }
+
+    /// Claim 5 companion: what the live store holds, not only whether the
+    /// stuck record would commit. Run with:
+    ///   IDUNN_LIVE_CONTROL=/path/to/control.cc cargo test live_store_inventory -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_store_inventory() -> Result<()> {
+        let Ok(path) = std::env::var("IDUNN_LIVE_CONTROL") else {
+            eprintln!("IDUNN_LIVE_CONTROL unset");
+            return Ok(());
+        };
+        let snapshot = ControlSnapshot::read(Path::new(&path))?;
+        println!(
+            "INVENTORY commands={} transactions={} admitted={}",
+            snapshot.commands.len(),
+            snapshot.transactions.len(),
+            snapshot.admitted.len()
+        );
+        for stored in &snapshot.transactions {
+            let value = &stored.value;
+            println!(
+                "TX {} target={} kind={:?} phase={:?} complete={} ready_seq={:?} latest_seq={:?} incumbent={:?}",
+                value.transaction_id,
+                value.target,
+                value.command_kind,
+                value.phase,
+                value.completion.is_some(),
+                value.ready.as_ref().map(|evidence| evidence.publisher_sequence),
+                value
+                    .latest_odin_observation
+                    .as_ref()
+                    .map(|evidence| evidence.publisher_sequence),
+                value.incumbent_generation_id,
+            );
+        }
+        for stored in &snapshot.admitted {
+            let value = &stored.value;
+            println!(
+                "ADMITTED target={} generation={} tx={} admitted_at={} ready_seq={} ready_admitted_at={} latest_seq={} latest_admitted_at={} instance={} unit={} restart={}",
+                value.target,
+                value.generation_id,
+                value.transaction_id,
+                value.admitted_at_unix_millis,
+                value.ready.publisher_sequence,
+                value.ready.admitted_at_unix_millis,
+                value.latest_odin_observation.publisher_sequence,
+                value.latest_odin_observation.admitted_at_unix_millis,
+                value.activation.runtime_instance_id,
+                value.workload.unit,
+                value.workload.restart_policy,
+            );
+        }
+        Ok(())
+    }
+
     fn topology(sequence: u64, byte: u8) -> TopologyEvidence {
         let canonical_bytes = vec![byte];
         TopologyEvidence {
