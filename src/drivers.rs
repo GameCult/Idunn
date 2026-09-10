@@ -3494,6 +3494,66 @@ impl CultCacheTopologyDriver {
         )
     }
 
+    /// Every incarnation currently projected for one target, by its Expected.
+    pub fn projected_incarnations(
+        &self,
+        target: &str,
+    ) -> Result<Vec<IdunnExpectedIncarnationRecord>> {
+        let mut incarnations = Vec::new();
+        for envelope in self.snapshot()? {
+            if envelope.r#type != IdunnExpectedIncarnationRecord::TYPE {
+                continue;
+            }
+            let Some((owner, _)) = envelope.key.split_once('@') else {
+                continue;
+            };
+            if owner != target {
+                continue;
+            }
+            if envelope.schema_id.as_deref() != Some(IDUNN_EXPECTED_INCARNATION_SCHEMA) {
+                continue;
+            }
+            let expected = IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)?;
+            if incarnation_key(&expected)? == envelope.key {
+                incarnations.push(expected);
+            }
+        }
+        Ok(incarnations)
+    }
+
+    /// Remove everything projected under one incarnation that nothing owns any
+    /// more: not the admitted generation, not a live transaction. The caller
+    /// has established that; no record under the key is compared, because a
+    /// stale incarnation is stale whatever it carries. The target's anchor
+    /// stays while any other incarnation of the target remains.
+    pub fn withdraw_stale_incarnation(
+        &self,
+        expected: &IdunnExpectedIncarnationRecord,
+        provider_anchor: &ServiceIdentityTrustAnchor,
+    ) -> Result<()> {
+        expected.validate()?;
+        let anchor = runtime_presence_trust_anchor(expected, provider_anchor)?;
+        let key = incarnation_key(expected)?;
+        self.mutate(|entries| {
+            if !entries.iter().any(|envelope| envelope.key == key) {
+                return Ok(None);
+            }
+            let anchor_stays = Self::other_incarnations_of(entries, &expected.target, &key);
+            Ok(Some(
+                entries
+                    .iter()
+                    .filter(|envelope| {
+                        !(envelope.key == key
+                            || (!anchor_stays
+                                && envelope.r#type == GameCultServiceTrustAnchorRecord::TYPE
+                                && envelope.key == anchor.trust_anchor_id))
+                    })
+                    .cloned()
+                    .collect(),
+            ))
+        })
+    }
+
     /// Whether the projection already carries this Expected and its anchor.
     /// Deliberately says nothing about the activation.
     pub fn admitted_expected_projection_is_exact(
@@ -7599,6 +7659,50 @@ mod tests {
             );
             assert_eq!(fs::read(&driver.projection_store)?, before);
         }
+        Ok(())
+    }
+
+    /// A replaced incarnation nothing owns is withdrawn whole; the one still
+    /// admitted, and the target's anchor, are untouched.
+    #[test]
+    fn a_stale_incarnation_is_withdrawn_whole_beside_the_admitted_one() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (admitted, activation, warming, provider_anchor) = authenticated_warming(temp.path())?;
+        let lease = lease(&admitted, &activation, &warming);
+        let driver = topology_driver(temp.path(), "stale");
+        let mut stale = admitted.clone();
+        stale.plan_id = digest('a');
+        stale.incarnation_id = "stale-incarnation".into();
+        stale.sealed_release_id = digest('b');
+        stale.artifact_sha256 = digest('c');
+        let mut stale_activation = activation.clone();
+        stale_activation.expected_projection_sha256 = stale.canonical_sha256()?;
+        stale_activation.runtime_instance_id = digest('d');
+        driver.publish_expected(&stale, &provider_anchor)?;
+        project_activation(&driver, &stale, &stale_activation)?;
+        driver.publish_expected(&admitted, &provider_anchor)?;
+        project_activation(&driver, &admitted, &activation)?;
+        driver.publish_process_write_lease(&admitted, &activation, &lease)?;
+
+        let mut projected = driver.projected_incarnations(&admitted.target)?;
+        projected.sort_by_key(|expected| expected.incarnation_id.clone());
+        assert_eq!(projected.len(), 2);
+        assert!(projected.contains(&stale) && projected.contains(&admitted));
+
+        driver.withdraw_stale_incarnation(&stale, &provider_anchor)?;
+        assert_eq!(
+            driver.projected_incarnations(&admitted.target)?,
+            vec![admitted.clone()]
+        );
+        assert!(driver.admitted_runtime_projection_is_exact(
+            &admitted,
+            &provider_anchor,
+            &activation,
+            Some(&lease),
+        )?);
+        let idempotent = fs::read(&driver.projection_store)?;
+        driver.withdraw_stale_incarnation(&stale, &provider_anchor)?;
+        assert_eq!(fs::read(&driver.projection_store)?, idempotent);
         Ok(())
     }
 

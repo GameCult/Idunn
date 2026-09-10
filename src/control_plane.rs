@@ -3190,6 +3190,17 @@ impl Engine {
                     current.value.target
                 ),
             }
+            match self.retire_stale_incarnations(&snapshot, current) {
+                Ok(true) => {
+                    progressed = true;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "Idunn preserved a stale {} incarnation projection: {error:#}",
+                    current.value.target
+                ),
+            }
             // Restore the admitted Expected before anything is asked of the
             // workload, and only the Expected.
             //
@@ -4880,6 +4891,46 @@ impl Engine {
                 required(&transaction.workload, "candidate workload")?,
             )
             .map(|_| ())
+    }
+
+    /// Withdraw one projected incarnation of this target that nothing owns:
+    /// not the admitted generation, not any live transaction. A replaced
+    /// incumbent, an aborted candidate whose reconciliation was skipped, or a
+    /// record left by the projection migration all end here. One per tick;
+    /// the projection is a shared file and each withdrawal is one CAS.
+    fn retire_stale_incarnations(
+        &self,
+        snapshot: &ControlSnapshot,
+        current: &Stored<AdmittedGeneration>,
+    ) -> Result<bool> {
+        let topology = self.topology();
+        let target = current.value.target.as_str();
+        let owned = snapshot
+            .transactions
+            .iter()
+            .filter(|stored| stored.value.target == target && !stored.value.is_terminal())
+            .filter_map(|stored| stored.value.expected.as_ref())
+            .map(IdunnExpectedIncarnationRecord::canonical_sha256)
+            .collect::<Result<BTreeSet<_>>>()?;
+        let admitted_sha256 = current.value.expected.canonical_sha256()?;
+        let Some(stale) = topology
+            .projected_incarnations(target)?
+            .into_iter()
+            .find(|expected| {
+                expected
+                    .canonical_sha256()
+                    .is_ok_and(|sha256| sha256 != admitted_sha256 && !owned.contains(&sha256))
+            })
+        else {
+            return Ok(false);
+        };
+        let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
+        topology.withdraw_stale_incarnation(&stale, &provider_anchor)?;
+        eprintln!(
+            "Idunn withdrew stale {} incarnation {} from the projection",
+            target, stale.incarnation_id
+        );
+        Ok(true)
     }
 
     /// The lifecycle brake as it applies to restarting one admitted
