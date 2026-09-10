@@ -3190,21 +3190,30 @@ impl Engine {
             // Counted against this generation id, so a successful restart --
             // which admits a new generation -- starts the count over rather
             // than carrying old failures forward.
+            // Failed restarts retire to history the moment they finish, so
+            // the count must read history: counting only the live set found
+            // zero every time and restarted a release that could not start
+            // forever, which is the loop the give-up exists to end.
+            let is_refused_restart = |transaction: &DeploymentTransaction| {
+                transaction.target == current.value.target
+                    && transaction.command_kind == CommandKind::Continuity
+                    && transaction.incumbent_generation_id.as_deref()
+                        == Some(current.value.generation_id.as_str())
+                    && matches!(
+                        transaction.completion,
+                        Some(TransactionCompletion::FailedBeforeFencing { .. })
+                            | Some(TransactionCompletion::FailedAfterFencing { .. })
+                    )
+            };
             let refused_restarts = snapshot
                 .transactions
                 .iter()
-                .filter(|stored| {
-                    stored.value.target == current.value.target
-                        && stored.value.command_kind == CommandKind::Continuity
-                        && stored.value.incumbent_generation_id.as_deref()
-                            == Some(current.value.generation_id.as_str())
-                        && matches!(
-                            stored.value.completion,
-                            Some(TransactionCompletion::FailedBeforeFencing { .. })
-                                | Some(TransactionCompletion::FailedAfterFencing { .. })
-                        )
-                })
-                .count();
+                .filter(|stored| is_refused_restart(&stored.value))
+                .count()
+                + read_history_transactions(&self.options.state_store)
+                    .iter()
+                    .filter(|transaction| is_refused_restart(transaction))
+                    .count();
 
             if let Some(blocker) = blocker {
                 // Yielding a *deployment* to continuity is right: the incumbent
