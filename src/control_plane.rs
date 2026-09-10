@@ -3853,10 +3853,19 @@ impl Engine {
             // bootstrap case -- "observed through Odin" is not available -- and
             // it stays scoped to this one target. Every other target keeps
             // waiting for Odin, which is what makes Odin the root of the chain.
-            let odin_can_observe = current.value.target != "odin"
-                || (snapshot.admitted_for("odin").is_some()
-                    && current.value.command_kind != CommandKind::Continuity
-                    && self.admit_latest_topology(current, None)?.is_some());
+            //
+            // Asked once. Admitting the latest topology persists the sequence
+            // cursor, so asking twice with the same record fails the second
+            // time as "transaction changed before topology admission".
+            let odin_observation = if current.value.target == "odin"
+                && snapshot.admitted_for("odin").is_some()
+                && current.value.command_kind != CommandKind::Continuity
+            {
+                self.admit_latest_topology(current, None)?
+            } else {
+                None
+            };
+            let odin_can_observe = current.value.target != "odin" || odin_observation.is_some();
             let odin_observes_itself = current.value.target == "odin" && !odin_can_observe;
             if odin_observes_itself {
                 ensure!(
@@ -3874,7 +3883,11 @@ impl Engine {
                     Ok(())
                 });
             }
-            let Some((admitted, authenticated)) = self.admit_latest_topology(current, None)? else {
+            let observation = match odin_observation {
+                Some(observation) => Some(observation),
+                None => self.admit_latest_topology(current, None)?,
+            };
+            let Some((admitted, authenticated)) = observation else {
                 // Only the first-Odin bootstrap above observes presence
                 // directly. Every other target's warming presence arrives as
                 // Odin's authenticated runtime topology correlation, so until
