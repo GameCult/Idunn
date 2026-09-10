@@ -314,7 +314,9 @@ pub trait TopologyPort {
         expected: &IdunnExpectedIncarnationRecord,
         provider_anchor: &ServiceIdentityTrustAnchor,
     ) -> Result<String>;
-    fn withdraw_expected(
+    /// Remove every record of one incarnation. Other incarnations of the same
+    /// target, and the target's anchor while any remain, are untouched.
+    fn withdraw_incarnation(
         &self,
         expected: &IdunnExpectedIncarnationRecord,
         provider_anchor: &ServiceIdentityTrustAnchor,
@@ -339,12 +341,20 @@ pub trait TopologyPort {
         activation: &IdunnRuntimeActivationRecord,
         lease: Option<&IdunnProcessWriteLeaseRecord>,
     ) -> Result<()>;
-    fn receive(&self, target: &str) -> Result<Option<ReceivedOdinTopologyCorrelation>>;
+    /// Odin's correlation for one exact incarnation. A correlation about another
+    /// incarnation of the same target is not this one's evidence and is never
+    /// returned for it.
+    fn receive(
+        &self,
+        target: &str,
+        expected_sha256: &str,
+    ) -> Result<Option<ReceivedOdinTopologyCorrelation>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceivedOdinTopologyCorrelation {
     pub target: String,
+    pub expected_sha256: String,
     pub canonical_bytes: Vec<u8>,
 }
 
@@ -2487,7 +2497,10 @@ impl SystemdTransientWorkloadDriver {
                 observation.load_credential == expected_load_credential,
                 "load credential",
             ),
-            (observation.working_directory == installed, "working directory"),
+            (
+                observation.working_directory == installed,
+                "working directory",
+            ),
             (observation.runtime_bundle == bundle, "runtime bundle"),
             (
                 observation.credentials_directory == expected_credentials_directory,
@@ -3219,203 +3232,288 @@ impl WriteLeasePort for CultCacheWriteLeaseDriver {
 /// Idunn projects desired identity plus its own activation and current-lease
 /// facts here. Service presence is absent by construction; only Odin may
 /// correlate these records with signed runtime observation into Present/Ready.
+///
+/// Every record is keyed by the incarnation it describes, never by the target
+/// alone. A target being replaced has two incarnations at once -- the admitted
+/// incumbent and the sealed candidate -- and both are projected side by side.
+/// Publishing the candidate therefore cannot touch what the incumbent is; the
+/// one target-keyed record is the runtime presence trust anchor, which is
+/// provider lookup material and the same for every incarnation.
 pub struct CultCacheTopologyDriver {
     pub projection_store: PathBuf,
     pub correlation_store: PathBuf,
 }
 
-impl CultCacheTopologyDriver {
-    /// Atomically demotes a failed pre-fence candidate back to the admitted
-    /// generation's Expected projection. Runtime activation and write-lease
-    /// records are deliberately absent until admitted-body supervision proves
-    /// the physical process and lease again.
-    pub fn restore_admitted_expected_only(
-        &self,
-        failed_expected: &IdunnExpectedIncarnationRecord,
-        failed_provider_anchor: &ServiceIdentityTrustAnchor,
-        failed_activation: Option<&IdunnRuntimeActivationRecord>,
-        admitted_expected: &IdunnExpectedIncarnationRecord,
-        admitted_provider_anchor: &ServiceIdentityTrustAnchor,
-        admitted_activation: &IdunnRuntimeActivationRecord,
-        admitted_lease: Option<&IdunnProcessWriteLeaseRecord>,
-    ) -> Result<String> {
-        failed_expected.validate()?;
-        admitted_expected.validate()?;
-        ensure!(
-            failed_expected.target == admitted_expected.target,
-            "projection restoration crosses deployment targets"
-        );
-        let failed_anchor = runtime_presence_trust_anchor(failed_expected, failed_provider_anchor)?;
-        let admitted_anchor =
-            runtime_presence_trust_anchor(admitted_expected, admitted_provider_anchor)?;
-        if let Some(activation) = failed_activation {
-            activation.validate()?;
+/// The key one incarnation's projection records live under.
+///
+/// This is a contract with Odin's reader (`IncarnationRef::key` in
+/// `odin-daemon`): `{target}@{expected projection sha256}`.
+pub fn incarnation_key(expected: &IdunnExpectedIncarnationRecord) -> Result<String> {
+    Ok(incarnation_key_of(
+        &expected.target,
+        &expected.canonical_sha256()?,
+    ))
+}
+
+pub fn incarnation_key_of(target: &str, expected_sha256: &str) -> String {
+    format!("{target}@{expected_sha256}")
+}
+
+/// The three record types that belong to one incarnation.
+fn is_incarnation_record_type(record_type: &str) -> bool {
+    matches!(
+        record_type,
+        IdunnExpectedIncarnationRecord::TYPE
+            | IdunnRuntimeActivationRecord::TYPE
+            | IdunnProcessWriteLeaseRecord::TYPE
+    )
+}
+
+/// One incarnation's records as currently projected, each checked to be the
+/// exact document the caller names. A record present under the key but
+/// differing from the caller's is a substitution and is refused.
+struct ProjectedIncarnation {
+    expected: Option<CultCacheEnvelope>,
+    activation: Option<CultCacheEnvelope>,
+    lease: Option<CultCacheEnvelope>,
+}
+
+impl ProjectedIncarnation {
+    fn read(
+        entries: &[CultCacheEnvelope],
+        expected: &IdunnExpectedIncarnationRecord,
+        activation: Option<&IdunnRuntimeActivationRecord>,
+        lease: Option<&IdunnProcessWriteLeaseRecord>,
+    ) -> Result<Self> {
+        let key = incarnation_key(expected)?;
+        let projected_expected =
+            projection_entry(entries, IdunnExpectedIncarnationRecord::TYPE, &key)?;
+        if let Some(envelope) = projected_expected {
             ensure!(
-                activation.expected_projection_sha256 == failed_expected.canonical_sha256()?,
-                "failed activation does not bind the failed Expected projection"
+                envelope.schema_id.as_deref() == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA)
+                    && IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)?
+                        == *expected,
+                "projected Expected under this incarnation key is substituted"
             );
         }
-        admitted_activation.validate()?;
-        ensure!(
-            admitted_activation.expected_projection_sha256
-                == admitted_expected.canonical_sha256()?,
-            "admitted activation does not bind the admitted Expected projection"
-        );
-        if let Some(lease) = admitted_lease {
-            validate_topology_lease(admitted_expected, admitted_activation, lease)?;
+        let projected_activation =
+            projection_entry(entries, IdunnRuntimeActivationRecord::TYPE, &key)?;
+        if let Some(envelope) = projected_activation {
+            let current = IdunnRuntimeActivationRecord::decode_canonical(&envelope.payload)?;
+            ensure!(
+                envelope.schema_id.as_deref() == Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA)
+                    && activation == Some(&current),
+                "projected activation under this incarnation key is substituted"
+            );
         }
+        let projected_lease = projection_entry(entries, IdunnProcessWriteLeaseRecord::TYPE, &key)?;
+        if let Some(envelope) = projected_lease {
+            let current = IdunnProcessWriteLeaseRecord::decode_canonical(&envelope.payload)?;
+            ensure!(
+                envelope.schema_id.as_deref() == Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA)
+                    && lease == Some(&current),
+                "projected write lease under this incarnation key is substituted"
+            );
+        }
+        Ok(Self {
+            expected: projected_expected.cloned(),
+            activation: projected_activation.cloned(),
+            lease: projected_lease.cloned(),
+        })
+    }
+}
+
+fn expected_envelope(expected: &IdunnExpectedIncarnationRecord) -> Result<CultCacheEnvelope> {
+    Ok(CultCacheEnvelope {
+        key: incarnation_key(expected)?,
+        r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
+        payload: expected.canonical_bytes()?,
+        stored_at: chrono::Utc::now().to_rfc3339(),
+        schema_id: Some(IDUNN_EXPECTED_INCARNATION_SCHEMA.into()),
+    })
+}
+
+fn anchor_envelope(anchor: &GameCultServiceTrustAnchorRecord) -> Result<CultCacheEnvelope> {
+    Ok(CultCacheEnvelope {
+        key: anchor.trust_anchor_id.clone(),
+        r#type: GameCultServiceTrustAnchorRecord::TYPE.into(),
+        payload: rmp_serde::to_vec(anchor)?,
+        stored_at: rfc3339_millis(anchor.bound_at_unix_millis)?,
+        schema_id: Some(GAMECULT_SERVICE_TRUST_ANCHOR_SCHEMA.into()),
+    })
+}
+
+fn activation_envelope(
+    key: &str,
+    activation: &IdunnRuntimeActivationRecord,
+) -> Result<CultCacheEnvelope> {
+    Ok(CultCacheEnvelope {
+        key: key.to_owned(),
+        r#type: IdunnRuntimeActivationRecord::TYPE.into(),
+        payload: activation.canonical_bytes()?,
+        stored_at: rfc3339_millis(activation.issued_at_unix_millis)?,
+        schema_id: Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA.into()),
+    })
+}
+
+/// Same-content envelopes compare equal regardless of `stored_at`, which is
+/// a publication timestamp and not part of the record's identity.
+fn same_record(current: &CultCacheEnvelope, replacement: &CultCacheEnvelope) -> bool {
+    current.key == replacement.key
+        && current.r#type == replacement.r#type
+        && current.schema_id == replacement.schema_id
+        && current.payload == replacement.payload
+}
+
+impl CultCacheTopologyDriver {
+    fn snapshot(&self) -> Result<Vec<CultCacheEnvelope>> {
+        if !self.projection_store.exists() {
+            return Ok(Vec::new());
+        }
+        SingleFileMessagePackBackingStore::new(&self.projection_store).pull_all_read_only_snapshot()
+    }
+
+    /// Apply one whole-snapshot mutation with compare-and-swap. `mutate`
+    /// returns `None` when the snapshot already has the shape it wants, and
+    /// the replacement set otherwise; every writer below is one of these.
+    fn mutate<F>(&self, mutate: F) -> Result<()>
+    where
+        F: Fn(&[CultCacheEnvelope]) -> Result<Option<Vec<CultCacheEnvelope>>>,
+    {
         if let Some(parent) = self.projection_store.parent() {
             fs::create_dir_all(parent)?;
         }
         let store = SingleFileMessagePackBackingStore::new(&self.projection_store);
-        let target = admitted_expected.target.as_str();
-        let anchor_key = runtime_presence_trust_anchor_id(target);
         for _ in 0..8 {
-            let entries = store.pull_all_read_only_snapshot()?;
-            let current_expected =
-                projection_entry(&entries, IdunnExpectedIncarnationRecord::TYPE, target)?;
-            if let Some(envelope) = current_expected {
-                ensure!(
-                    envelope.schema_id.as_deref() == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA),
-                    "restored Expected projection schema is foreign"
-                );
-                let current = IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)?;
-                ensure!(
-                    current == *failed_expected || current == *admitted_expected,
-                    "refusing to replace an unknown Expected projection"
-                );
+            let entries = self.snapshot()?;
+            let Some(replacement) = mutate(&entries)? else {
+                return Ok(());
+            };
+            if store.compare_exchange_snapshot(&entries, &replacement)? {
+                publish_projection_mode(&self.projection_store)?;
+                return Ok(());
             }
+        }
+        bail!("CultCache projection changed repeatedly during publication")
+    }
+
+    fn other_incarnations_of(entries: &[CultCacheEnvelope], target: &str, key: &str) -> bool {
+        entries.iter().any(|envelope| {
+            envelope.r#type == IdunnExpectedIncarnationRecord::TYPE
+                && envelope.key != key
+                && envelope
+                    .key
+                    .split_once('@')
+                    .is_some_and(|(owner, _)| owner == target)
+        })
+    }
+
+    /// Records this contract does not own: the three incarnation types keyed by
+    /// the bare target, as the previous single-slot projection wrote them. A
+    /// publish for that target retires them; nothing reads them.
+    fn is_legacy_slot_record(envelope: &CultCacheEnvelope, target: &str) -> bool {
+        is_incarnation_record_type(&envelope.r#type) && envelope.key == target
+    }
+
+    /// Demote one admitted incarnation to Expected-only. Its activation and
+    /// write lease are withdrawn; its Expected and anchor are ensured present.
+    /// This is for an incarnation whose process is gone -- continuity about
+    /// to restart it, or an abort that already fenced and stopped it -- and
+    /// says nothing about any other incarnation of the target.
+    pub fn demote_to_expected_only(
+        &self,
+        expected: &IdunnExpectedIncarnationRecord,
+        provider_anchor: &ServiceIdentityTrustAnchor,
+        activation: &IdunnRuntimeActivationRecord,
+        lease: Option<&IdunnProcessWriteLeaseRecord>,
+    ) -> Result<String> {
+        expected.validate()?;
+        activation.validate()?;
+        ensure!(
+            activation.expected_projection_sha256 == expected.canonical_sha256()?,
+            "admitted activation does not bind the admitted Expected projection"
+        );
+        if let Some(lease) = lease {
+            validate_topology_lease(expected, activation, lease)?;
+        }
+        let anchor = runtime_presence_trust_anchor(expected, provider_anchor)?;
+        let key = incarnation_key(expected)?;
+        self.mutate(|entries| {
+            let projected = ProjectedIncarnation::read(entries, expected, Some(activation), lease)?;
             let current_anchor = projection_entry(
-                &entries,
+                entries,
                 GameCultServiceTrustAnchorRecord::TYPE,
-                &anchor_key,
+                &anchor.trust_anchor_id,
             )?;
             if let Some(envelope) = current_anchor {
-                let current = service_trust_anchor_from_envelope(envelope)?;
                 ensure!(
-                    current == failed_anchor || current == admitted_anchor,
+                    service_trust_anchor_from_envelope(envelope)? == anchor,
                     "refusing to replace an unknown runtime presence trust anchor"
                 );
             }
-            let current_activation =
-                projection_entry(&entries, IdunnRuntimeActivationRecord::TYPE, target)?;
-            if let Some(envelope) = current_activation {
-                ensure!(
-                    envelope.schema_id.as_deref() == Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA),
-                    "restored activation projection schema is foreign"
-                );
-                let current = IdunnRuntimeActivationRecord::decode_canonical(&envelope.payload)?;
-                ensure!(
-                    failed_activation == Some(&current) || admitted_activation == &current,
-                    "refusing to remove an unknown runtime activation projection"
-                );
-            }
-            let current_lease =
-                projection_entry(&entries, IdunnProcessWriteLeaseRecord::TYPE, target)?;
-            if let Some(envelope) = current_lease {
-                ensure!(
-                    envelope.schema_id.as_deref() == Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA),
-                    "restored write-lease projection schema is foreign"
-                );
-                let current = IdunnProcessWriteLeaseRecord::decode_canonical(&envelope.payload)?;
-                ensure!(
-                    admitted_lease == Some(&current),
-                    "refusing to remove an unknown process write-lease projection"
-                );
-            }
-            if current_expected.is_some_and(|envelope| {
-                IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)
-                    .is_ok_and(|current| current == *admitted_expected)
-            }) && current_anchor.is_some_and(|envelope| {
-                service_trust_anchor_from_envelope(envelope)
-                    .is_ok_and(|current| current == admitted_anchor)
-            }) && current_activation.is_none()
-                && current_lease.is_none()
+            if projected.expected.is_some()
+                && current_anchor.is_some()
+                && projected.activation.is_none()
+                && projected.lease.is_none()
             {
-                return admitted_expected.canonical_sha256();
+                return Ok(None);
             }
             let mut replacement = entries
                 .iter()
                 .filter(|envelope| {
-                    !((envelope.key == target
-                        && matches!(
-                            envelope.r#type.as_str(),
-                            IdunnExpectedIncarnationRecord::TYPE
-                                | IdunnRuntimeActivationRecord::TYPE
-                                | IdunnProcessWriteLeaseRecord::TYPE
-                        ))
-                        || (envelope.key == anchor_key
-                            && envelope.r#type == GameCultServiceTrustAnchorRecord::TYPE))
+                    !(envelope.key == key
+                        || (envelope.r#type == GameCultServiceTrustAnchorRecord::TYPE
+                            && envelope.key == anchor.trust_anchor_id))
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            replacement.extend([
-                CultCacheEnvelope {
-                    key: admitted_expected.target.clone(),
-                    r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
-                    payload: admitted_expected.canonical_bytes()?,
-                    stored_at: chrono::Utc::now().to_rfc3339(),
-                    schema_id: Some(IDUNN_EXPECTED_INCARNATION_SCHEMA.into()),
-                },
-                CultCacheEnvelope {
-                    key: admitted_anchor.trust_anchor_id.clone(),
-                    r#type: GameCultServiceTrustAnchorRecord::TYPE.into(),
-                    payload: rmp_serde::to_vec(&admitted_anchor)?,
-                    stored_at: rfc3339_millis(admitted_anchor.bound_at_unix_millis)?,
-                    schema_id: Some(GAMECULT_SERVICE_TRUST_ANCHOR_SCHEMA.into()),
-                },
-            ]);
-            if store.compare_exchange_snapshot(&entries, &replacement)? {
-                publish_projection_mode(&self.projection_store)?;
-                return admitted_expected.canonical_sha256();
-            }
-        }
-        bail!("topology projection changed repeatedly during admitted restoration")
+            replacement.push(match projected.expected {
+                Some(envelope) => envelope,
+                None => expected_envelope(expected)?,
+            });
+            replacement.push(match current_anchor {
+                Some(envelope) => envelope.clone(),
+                None => anchor_envelope(&anchor)?,
+            });
+            Ok(Some(replacement))
+        })?;
+        expected.canonical_sha256()
     }
 
-    /// Whether the projection currently names any activation for this target.
-    ///
-    /// Continuity asks so it can tell a projection that still describes a dead
-    /// incarnation from one that has already been demoted to Expected-only.
-    pub fn projected_activation_is_present(&self, target: &str) -> Result<bool> {
-        if !self.projection_store.exists() {
-            return Ok(false);
-        }
-        let entries = SingleFileMessagePackBackingStore::new(&self.projection_store)
-            .pull_all_read_only_snapshot()?;
-        Ok(projection_entry(&entries, IdunnRuntimeActivationRecord::TYPE, target)?.is_some())
+    /// Whether the projection currently names an activation for this
+    /// incarnation. Continuity asks so it can tell a projection that still
+    /// describes a dead incarnation from one already demoted to Expected-only.
+    pub fn projected_activation_is_present(
+        &self,
+        expected: &IdunnExpectedIncarnationRecord,
+    ) -> Result<bool> {
+        let key = incarnation_key(expected)?;
+        Ok(
+            projection_entry(&self.snapshot()?, IdunnRuntimeActivationRecord::TYPE, &key)?
+                .is_some(),
+        )
     }
 
-    /// Whether the projection already carries this admitted Expected.
-    ///
-    /// Deliberately says nothing about the activation. Continuity restores the
-    /// Expected for a target whose process is gone, and at that moment there is
-    /// no activation to be exact about -- the next one is issued when the
-    /// workload starts.
+    /// Whether the projection already carries this Expected and its anchor.
+    /// Deliberately says nothing about the activation.
     pub fn admitted_expected_projection_is_exact(
         &self,
         expected: &IdunnExpectedIncarnationRecord,
         provider_anchor: &ServiceIdentityTrustAnchor,
     ) -> Result<bool> {
         expected.validate()?;
-        if !self.projection_store.exists() {
-            return Ok(false);
-        }
-        let entries = SingleFileMessagePackBackingStore::new(&self.projection_store)
-            .pull_all_read_only_snapshot()?;
+        let entries = self.snapshot()?;
         let anchor = runtime_presence_trust_anchor(expected, provider_anchor)?;
-        let expected_is_exact = match projection_entry(
-            &entries,
-            IdunnExpectedIncarnationRecord::TYPE,
-            &expected.target,
-        )? {
-            Some(envelope) => {
-                envelope.schema_id.as_deref() == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA)
-                    && IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)?
-                        == *expected
-            }
-            None => false,
-        };
+        let key = incarnation_key(expected)?;
+        let expected_is_exact =
+            match projection_entry(&entries, IdunnExpectedIncarnationRecord::TYPE, &key)? {
+                Some(envelope) => {
+                    envelope.schema_id.as_deref() == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA)
+                        && IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)?
+                            == *expected
+                }
+                None => false,
+            };
         let anchor_is_exact = match projection_entry(
             &entries,
             GameCultServiceTrustAnchorRecord::TYPE,
@@ -3443,31 +3541,10 @@ impl CultCacheTopologyDriver {
         if let Some(lease) = lease {
             validate_topology_lease(expected, activation, lease)?;
         }
-        if !self.projection_store.exists() {
-            return Ok(false);
-        }
-        let entries = SingleFileMessagePackBackingStore::new(&self.projection_store)
-            .pull_all_read_only_snapshot()?;
+        let entries = self.snapshot()?;
         let anchor = runtime_presence_trust_anchor(expected, provider_anchor)?;
-        let expected_is_exact = match projection_entry(
-            &entries,
-            IdunnExpectedIncarnationRecord::TYPE,
-            &expected.target,
-        )? {
-            Some(envelope) => {
-                ensure!(
-                    envelope.schema_id.as_deref() == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA),
-                    "admitted Expected projection schema is foreign"
-                );
-                ensure!(
-                    IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)?
-                        == *expected,
-                    "admitted Expected projection was replaced by another incarnation"
-                );
-                true
-            }
-            None => false,
-        };
+        let projected = ProjectedIncarnation::read(&entries, expected, Some(activation), lease)
+            .context("admitted runtime projection was replaced")?;
         let anchor_is_exact = match projection_entry(
             &entries,
             GameCultServiceTrustAnchorRecord::TYPE,
@@ -3482,45 +3559,10 @@ impl CultCacheTopologyDriver {
             }
             None => false,
         };
-        let activation_is_exact = match projection_entry(
-            &entries,
-            IdunnRuntimeActivationRecord::TYPE,
-            &expected.target,
-        )? {
-            Some(envelope) => {
-                ensure!(
-                    envelope.schema_id.as_deref() == Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA),
-                    "admitted activation projection schema is foreign"
-                );
-                ensure!(
-                    IdunnRuntimeActivationRecord::decode_canonical(&envelope.payload)?
-                        == *activation,
-                    "admitted activation projection was replaced"
-                );
-                true
-            }
-            None => false,
-        };
-        let lease_is_exact = match projection_entry(
-            &entries,
-            IdunnProcessWriteLeaseRecord::TYPE,
-            &expected.target,
-        )? {
-            Some(envelope) => {
-                ensure!(
-                    envelope.schema_id.as_deref() == Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA),
-                    "admitted write-lease projection schema is foreign"
-                );
-                let current = IdunnProcessWriteLeaseRecord::decode_canonical(&envelope.payload)?;
-                ensure!(
-                    lease == Some(&current),
-                    "admitted write-lease projection was replaced"
-                );
-                true
-            }
-            None => lease.is_none(),
-        };
-        Ok(expected_is_exact && anchor_is_exact && activation_is_exact && lease_is_exact)
+        Ok(projected.expected.is_some()
+            && anchor_is_exact
+            && projected.activation.is_some()
+            && projected.lease.is_some() == lease.is_some())
     }
 }
 
@@ -3617,47 +3659,6 @@ fn service_trust_anchor_from_envelope(
     Ok(anchor)
 }
 
-fn replace_records_atomically(path: &Path, replacements: &[CultCacheEnvelope]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    ensure!(
-        replacements.iter().enumerate().all(|(index, entry)| {
-            replacements[index + 1..].iter().all(|other| {
-                (entry.r#type.as_str(), entry.key.as_str())
-                    != (other.r#type.as_str(), other.key.as_str())
-            })
-        }),
-        "atomic projection set contains a duplicate identity"
-    );
-    let store = SingleFileMessagePackBackingStore::new(path);
-    for _ in 0..8 {
-        let entries = store.pull_all_read_only_snapshot()?;
-        let conditions = replacements
-            .iter()
-            .map(|replacement| {
-                Ok(CultCacheExpectedEnvelope {
-                    r#type: replacement.r#type.clone(),
-                    key: replacement.key.clone(),
-                    current: projection_entry(&entries, &replacement.r#type, &replacement.key)?
-                        .cloned(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if conditions
-            .iter()
-            .zip(replacements)
-            .all(|(condition, replacement)| condition.current.as_ref() == Some(replacement))
-        {
-            return Ok(());
-        }
-        if store.compare_exchange(&conditions, replacements)? {
-            return Ok(());
-        }
-    }
-    bail!("CultCache projection changed too often to publish atomic set")
-}
-
 fn projection_entry<'a>(
     entries: &'a [CultCacheEnvelope],
     r#type: &str,
@@ -3674,101 +3675,6 @@ fn projection_entry<'a>(
     Ok(current)
 }
 
-fn insert_exact_process_lease(
-    path: &Path,
-    expected: &IdunnExpectedIncarnationRecord,
-    activation: &IdunnRuntimeActivationRecord,
-    replacement: CultCacheEnvelope,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let store = SingleFileMessagePackBackingStore::new(path);
-    for _ in 0..8 {
-        let entries = store.pull_all_read_only_snapshot()?;
-        let projected_expected = projection_entry(
-            &entries,
-            IdunnExpectedIncarnationRecord::TYPE,
-            &expected.target,
-        )?
-        .context("process write lease has no current Expected projection")?;
-        ensure!(
-            projected_expected.schema_id.as_deref() == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA)
-                && IdunnExpectedIncarnationRecord::decode_canonical(&projected_expected.payload)?
-                    == *expected,
-            "process write lease current Expected projection is substituted"
-        );
-        let projected_activation = projection_entry(
-            &entries,
-            IdunnRuntimeActivationRecord::TYPE,
-            &expected.target,
-        )?
-        .context("process write lease has no observed activation projection")?;
-        ensure!(
-            projected_activation.schema_id.as_deref() == Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA)
-                && IdunnRuntimeActivationRecord::decode_canonical(&projected_activation.payload)?
-                    == *activation,
-            "process write lease observed activation projection is substituted"
-        );
-        let projected_anchor = service_trust_anchor_from_envelope(
-            projection_entry(
-                &entries,
-                GameCultServiceTrustAnchorRecord::TYPE,
-                &runtime_presence_trust_anchor_id(&expected.target),
-            )?
-            .context("process write lease has no runtime presence trust anchor")?,
-        )?;
-        ensure!(
-            projected_anchor.service_id == expected.target
-                && projected_anchor.runtime_id == expected.runtime_id
-                && projected_anchor.signer_identity_id == expected.expected_signer_identity_id
-                && projected_anchor.signing_purpose
-                    == GAMECULT_RUNTIME_PRESENCE_HEALTH_SIGNING_PURPOSE
-                && projected_anchor.signed_schema == GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
-            "process write lease runtime presence trust anchor is substituted"
-        );
-        let current = projection_entry(&entries, &replacement.r#type, &replacement.key)?;
-        if current == Some(&replacement) {
-            return Ok(());
-        }
-        ensure!(
-            current.is_none(),
-            "refusing to replace a different current process write-lease projection"
-        );
-        let conditions = [
-            CultCacheExpectedEnvelope {
-                r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
-                key: expected.target.clone(),
-                current: Some(projected_expected.clone()),
-            },
-            CultCacheExpectedEnvelope {
-                r#type: IdunnRuntimeActivationRecord::TYPE.into(),
-                key: expected.target.clone(),
-                current: Some(projected_activation.clone()),
-            },
-            CultCacheExpectedEnvelope {
-                r#type: GameCultServiceTrustAnchorRecord::TYPE.into(),
-                key: runtime_presence_trust_anchor_id(&expected.target),
-                current: projection_entry(
-                    &entries,
-                    GameCultServiceTrustAnchorRecord::TYPE,
-                    &runtime_presence_trust_anchor_id(&expected.target),
-                )?
-                .cloned(),
-            },
-            CultCacheExpectedEnvelope {
-                r#type: replacement.r#type.clone(),
-                key: replacement.key.clone(),
-                current: None,
-            },
-        ];
-        if store.compare_exchange(&conditions, std::slice::from_ref(&replacement))? {
-            return Ok(());
-        }
-    }
-    bail!("CultCache projection changed too often to publish exact record")
-}
-
 impl TopologyPort for CultCacheTopologyDriver {
     fn publish_expected(
         &self,
@@ -3777,30 +3683,52 @@ impl TopologyPort for CultCacheTopologyDriver {
     ) -> Result<String> {
         expected.validate()?;
         let anchor = runtime_presence_trust_anchor(expected, provider_anchor)?;
-        replace_records_atomically(
-            &self.projection_store,
-            &[
-                CultCacheEnvelope {
-                    key: expected.target.clone(),
-                    r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
-                    payload: expected.canonical_bytes()?,
-                    stored_at: chrono::Utc::now().to_rfc3339(),
-                    schema_id: Some(IDUNN_EXPECTED_INCARNATION_SCHEMA.into()),
-                },
-                CultCacheEnvelope {
-                    key: anchor.trust_anchor_id.clone(),
-                    r#type: GameCultServiceTrustAnchorRecord::TYPE.into(),
-                    payload: rmp_serde::to_vec(&anchor)?,
-                    stored_at: rfc3339_millis(anchor.bound_at_unix_millis)?,
-                    schema_id: Some(GAMECULT_SERVICE_TRUST_ANCHOR_SCHEMA.into()),
-                },
-            ],
-        )?;
-        publish_projection_mode(&self.projection_store)?;
+        let key = incarnation_key(expected)?;
+        let target = expected.target.clone();
+        self.mutate(|entries| {
+            let expected_record = expected_envelope(expected)?;
+            let anchor_record = anchor_envelope(&anchor)?;
+            let current_expected =
+                projection_entry(entries, IdunnExpectedIncarnationRecord::TYPE, &key)?;
+            let current_anchor = projection_entry(
+                entries,
+                GameCultServiceTrustAnchorRecord::TYPE,
+                &anchor.trust_anchor_id,
+            )?;
+            let legacy = entries
+                .iter()
+                .any(|envelope| Self::is_legacy_slot_record(envelope, &target));
+            if !legacy
+                && current_expected.is_some_and(|current| same_record(current, &expected_record))
+                && current_anchor.is_some_and(|current| same_record(current, &anchor_record))
+            {
+                return Ok(None);
+            }
+            // Only the Expected and anchor records are replaced. An activation
+            // or lease already projected under this key is this incarnation's
+            // own runtime fact and is left exactly as published.
+            let mut replacement = entries
+                .iter()
+                .filter(|envelope| {
+                    !((envelope.key == key
+                        && envelope.r#type == IdunnExpectedIncarnationRecord::TYPE)
+                        || (envelope.r#type == GameCultServiceTrustAnchorRecord::TYPE
+                            && envelope.key == anchor.trust_anchor_id)
+                        || Self::is_legacy_slot_record(envelope, &target))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            replacement.push(match current_expected {
+                Some(current) if same_record(current, &expected_record) => current.clone(),
+                _ => expected_record,
+            });
+            replacement.push(anchor_record);
+            Ok(Some(replacement))
+        })?;
         expected.canonical_sha256()
     }
 
-    fn withdraw_expected(
+    fn withdraw_incarnation(
         &self,
         expected: &IdunnExpectedIncarnationRecord,
         provider_anchor: &ServiceIdentityTrustAnchor,
@@ -3824,82 +3752,41 @@ impl TopologyPort for CultCacheTopologyDriver {
                 lease,
             )?;
         }
-        if !self.projection_store.exists() {
-            return Ok(());
-        }
-        let store = SingleFileMessagePackBackingStore::new(&self.projection_store);
-        for _ in 0..8 {
-            let entries = store.pull_all_read_only_snapshot()?;
-            let mut found_expected = false;
-            let mut found_anchor = false;
-            let mut found_activation = false;
-            let mut found_lease = false;
-            let mut retained = Vec::with_capacity(entries.len());
-            for envelope in &entries {
-                if envelope.r#type == GameCultServiceTrustAnchorRecord::TYPE
-                    && envelope.key == exact_anchor.trust_anchor_id
-                {
-                    ensure!(
-                        !found_anchor
-                            && service_trust_anchor_from_envelope(envelope)? == exact_anchor,
-                        "refusing to withdraw a substituted runtime presence trust anchor"
-                    );
-                    found_anchor = true;
-                    continue;
-                }
-                if envelope.key != expected.target {
-                    retained.push(envelope.clone());
-                    continue;
-                }
-                if envelope.r#type == IdunnExpectedIncarnationRecord::TYPE {
-                    ensure!(
-                        !found_expected
-                            && envelope.schema_id.as_deref()
-                                == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA)
-                            && IdunnExpectedIncarnationRecord::decode_canonical(&envelope.payload)?
-                                == *expected,
-                        "refusing to withdraw a substituted Expected projection"
-                    );
-                    found_expected = true;
-                    continue;
-                }
-                if envelope.r#type == IdunnRuntimeActivationRecord::TYPE {
-                    let current =
-                        IdunnRuntimeActivationRecord::decode_canonical(&envelope.payload)?;
-                    ensure!(
-                        !found_activation
-                            && envelope.schema_id.as_deref()
-                                == Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA)
-                            && activation == Some(&current),
-                        "refusing to withdraw a substituted runtime activation"
-                    );
-                    found_activation = true;
-                    continue;
-                }
-                if envelope.r#type == IdunnProcessWriteLeaseRecord::TYPE {
-                    let current =
-                        IdunnProcessWriteLeaseRecord::decode_canonical(&envelope.payload)?;
-                    ensure!(
-                        !found_lease
-                            && envelope.schema_id.as_deref()
-                                == Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA)
-                            && lease == Some(&current),
-                        "refusing to withdraw a substituted process write lease"
-                    );
-                    found_lease = true;
-                    continue;
-                }
-                retained.push(envelope.clone());
+        let key = incarnation_key(expected)?;
+        self.mutate(|entries| {
+            let projected = ProjectedIncarnation::read(entries, expected, activation, lease)?;
+            let anchor_stays = Self::other_incarnations_of(entries, &expected.target, &key);
+            let current_anchor = projection_entry(
+                entries,
+                GameCultServiceTrustAnchorRecord::TYPE,
+                &exact_anchor.trust_anchor_id,
+            )?;
+            if let Some(envelope) = current_anchor {
+                ensure!(
+                    service_trust_anchor_from_envelope(envelope)? == exact_anchor,
+                    "refusing to withdraw a substituted runtime presence trust anchor"
+                );
             }
-            if !found_expected && !found_anchor && !found_activation && !found_lease {
-                return Ok(());
+            let nothing_to_remove = projected.expected.is_none()
+                && projected.activation.is_none()
+                && projected.lease.is_none()
+                && (anchor_stays || current_anchor.is_none());
+            if nothing_to_remove {
+                return Ok(None);
             }
-            if store.compare_exchange_snapshot(&entries, &retained)? {
-                publish_projection_mode(&self.projection_store)?;
-                return Ok(());
-            }
-        }
-        bail!("Expected projection changed repeatedly while withdrawing it")
+            Ok(Some(
+                entries
+                    .iter()
+                    .filter(|envelope| {
+                        !(envelope.key == key
+                            || (!anchor_stays
+                                && envelope.r#type == GameCultServiceTrustAnchorRecord::TYPE
+                                && envelope.key == exact_anchor.trust_anchor_id))
+                    })
+                    .cloned()
+                    .collect(),
+            ))
+        })
     }
 
     fn publish_observed_activation(
@@ -3916,17 +3803,38 @@ impl TopologyPort for CultCacheTopologyDriver {
                 && observation.executable_sha256 == expected.artifact_sha256,
             "observed activation does not name the Expected native process"
         );
-        upsert_record(
-            &self.projection_store,
-            CultCacheEnvelope {
-                key: expected.target.clone(),
-                r#type: IdunnRuntimeActivationRecord::TYPE.into(),
-                payload: activation.canonical_bytes()?,
-                stored_at: rfc3339_millis(activation.issued_at_unix_millis)?,
-                schema_id: Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA.into()),
-            },
-        )?;
-        publish_projection_mode(&self.projection_store)?;
+        let key = incarnation_key(expected)?;
+        self.mutate(|entries| {
+            // The Expected must be this one. A prior activation under the key
+            // is replaced without comparison: every launch is issued a fresh
+            // one, and the observation just made is the authority on which is
+            // current.
+            let projected_expected =
+                projection_entry(entries, IdunnExpectedIncarnationRecord::TYPE, &key)?
+                    .context("observed activation has no current Expected projection")?;
+            ensure!(
+                projected_expected.schema_id.as_deref() == Some(IDUNN_EXPECTED_INCARNATION_SCHEMA)
+                    && IdunnExpectedIncarnationRecord::decode_canonical(
+                        &projected_expected.payload
+                    )? == *expected,
+                "observed activation's Expected projection is substituted"
+            );
+            let record = activation_envelope(&key, activation)?;
+            if projection_entry(entries, IdunnRuntimeActivationRecord::TYPE, &key)?
+                .is_some_and(|current| same_record(current, &record))
+            {
+                return Ok(None);
+            }
+            let mut replacement = entries
+                .iter()
+                .filter(|envelope| {
+                    !(envelope.key == key && envelope.r#type == IdunnRuntimeActivationRecord::TYPE)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            replacement.push(record);
+            Ok(Some(replacement))
+        })?;
         activation.canonical_sha256()
     }
 
@@ -3937,19 +3845,45 @@ impl TopologyPort for CultCacheTopologyDriver {
         lease: &IdunnProcessWriteLeaseRecord,
     ) -> Result<String> {
         validate_topology_lease(expected, activation, lease)?;
-        insert_exact_process_lease(
-            &self.projection_store,
-            expected,
-            activation,
-            CultCacheEnvelope {
-                key: expected.target.clone(),
+        let key = incarnation_key(expected)?;
+        let anchor_id = runtime_presence_trust_anchor_id(&expected.target);
+        self.mutate(|entries| {
+            let projected =
+                ProjectedIncarnation::read(entries, expected, Some(activation), Some(lease))?;
+            ensure!(
+                projected.expected.is_some(),
+                "process write lease has no current Expected projection"
+            );
+            ensure!(
+                projected.activation.is_some(),
+                "process write lease has no observed activation projection"
+            );
+            let projected_anchor = service_trust_anchor_from_envelope(
+                projection_entry(entries, GameCultServiceTrustAnchorRecord::TYPE, &anchor_id)?
+                    .context("process write lease has no runtime presence trust anchor")?,
+            )?;
+            ensure!(
+                projected_anchor.service_id == expected.target
+                    && projected_anchor.runtime_id == expected.runtime_id
+                    && projected_anchor.signer_identity_id == expected.expected_signer_identity_id
+                    && projected_anchor.signing_purpose
+                        == GAMECULT_RUNTIME_PRESENCE_HEALTH_SIGNING_PURPOSE
+                    && projected_anchor.signed_schema == GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
+                "process write lease runtime presence trust anchor is substituted"
+            );
+            if projected.lease.is_some() {
+                return Ok(None);
+            }
+            let mut replacement = entries.to_vec();
+            replacement.push(CultCacheEnvelope {
+                key: key.clone(),
                 r#type: IdunnProcessWriteLeaseRecord::TYPE.into(),
                 payload: lease.canonical_bytes()?,
                 stored_at: rfc3339_millis(lease.issued_at_unix_millis)?,
                 schema_id: Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA.into()),
-            },
-        )?;
-        publish_projection_mode(&self.projection_store)?;
+            });
+            Ok(Some(replacement))
+        })?;
         lease.canonical_sha256()
     }
 
@@ -3964,50 +3898,42 @@ impl TopologyPort for CultCacheTopologyDriver {
         if let Some(lease) = lease {
             validate_topology_lease(expected, activation, lease)?;
         }
-        if !self.projection_store.exists() {
-            return Ok(());
-        }
-        let store = SingleFileMessagePackBackingStore::new(&self.projection_store);
-        for _ in 0..8 {
-            let entries = store.pull_all_read_only_snapshot()?;
-            let mut found = false;
-            let mut retained = Vec::with_capacity(entries.len());
-            for envelope in &entries {
-                if envelope.key != expected.target
-                    || envelope.r#type != IdunnProcessWriteLeaseRecord::TYPE
-                {
-                    retained.push(envelope.clone());
-                    continue;
-                }
-                let current = IdunnProcessWriteLeaseRecord::decode_canonical(&envelope.payload)?;
-                ensure!(
-                    !found
-                        && envelope.schema_id.as_deref() == Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA)
-                        && lease == Some(&current),
-                    "refusing to withdraw an unexpected process write-lease projection"
-                );
-                found = true;
-            }
-            if !found {
-                return Ok(());
-            }
-            if store.compare_exchange_snapshot(&entries, &retained)? {
-                publish_projection_mode(&self.projection_store)?;
-                return Ok(());
-            }
-        }
-        bail!("process write-lease projection changed repeatedly while withdrawing it")
+        let key = incarnation_key(expected)?;
+        self.mutate(|entries| {
+            let current = projection_entry(entries, IdunnProcessWriteLeaseRecord::TYPE, &key)?;
+            let Some(envelope) = current else {
+                return Ok(None);
+            };
+            let projected = IdunnProcessWriteLeaseRecord::decode_canonical(&envelope.payload)?;
+            ensure!(
+                envelope.schema_id.as_deref() == Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA)
+                    && lease == Some(&projected),
+                "refusing to withdraw an unexpected process write-lease projection"
+            );
+            Ok(Some(
+                entries
+                    .iter()
+                    .filter(|candidate| *candidate != envelope)
+                    .cloned()
+                    .collect(),
+            ))
+        })
     }
 
-    fn receive(&self, target: &str) -> Result<Option<ReceivedOdinTopologyCorrelation>> {
+    fn receive(
+        &self,
+        target: &str,
+        expected_sha256: &str,
+    ) -> Result<Option<ReceivedOdinTopologyCorrelation>> {
         require_driver_id(target, "topology target")?;
         if !self.correlation_store.exists() {
             return Ok(None);
         }
+        let key = incarnation_key_of(target, expected_sha256);
         let entries = SingleFileMessagePackBackingStore::new(&self.correlation_store)
             .pull_all_read_only_snapshot()?;
         let mut matches = entries.iter().filter(|envelope| {
-            envelope.r#type == OdinRuntimeTopologyCorrelationRecord::TYPE && envelope.key == target
+            envelope.r#type == OdinRuntimeTopologyCorrelationRecord::TYPE && envelope.key == key
         });
         let Some(envelope) = matches.next() else {
             return Ok(None);
@@ -4022,6 +3948,7 @@ impl TopologyPort for CultCacheTopologyDriver {
         );
         Ok(Some(ReceivedOdinTopologyCorrelation {
             target: target.to_owned(),
+            expected_sha256: expected_sha256.to_owned(),
             canonical_bytes: envelope.payload.clone(),
         }))
     }
@@ -6008,7 +5935,10 @@ fn remove_exact_root_owned_file(path: &Path, mode: u32) -> Result<()> {
 /// `ReadOnlyPaths=` on the bundle does not help: it binds the leaf into the
 /// unit's namespace but grants no traversal on the path above it.
 #[cfg(unix)]
-fn ensure_bundle_is_reachable_by_workload(bundle: &Path, state_group_id: Option<u32>) -> Result<()> {
+fn ensure_bundle_is_reachable_by_workload(
+    bundle: &Path,
+    state_group_id: Option<u32>,
+) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     for ancestor in bundle.ancestors().skip(1) {
@@ -6020,8 +5950,7 @@ fn ensure_bundle_is_reachable_by_workload(bundle: &Path, state_group_id: Option<
         let mode = metadata.permissions().mode();
         // The workload's uid is allocated by DynamicUser and owns nothing here,
         // so traversal can only come from the state group or from other.
-        let by_group =
-            state_group_id == Some(metadata.gid()) && mode & 0o010 != 0;
+        let by_group = state_group_id == Some(metadata.gid()) && mode & 0o010 != 0;
         ensure!(
             mode & 0o001 != 0 || by_group,
             "{} is not traversable by the workload, so the runtime bundle cannot be read;              give it o+x (0711 leaks no names) or group-own it by the state group with g+x",
@@ -6032,7 +5961,10 @@ fn ensure_bundle_is_reachable_by_workload(bundle: &Path, state_group_id: Option<
 }
 
 #[cfg(not(unix))]
-fn ensure_bundle_is_reachable_by_workload(_bundle: &Path, _state_group_id: Option<u32>) -> Result<()> {
+fn ensure_bundle_is_reachable_by_workload(
+    _bundle: &Path,
+    _state_group_id: Option<u32>,
+) -> Result<()> {
     Ok(())
 }
 
@@ -6081,8 +6013,14 @@ fn build_machine_id_file(workspace: &Path) -> Result<PathBuf> {
     let id = build_machine_id(workspace)?;
     let path = root.join(&id);
     if !path.exists() {
-        fs::write(&path, format!("{id}
-")).context("writing the build machine-id")?;
+        fs::write(
+            &path,
+            format!(
+                "{id}
+"
+            ),
+        )
+        .context("writing the build machine-id")?;
         fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444))
             .context("sealing the build machine-id")?;
     }
@@ -6718,7 +6656,9 @@ mod tests {
         let observation = audit_workload_observation("no");
 
         let show = |load: &str, active: &str, sub: &str| -> String {
-            format!("LoadState={load}\nActiveState={active}\nSubState={sub}\nInvocationID=inv\nDescription=Idunn test\n")
+            format!(
+                "LoadState={load}\nActiveState={active}\nSubState={sub}\nInvocationID=inv\nDescription=Idunn test\n"
+            )
         };
         for (active, sub) in [
             ("active", "running"),
@@ -6737,11 +6677,17 @@ mod tests {
         }
 
         std::fs::write(&state, show("loaded", "failed", "failed"))?;
-        assert!(driver.is_permanently_stopped(&observation)?, "failed is permanent under Restart=no");
+        assert!(
+            driver.is_permanently_stopped(&observation)?,
+            "failed is permanent under Restart=no"
+        );
 
         // systemd has no such unit: `systemctl show` exits 0 with not-found.
         std::fs::write(&state, show("not-found", "inactive", "dead"))?;
-        assert!(driver.is_permanently_stopped(&observation)?, "a forgotten unit cannot restart");
+        assert!(
+            driver.is_permanently_stopped(&observation)?,
+            "a forgotten unit cannot restart"
+        );
 
         // A systemctl failure with no properties is an error, not "stopped".
         std::fs::write(&state, "")?;
@@ -6843,7 +6789,10 @@ mod tests {
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o640)).unwrap();
         publish_projection_mode(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "every target must be able to read the projection");
+        assert_eq!(
+            mode, 0o644,
+            "every target must be able to read the projection"
+        );
         let lock_mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
         assert_eq!(lock_mode, 0o644, "the lock is opened alongside the store");
     }
@@ -6859,16 +6808,19 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = ensure_bundle_is_reachable_by_workload(&bundle, None).unwrap_err();
-        assert!(error.to_string().contains("not traversable by the workload"));
+        assert!(
+            error
+                .to_string()
+                .contains("not traversable by the workload")
+        );
         std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o711)).unwrap();
         ensure_bundle_is_reachable_by_workload(&bundle, None).unwrap();
         // A 0750 root group-owned by the state group is the other correct
         // shape, and is what the write-lease hardening expects: it derives the
         // record's group from this directory.
         std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let owning_group = std::os::unix::fs::MetadataExt::gid(
-            &std::fs::metadata(&runtime_root).unwrap(),
-        );
+        let owning_group =
+            std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&runtime_root).unwrap());
         ensure_bundle_is_reachable_by_workload(&bundle, Some(owning_group)).unwrap();
         assert!(ensure_bundle_is_reachable_by_workload(&bundle, Some(owning_group + 1)).is_err());
     }
@@ -6878,7 +6830,11 @@ mod tests {
         let first = build_machine_id(Path::new("/var/lib/gamecult/idunn/staging/tx-a")).unwrap();
         let second = build_machine_id(Path::new("/var/lib/gamecult/idunn/staging/tx-b")).unwrap();
         assert_eq!(first.len(), 32);
-        assert!(first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
         assert_ne!(first, second);
         assert_eq!(
             first,
@@ -7098,7 +7054,7 @@ mod tests {
         upsert_record(
             &driver.projection_store,
             CultCacheEnvelope {
-                key: expected.target.clone(),
+                key: incarnation_key(expected)?,
                 r#type: IdunnRuntimeActivationRecord::TYPE.into(),
                 payload: activation.canonical_bytes()?,
                 stored_at: rfc3339_millis(activation.issued_at_unix_millis)?,
@@ -7295,7 +7251,7 @@ mod tests {
         upsert_record(
             &correlation_store,
             CultCacheEnvelope {
-                key: "service".into(),
+                key: incarnation_key_of("service", &digest('1')),
                 r#type: OdinRuntimeTopologyCorrelationRecord::TYPE.into(),
                 payload: opaque.clone(),
                 stored_at: "2026-09-03T00:00:00Z".into(),
@@ -7307,10 +7263,12 @@ mod tests {
             correlation_store,
         };
 
+        assert_eq!(driver.receive("service", &digest('2'))?, None);
         assert_eq!(
-            driver.receive("service")?,
+            driver.receive("service", &digest('1'))?,
             Some(ReceivedOdinTopologyCorrelation {
                 target: "service".into(),
+                expected_sha256: digest('1'),
                 canonical_bytes: opaque,
             })
         );
@@ -7328,7 +7286,8 @@ mod tests {
             .pull_all_read_only_snapshot()?;
         assert_eq!(published.len(), 2);
         assert!(published.iter().any(|entry| {
-            entry.key == expected.target && entry.r#type == IdunnExpectedIncarnationRecord::TYPE
+            entry.key == incarnation_key(&expected).unwrap()
+                && entry.r#type == IdunnExpectedIncarnationRecord::TYPE
         }));
         let published_anchor = published
             .iter()
@@ -7346,7 +7305,7 @@ mod tests {
         upsert_record(
             &driver.projection_store,
             CultCacheEnvelope {
-                key: expected.target.clone(),
+                key: incarnation_key(&expected)?,
                 r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
                 payload: substituted_expected.canonical_bytes()?,
                 stored_at: "2026-09-03T00:00:00Z".into(),
@@ -7355,7 +7314,7 @@ mod tests {
         )?;
         assert!(
             driver
-                .withdraw_expected(&expected, &provider_anchor, Some(&activation), Some(&lease))
+                .withdraw_incarnation(&expected, &provider_anchor, Some(&activation), Some(&lease))
                 .is_err()
         );
         driver.publish_expected(&expected, &provider_anchor)?;
@@ -7375,7 +7334,7 @@ mod tests {
         )?;
         assert!(
             driver
-                .withdraw_expected(&expected, &provider_anchor, Some(&activation), Some(&lease))
+                .withdraw_incarnation(&expected, &provider_anchor, Some(&activation), Some(&lease))
                 .is_err()
         );
         driver.publish_expected(&expected, &provider_anchor)?;
@@ -7385,7 +7344,7 @@ mod tests {
         upsert_record(
             &driver.projection_store,
             CultCacheEnvelope {
-                key: expected.target.clone(),
+                key: incarnation_key(&expected)?,
                 r#type: IdunnRuntimeActivationRecord::TYPE.into(),
                 payload: substituted_activation.canonical_bytes()?,
                 stored_at: "2026-09-03T00:00:00Z".into(),
@@ -7394,7 +7353,7 @@ mod tests {
         )?;
         assert!(
             driver
-                .withdraw_expected(&expected, &provider_anchor, Some(&activation), None)
+                .withdraw_incarnation(&expected, &provider_anchor, Some(&activation), None)
                 .is_err()
         );
         project_activation(&driver, &expected, &activation)?;
@@ -7408,7 +7367,7 @@ mod tests {
         );
         assert!(
             driver
-                .withdraw_expected(
+                .withdraw_incarnation(
                     &expected,
                     &provider_anchor,
                     Some(&activation),
@@ -7427,12 +7386,22 @@ mod tests {
                 schema_id: Some("test.unrelated.v1".into()),
             },
         )?;
-        driver.withdraw_expected(&expected, &provider_anchor, Some(&activation), Some(&lease))?;
+        driver.withdraw_incarnation(
+            &expected,
+            &provider_anchor,
+            Some(&activation),
+            Some(&lease),
+        )?;
         let remaining = SingleFileMessagePackBackingStore::new(&driver.projection_store)
             .pull_all_read_only_snapshot()?;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].key, "unrelated");
-        driver.withdraw_expected(&expected, &provider_anchor, Some(&activation), Some(&lease))?;
+        driver.withdraw_incarnation(
+            &expected,
+            &provider_anchor,
+            Some(&activation),
+            Some(&lease),
+        )?;
         Ok(())
     }
 
@@ -7446,6 +7415,7 @@ mod tests {
         driver.publish_expected(&incumbent, &provider_anchor)?;
         project_activation(&driver, &incumbent, &activation)?;
         driver.publish_process_write_lease(&incumbent, &activation, &lease)?;
+        let incumbent_key = incarnation_key(&incumbent)?;
 
         let mut candidate = incumbent.clone();
         candidate.plan_id = digest('a');
@@ -7455,8 +7425,35 @@ mod tests {
         let mut candidate_activation = activation.clone();
         candidate_activation.expected_projection_sha256 = candidate.canonical_sha256()?;
         candidate_activation.runtime_instance_id = digest('d');
+        let candidate_key = incarnation_key(&candidate)?;
+
+        // Sealing the candidate beside the incumbent changes nothing the
+        // incumbent owns: its Expected, activation and lease are still there
+        // under its own key, byte for byte.
+        let before_candidate = SingleFileMessagePackBackingStore::new(&driver.projection_store)
+            .pull_all_read_only_snapshot()?;
         driver.publish_expected(&candidate, &provider_anchor)?;
         project_activation(&driver, &candidate, &candidate_activation)?;
+        let with_candidate = SingleFileMessagePackBackingStore::new(&driver.projection_store)
+            .pull_all_read_only_snapshot()?;
+        for envelope in &before_candidate {
+            if envelope.key == incumbent_key {
+                assert!(with_candidate.contains(envelope));
+            }
+        }
+        assert!(driver.admitted_runtime_projection_is_exact(
+            &incumbent,
+            &provider_anchor,
+            &activation,
+            Some(&lease),
+        )?);
+        assert_eq!(
+            with_candidate
+                .iter()
+                .filter(|entry| entry.r#type == IdunnExpectedIncarnationRecord::TYPE)
+                .count(),
+            2
+        );
 
         upsert_record(
             &driver.projection_store,
@@ -7469,11 +7466,36 @@ mod tests {
             },
         )?;
 
+        // A pre-fencing abort withdraws the candidate and only the candidate.
+        driver.withdraw_incarnation(
+            &candidate,
+            &provider_anchor,
+            Some(&candidate_activation),
+            None,
+        )?;
+        let after_withdrawal = SingleFileMessagePackBackingStore::new(&driver.projection_store)
+            .pull_all_read_only_snapshot()?;
+        assert!(
+            after_withdrawal
+                .iter()
+                .all(|entry| entry.key != candidate_key)
+        );
+        assert!(driver.admitted_runtime_projection_is_exact(
+            &incumbent,
+            &provider_anchor,
+            &activation,
+            Some(&lease),
+        )?);
+        assert!(
+            after_withdrawal
+                .iter()
+                .any(|entry| entry.r#type == GameCultServiceTrustAnchorRecord::TYPE)
+        );
+
+        // Demotion is for an incumbent whose process is gone: activation and
+        // lease go, Expected and anchor stay.
         assert_eq!(
-            driver.restore_admitted_expected_only(
-                &candidate,
-                &provider_anchor,
-                Some(&candidate_activation),
+            driver.demote_to_expected_only(
                 &incumbent,
                 &provider_anchor,
                 &activation,
@@ -7481,7 +7503,6 @@ mod tests {
             )?,
             incumbent.canonical_sha256()?
         );
-
         let restored = SingleFileMessagePackBackingStore::new(&driver.projection_store)
             .pull_all_read_only_snapshot()?;
         assert_eq!(restored.len(), 3);
@@ -7515,18 +7536,13 @@ mod tests {
                 .iter()
                 .any(|entry| entry.key == "unrelated" && entry.r#type == "test.unrelated")
         );
+        assert!(!driver.projected_activation_is_present(&incumbent)?);
         let idempotent_bytes = fs::read(&driver.projection_store)?;
-        driver.restore_admitted_expected_only(
-            &candidate,
-            &provider_anchor,
-            Some(&candidate_activation),
-            &incumbent,
-            &provider_anchor,
-            &activation,
-            Some(&lease),
-        )?;
+        driver.demote_to_expected_only(&incumbent, &provider_anchor, &activation, Some(&lease))?;
         assert_eq!(fs::read(&driver.projection_store)?, idempotent_bytes);
 
+        // A record under the incumbent's key that is not the incumbent's is a
+        // substitution; demotion refuses it and leaves the store as found.
         let admitted_anchor = runtime_presence_trust_anchor(&incumbent, &provider_anchor)?;
         let mut unknown_expected = incumbent.clone();
         unknown_expected.incarnation_id = "unknown-incarnation".into();
@@ -7539,7 +7555,7 @@ mod tests {
         unknown_lease.lease_epoch += 1;
         let substitutions = [
             CultCacheEnvelope {
-                key: incumbent.target.clone(),
+                key: incumbent_key.clone(),
                 r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
                 payload: unknown_expected.canonical_bytes()?,
                 stored_at: "2026-09-03T00:00:00Z".into(),
@@ -7553,14 +7569,14 @@ mod tests {
                 schema_id: Some(GAMECULT_SERVICE_TRUST_ANCHOR_SCHEMA.into()),
             },
             CultCacheEnvelope {
-                key: incumbent.target.clone(),
+                key: incumbent_key.clone(),
                 r#type: IdunnRuntimeActivationRecord::TYPE.into(),
                 payload: unknown_activation.canonical_bytes()?,
                 stored_at: "2026-09-03T00:00:00Z".into(),
                 schema_id: Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA.into()),
             },
             CultCacheEnvelope {
-                key: incumbent.target.clone(),
+                key: incumbent_key.clone(),
                 r#type: IdunnProcessWriteLeaseRecord::TYPE.into(),
                 payload: unknown_lease.canonical_bytes()?,
                 stored_at: "2026-09-03T00:00:00Z".into(),
@@ -7573,10 +7589,7 @@ mod tests {
             let before = fs::read(&driver.projection_store)?;
             assert!(
                 driver
-                    .restore_admitted_expected_only(
-                        &candidate,
-                        &provider_anchor,
-                        Some(&candidate_activation),
+                    .demote_to_expected_only(
                         &incumbent,
                         &provider_anchor,
                         &activation,
@@ -7586,6 +7599,44 @@ mod tests {
             );
             assert_eq!(fs::read(&driver.projection_store)?, before);
         }
+        Ok(())
+    }
+
+    /// The single-slot projection an older Idunn wrote is retired the first
+    /// time this one publishes for the target, and never read.
+    #[test]
+    fn a_legacy_target_keyed_slot_is_retired_on_publish() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (expected, activation, _warming, provider_anchor) = authenticated_warming(temp.path())?;
+        let driver = topology_driver(temp.path(), "legacy");
+        upsert_record(
+            &driver.projection_store,
+            CultCacheEnvelope {
+                key: expected.target.clone(),
+                r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
+                payload: expected.canonical_bytes()?,
+                stored_at: "2026-09-03T00:00:00Z".into(),
+                schema_id: Some(IDUNN_EXPECTED_INCARNATION_SCHEMA.into()),
+            },
+        )?;
+        upsert_record(
+            &driver.projection_store,
+            CultCacheEnvelope {
+                key: expected.target.clone(),
+                r#type: IdunnRuntimeActivationRecord::TYPE.into(),
+                payload: activation.canonical_bytes()?,
+                stored_at: "2026-09-03T00:00:00Z".into(),
+                schema_id: Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA.into()),
+            },
+        )?;
+        assert!(!driver.admitted_expected_projection_is_exact(&expected, &provider_anchor)?);
+        assert!(!driver.projected_activation_is_present(&expected)?);
+        driver.publish_expected(&expected, &provider_anchor)?;
+        let published = SingleFileMessagePackBackingStore::new(&driver.projection_store)
+            .pull_all_read_only_snapshot()?;
+        assert!(published.iter().all(|entry| entry.key != expected.target));
+        assert_eq!(published.len(), 2);
+        assert!(driver.admitted_expected_projection_is_exact(&expected, &provider_anchor)?);
         Ok(())
     }
 

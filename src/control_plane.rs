@@ -18,8 +18,7 @@ use cultnet_rs::{
     IdunnRuntimeActivationRecord, IdunnServiceIdentity, OdinTopologyAuthenticationContext,
     OdinTopologyDisagreement, OdinTopologyIdentity, RuntimePresenceAuthenticationContext,
     ServiceIdentityProfile, ServiceIdentitySigner, ServiceIdentityTrustAnchor,
-    OdinRuntimeTopologyCorrelationRecord, authenticate_odin_runtime_topology_correlation,
-    authenticate_runtime_presence_claim,
+    authenticate_odin_runtime_topology_correlation, authenticate_runtime_presence_claim,
     correlate_runtime_presence_claim, derive_service_identity_id,
     evaluate_idunn_continuity_restart, evaluate_idunn_deployment_brake, open_service_identity_at,
     verify_idunn_deployment_brake_authorization, verify_runtime_authority,
@@ -1059,7 +1058,10 @@ impl DeploymentTransaction {
                 self.phase == DeploymentPhase::Complete,
                 "terminal failure is not Complete"
             );
-            let abort = required(&self.post_fencing_abort, "terminal post-fence abort evidence")?;
+            let abort = required(
+                &self.post_fencing_abort,
+                "terminal post-fence abort evidence",
+            )?;
             let TransactionCompletion::FailedAfterFencing { error } =
                 self.completion.as_ref().unwrap()
             else {
@@ -1104,9 +1106,15 @@ impl DeploymentTransaction {
                     self.plan.is_some()
                         && self.sealed_release.is_some()
                         && self.installed_release.is_some()
-                        && self.expected.is_some()
-                        && self.expected_publication_sha256.is_some(),
+                        && self.expected.is_some(),
                     "Starting transaction lacks sealed release evidence"
+                );
+                // Expected is published as Starting's first step, after the
+                // brake; from the activation onward it must be there.
+                ensure!(
+                    self.expected_publication_sha256.is_some()
+                        || (self.activation.is_none() && self.phase == DeploymentPhase::Starting),
+                    "started transaction has not published its Expected"
                 );
                 match self.command_kind {
                     CommandKind::Deploy => ensure!(
@@ -1470,6 +1478,11 @@ enum Command {
         state_store: PathBuf,
         command_id: Option<String>,
     },
+    Cancel {
+        state_store: PathBuf,
+        command_id: String,
+        requested_by: String,
+    },
     Validate {
         recipe: PathBuf,
         binding: Option<PathBuf>,
@@ -1496,6 +1509,11 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             state_store,
             command_id,
         } => status(&state_store, command_id.as_deref()),
+        Command::Cancel {
+            state_store,
+            command_id,
+            requested_by,
+        } => cancel(&state_store, &command_id, &requested_by),
         Command::Validate { recipe, binding } => validate(&recipe, binding.as_deref()),
     }
 }
@@ -1509,7 +1527,11 @@ fn validate(recipe_path: &Path, binding_path: Option<&Path>) -> Result<()> {
         .with_context(|| format!("reading recipe {}", recipe_path.display()))?;
     let recipe = crate::deployment::TargetDeclaration::parse(&recipe_text)
         .with_context(|| format!("validating recipe {}", recipe_path.display()))?;
-    println!("recipe ok: {} declares target {}", recipe_path.display(), recipe.target);
+    println!(
+        "recipe ok: {} declares target {}",
+        recipe_path.display(),
+        recipe.target
+    );
 
     let Some(binding_path) = binding_path else {
         return Ok(());
@@ -1527,7 +1549,11 @@ fn validate(recipe_path: &Path, binding_path: Option<&Path>) -> Result<()> {
     binding
         .admit(&recipe)
         .with_context(|| format!("admitting {} against its recipe", binding.target))?;
-    println!("binding ok: {} admits target {}", binding_path.display(), binding.target);
+    println!(
+        "binding ok: {} admits target {}",
+        binding_path.display(),
+        binding.target
+    );
     Ok(())
 }
 
@@ -1538,6 +1564,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command> {
         "serve" => parse_serve(args),
         "up" => parse_up(args),
         "status" => parse_status(args),
+        "cancel" => parse_cancel(args),
         "validate" => parse_validate(args),
         "--help" | "-h" | "help" => bail!(usage()),
         _ => bail!("unknown Idunn command {command:?}\n\n{}", usage()),
@@ -1644,6 +1671,85 @@ fn parse_status(mut args: impl Iterator<Item = String>) -> Result<Command> {
         state_store,
         command_id,
     })
+}
+
+fn parse_cancel(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let command_id = args
+        .next()
+        .ok_or_else(|| anyhow!("idunn cancel requires a deployment command id"))?;
+    require_id(&command_id, "deployment command id")?;
+    let mut state_store = RuntimeOptions::default().state_store;
+    let mut requested_by = env::var("SUDO_USER")
+        .or_else(|_| env::var("USER"))
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "operator".into());
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--state-store" => state_store = path_value(&mut args, &argument)?,
+            "--requested-by" => requested_by = string_value(&mut args, &argument)?,
+            "--help" | "-h" => bail!(usage()),
+            _ => bail!("unknown Idunn cancel option {argument:?}"),
+        }
+    }
+    require_value(&requested_by, "cancellation requester")?;
+    Ok(Command::Cancel {
+        state_store,
+        command_id,
+        requested_by,
+    })
+}
+
+/// Withdraw a queued deployment command before it is frozen.
+///
+/// A command with a live transaction has already changed something and is
+/// not cancellable from here; the transaction's own abort paths own that. A
+/// queued one has changed nothing, so it is retired the way a rejected one
+/// is: a terminal refusal transaction naming the requester goes to history
+/// with the command, and `status` reports it as such rather than as a command
+/// that never ran.
+fn cancel(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()> {
+    let snapshot = ControlSnapshot::read(store_path)?;
+    let command = snapshot
+        .commands
+        .iter()
+        .find(|stored| stored.value.command_id == command_id)
+        .context("deployment command is unknown or already retired")?;
+    ensure!(
+        command.value.kind == CommandKind::Deploy,
+        "only deployment commands can be cancelled; continuity is Idunn's own"
+    );
+    ensure!(
+        snapshot.transaction_for_command(command_id).is_empty(),
+        "deployment command already has a live transaction; it is past cancellation"
+    );
+    let now = now_millis()?;
+    let refusal = DeploymentTransaction::rejected(
+        &command.value,
+        anyhow!("cancelled by {requested_by} before freezing"),
+        now,
+    )?;
+    let envelope = transaction_envelope(&refusal, now)?;
+    ensure!(
+        SingleFileMessagePackBackingStore::new(store_path).compare_exchange(
+            &[
+                CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command_id.to_owned(),
+                    current: Some(command.envelope.clone()),
+                },
+                CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: refusal.transaction_id.clone(),
+                    current: None,
+                },
+            ],
+            std::slice::from_ref(&envelope),
+        )?,
+        "deployment command changed before it could be cancelled"
+    );
+    archive_terminal_transaction(store_path, &envelope)?;
+    println!("{command_id} cancelled");
+    Ok(())
 }
 
 fn parse_validate(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -2071,6 +2177,30 @@ fn archive_terminal_transaction(state_store: &Path, envelope: &CultCacheEnvelope
     SingleFileMessagePackBackingStore::new(state_store)
         .delete_batch_if_unchanged(std::slice::from_ref(envelope))
         .context("retiring a finished transaction from the control store")?;
+    // The command goes with its last transaction. A command is consumed by
+    // being frozen once; left resident after its transaction retired, it read
+    // as queued again and was frozen again on the next tick, which is how one
+    // `idunn up` became an unbounded series of deployment attempts.
+    let transaction = read_transaction_record(envelope)?;
+    let snapshot = ControlSnapshot::read(state_store)?;
+    if !snapshot
+        .transaction_for_command(&transaction.command_id)
+        .is_empty()
+    {
+        return Ok(());
+    }
+    if let Some(command) = snapshot
+        .commands
+        .iter()
+        .find(|stored| stored.value.command_id == transaction.command_id)
+    {
+        SingleFileMessagePackBackingStore::new(&history_store_path(state_store))
+            .insert_entry_if_absent(command.envelope.clone())
+            .context("archiving a consumed command to history")?;
+        SingleFileMessagePackBackingStore::new(state_store)
+            .delete_batch_if_unchanged(std::slice::from_ref(&command.envelope))
+            .context("retiring a consumed command from the control store")?;
+    }
     Ok(())
 }
 
@@ -2092,7 +2222,26 @@ fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
     envelopes
         .into_iter()
         .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
-        .filter_map(|envelope| rmp_serde::from_slice::<DeploymentTransaction>(&envelope.payload).ok())
+        .filter_map(|envelope| {
+            rmp_serde::from_slice::<DeploymentTransaction>(&envelope.payload).ok()
+        })
+        .collect()
+}
+
+/// Consumed commands, read as leniently as their transactions.
+fn read_history_commands(state_store: &Path) -> Vec<DeploymentCommand> {
+    let path = history_store_path(state_store);
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(envelopes) = SingleFileMessagePackBackingStore::new(&path).pull_all_read_only_snapshot()
+    else {
+        return Vec::new();
+    };
+    envelopes
+        .into_iter()
+        .filter(|envelope| envelope.r#type == DeploymentCommand::TYPE)
+        .filter_map(|envelope| rmp_serde::from_slice::<DeploymentCommand>(&envelope.payload).ok())
         .collect()
 }
 
@@ -2339,14 +2488,19 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
     // which is the operator surface R11 refused to trade away for a smaller
     // live set.
     let archived = read_history_transactions(store_path);
-    let mut commands = snapshot.commands.iter().collect::<Vec<_>>();
-    commands.sort_by_key(|stored| stored.value.requested_at_unix_millis);
+    let archived_commands = read_history_commands(store_path);
+    let mut commands = snapshot
+        .commands
+        .iter()
+        .map(|stored| &stored.value)
+        .chain(archived_commands.iter())
+        .collect::<Vec<_>>();
+    commands.sort_by_key(|command| command.requested_at_unix_millis);
     if let Some(command_id) = command_id {
-        commands.retain(|stored| stored.value.command_id == command_id);
+        commands.retain(|command| command.command_id == command_id);
         ensure!(!commands.is_empty(), "deployment command is unknown");
     }
-    for stored in commands {
-        let command = &stored.value;
+    for command in commands {
         let mut transactions = snapshot.transaction_for_command(&command.command_id);
         transactions.extend(
             archived
@@ -2368,7 +2522,10 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
         if command_id.is_some() {
             for transaction in transactions {
                 println!("  transaction {}", transaction.transaction_id);
-                println!("    target {} phase {:?}", transaction.target, transaction.phase);
+                println!(
+                    "    target {} phase {:?}",
+                    transaction.target, transaction.phase
+                );
                 if let Some(expected) = &transaction.expected {
                     println!("    runtime {}", expected.runtime_id);
                     println!("    release {}", expected.sealed_release_id);
@@ -2565,11 +2722,10 @@ impl Engine {
                 let record: IdunnDeploymentBrakeRecord =
                     rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
                 if operator_anchor.is_none() {
-                    operator_anchor = Some(read_trust_anchor::<
-                        IdunnDeploymentBrakeOperatorIdentity,
-                    >(
-                        &self.options.deployment_brake_operator_anchor
-                    )?);
+                    operator_anchor =
+                        Some(read_trust_anchor::<IdunnDeploymentBrakeOperatorIdentity>(
+                            &self.options.deployment_brake_operator_anchor,
+                        )?);
                 }
                 verify_idunn_deployment_brake_authorization(
                     &record,
@@ -2732,9 +2888,7 @@ impl Engine {
     fn run_scheduler_tick(&self) -> Result<bool> {
         let transaction_progress = self.resume_one_transaction()?;
         let continuity_progress = self.supervise_one_admitted_generation()?;
-        Ok(!transaction_progress
-            && !continuity_progress
-            && self.freeze_one_queued_command()?)
+        Ok(!transaction_progress && !continuity_progress && self.freeze_one_queued_command()?)
     }
 
     /// Startup and every later loop use the same order: unfinished ownership
@@ -3098,13 +3252,10 @@ impl Engine {
             let demotion = (|| -> Result<()> {
                 let topology = self.topology();
                 let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
-                if !topology.projected_activation_is_present(&current.value.target)? {
+                if !topology.projected_activation_is_present(&current.value.expected)? {
                     return Ok(());
                 }
-                topology.restore_admitted_expected_only(
-                    &current.value.expected,
-                    &provider_anchor,
-                    Some(&current.value.activation),
+                topology.demote_to_expected_only(
                     &current.value.expected,
                     &provider_anchor,
                     &current.value.activation,
@@ -3119,6 +3270,15 @@ impl Engine {
                 );
             }
             let now = now_millis()?;
+            // An engaged lifecycle brake means no continuity transaction is
+            // minted at all. A transaction that exists and waits on the brake
+            // owns the target, and a target owned by a parked restart accepts
+            // no deployment -- which is the one thing a lifecycle brake must
+            // never gate. The Sealing-phase check remains as the guard for a
+            // transaction minted just before the brake was engaged.
+            if !self.lifecycle_allows_generation(current, now)? {
+                continue;
+            }
             let command = DeploymentCommand {
                 schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
                 command_id: format!("continuity-{}", Uuid::new_v4()),
@@ -3282,7 +3442,11 @@ impl Engine {
         snapshot: &ControlSnapshot,
         current: &Stored<AdmittedGeneration>,
     ) -> Result<bool> {
-        let Some(received) = self.topology().receive(&current.value.target)? else {
+        let Some(received) = self.topology().receive(
+            &current.value.target,
+            &current.value.expected.canonical_sha256()?,
+        )?
+        else {
             return Ok(false);
         };
         ensure!(
@@ -3429,22 +3593,9 @@ impl Engine {
             });
         }
 
-        if current.value.expected_publication_sha256.is_none() {
-            let now = now_millis()?;
-            let plan = required(&current.value.plan, "transaction plan")?;
-            let expected = required(&current.value.expected, "Expected projection")?;
-            let provider_anchor = self.provider_anchor_for_plan(plan)?;
-            let digest = self
-                .topology()
-                .publish_expected(expected, &provider_anchor)?;
-            return self.persist_same_phase(current, |next| {
-                next.expected_publication_sha256 = Some(digest);
-                next.updated_at_unix_millis = now;
-                next.last_error = None;
-                Ok(())
-            });
-        }
-
+        // The candidate's Expected is published in Starting, after the brake
+        // has admitted this exact transaction. Publishing it is the first
+        // Verse-visible change a deployment makes, and the brake gates changes.
         let now = now_millis()?;
         let mut next = current.value.clone();
         match current.value.command_kind {
@@ -3482,6 +3633,22 @@ impl Engine {
         let plan = required(&current.value.plan, "transaction plan")?;
         let release = required(&current.value.sealed_release, "sealed release")?;
         let installed = required(&current.value.installed_release, "installed release")?;
+        if current.value.expected_publication_sha256.is_none() {
+            // Published under the candidate's own incarnation key, beside
+            // whatever the target's admitted incarnation currently projects.
+            // Nothing the incumbent reads about itself changes here.
+            let now = now_millis()?;
+            let provider_anchor = self.provider_anchor_for_plan(plan)?;
+            let digest = self
+                .topology()
+                .publish_expected(expected, &provider_anchor)?;
+            return self.persist_same_phase(current, |next| {
+                next.expected_publication_sha256 = Some(digest);
+                next.updated_at_unix_millis = now;
+                next.last_error = None;
+                Ok(())
+            });
+        }
         if current.value.activation.is_none() {
             validate_live_providers_for_deploy(current.value.command_kind, || {
                 self.validate_selected_providers_current(plan, now_millis()?)
@@ -3661,7 +3828,13 @@ impl Engine {
             // identity turns ordinary UID reuse into a permanent refusal to
             // fence. There is nothing left to be isolated from.
             let incumbent_workload = match incumbent {
-                Some(value) if self.workload.is_permanently_stopped(&value.value.workload)? => None,
+                Some(value)
+                    if self
+                        .workload
+                        .is_permanently_stopped(&value.value.workload)? =>
+                {
+                    None
+                }
                 other => other.map(|value| &value.value.workload),
             };
             let isolation = prove_isolation(workload, incumbent_workload)?;
@@ -4574,6 +4747,35 @@ impl Engine {
         }
     }
 
+    /// The lifecycle brake as it applies to restarting one admitted
+    /// generation: the same evaluation `lifecycle_allows` makes for a
+    /// continuity transaction, asked before one is minted.
+    fn lifecycle_allows_generation(
+        &self,
+        current: &Stored<AdmittedGeneration>,
+        now: u64,
+    ) -> Result<bool> {
+        let binding = current.value.plan.parsed_inputs()?.1;
+        let expected = &current.value.expected;
+        match read_lifecycle_brake(&binding.brakes.lifecycle_store) {
+            Ok(Some(record)) => Ok(evaluate_idunn_continuity_restart(
+                IdunnLifecycleBrakeObservation::Present(&record),
+                &expected.runtime_id,
+                &current.value.target,
+                now,
+            )
+            .is_ok()),
+            Ok(None) => Ok(evaluate_idunn_continuity_restart(
+                IdunnLifecycleBrakeObservation::Missing,
+                &expected.runtime_id,
+                &current.value.target,
+                now,
+            )
+            .is_ok()),
+            Err(_) => Ok(false),
+        }
+    }
+
     fn record_gate_wait(
         &self,
         current: &Stored<DeploymentTransaction>,
@@ -4856,7 +5058,16 @@ impl Engine {
             AuthenticatedOdinRuntimeTopologyCorrelation,
         )>,
     > {
-        let Some(received) = self.topology().receive(&current.value.target)? else {
+        // Odin keeps one correlation per incarnation, so the transaction's own
+        // Expected selects exactly the evidence about it. A correlation about
+        // the incarnation this one is replacing lives under another key and is
+        // never handed back here.
+        let expected_sha256 =
+            required(&current.value.expected, "Expected projection")?.canonical_sha256()?;
+        let Some(received) = self
+            .topology()
+            .receive(&current.value.target, &expected_sha256)?
+        else {
             return Ok(None);
         };
         ensure!(
@@ -4874,29 +5085,6 @@ impl Engine {
             live.envelope == current.envelope,
             "transaction changed before topology admission"
         );
-        // A correlation that describes another incarnation is not evidence
-        // about this one, and it is not a fault either. Odin's stored
-        // correlation outlives the incarnation that wrote it, so a target being
-        // replaced -- Odin above all, which writes its own -- routinely finds
-        // one describing the Expected it is superseding. Treating that as an
-        // error failed the deployment that would have replaced it, and only the
-        // superseded process could have refreshed it.
-        //
-        // Read as absence instead. This says nothing about trust: the record is
-        // unauthenticated here and is used only to decide it is about something
-        // else, which is the same conclusion an attacker would get for free by
-        // publishing nothing. Everything that follows is fully authenticated.
-        let describes_this_incarnation = (|| -> Result<bool> {
-            let expected = required(&live.value.expected, "Expected projection")?;
-            let (record, _) = OdinRuntimeTopologyCorrelationRecord::decode_canonical_signed_payload(
-                &received.canonical_bytes,
-            )?;
-            Ok(record.expected_projection_sha256 == expected.canonical_sha256()?)
-        })()
-        .unwrap_or(false);
-        if !describes_this_incarnation {
-            return Ok(None);
-        }
         let authenticated = self.authenticate_topology_bytes(
             &snapshot,
             &live.value,
@@ -5088,7 +5276,10 @@ impl Engine {
             &odin_authority.signer_public_key,
             self.trusted_topology_context(now),
         )?;
-        validate_authenticated_evidence(&generation.latest_odin_observation, &authenticated_latest)?;
+        validate_authenticated_evidence(
+            &generation.latest_odin_observation,
+            &authenticated_latest,
+        )?;
         ensure!(
             is_semantic_ready(&authenticated_latest),
             "admitted provider's latest Odin observation is no longer Ready"
@@ -5258,7 +5449,10 @@ impl Engine {
     ///
     /// A transaction that has never started one has no candidate to be dead, so
     /// it is not permanently stopped -- it is simply not there yet.
-    fn candidate_is_permanently_stopped(&self, transaction: &DeploymentTransaction) -> Result<bool> {
+    fn candidate_is_permanently_stopped(
+        &self,
+        transaction: &DeploymentTransaction,
+    ) -> Result<bool> {
         let Some(workload) = &transaction.workload else {
             return Ok(false);
         };
@@ -5394,22 +5588,27 @@ impl Engine {
         if abort.topology_reconciliation == CleanupEvidence::Pending {
             let expected = required(&current.value.expected, "failed Expected projection")?;
             let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-            if let Some(incumbent) = self.exact_incumbent(&snapshot, &current.value)? {
-                // Restoring the incumbent's admitted Expected is what lets
-                // continuity bring it back. Fencing stopped it and revoked its
-                // lease, and continuity is the organ that restarts an admitted
-                // incarnation; deployment does not restart it from here.
-                let topology = self.topology();
-                let failed_provider_anchor = self.provider_anchor_for_plan(required(
-                    &current.value.plan,
-                    "failed transaction plan",
-                )?)?;
-                let admitted_provider_anchor =
-                    self.provider_anchor_for_plan(&incumbent.value.plan)?;
-                let expected_sha256 = topology.restore_admitted_expected_only(
+            // The failed candidate's records go, under its own key. Fencing
+            // stopped the incumbent and revoked its lease, so the incumbent is
+            // demoted to Expected-only under its key, which is what lets
+            // continuity bring it back; deployment does not restart it here.
+            let topology = self.topology();
+            let failed_provider_anchor = self.provider_anchor_for_plan(required(
+                &current.value.plan,
+                "failed transaction plan",
+            )?)?;
+            topology
+                .withdraw_incarnation(
                     expected,
                     &failed_provider_anchor,
                     current.value.activation.as_ref(),
+                    None,
+                )
+                .context("withdrawing the failed candidate projection")?;
+            if let Some(incumbent) = self.exact_incumbent(&snapshot, &current.value)? {
+                let admitted_provider_anchor =
+                    self.provider_anchor_for_plan(&incumbent.value.plan)?;
+                let expected_sha256 = topology.demote_to_expected_only(
                     &incumbent.value.expected,
                     &admitted_provider_anchor,
                     &incumbent.value.activation,
@@ -5419,17 +5618,6 @@ impl Engine {
                     expected_sha256 == incumbent.value.expected.canonical_sha256()?,
                     "restored incumbent Expected receipt differs"
                 );
-            } else {
-                let plan = required(&current.value.plan, "failed transaction plan")?;
-                let provider_anchor = self.provider_anchor_for_plan(plan)?;
-                self.topology()
-                    .withdraw_expected(
-                        expected,
-                        &provider_anchor,
-                        current.value.activation.as_ref(),
-                        None,
-                    )
-                    .context("withdrawing the abandoned Expected projection")?;
             }
             return self.persist_same_phase(current, |next| {
                 next.post_fencing_abort
@@ -5447,7 +5635,8 @@ impl Engine {
                 )
                 .context("cleaning the abandoned source")?;
             return self.persist_same_phase(current, |next| {
-                next.post_fencing_abort.as_mut().unwrap().source_cleanup = CleanupEvidence::Complete;
+                next.post_fencing_abort.as_mut().unwrap().source_cleanup =
+                    CleanupEvidence::Complete;
                 Ok(())
             });
         }
@@ -5492,40 +5681,21 @@ impl Engine {
         }
         if abort.topology_reconciliation == CleanupEvidence::Pending {
             let expected = required(&current.value.expected, "failed Expected projection")?;
-            let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-            if let Some(incumbent) = self.exact_incumbent(&snapshot, &current.value)? {
-                let topology = self.topology();
-                let failed_provider_anchor = self.provider_anchor_for_plan(required(
-                    &current.value.plan,
-                    "failed transaction plan",
-                )?)?;
-                let admitted_provider_anchor =
-                    self.provider_anchor_for_plan(&incumbent.value.plan)?;
-                let expected_sha256 = topology.restore_admitted_expected_only(
+            // Before fencing the incumbent was never touched: it is still
+            // running under its own key with its activation and lease. Only the
+            // failed candidate's records are withdrawn. The incumbent's
+            // projection is not demoted -- doing so would tell a live process
+            // it has no activation.
+            let plan = required(&current.value.plan, "failed transaction plan")?;
+            let provider_anchor = self.provider_anchor_for_plan(plan)?;
+            self.topology()
+                .withdraw_incarnation(
                     expected,
-                    &failed_provider_anchor,
+                    &provider_anchor,
                     current.value.activation.as_ref(),
-                    &incumbent.value.expected,
-                    &admitted_provider_anchor,
-                    &incumbent.value.activation,
-                    incumbent.value.leasing.lease(),
-                )?;
-                ensure!(
-                    expected_sha256 == incumbent.value.expected.canonical_sha256()?,
-                    "restored incumbent Expected receipt differs"
-                );
-            } else {
-                let plan = required(&current.value.plan, "failed transaction plan")?;
-                let provider_anchor = self.provider_anchor_for_plan(plan)?;
-                self.topology()
-                    .withdraw_expected(
-                        expected,
-                        &provider_anchor,
-                        current.value.activation.as_ref(),
-                        None,
-                    )
-                    .context("withdrawing exact failed Expected projection")?;
-            }
+                    None,
+                )
+                .context("withdrawing exact failed Expected projection")?;
             return self.persist_same_phase(current, |next| {
                 next.pre_fencing_abort
                     .as_mut()
@@ -5989,6 +6159,7 @@ fn usage() -> &'static str {
      idunn serve [runtime options]\n\
      idunn up <service|profile:name> [--state-store PATH] [--no-wait]\n\
      idunn status [--state-store PATH] [--command ID]\n\
+     idunn cancel <command-id> [--state-store PATH]\n\
      idunn validate --recipe PATH [--binding PATH]\n\n\
      Recipes describe capability and process requirements. Idunn seals exact\n\
      source and artifacts, admits one incarnation, and delegates execution to\n\
@@ -5999,7 +6170,8 @@ fn usage() -> &'static str {
 mod tests {
     use cultnet_rs::{
         GameCultProviderHealthIdentity, OdinRuntimeTopologyCorrelationPurpose,
-        enroll_service_identity_at, export_service_identity_trust_anchor,
+        OdinRuntimeTopologyCorrelationRecord, enroll_service_identity_at,
+        export_service_identity_trust_anchor,
     };
     use tempfile::TempDir;
 
@@ -6067,18 +6239,27 @@ mod tests {
             };
             println!(
                 "LIVE {} target={} phase={:?} ready_seq={} latest_seq={}",
-                value.transaction_id, value.target, value.phase, ready.publisher_sequence,
+                value.transaction_id,
+                value.target,
+                value.phase,
+                ready.publisher_sequence,
                 latest.publisher_sequence
             );
-            println!("  old gate (receipt == cursor): {}", if ready == latest { "PASS" } else { "REFUSE" });
+            println!(
+                "  old gate (receipt == cursor): {}",
+                if ready == latest { "PASS" } else { "REFUSE" }
+            );
             let (latest_record, _) =
                 OdinRuntimeTopologyCorrelationRecord::decode_canonical_signed_payload(
                     &latest.canonical_bytes,
                 )?;
             println!(
                 "  cursor says: projection={} instance={:?} ready={} present={} disagreements={}",
-                latest_record.expected_projection_sha256, latest_record.runtime_instance_id,
-                latest_record.ready, latest_record.present, latest_record.disagreements.len()
+                latest_record.expected_projection_sha256,
+                latest_record.runtime_instance_id,
+                latest_record.ready,
+                latest_record.present,
+                latest_record.disagreements.len()
             );
             let (Some(expected), Some(activation)) = (&value.expected, &value.activation) else {
                 println!("  transaction has not declared an incarnation yet");
@@ -6086,14 +6267,13 @@ mod tests {
             };
             println!(
                 "  declared:   projection={} instance={}",
-                expected.canonical_sha256()?, activation.runtime_instance_id
+                expected.canonical_sha256()?,
+                activation.runtime_instance_id
             );
             let binds = latest_record.expected_projection_sha256 == expected.canonical_sha256()?
                 && latest_record.runtime_instance_id.as_deref()
                     == Some(activation.runtime_instance_id.as_str());
-            println!(
-                "  binds declared incarnation (what authentication enforces): {binds}"
-            );
+            println!("  binds declared incarnation (what authentication enforces): {binds}");
         }
         Ok(())
     }
@@ -6185,7 +6365,10 @@ mod tests {
                     key: command.command_id.clone(),
                     current: None,
                 }],
-                &[command_envelope(&command, command.requested_at_unix_millis)?],
+                &[command_envelope(
+                    &command,
+                    command.requested_at_unix_millis
+                )?],
             )?
         );
         let mut opening = live.clone();
@@ -6213,7 +6396,9 @@ mod tests {
 
         // Gone from the set that still gates decisions...
         assert!(
-            ControlSnapshot::read(&world.state_store)?.transactions.is_empty(),
+            ControlSnapshot::read(&world.state_store)?
+                .transactions
+                .is_empty(),
             "a finished transaction stayed resident"
         );
         // ...and still answerable, which is what R11 refused to trade away.
@@ -6221,6 +6406,19 @@ mod tests {
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].transaction_id, live.transaction_id);
         assert!(history.exists());
+        // The command went with it. Left resident it would read as queued and
+        // be frozen again next tick; consumed, it is history beside its
+        // transaction and `status` still answers for it.
+        assert!(
+            ControlSnapshot::read(&world.state_store)?
+                .commands
+                .is_empty(),
+            "a consumed command stayed resident"
+        );
+        let archived_commands = read_history_commands(&world.state_store);
+        assert_eq!(archived_commands.len(), 1);
+        assert_eq!(archived_commands[0].command_id, command.command_id);
+        assert!(!world.engine.freeze_one_queued_command()?);
         Ok(())
     }
 
@@ -6280,7 +6478,11 @@ mod tests {
         // describing one target's consent.
         let world = EngineFixture::new()?;
         assert!(
-            !world.engine.options.deployment_brake_operator_anchor.exists(),
+            !world
+                .engine
+                .options
+                .deployment_brake_operator_anchor
+                .exists(),
             "fixture must not have written a brake anchor"
         );
         let snapshot = ControlSnapshot::read(&world.state_store)?;
@@ -6416,7 +6618,11 @@ mod tests {
             )
         }
 
-        fn correlation(&self, sequence: u64, ready: bool) -> Result<OdinRuntimeTopologyCorrelationRecord> {
+        fn correlation(
+            &self,
+            sequence: u64,
+            ready: bool,
+        ) -> Result<OdinRuntimeTopologyCorrelationRecord> {
             Ok(OdinRuntimeTopologyCorrelationRecord {
                 schema_version: cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into(),
                 target: self.expected.target.clone(),
@@ -6445,7 +6651,9 @@ mod tests {
         fn sign(&self, record: &mut OdinRuntimeTopologyCorrelationRecord) -> Result<Vec<u8>> {
             record.signature = self
                 .odin_signer
-                .sign::<OdinRuntimeTopologyCorrelationPurpose>(&record.unsigned_signature_payload()?)
+                .sign::<OdinRuntimeTopologyCorrelationPurpose>(
+                    &record.unsigned_signature_payload()?,
+                )
                 .signature;
             record.canonical_bytes()
         }
@@ -6671,10 +6879,7 @@ mod tests {
         // Likewise refused at encoding: a Present record must carry its
         // instance id ("runtime instance identity and observation evidence are
         // partial").
-        assert!(
-            format!("{error:#}").contains("are partial"),
-            "{error:#}"
-        );
+        assert!(format!("{error:#}").contains("are partial"), "{error:#}");
         Ok(())
     }
 
@@ -6688,7 +6893,9 @@ mod tests {
         let mut stranger = world.correlation(501_713, true)?;
         stranger.target = "ghostlight".into();
         let canonical = world.sign(&mut stranger)?;
-        let error = world.authenticate(&canonical).expect_err("target must bind");
+        let error = world
+            .authenticate(&canonical)
+            .expect_err("target must bind");
         assert!(
             format!("{error:#}").contains("substitutes or omits Expected authority"),
             "{error:#}"
@@ -6791,7 +6998,9 @@ mod tests {
 
         let before_observation = NOW - DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS - 1;
         assert!(
-            world.authenticate_at(&canonical, before_observation).is_err(),
+            world
+                .authenticate_at(&canonical, before_observation)
+                .is_err(),
             "an admitted_at earlier than the observation must not authenticate"
         );
         Ok(())
@@ -6823,7 +7032,10 @@ mod tests {
                 value.command_kind,
                 value.phase,
                 value.completion.is_some(),
-                value.ready.as_ref().map(|evidence| evidence.publisher_sequence),
+                value
+                    .ready
+                    .as_ref()
+                    .map(|evidence| evidence.publisher_sequence),
                 value
                     .latest_odin_observation
                     .as_ref()
@@ -6949,10 +7161,7 @@ mod tests {
                 .map(str::to_owned),
         )
         .unwrap();
-        assert!(matches!(
-            parsed,
-            Command::Validate { binding: None, .. }
-        ));
+        assert!(matches!(parsed, Command::Validate { binding: None, .. }));
 
         assert!(
             parse(
@@ -6964,7 +7173,13 @@ mod tests {
         );
         assert!(parse(["validate"].into_iter().map(str::to_owned)).is_err());
         for rejected in [
-            vec!["validate", "--recipe", "/r.toml", "--deploy-command", "sh -c bad"],
+            vec![
+                "validate",
+                "--recipe",
+                "/r.toml",
+                "--deploy-command",
+                "sh -c bad",
+            ],
             vec!["validate", "--recipe", "/r.toml", "--state-store", "/s.cc"],
         ] {
             assert!(parse(rejected.into_iter().map(str::to_owned)).is_err());

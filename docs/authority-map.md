@@ -26,10 +26,11 @@ The detailed contract is
   presence and health; Idunn's current observed-activation projection; and
   observations from narrow execution and route drivers.
 - **Outputs:** private compiled plans and sealed releases; a release-bound
-  sanitized Expected projection for Odin/CultMesh; one launch-scoped runtime
-  activation published only after driver observation; process write-lease and
-  route decisions; continuity actions; and explicit disagreement or failure
-  records.
+  sanitized Expected projection for Odin/CultMesh, keyed by incarnation so an
+  incumbent and its candidate are projected side by side; one launch-scoped
+  runtime activation published only after driver observation; process
+  write-lease and route decisions; continuity actions; and explicit
+  disagreement or failure records.
 - **Derived state:** dashboards, operator summaries, proxy displays, process
   listings, and Odin correlation views are projections. They do not establish
   deployment, write, route, presence, or readiness authority.

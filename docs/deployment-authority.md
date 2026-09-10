@@ -100,6 +100,24 @@ Every Idunn-managed deployment has an Odin-visible expected projection before
 dependent services are promoted, and an Odin-observed runtime projection before
 they are considered ready.
 
+### Projection keying
+
+The three truths are per incarnation, and so is the projection. Every
+Expected, activation, and write-lease record Idunn publishes is keyed by
+`{target}@{expected projection sha256}`; only the runtime presence trust
+anchor is keyed by target, because it is provider lookup material shared by
+every incarnation. Odin keys its presence and correlation records the same way
+and reads Idunn's projection by that key.
+
+A target being replaced therefore has two incarnations projected side by side:
+the admitted incumbent under its key, the sealed candidate under its own.
+Publishing the candidate cannot change what the incumbent reads about itself,
+withdrawing a failed candidate removes only the candidate's records, and a
+correlation Odin holds about one incarnation is never mistaken for evidence
+about another. A record of those three types keyed by the bare target is the
+shape of an earlier single-slot projection; Idunn retires such records the
+first time it publishes for that target, and Odin never reads them.
+
 ## Source-owned deployment declaration
 
 Each deployable repository publishes one small, reviewable declaration at a
@@ -227,8 +245,10 @@ For a singleton incarnation:
    root-owned actuation stage. The privileged driver never opens Git.
 4. Build, test, and package inside the bound runners. Seal the artifact,
    declaration, binding, launch contract, and input digests.
-5. Derive and publish the release-bound Expected incarnation from the validated
-   sealed release and its exact compiled plan.
+5. Derive the release-bound Expected incarnation from the validated sealed
+   release and its exact compiled plan. Publish it only once the deployment
+   brake has admitted this exact transaction, under the candidate's own
+   incarnation key, beside whatever the target's admitted incarnation projects.
 6. Issue one opaque runtime-instance activation bound to the Expected digest,
    pass the exact Expected and activation documents through the actuator's
    isolated credential mechanism, and start the candidate privately. It has no
