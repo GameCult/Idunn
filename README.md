@@ -199,12 +199,20 @@ purpose; Idunn discovers no authority implicitly.
 
 ## Platform
 
-Idunn targets Linux. `cargo test` on Windows reports **63 passed, 18 failed**;
-those 18 assert against absolute deployment paths (`/srv/...`,
-`/var/lib/gamecult/...`) and Rust's `Path::is_absolute()` requires a drive
-prefix there. It is platform semantics, not breakage — the same 18 fail
-identically in the Odin tree this was extracted from. Build and test on Linux
-for a true result.
+Idunn targets Linux and does not compile on Windows (`drivers.rs` uses
+`std::os::unix` unconditionally). A local `cargo check` on a Windows
+workstation proves nothing. Test and build where it runs, in the same image
+Odin uses, with the working tree shipped to the host's build root:
+
+```bash
+git ls-files -z | tar --null -T - -cf - | ssh ygg 'sudo rm -rf /srv/build/idunn && sudo mkdir -p /srv/build/idunn && sudo tar -x -C /srv/build/idunn && sudo chown -R gamecultadmin:gamecultadmin /srv/build/idunn'
+ssh ygg 'sudo docker run --rm -v /srv/build/idunn:/w -v /etc/machine-id:/etc/machine-id:ro -v /srv/build/cargo-registry:/usr/local/cargo/registry -v /srv/build/cargo-git:/usr/local/cargo/git -w /w rust:1.95-bookworm sh -c "cargo test --lib && cargo build --release"'
+```
+
+`/etc/machine-id` must be mounted or every identity-enrolling test fails.
+`--lib` because the tests under `tests/` assume the host layout. The release
+binary lands in `/srv/build/idunn/target/release/idunn`; install it over
+`/usr/local/bin/idunn` and restart `idunn-yggdrasil.service`.
 
 ## Licence
 

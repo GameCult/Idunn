@@ -2543,6 +2543,27 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
                 if let Some(reason) = &transaction.last_error {
                     println!("    waiting on {reason}");
                 }
+                // A Complete transaction that is not terminal still owns its
+                // target through unfinished cleanup. Without this an operator
+                // sees "Complete" and a stale reason and cannot tell what is
+                // holding the target.
+                if let Some(completion) = &transaction.completion {
+                    println!("    completion {completion:?}");
+                }
+                if let Some(abort) = &transaction.pre_fencing_abort {
+                    println!("    pre-fencing abort {abort:?}");
+                }
+                if let Some(abort) = &transaction.post_fencing_abort {
+                    println!("    post-fencing abort {abort:?}");
+                }
+                if let Some(cleanup) = &transaction.post_commit_cleanup {
+                    println!("    post-commit cleanup {cleanup:?}");
+                }
+                println!(
+                    "    terminal {} owns-target {}",
+                    transaction.is_terminal(),
+                    transaction.blocks_new_target_mutation()
+                );
             }
         }
     }
@@ -2552,6 +2573,17 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
 fn derived_command_status(transactions: &[&DeploymentTransaction]) -> (&'static str, String) {
     if transactions.is_empty() {
         return ("queued", String::new());
+    }
+    // A live transaction is the command's present tense. Reporting an older
+    // attempt's failure while a new one is sealing hid a running deployment
+    // behind the word "failed".
+    let current = transactions
+        .iter()
+        .filter(|transaction| !transaction.is_terminal())
+        .map(|transaction| format!("{}:{:?}", transaction.target, transaction.phase))
+        .collect::<Vec<_>>();
+    if !current.is_empty() {
+        return ("running", current.join(","));
     }
     if let Some(error) = transactions
         .iter()
@@ -2579,13 +2611,7 @@ fn derived_command_status(transactions: &[&DeploymentTransaction]) -> (&'static 
                 .join(","),
         );
     }
-    let current = transactions
-        .iter()
-        .filter(|transaction| !transaction.is_terminal())
-        .map(|transaction| format!("{}:{:?}", transaction.target, transaction.phase))
-        .collect::<Vec<_>>()
-        .join(",");
-    ("running", current)
+    ("complete", String::new())
 }
 
 struct ProcessLock {
@@ -2955,23 +2981,72 @@ impl Engine {
 
     fn freeze_one_queued_command(&self) -> Result<bool> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-        let transaction_commands = snapshot
+        let live_commands = snapshot
             .transactions
             .iter()
-            .map(|stored| stored.value.command_id.as_str())
+            .map(|stored| stored.value.command_id.clone())
             .collect::<BTreeSet<_>>();
-        let mut queued = snapshot
+        let mut candidates = snapshot
             .commands
             .iter()
             .filter(|stored| {
                 stored.value.kind == CommandKind::Deploy
-                    && !transaction_commands.contains(stored.value.command_id.as_str())
+                    && !live_commands.contains(&stored.value.command_id)
             })
             .collect::<Vec<_>>();
-        queued.sort_by_key(|stored| stored.value.requested_at_unix_millis);
-        let Some(command) = queued.first() else {
+        if candidates.is_empty() {
             return Ok(false);
-        };
+        }
+        // A command is consumed by any transaction, live or retired. Commands
+        // whose transactions were retired to history before commands travelled
+        // with them are still resident; they are not queued, they are
+        // history that never moved. Retire them here and never freeze them.
+        let historical_commands = read_history_transactions(&self.options.state_store)
+            .into_iter()
+            .map(|transaction| transaction.command_id)
+            .collect::<BTreeSet<_>>();
+        let mut retired = false;
+        candidates.retain(|stored| {
+            if !historical_commands.contains(&stored.value.command_id) {
+                return true;
+            }
+            match SingleFileMessagePackBackingStore::new(&history_store_path(
+                &self.options.state_store,
+            ))
+            .insert_entry_if_absent(stored.envelope.clone())
+            .and_then(|_| {
+                SingleFileMessagePackBackingStore::new(&self.options.state_store)
+                    .delete_batch_if_unchanged(std::slice::from_ref(&stored.envelope))
+            }) {
+                Ok(_) => retired = true,
+                Err(error) => eprintln!(
+                    "Idunn left consumed command {} resident: {error:#}",
+                    stored.value.command_id
+                ),
+            }
+            false
+        });
+        if retired {
+            return Ok(true);
+        }
+        candidates.sort_by_key(|stored| stored.value.requested_at_unix_millis);
+        // Oldest first, but a command whose target is busy does not block the
+        // ones behind it for other targets.
+        for command in candidates {
+            if self.freeze_command(&snapshot, command)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Freeze one queued command into its transactions. `Ok(false)` means its
+    /// target is busy and nothing was written.
+    fn freeze_command(
+        &self,
+        snapshot: &ControlSnapshot,
+        command: &Stored<DeploymentCommand>,
+    ) -> Result<bool> {
         let bindings = match load_bindings(&self.options.bindings_dir) {
             Ok(bindings) => bindings,
             Err(error) => {
