@@ -66,19 +66,19 @@ ProtectHome=yes
 # and it is the reason running as root is tolerable: root plus an enumerated
 # write set is narrower than root everywhere.
 ProtectSystem=full
-ReadWritePaths=/etc/gamecult/idunn
-ReadWritePaths=/etc/nginx/idunn-stream-routes
-ReadWritePaths=/etc/systemd/system
+ReadWritePaths=/etc/gamecult/idunn /etc/ufw
+ReadWritePaths=/etc/nginx/idunn-stream-routes /etc/ufw
+ReadWritePaths=/etc/systemd/system /etc/ufw
 # idunn-projection is deliberately outside Idunn's own 0750 directory: the
 # topology store is Idunn's *published* surface, and every managed target must
 # read it to verify its own Expected incarnation against the Idunn anchor. It
 # was inside the private root, where no workload could traverse to it.
-ReadWritePaths=/var/lib/gamecult/idunn /var/lib/gamecult/idunn-authority /var/lib/gamecult/idunn-projection
-ReadWritePaths=/srv/build
+ReadWritePaths=/var/lib/gamecult/idunn /var/lib/gamecult/idunn-authority /var/lib/gamecult/idunn-projection /etc/ufw
+ReadWritePaths=/srv/build /etc/ufw
 # One entry per managed target: its runtime root, state root and release root.
 # A target Idunn cannot write is a target it cannot deploy, so this list grows
 # by exactly three paths per migration and is the honest blast radius.
-ReadWritePaths=/etc/gamecult/heimdall /var/lib/gamecult/heimdall /srv/heimdall/app
+ReadWritePaths=/etc/gamecult/heimdall /var/lib/gamecult/heimdall /srv/heimdall/app /etc/ufw
 # Odin is a managed target like any other now, so its three roots are writable
 # on the same terms. This used to be ReadOnlyPaths, on the reasoning that Idunn
 # only *reads* Odin's correlation store to gate promotion. That remains true of
@@ -88,7 +88,7 @@ ReadWritePaths=/etc/gamecult/heimdall /var/lib/gamecult/heimdall /srv/heimdall/a
 # and leaves daemon survival untouched. But a target Idunn cannot write is a
 # target it cannot deploy, and Odin has to be deployable: it is the bootstrap
 # target every other target's warming presence is observed through.
-ReadWritePaths=/etc/gamecult/odin /var/lib/gamecult/odin /srv/odin
+ReadWritePaths=/etc/gamecult/odin /var/lib/gamecult/odin /srv/odin /etc/ufw
 
 [Install]
 WantedBy=multi-user.target
