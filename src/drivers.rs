@@ -4018,11 +4018,18 @@ impl TopologyPort for CultCacheTopologyDriver {
 /// validates the complete nginx configuration, and reloads it. Configuration
 /// bytes are actuator state, not proof that the selected runtime answered on
 /// the stable route; the control plane admits that proof separately.
+///
+/// The host firewall allow for the stable endpoint is the same authority as
+/// the fragment: a route that is admitted is reachable, a route that is
+/// withdrawn is not, and neither is something an operator opens by hand. The
+/// driver owns exactly the one rule it writes, tagged with its route id, and
+/// touches no other.
 pub struct NginxRouteDriver {
     pub binding: RouteBinding,
     pub nginx_program: PathBuf,
     pub systemd_run_program: PathBuf,
     pub systemctl_program: PathBuf,
+    pub ufw_program: PathBuf,
     pub preflight_root: PathBuf,
 }
 
@@ -4033,7 +4040,54 @@ impl NginxRouteDriver {
             nginx_program: PathBuf::from("/usr/sbin/nginx"),
             systemd_run_program: PathBuf::from("/usr/bin/systemd-run"),
             systemctl_program: PathBuf::from("/usr/bin/systemctl"),
+            ufw_program: PathBuf::from("/usr/sbin/ufw"),
             preflight_root: PathBuf::from("/run/idunn/route-preflight"),
+        }
+    }
+
+    /// The one firewall rule this route owns: inbound to the stable endpoint's
+    /// address and port, its transport's protocol, tagged with the route id.
+    fn endpoint_rule(&self) -> Result<Vec<OsString>> {
+        let (host, port) = self.binding.stable_socket()?;
+        let protocol = match self.binding.driver {
+            RouteDriver::NginxStreamTcp => "tcp",
+            RouteDriver::NginxStreamUdp => "udp",
+        };
+        Ok(vec![
+            OsString::from("allow"),
+            OsString::from("in"),
+            OsString::from("to"),
+            OsString::from(host.to_string()),
+            OsString::from("port"),
+            OsString::from(port.to_string()),
+            OsString::from("proto"),
+            OsString::from(protocol),
+        ])
+    }
+
+    fn admit_endpoint(&self) -> Result<()> {
+        let mut args = self.endpoint_rule()?;
+        args.push(OsString::from("comment"));
+        args.push(OsString::from(format!(
+            "Idunn route {}",
+            self.binding.route_id
+        )));
+        self.command(&self.ufw_program, args)
+            .context("admitting the stable endpoint on the host firewall")?;
+        Ok(())
+    }
+
+    fn withdraw_endpoint(&self) -> Result<()> {
+        let mut args = vec![OsString::from("delete")];
+        args.extend(self.endpoint_rule()?);
+        match self.command(&self.ufw_program, args) {
+            Ok(_) => Ok(()),
+            // ufw reports a rule that is already gone as a failure; for a
+            // withdrawal that is the state being asked for.
+            Err(error) if format!("{error:#}").contains("non-existent") => Ok(()),
+            Err(error) => {
+                Err(error).context("withdrawing the stable endpoint from the host firewall")
+            }
         }
     }
 
@@ -4191,7 +4245,13 @@ impl NginxRouteDriver {
 
     fn restore(&self, prior: Option<&[u8]>) -> Result<()> {
         self.write_fragment(prior)?;
-        self.reload()
+        self.reload()?;
+        // No prior membership means the stable endpoint no longer routes to
+        // anything; its firewall allow goes with the fragment.
+        if prior.is_none() {
+            self.withdraw_endpoint()?;
+        }
+        Ok(())
     }
 
     fn fail_after_rollback<T>(
@@ -4280,7 +4340,7 @@ impl NginxRouteDriver {
         if !candidate_already_written {
             atomic_replace(&self.binding.config_path, &rendered)?;
         }
-        if let Err(error) = self.reload() {
+        if let Err(error) = self.admit_endpoint().and_then(|()| self.reload()) {
             if rollback_allowed {
                 return self.fail_after_rollback(
                     preflight.incumbent_configuration.as_deref(),
@@ -4347,7 +4407,7 @@ impl NginxRouteDriver {
         if self.current_configuration()?.as_deref() != Some(rendered.as_slice()) {
             atomic_replace(&self.binding.config_path, &rendered)?;
         }
-        if let Err(reload) = self.reload() {
+        if let Err(reload) = self.admit_endpoint().and_then(|()| self.reload()) {
             return match self.write_fragment(None) {
                 Ok(()) => Err(reload).context("reloading the exact admitted route membership"),
                 Err(cleanup) => Err(reload).context(format!(
@@ -7123,6 +7183,61 @@ mod tests {
         )
     }
 
+    /// Withdrawing the last membership withdraws the endpoint's allow, and a
+    /// rule that is already gone is the state being asked for, not an error.
+    #[cfg(unix)]
+    #[test]
+    fn withdrawing_the_last_route_membership_withdraws_its_firewall_allow() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let program = |name: &str, body: &str| -> Result<PathBuf> {
+            let path = temp.path().join(name);
+            fs::write(&path, body)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+            Ok(path)
+        };
+        let ufw = program(
+            "ufw",
+            "#!/bin/sh\nif [ \"$1\" = \"delete\" ] && [ -e \"$0.absent\" ]; then echo 'Could not delete non-existent rule' >&2; exit 1; fi\necho \"$*\" >> \"$0.calls\"\nexit 0\n",
+        )?;
+        let driver = NginxRouteDriver {
+            binding: RouteBinding {
+                driver: RouteDriver::NginxStreamUdp,
+                route_id: "odin-rendezvous".into(),
+                stable_endpoint: "rudp://10.77.0.1:17971".into(),
+                private_host: "127.0.0.1".into(),
+                private_port_start: 17972,
+                private_port_end: 17979,
+                config_path: temp.path().join("odin.conf"),
+                reload_unit: "nginx.service".into(),
+            },
+            nginx_program: program("nginx", "#!/bin/sh\nexit 0\n")?,
+            systemd_run_program: program("systemd-run", "#!/bin/sh\nexit 64\n")?,
+            systemctl_program: program("systemctl", "#!/bin/sh\nexit 0\n")?,
+            ufw_program: ufw.clone(),
+            preflight_root: temp.path().join("preflight"),
+        };
+        assert_eq!(
+            driver
+                .endpoint_rule()?
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "allow in to 10.77.0.1 port 17971 proto udp"
+        );
+
+        driver.restore(None)?;
+        assert_eq!(
+            fs::read_to_string(ufw.with_extension("calls"))?,
+            "delete allow in to 10.77.0.1 port 17971 proto udp\n"
+        );
+        fs::write(ufw.with_extension("absent"), b"gone\n")?;
+        driver.restore(None)?;
+        Ok(())
+    }
+
     #[test]
     fn an_empty_route_fragment_is_absence_not_a_membership() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -7207,6 +7322,12 @@ mod tests {
         fs::set_permissions(&nginx, fs::Permissions::from_mode(0o755))?;
         fs::set_permissions(&systemd_run, fs::Permissions::from_mode(0o755))?;
         fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))?;
+        let ufw = temp.path().join("ufw");
+        fs::write(
+            &ufw,
+            "#!/bin/sh\nif [ \"$1\" = \"delete\" ] && [ -e \"$0.absent\" ]; then echo 'Could not delete non-existent rule' >&2; exit 1; fi\necho \"$*\" >> \"$0.calls\"\nexit 0\n",
+        )?;
+        fs::set_permissions(&ufw, fs::Permissions::from_mode(0o755))?;
 
         let binding = RouteBinding {
             driver: RouteDriver::NginxStreamTcp,
@@ -7223,6 +7344,7 @@ mod tests {
             nginx_program: nginx,
             systemd_run_program: systemd_run,
             systemctl_program: systemctl.clone(),
+            ufw_program: ufw.clone(),
             preflight_root: temp.path().join("preflight"),
         };
         let mut candidate = expected();
@@ -7242,6 +7364,12 @@ mod tests {
         assert_eq!(
             fs::read_to_string(systemctl.with_extension("calls"))?,
             "reload\n"
+        );
+        // The stable endpoint's allow is admitted with the fragment, before
+        // the reload that makes the listener live.
+        assert_eq!(
+            fs::read_to_string(ufw.with_extension("calls"))?,
+            "allow in to 127.0.0.1 port 4103 proto tcp comment Idunn route service-route\n"
         );
         assert!(driver.observe_membership(&candidate, &membership_sha256)?);
         let admitted_bytes = fs::read(&config)?;
