@@ -223,6 +223,9 @@ The first Yggdrasil implementation uses:
 - nginx stream proxying for CodexConnector's stable TCP endpoint;
 - atomic root-owned files for process-bound write leases and separately
   generated proxy membership;
+- one host firewall allow per routed stable endpoint, owned by the route
+  driver beside its fragment: admitted with the membership, withdrawn with the
+  last membership, never opened by hand;
 - graceful nginx validation and reload for route changes.
 
 Idunn calls narrow workload, route, and write-lease/fencing driver ports. Those
