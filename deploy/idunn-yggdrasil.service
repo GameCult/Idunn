@@ -68,7 +68,6 @@ ProtectHome=yes
 ProtectSystem=full
 ReadWritePaths=/etc/gamecult/idunn
 ReadWritePaths=/etc/nginx/idunn-stream-routes
-ReadWritePaths=/etc/ufw
 # ufw keeps its rule files under /etc/ufw; the route driver owns one allow per
 # routed stable endpoint and writes it through ufw.
 ReadWritePaths=/etc/systemd/system
