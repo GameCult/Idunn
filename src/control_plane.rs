@@ -3587,13 +3587,19 @@ impl Engine {
             &current.value.activation,
         )?;
         let odin_authority = self.current_odin_authority(snapshot)?;
-        let authenticated = authenticate_odin_runtime_topology_correlation(
+        let authenticated = match authenticate_odin_runtime_topology_correlation(
             &received.canonical_bytes,
             &authority,
             current.value.leasing.lease_sha256(),
             &odin_authority.signer_public_key,
             self.trusted_topology_context(now),
-        )?;
+        ) {
+            Ok(authenticated) => authenticated,
+            // An aged-out correlation is nothing new about the admitted
+            // generation, not a rejected observation.
+            Err(error) if is_stale_observation(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let evidence = TopologyEvidence::from_authenticated(&authenticated, now)?;
         if !sequence_requires_admission(
             Some(&current.value.latest_odin_observation),
@@ -5284,13 +5290,23 @@ impl Engine {
             live.envelope == current.envelope,
             "transaction changed before topology admission"
         );
-        let authenticated = self.authenticate_topology_bytes(
+        let authenticated = match self.authenticate_topology_bytes(
             &snapshot,
             &live.value,
             &received.canonical_bytes,
             current_write_lease_sha256,
             now,
-        )?;
+        ) {
+            Ok(authenticated) => authenticated,
+            // Odin re-stamps a correlation only when its facts change, and a
+            // live presence changes them every heartbeat. A correlation that
+            // has aged out therefore says one thing: nothing about this
+            // incarnation has arrived lately. That is absence to wait on, not
+            // evidence to refuse; it failed every Heimdall deployment and the
+            // first observed Odin deployment as a fault.
+            Err(error) if is_stale_observation(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let evidence = TopologyEvidence::from_authenticated(&authenticated, now)?;
         if !sequence_requires_admission(
             live.value.latest_odin_observation.as_ref(),
@@ -5989,6 +6005,13 @@ fn route_drain_deadline(promoted_at_unix_millis: u64, drain_seconds: u32) -> Res
                 .context("route drain duration overflows milliseconds")?,
         )
         .context("route drain deadline overflows Unix milliseconds")
+}
+
+/// CultLib refuses a correlation older than the trusted window with this
+/// text. Idunn reads that one refusal as "nothing new", everywhere it waits
+/// on Odin's evidence; every other refusal stays a refusal.
+fn is_stale_observation(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("outside the trusted observation window")
 }
 
 fn route_observation_is_current(
