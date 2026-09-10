@@ -2911,7 +2911,33 @@ impl Engine {
     /// One pass of the scheduler, with the loop's ordering preserved exactly:
     /// `Ok(true)` means "went round again immediately", which is what the
     /// caller's `continue` did.
+    /// One resident terminal transaction goes to history per tick.
+    ///
+    /// Transactions that finished before finished transactions travelled to
+    /// history are still resident with their commands, gating nothing and
+    /// consuming their commands correctly, but growing the store every decision
+    /// reads. They leave the same way a transaction finishing today does.
+    fn retire_one_terminal_transaction(&self) -> Result<bool> {
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let Some(stored) = snapshot
+            .transactions
+            .iter()
+            .find(|stored| stored.value.is_terminal())
+        else {
+            return Ok(false);
+        };
+        archive_terminal_transaction(&self.options.state_store, &stored.envelope)?;
+        eprintln!(
+            "Idunn retired resident terminal transaction {} to history",
+            stored.value.transaction_id
+        );
+        Ok(true)
+    }
+
     fn run_scheduler_tick(&self) -> Result<bool> {
+        if self.retire_one_terminal_transaction()? {
+            return Ok(true);
+        }
         let transaction_progress = self.resume_one_transaction()?;
         let continuity_progress = self.supervise_one_admitted_generation()?;
         Ok(!transaction_progress && !continuity_progress && self.freeze_one_queued_command()?)
@@ -6564,6 +6590,25 @@ mod tests {
             "a consumed command was frozen again"
         );
         assert!(!world.engine.freeze_one_queued_command()?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_resident_terminal_transaction_is_retired_by_the_tick_with_its_command() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let (finished, command) = terminal_transaction_with_command("ghostlight")?;
+        SingleFileMessagePackBackingStore::new(&world.state_store).insert_entry_if_absent(
+            command_envelope(&command, command.requested_at_unix_millis)?,
+        )?;
+        SingleFileMessagePackBackingStore::new(&world.state_store).insert_entry_if_absent(
+            transaction_envelope(&finished, finished.updated_at_unix_millis)?,
+        )?;
+        assert!(world.engine.retire_one_terminal_transaction()?);
+        let live = ControlSnapshot::read(&world.state_store)?;
+        assert!(live.transactions.is_empty() && live.commands.is_empty());
+        assert_eq!(read_history_transactions(&world.state_store).len(), 1);
+        assert_eq!(read_history_commands(&world.state_store).len(), 1);
+        assert!(!world.engine.retire_one_terminal_transaction()?);
         Ok(())
     }
 
