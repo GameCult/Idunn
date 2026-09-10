@@ -4103,6 +4103,7 @@ impl Engine {
     fn advance_awaiting_ready(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
         let now = now_millis()?;
         let expected = required(&current.value.expected, "Expected projection")?;
+        self.observe_candidate_before_waiting(&current.value)?;
         if expected.write_lease_required {
             let activation = required(&current.value.activation, "activation")?;
             let warming = self.rehydrate_warming_token(&current.value, now, false)?;
@@ -4166,6 +4167,7 @@ impl Engine {
     fn advance_routing(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
         let expected = required(&current.value.expected, "Expected projection")?;
         let activation = required(&current.value.activation, "activation")?;
+        self.observe_candidate_before_waiting(&current.value)?;
         if current.value.routing.is_none() {
             let current_lease = current
                 .value
@@ -4275,6 +4277,7 @@ impl Engine {
     }
 
     fn advance_committing(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
+        self.observe_candidate_before_waiting(&current.value)?;
         let current_lease_sha256 = current
             .value
             .leasing
@@ -4745,6 +4748,22 @@ impl Engine {
             .is_ok()),
             Err(_) => Ok(false),
         }
+    }
+
+    /// A phase that waits on Odin's evidence about the candidate must first
+    /// confirm the candidate still exists. Otherwise a candidate that died
+    /// while its correlation was pending is never observed again: the phase
+    /// returns early on "no evidence yet" every tick, the error that would have
+    /// triggered the post-fencing abort never happens, and the transaction
+    /// owns the target forever behind a process that is gone.
+    fn observe_candidate_before_waiting(&self, transaction: &DeploymentTransaction) -> Result<()> {
+        self.workload
+            .observe(
+                required(&transaction.expected, "Expected projection")?,
+                required(&transaction.activation, "activation")?,
+                required(&transaction.workload, "candidate workload")?,
+            )
+            .map(|_| ())
     }
 
     /// The lifecycle brake as it applies to restarting one admitted
