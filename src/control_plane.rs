@@ -3018,7 +3018,13 @@ impl Engine {
                 SingleFileMessagePackBackingStore::new(&self.options.state_store)
                     .delete_batch_if_unchanged(std::slice::from_ref(&stored.envelope))
             }) {
-                Ok(_) => retired = true,
+                Ok(_) => {
+                    eprintln!(
+                        "Idunn retired consumed command {}: its transactions are history",
+                        stored.value.command_id
+                    );
+                    retired = true;
+                }
                 Err(error) => eprintln!(
                     "Idunn left consumed command {} resident: {error:#}",
                     stored.value.command_id
@@ -6521,6 +6527,42 @@ mod tests {
         let archived_commands = read_history_commands(&world.state_store);
         assert_eq!(archived_commands.len(), 1);
         assert_eq!(archived_commands[0].command_id, command.command_id);
+        assert!(!world.engine.freeze_one_queued_command()?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_resident_command_whose_transactions_are_history_is_retired_not_frozen() -> Result<()> {
+        // Before commands travelled to history with their transactions, a
+        // command outlived its retired transaction in the control store and
+        // read as queued again. Freeze must retire it, never re-freeze it.
+        let world = EngineFixture::new()?;
+        let (finished, command) = terminal_transaction_with_command("ghostlight")?;
+        SingleFileMessagePackBackingStore::new(&world.state_store).insert_entry_if_absent(
+            command_envelope(&command, command.requested_at_unix_millis)?,
+        )?;
+        SingleFileMessagePackBackingStore::new(&history_store_path(&world.state_store))
+            .insert_entry_if_absent(transaction_envelope(
+                &finished,
+                finished.updated_at_unix_millis,
+            )?)?;
+        assert_eq!(ControlSnapshot::read(&world.state_store)?.commands.len(), 1);
+
+        assert!(world.engine.freeze_one_queued_command()?);
+
+        assert!(
+            ControlSnapshot::read(&world.state_store)?
+                .commands
+                .is_empty(),
+            "consumed command stayed resident"
+        );
+        assert_eq!(read_history_commands(&world.state_store).len(), 1);
+        assert!(
+            ControlSnapshot::read(&world.state_store)?
+                .transactions
+                .is_empty(),
+            "a consumed command was frozen again"
+        );
         assert!(!world.engine.freeze_one_queued_command()?);
         Ok(())
     }
