@@ -2048,6 +2048,54 @@ fn typed_envelope<T: Serialize>(
     })
 }
 
+/// `history.cc`, beside the control store. Terminal transactions live here so
+/// the control store holds only what still gates a decision.
+fn history_store_path(state_store: &Path) -> PathBuf {
+    state_store.with_file_name("history.cc")
+}
+
+/// Move one finished transaction out of the live set.
+///
+/// History first, then the live copy: a crash between the two leaves the
+/// record in both, which reads as still-resident and is archived again on the
+/// next attempt. The other order can lose it, and a completion nobody can
+/// observe is the failure that actually costs an operator something.
+///
+/// `insert_entry_if_absent` makes the repeat a no-op, and the delete is a
+/// compare-and-swap on the exact envelope archived, so a transaction that
+/// changed underneath us is left alone rather than dropped.
+fn archive_terminal_transaction(state_store: &Path, envelope: &CultCacheEnvelope) -> Result<()> {
+    SingleFileMessagePackBackingStore::new(&history_store_path(state_store))
+        .insert_entry_if_absent(envelope.clone())
+        .context("archiving a finished transaction to history")?;
+    SingleFileMessagePackBackingStore::new(state_store)
+        .delete_batch_if_unchanged(std::slice::from_ref(envelope))
+        .context("retiring a finished transaction from the control store")?;
+    Ok(())
+}
+
+/// Finished transactions, read leniently and for display only.
+///
+/// `control.cc` keeps the byte-exact canonical check because its records still
+/// gate decisions. History describes what already happened, so an unreadable
+/// entry here is skipped rather than allowed to refuse the read -- that
+/// asymmetry is the whole reason the two files are separate.
+fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
+    let path = history_store_path(state_store);
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(envelopes) = SingleFileMessagePackBackingStore::new(&path).pull_all_read_only_snapshot()
+    else {
+        return Vec::new();
+    };
+    envelopes
+        .into_iter()
+        .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
+        .filter_map(|envelope| rmp_serde::from_slice::<DeploymentTransaction>(&envelope.payload).ok())
+        .collect()
+}
+
 fn replace_transaction(
     store_path: &Path,
     current: &Stored<DeploymentTransaction>,
@@ -2058,6 +2106,7 @@ fn replace_transaction(
         current.value.transaction_id == next.transaction_id,
         "transaction replacement changes identity"
     );
+    let envelope = transaction_envelope(next, next.updated_at_unix_millis)?;
     ensure!(
         SingleFileMessagePackBackingStore::new(store_path).compare_exchange(
             &[CultCacheExpectedEnvelope {
@@ -2065,10 +2114,13 @@ fn replace_transaction(
                 key: current.value.transaction_id.clone(),
                 current: Some(current.envelope.clone()),
             }],
-            &[transaction_envelope(next, next.updated_at_unix_millis)?],
+            std::slice::from_ref(&envelope),
         )?,
         "deployment transaction changed before its compare-exchange"
     );
+    if next.is_terminal() {
+        archive_terminal_transaction(store_path, &envelope)?;
+    }
     Ok(())
 }
 
@@ -2282,6 +2334,11 @@ fn submit(
 
 fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
     let snapshot = ControlSnapshot::read(store_path)?;
+    // Commands stay resident; their finished transactions do not. Without
+    // history a completed command would report as though it had never run,
+    // which is the operator surface R11 refused to trade away for a smaller
+    // live set.
+    let archived = read_history_transactions(store_path);
     let mut commands = snapshot.commands.iter().collect::<Vec<_>>();
     commands.sort_by_key(|stored| stored.value.requested_at_unix_millis);
     if let Some(command_id) = command_id {
@@ -2290,7 +2347,13 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
     }
     for stored in commands {
         let command = &stored.value;
-        let transactions = snapshot.transaction_for_command(&command.command_id);
+        let mut transactions = snapshot.transaction_for_command(&command.command_id);
+        transactions.extend(
+            archived
+                .iter()
+                .filter(|value| value.command_id == command.command_id),
+        );
+        transactions.sort_by_key(|value| value.ordinal);
         let (state, detail) = derived_command_status(&transactions);
         println!(
             "{} {} {} {}",
@@ -6076,6 +6139,136 @@ mod tests {
                 state_store,
             })
         }
+    }
+
+    fn terminal_transaction(target: &str) -> Result<DeploymentTransaction> {
+        Ok(terminal_transaction_with_command(target)?.0)
+    }
+
+    fn terminal_transaction_with_command(
+        target: &str,
+    ) -> Result<(DeploymentTransaction, DeploymentCommand)> {
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: format!("up-{target}"),
+            kind: CommandKind::Deploy,
+            selector: target.into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        let mut transaction = DeploymentTransaction::new(&command, target.into(), 0, None, 100)?;
+        transaction.phase = DeploymentPhase::Complete;
+        transaction.completion = Some(TransactionCompletion::FailedBeforeFencing {
+            error: "sealed source vanished".into(),
+        });
+        transaction.pre_fencing_abort = Some(PreFencingAbort {
+            error: "sealed source vanished".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Complete,
+        });
+        assert!(transaction.is_terminal(), "fixture must be terminal");
+        Ok((transaction, command))
+    }
+
+    #[test]
+    fn a_finished_transaction_leaves_the_live_set_and_stays_observable() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let history = history_store_path(&world.state_store);
+
+        let (live, command) = terminal_transaction_with_command("ghostlight")?;
+        // A transaction is only readable beside its immutable command.
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command.command_id.clone(),
+                    current: None,
+                }],
+                &[command_envelope(&command, command.requested_at_unix_millis)?],
+            )?
+        );
+        let mut opening = live.clone();
+        opening.phase = DeploymentPhase::Sealing;
+        opening.completion = None;
+        opening.pre_fencing_abort = None;
+        let opening_envelope = transaction_envelope(&opening, opening.updated_at_unix_millis)?;
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: opening.transaction_id.clone(),
+                    current: None,
+                }],
+                std::slice::from_ref(&opening_envelope),
+            )?
+        );
+        let stored = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .next()
+            .context("seeded transaction")?;
+
+        replace_transaction(&world.state_store, &stored, &live)?;
+
+        // Gone from the set that still gates decisions...
+        assert!(
+            ControlSnapshot::read(&world.state_store)?.transactions.is_empty(),
+            "a finished transaction stayed resident"
+        );
+        // ...and still answerable, which is what R11 refused to trade away.
+        let archived = read_history_transactions(&world.state_store);
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].transaction_id, live.transaction_id);
+        assert!(history.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn re_archiving_after_a_crash_window_is_a_no_op() -> Result<()> {
+        // History is written before the live copy is removed, so a crash
+        // between the two leaves the record in both. The repeat must not
+        // duplicate it or fail.
+        let world = EngineFixture::new()?;
+        let live = terminal_transaction("odin")?;
+        let envelope = transaction_envelope(&live, live.updated_at_unix_millis)?;
+
+        archive_terminal_transaction(&world.state_store, &envelope)?;
+        archive_terminal_transaction(&world.state_store, &envelope)?;
+
+        let archived = read_history_transactions(&world.state_store);
+        assert_eq!(archived.len(), 1, "the repeat duplicated the record");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_history_entry_is_skipped_rather_than_fatal() -> Result<()> {
+        // The asymmetry that justifies two files: control.cc refuses a record
+        // it cannot re-encode byte for byte, because those records still gate
+        // decisions. History describes what already happened and must never be
+        // able to refuse a read.
+        let world = EngineFixture::new()?;
+        let live = terminal_transaction("voidbot")?;
+        let envelope = transaction_envelope(&live, live.updated_at_unix_millis)?;
+        archive_terminal_transaction(&world.state_store, &envelope)?;
+
+        let history = history_store_path(&world.state_store);
+        assert!(
+            SingleFileMessagePackBackingStore::new(&history).insert_entry_if_absent(
+                CultCacheEnvelope {
+                    key: "tx-corrupt".into(),
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    payload: vec![0xc1],
+                    stored_at: rfc3339_millis(1)?,
+                    schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
+                }
+            )?
+        );
+
+        let archived = read_history_transactions(&world.state_store);
+        assert_eq!(archived.len(), 1, "the readable record must survive");
+        assert_eq!(archived[0].transaction_id, live.transaction_id);
+        Ok(())
     }
 
     #[test]
