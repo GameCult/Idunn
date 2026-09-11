@@ -87,6 +87,47 @@ running a script, and a dead `muninn serve` is seen the tick it dies.
 4. The actuator cannot be told to run a program the recipe did not declare;
    `allowed_programs` on the host-native runner is enforced on the host.
 
+## What the cut taught, same day
+
+Each of these was found by running the pipe against Raven, not by reading.
+
+- **Fixed host resources cannot overlap.** Muninn owns the desktop, the
+  capture device and two advertised ports; candidate-then-promote failed at
+  bind time. `rollout.strategy = "stop-then-start"` exists for exactly a
+  route-less host-actuator workload: the admitted incumbent is stopped at
+  Starting, before the candidate starts, and supervision leaves the target
+  alone from Starting on. A systemd-transient workload may not declare it.
+- **An unobservable host is silence.** The hub returns a typed
+  `HostUnobservable` for not-attached, detached, reconnected and unanswered.
+  Supervision skips that tick and logs it. Before this, an Idunn restart
+  burned all three continuity attempts inside the actuator's 15-second
+  reattach window and demoted a healthy Muninn.
+- **The hub is serviced on its own thread.** A tick that blocked on odin's
+  docker build for a minute starved every attached host into a timeout.
+- **A binding path is absolute by its own shape.** The actuator re-parses
+  the Linux binding on Windows; `/var/...` must not fail there.
+- **The actuator's git never rewrites line endings.** The frozen tree is
+  byte-exact; Windows git's autocrlf made the recipe bytes differ from the
+  plan's.
+- **The actuator must be rebuilt when the binding vocabulary grows.** It
+  parses the same TOML the daemon does, from the same crate; an older
+  actuator refuses a plan whose binding it cannot decode, which is the
+  right refusal and a deploy step to remember.
+- **A provider's presence sequence must survive its restart.** Odin admits
+  only above the sequence it last stored for a signer; Muninn now uses the
+  observation clock.
+- **Odin (not this repo) died on a stale provider presence.** A continuity
+  restart of raven-muninn left the previous presence in Odin's store; Odin
+  treated a stored presence that no longer authenticated as tampering and
+  exited, on every restart, until Idunn gave up on it. Fixed in Odin
+  `aaaa8ed`: stale, logged, not fatal. Recorded here because this cut is
+  what made a provider restart under Idunn a routine event.
+
+Measured on Raven: cold build 1 m 20 s, warm 50 s; seal to admitted about
+90 s including the brake release; a killed `serve` is observed on the next
+tick and restarted by continuity in 6 s; reattach after an Idunn restart
+about 20 s, during which the target is logged unobservable and untouched.
+
 ## Subtraction budget
 
 Removed: `WorkloadDriver`, `RunnerDriver` enums; the Muninn serve launcher
@@ -98,7 +139,11 @@ the operator ordered: a Windows host inside Idunn's authority.
 
 ## Build budget
 
-`idunn` and `idunn-provision` build on yggdrasil in the pinned Rust image as
-before. `idunn-host` builds on a Windows host with the stable toolchain and
-runs on Raven; it is not built on yggdrasil. The library compiles on both;
-unix-only code is `cfg(unix)`.
+`idunn` and `idunn-provision` are built for yggdrasil in docker
+(`rust:latest`, `CARGO_TARGET_DIR=target/linux`; the test suite needs an
+`/etc/machine-id` in the container) and installed with
+`gamecult-ops/scripts/install-idunn-yggdrasil-release.sh`. `idunn-host`
+builds on a Windows host with the stable toolchain and runs on Raven; it is
+not built on yggdrasil. The library compiles on both; unix-only code is
+`cfg(unix)`, and the Linux-shaped test fixtures pass on a Windows checkout
+except the one parent-only-descriptor test.
