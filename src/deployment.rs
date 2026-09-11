@@ -1541,9 +1541,18 @@ impl OperatorBinding {
             .union(&declaration.service.optional_environment)
             .cloned()
             .collect();
+        // On the Idunn host the presence identity reaches the workload as a
+        // parent-only descriptor, so a recipe that names it as environment
+        // is asking for something that will never be set. A host actuator
+        // has no descriptor to pass and hands it over as a file named by
+        // exactly this variable, so there the recipe must declare it.
         ensure!(
-            !declared_environment.contains(RUNTIME_PRESENCE_IDENTITY_BINDING),
-            "runtime presence identity is a named parent-only descriptor, not service environment"
+            host_workload == declared_environment.contains(RUNTIME_PRESENCE_IDENTITY_BINDING),
+            if host_workload {
+                "a host-actuator workload must declare the runtime presence identity as required environment"
+            } else {
+                "runtime presence identity is a named parent-only descriptor, not service environment"
+            }
         );
         ensure!(
             available_environment.is_subset(&declared_environment),
