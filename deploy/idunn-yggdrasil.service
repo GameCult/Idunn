@@ -45,6 +45,7 @@ ExecStart=/usr/local/bin/idunn serve \
   --odin-correlation-store /var/lib/gamecult/odin/topology.cc \
   --odin-trust-anchor /etc/gamecult/idunn/odin-topology-anchor.cc \
   --deployment-brake-operator-anchor /etc/gamecult/idunn/deployment-brake-operator-anchor.cc \
+  --host-actuator-bind 10.77.0.1:17890 \
   --source-uid 986 \
   --source-gid 978
 Restart=always

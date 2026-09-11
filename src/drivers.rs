@@ -83,6 +83,12 @@ pub struct FrozenSource {
     root: PathBuf,
 }
 
+impl FrozenSource {
+    pub fn receipt(&self) -> &FrozenSourceReceipt {
+        &self.receipt
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenSourceReceipt {
     pub transaction_id: String,
@@ -1360,6 +1366,7 @@ impl SourcePort for GitSourceDriver {
 /// operator binding selects the exact image/network/mount affordances, and the
 /// driver returns complete materialization receipts rather than build truth by
 /// convention.
+#[derive(Clone)]
 pub struct DockerRunnerDriver {
     pub docker_program: PathBuf,
 }
@@ -1710,6 +1717,7 @@ impl RunnerPort for DockerRunnerDriver {
 /// contract into a transient unit and then proves the native process and
 /// executable that systemd actually started. It does not decide admission,
 /// readiness, write authority, or route membership.
+#[derive(Clone)]
 pub struct SystemdTransientWorkloadDriver {
     pub systemd_run_program: PathBuf,
     pub systemctl_program: PathBuf,
@@ -2025,28 +2033,7 @@ impl SystemdTransientWorkloadDriver {
             .systemd()?
             .runtime_root
             .join(&activation.runtime_instance_id);
-        fs::create_dir_all(&bundle)
-            .with_context(|| format!("creating runtime bundle {}", bundle.display()))?;
-        write_immutable_record(
-            &bundle.join("expected.cc"),
-            CultCacheEnvelope {
-                key: expected.target.clone(),
-                r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
-                payload: expected.canonical_bytes()?,
-                stored_at: rfc3339_millis(activation.issued_at_unix_millis)?,
-                schema_id: Some(IDUNN_EXPECTED_INCARNATION_SCHEMA.into()),
-            },
-        )?;
-        write_immutable_record(
-            &bundle.join("activation.cc"),
-            CultCacheEnvelope {
-                key: expected.target.clone(),
-                r#type: IdunnRuntimeActivationRecord::TYPE.into(),
-                payload: activation.canonical_bytes()?,
-                stored_at: rfc3339_millis(activation.issued_at_unix_millis)?,
-                schema_id: Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA.into()),
-            },
-        )?;
+        write_runtime_bundle_records(&bundle, expected, activation)?;
         harden_runtime_bundle(&bundle)?;
         let state_group_id = binding
             .workload
@@ -4912,7 +4899,7 @@ fn exact_route_snapshot_response(
     })
 }
 
-fn release_artifact<'a>(
+pub(crate) fn release_artifact<'a>(
     declaration: &'a TargetDeclaration,
     artifact_id: &str,
 ) -> Result<&'a ArtifactOutput> {
@@ -4923,7 +4910,40 @@ fn release_artifact<'a>(
         .with_context(|| format!("target declares no artifact {artifact_id}"))
 }
 
-fn write_immutable_record(path: &Path, envelope: CultCacheEnvelope) -> Result<()> {
+/// The two records every Idunn-launched workload reads at start: its Expected
+/// and its activation, each immutable once written. Shared by every workload
+/// driver; the systemd driver hardens the directory afterwards, the host
+/// actuator writes it inside the host user's own profile.
+pub(crate) fn write_runtime_bundle_records(
+    bundle: &Path,
+    expected: &IdunnExpectedIncarnationRecord,
+    activation: &IdunnRuntimeActivationRecord,
+) -> Result<()> {
+    fs::create_dir_all(bundle)
+        .with_context(|| format!("creating runtime bundle {}", bundle.display()))?;
+    write_immutable_record(
+        &bundle.join("expected.cc"),
+        CultCacheEnvelope {
+            key: expected.target.clone(),
+            r#type: IdunnExpectedIncarnationRecord::TYPE.into(),
+            payload: expected.canonical_bytes()?,
+            stored_at: rfc3339_millis(activation.issued_at_unix_millis)?,
+            schema_id: Some(IDUNN_EXPECTED_INCARNATION_SCHEMA.into()),
+        },
+    )?;
+    write_immutable_record(
+        &bundle.join("activation.cc"),
+        CultCacheEnvelope {
+            key: expected.target.clone(),
+            r#type: IdunnRuntimeActivationRecord::TYPE.into(),
+            payload: activation.canonical_bytes()?,
+            stored_at: rfc3339_millis(activation.issued_at_unix_millis)?,
+            schema_id: Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA.into()),
+        },
+    )
+}
+
+pub(crate) fn write_immutable_record(path: &Path, envelope: CultCacheEnvelope) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -4970,7 +4990,7 @@ fn upsert_record(path: &Path, replacement: CultCacheEnvelope) -> Result<()> {
     bail!("CultCache projection changed too often to publish")
 }
 
-fn rfc3339_millis(millis: u64) -> Result<String> {
+pub(crate) fn rfc3339_millis(millis: u64) -> Result<String> {
     Ok(
         chrono::DateTime::from_timestamp_millis(i64::try_from(millis)?)
             .context("runtime timestamp is out of range")?
@@ -6434,7 +6454,7 @@ fn normalized_relative(path: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     ensure!(source.is_dir(), "source tree is not a directory");
     ensure!(!destination.exists(), "destination tree already exists");
     fs::create_dir_all(destination)?;
@@ -6479,7 +6499,7 @@ fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_artifact(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_artifact(source: &Path, destination: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_dir() {
         copy_tree(source, destination)
@@ -6494,7 +6514,7 @@ fn copy_artifact(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-fn digest_artifact(path: &Path) -> Result<(String, u64)> {
+pub(crate) fn digest_artifact(path: &Path) -> Result<(String, u64)> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_file() {
         let bytes = fs::read(path)?;
@@ -6543,11 +6563,11 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
     Ok(())
 }
 
-fn raw_sha256(bytes: &[u8]) -> String {
+pub(crate) fn raw_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn remove_tree_inside(root: &Path, target: &Path) -> Result<()> {
+pub(crate) fn remove_tree_inside(root: &Path, target: &Path) -> Result<()> {
     let root = root.canonicalize()?;
     let target = target.canonicalize()?;
     ensure!(
@@ -6558,7 +6578,7 @@ fn remove_tree_inside(root: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("removing disposable runner workspace {}", target.display()))
 }
 
-fn sha256_id(bytes: &[u8]) -> String {
+pub(crate) fn sha256_id(bytes: &[u8]) -> String {
     format!("sha256-{:x}", Sha256::digest(bytes))
 }
 

@@ -11,6 +11,10 @@ pub const IDUNN_RUNTIME_BUNDLE_ENVIRONMENT: &str = "GAMECULT_IDUNN_RUNTIME_BUNDL
 pub const IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT: &str = "GAMECULT_IDUNN_CANDIDATE_BIND";
 pub const IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT: &str = "GAMECULT_IDUNN_PROCESS_WRITE_LEASE";
 pub const RUNTIME_PRESENCE_IDENTITY_BINDING: &str = "GAMECULT_RUNTIME_PRESENCE_IDENTITY";
+/// A host actuator hands the workload its activation credential as a file
+/// named by this variable; on the Idunn host it arrives as a parent-only
+/// descriptor instead and this name is never set.
+pub const IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT: &str = "GAMECULT_IDUNN_ACTIVATION_CREDENTIAL";
 pub const RUNTIME_PRESENCE_IDENTITY_FD_NAME: &str = "gamecult-runtime-presence-identity";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1497,18 +1501,27 @@ impl OperatorBinding {
             IDUNN_RUNTIME_BUNDLE_ENVIRONMENT,
             IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT,
             IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT,
+            IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT,
         ] {
             ensure!(
                 !workload_names.contains(&owned.to_string()),
                 "operator binding cannot replace Idunn-owned launch environment {owned}"
             );
         }
+        // On the Idunn host the presence identity is a parent-only descriptor
+        // and the activation credential another; neither is environment. A
+        // host actuator has no descriptor to hand over and passes both as
+        // files named by environment.
+        let host_workload = matches!(self.workload, WorkloadBinding::HostActuator(_));
         let mut available_environment: BTreeSet<_> = workload_names
             .into_iter()
-            .filter(|name| name.as_str() != RUNTIME_PRESENCE_IDENTITY_BINDING)
+            .filter(|name| host_workload || name.as_str() != RUNTIME_PRESENCE_IDENTITY_BINDING)
             .cloned()
             .collect();
         available_environment.insert(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT.into());
+        if host_workload {
+            available_environment.insert(IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT.into());
+        }
         if declaration.service.route_required {
             available_environment.insert(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT.into());
         }

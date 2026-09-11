@@ -486,6 +486,7 @@ dependencies = [
  "tempfile",
  "toml",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

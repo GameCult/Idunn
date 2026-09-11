@@ -55,6 +55,12 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
             &options, "provider health public anchor"
         )?,
         "enroll-idunn-identity" => enroll_identity::<IdunnServiceIdentity>(&options)?,
+        "enroll-host-actuator-identity" => {
+            enroll_identity::<crate::host_actuator::IdunnHostActuatorIdentity>(&options)?
+        }
+        "export-host-actuator-public-anchor" => export_identity_anchor::<
+            crate::host_actuator::IdunnHostActuatorIdentity,
+        >(&options, "host actuator public anchor")?,
         "export-idunn-public-anchor" => {
             export_identity_anchor::<IdunnServiceIdentity>(&options, "Idunn public anchor")?
         }

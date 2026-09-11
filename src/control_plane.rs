@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::deployment::{DependencyKind, OperatorBinding, RouteBinding, capability_compatible};
+use crate::deployment::{
+    DependencyKind, OperatorBinding, RouteBinding, WorkloadBinding, capability_compatible,
+};
 use crate::deployment_plan::{
     CompiledDeploymentPlan, DependencyProviderAuthority, SealedRelease, compile_deployment_plan,
 };
@@ -37,6 +41,10 @@ use crate::drivers::{
     ProcessIdentity, RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
     SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
     WriteLeasePort,
+};
+use crate::host_actuator::{
+    HostActuatorAccess, HostActuatorHub, HostActuatorRunnerDriver, HostActuatorWorkloadDriver,
+    IdunnHostActuatorIdentity,
 };
 
 const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
@@ -1425,6 +1433,10 @@ struct RuntimeOptions {
     topology_maximum_age_millis: u64,
     topology_maximum_future_skew_millis: u64,
     poll_millis: u64,
+    /// Where host actuators dial in. `None` means no host-actuator workload
+    /// can be served; a binding that names one then fails at its first
+    /// driver call, not at startup, so an Idunn without hosts is unchanged.
+    host_actuator_bind: Option<SocketAddr>,
 }
 
 impl Default for RuntimeOptions {
@@ -1449,6 +1461,7 @@ impl Default for RuntimeOptions {
             topology_maximum_age_millis: DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS,
             topology_maximum_future_skew_millis: DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS,
             poll_millis: 500,
+            host_actuator_bind: None,
         }
     }
 }
@@ -1590,6 +1603,14 @@ fn parse_serve(mut args: impl Iterator<Item = String>) -> Result<Command> {
             "--source-uid" => source_uid = Some(u32_value(&mut args, &argument)?),
             "--source-gid" => source_gid = Some(u32_value(&mut args, &argument)?),
             "--poll-millis" => options.poll_millis = u64_value(&mut args, &argument)?,
+            "--host-actuator-bind" => {
+                let value = string_value(&mut args, &argument)?;
+                options.host_actuator_bind = Some(
+                    value
+                        .parse()
+                        .with_context(|| format!("{argument} is not a socket address"))?,
+                );
+            }
             "--help" | "-h" => bail!(usage()),
             _ => bail!("unknown Idunn serve option {argument:?}"),
         }
@@ -2661,8 +2682,9 @@ struct Engine {
     idunn_anchor: ServiceIdentityTrustAnchor,
     bootstrap_odin_authority: AdmittedOdinAuthority,
     source: GitSourceDriver,
-    runner: DockerRunnerDriver,
-    workload: SystemdTransientWorkloadDriver,
+    docker_runner: DockerRunnerDriver,
+    systemd_workload: SystemdTransientWorkloadDriver,
+    host_actuators: Option<RefCell<HostActuatorHub>>,
 }
 
 impl Engine {
@@ -2679,14 +2701,102 @@ impl Engine {
             options.staging_root.join("frozen-sources"),
             options.source_identity,
         );
+        let host_actuators = options
+            .host_actuator_bind
+            .map(|bind| HostActuatorHub::bind(bind).map(RefCell::new))
+            .transpose()?;
+        if let Some(hub) = &host_actuators {
+            eprintln!(
+                "Idunn host actuator hub listening on {}",
+                hub.borrow().local_addr()?
+            );
+        }
         Ok(Self {
             options,
             idunn_signer,
             idunn_anchor,
             bootstrap_odin_authority,
             source,
-            runner: DockerRunnerDriver::default(),
-            workload: SystemdTransientWorkloadDriver::default(),
+            docker_runner: DockerRunnerDriver::default(),
+            systemd_workload: SystemdTransientWorkloadDriver::default(),
+            host_actuators,
+        })
+    }
+
+    /// The trust anchor of every host a binding names. A binding whose anchor
+    /// cannot be read leaves its host unattachable and is logged; the other
+    /// hosts are unaffected.
+    fn host_anchors(&self) -> BTreeMap<String, ServiceIdentityTrustAnchor> {
+        let mut anchors = BTreeMap::new();
+        let bindings = match load_bindings(&self.options.bindings_dir) {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                eprintln!("Idunn cannot read bindings for host anchors: {error:#}");
+                return anchors;
+            }
+        };
+        for loaded in bindings.values() {
+            let WorkloadBinding::HostActuator(workload) = &loaded.binding.workload else {
+                continue;
+            };
+            match read_trust_anchor::<IdunnHostActuatorIdentity>(&workload.host_trust_anchor_store)
+            {
+                Ok(anchor) => {
+                    anchors.insert(workload.host.clone(), anchor);
+                }
+                Err(error) => eprintln!(
+                    "Idunn cannot read the actuator anchor for host {}: {error:#}",
+                    workload.host
+                ),
+            }
+        }
+        anchors
+    }
+
+    /// Once per tick: attach hosts that dialled in, drop hosts that went
+    /// silent. Nothing here decides anything about a target.
+    fn service_host_actuators(&self) {
+        let Some(hub) = &self.host_actuators else {
+            return;
+        };
+        let anchors = self.host_anchors();
+        if let Err(error) = hub.borrow_mut().service(&anchors, &self.idunn_signer) {
+            eprintln!("Idunn host actuator hub fault: {error:#}");
+        }
+    }
+
+    fn host_access(&self) -> Result<HostActuatorAccess<'_>> {
+        let hub = self
+            .host_actuators
+            .as_ref()
+            .context("this Idunn serves no host actuators (no --host-actuator-bind)")?;
+        Ok(HostActuatorAccess {
+            hub,
+            anchors: self.host_anchors(),
+            signer: &self.idunn_signer,
+        })
+    }
+
+    /// The runner the plan's binding declares. Every runner in one binding
+    /// is of one kind; the binding validated that.
+    fn runner_for(&self, plan: &CompiledDeploymentPlan) -> Result<Box<dyn RunnerPort + '_>> {
+        let (_, binding) = plan.parsed_inputs()?;
+        Ok(match &binding.workload {
+            WorkloadBinding::SystemdTransient(_) => Box::new(self.docker_runner.clone()),
+            WorkloadBinding::HostActuator(_) => Box::new(HostActuatorRunnerDriver {
+                access: self.host_access()?,
+            }),
+        })
+    }
+
+    /// The workload driver the plan's binding declares.
+    fn workload_for(&self, plan: &CompiledDeploymentPlan) -> Result<Box<dyn WorkloadPort + '_>> {
+        let (_, binding) = plan.parsed_inputs()?;
+        Ok(match &binding.workload {
+            WorkloadBinding::SystemdTransient(_) => Box::new(self.systemd_workload.clone()),
+            WorkloadBinding::HostActuator(_) => Box::new(HostActuatorWorkloadDriver {
+                access: self.host_access()?,
+            }),
         })
     }
 
@@ -2924,6 +3034,7 @@ impl Engine {
     }
 
     fn run_scheduler_tick(&self) -> Result<bool> {
+        self.service_host_actuators();
         if self.retire_one_terminal_transaction()? {
             return Ok(true);
         }
@@ -3227,11 +3338,13 @@ impl Engine {
                 }
             }
             let mut operational_error = None;
-            let observation = match self.workload.observe(
-                &current.value.expected,
-                &current.value.activation,
-                &current.value.workload,
-            ) {
+            let observation = match self.workload_for(&current.value.plan).and_then(|workload| {
+                workload.observe(
+                    &current.value.expected,
+                    &current.value.activation,
+                    &current.value.workload,
+                )
+            }) {
                 Ok(observation) => {
                     let lease_is_missing = if let Some(lease) = current.value.leasing.lease() {
                         let lease_health = (|| -> Result<bool> {
@@ -3700,10 +3813,13 @@ impl Engine {
             let plan = required(&current.value.plan, "transaction plan")?;
             let frozen_receipt = required(&current.value.frozen_source, "frozen source")?;
             let frozen = self.source.observe_frozen(plan, frozen_receipt)?;
-            let materialized =
-                self.runner
-                    .materialize(&frozen, plan, &self.options.staging_root, now)?;
-            let installed = self.workload.install(plan, &materialized)?;
+            let materialized = self.runner_for(plan)?.materialize(
+                &frozen,
+                plan,
+                &self.options.staging_root,
+                now,
+            )?;
+            let installed = self.workload_for(plan)?.install(plan, &materialized)?;
             let expected = materialized.release.expected_projection(plan)?;
             return self.persist_same_phase(current, |next| {
                 next.sealed_release = Some(materialized.release);
@@ -3783,7 +3899,9 @@ impl Engine {
                 now,
                 &self.idunn_signer,
             )?;
-            let activation = self.workload.prepare_activation(plan, expected, launch)?;
+            let activation = self
+                .workload_for(plan)?
+                .prepare_activation(plan, expected, launch)?;
             return self.persist_same_phase(current, |next| {
                 next.activation = Some(activation);
                 next.updated_at_unix_millis = now;
@@ -3795,7 +3913,7 @@ impl Engine {
             let now = now_millis()?;
             let activation = required(&current.value.activation, "activation")?;
             let observation = self
-                .workload
+                .workload_for(plan)?
                 .start_prepared(plan, release, installed, expected, activation)?;
             return self.persist_same_phase(current, |next| {
                 next.workload = Some(observation);
@@ -3808,7 +3926,8 @@ impl Engine {
             let now = now_millis()?;
             let activation = required(&current.value.activation, "activation")?;
             let workload = required(&current.value.workload, "workload")?;
-            self.workload.observe(expected, activation, workload)?;
+            self.workload_for(required(&current.value.plan, "transaction plan")?)?
+                .observe(expected, activation, workload)?;
             let digest = self
                 .topology()
                 .publish_observed_activation(expected, activation, workload)?;
@@ -3830,7 +3949,8 @@ impl Engine {
         let expected = required(&current.value.expected, "Expected projection")?;
         let activation = required(&current.value.activation, "activation")?;
         let workload = required(&current.value.workload, "workload")?;
-        self.workload.observe(expected, activation, workload)?;
+        self.workload_for(required(&current.value.plan, "transaction plan")?)?
+            .observe(expected, activation, workload)?;
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let incumbent_lease_sha256 =
             self.incumbent_lease_sha256_for_warming(&snapshot, &current.value)?;
@@ -3965,7 +4085,7 @@ impl Engine {
             let incumbent_workload = match incumbent {
                 Some(value)
                     if self
-                        .workload
+                        .workload_for(&value.value.plan)?
                         .is_permanently_stopped(&value.value.workload)? =>
                 {
                     None
@@ -4006,7 +4126,7 @@ impl Engine {
                     .transpose()?;
                 if let (Some(lease), Some(path)) = (incumbent_lease, &incumbent_lease_path) {
                     let incumbent = incumbent.context("incumbent lease lost its generation")?;
-                    self.workload
+                    self.workload_for(&incumbent.value.plan)?
                         .stop(&incumbent.value.workload)
                         .context("stopping the exact incumbent before revoking its lifetime-held write lease")?;
                     let driver = CultCacheWriteLeaseDriver::new(&current.value.target, path);
@@ -4113,11 +4233,12 @@ impl Engine {
                 driver.observe_exact(lease)?,
                 "physical write lease disappeared after Granted became durable"
             );
-            self.workload.observe(
-                expected,
-                activation,
-                required(&current.value.workload, "candidate workload")?,
-            )?;
+            self.workload_for(required(&current.value.plan, "transaction plan")?)?
+                .observe(
+                    expected,
+                    activation,
+                    required(&current.value.workload, "candidate workload")?,
+                )?;
             ensure!(
                 driver.grant(expected, activation, &warming, lease)? == recorded_sha256,
                 "replayed physical write lease differs from Granted evidence"
@@ -4174,11 +4295,12 @@ impl Engine {
                     }
                 }
             };
-            self.workload.observe(
-                expected,
-                activation,
-                required(&current.value.workload, "candidate workload")?,
-            )?;
+            self.workload_for(required(&current.value.plan, "transaction plan")?)?
+                .observe(
+                    expected,
+                    activation,
+                    required(&current.value.workload, "candidate workload")?,
+                )?;
             if !physical_is_exact {
                 ensure!(
                     driver.observe_empty()?,
@@ -4449,7 +4571,8 @@ impl Engine {
         let expected = required(&ready_current.value.expected, "Expected projection")?;
         let activation = required(&ready_current.value.activation, "activation")?;
         let workload = required(&ready_current.value.workload, "workload")?;
-        self.workload.observe(expected, activation, workload)?;
+        self.workload_for(required(&ready_current.value.plan, "transaction plan")?)?
+            .observe(expected, activation, workload)?;
         self.ensure_transaction_write_lease_current(&ready_current.value, now_millis()?)?;
         if let Some(route) = ready_current
             .value
@@ -4513,11 +4636,12 @@ impl Engine {
                 now,
             )
         })?;
-        self.workload.observe(
-            required(&commit_current.value.expected, "Expected projection")?,
-            required(&commit_current.value.activation, "activation")?,
-            required(&commit_current.value.workload, "workload")?,
-        )?;
+        self.workload_for(required(&commit_current.value.plan, "transaction plan")?)?
+            .observe(
+                required(&commit_current.value.expected, "Expected projection")?,
+                required(&commit_current.value.activation, "activation")?,
+                required(&commit_current.value.workload, "workload")?,
+            )?;
         self.ensure_transaction_write_lease_current(&commit_current.value, now)?;
 
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
@@ -4892,7 +5016,7 @@ impl Engine {
     /// triggered the post-fencing abort never happens, and the transaction
     /// owns the target forever behind a process that is gone.
     fn observe_candidate_before_waiting(&self, transaction: &DeploymentTransaction) -> Result<()> {
-        self.workload
+        self.workload_for(required(&transaction.plan, "transaction plan")?)?
             .observe(
                 required(&transaction.expected, "Expected projection")?,
                 required(&transaction.activation, "activation")?,
@@ -5660,7 +5784,8 @@ impl Engine {
         let Some(workload) = &transaction.workload else {
             return Ok(false);
         };
-        self.workload.is_permanently_stopped(workload)
+        self.workload_for(required(&transaction.plan, "transaction plan")?)?
+            .is_permanently_stopped(workload)
     }
 
     fn begin_post_fencing_abort(
@@ -5771,12 +5896,13 @@ impl Engine {
             });
         }
         if abort.candidate_cleanup == CleanupEvidence::Pending {
+            let plan = required(&current.value.plan, "abandoned candidate plan")?;
             if let Some(workload) = &current.value.workload {
-                self.workload
+                self.workload_for(plan)?
                     .stop(workload)
                     .context("stopping the abandoned candidate")?;
             }
-            self.workload
+            self.workload_for(plan)?
                 .discard_prepared(
                     required(&current.value.plan, "abandoned candidate plan")?,
                     required(&current.value.expected, "abandoned Expected projection")?,
@@ -5865,12 +5991,13 @@ impl Engine {
         );
         let abort = required(&current.value.pre_fencing_abort, "pre-fencing abort intent")?;
         if abort.candidate_cleanup == CleanupEvidence::Pending {
+            let plan = required(&current.value.plan, "transaction plan")?;
             if let Some(workload) = &current.value.workload {
-                self.workload
+                self.workload_for(plan)?
                     .stop(workload)
                     .context("stopping exact pre-fence candidate")?;
             }
-            self.workload
+            self.workload_for(plan)?
                 .discard_prepared(
                     required(&current.value.plan, "pre-fencing candidate plan")?,
                     required(&current.value.expected, "pre-fencing Expected projection")?,
@@ -5959,7 +6086,10 @@ impl Engine {
                     return Ok(());
                 }
             }
-            self.workload
+            // The incumbent is the same target under the same binding kind;
+            // an incumbent of another kind is refused by the driver, not
+            // guessed at.
+            self.workload_for(required(&current.value.plan, "committed transaction plan")?)?
                 .stop(workload)
                 .with_context(|| format!("retiring admitted incumbent {generation_id}"))?;
             let generation_id = generation_id.clone();
@@ -6194,7 +6324,9 @@ fn read_single_envelope(path: &Path) -> Result<Option<CultCacheEnvelope>> {
     }
 }
 
-fn read_trust_anchor<P: ServiceIdentityProfile>(path: &Path) -> Result<ServiceIdentityTrustAnchor> {
+pub(crate) fn read_trust_anchor<P: ServiceIdentityProfile>(
+    path: &Path,
+) -> Result<ServiceIdentityTrustAnchor> {
     let envelope = read_single_envelope(path)?
         .with_context(|| format!("service identity trust anchor {} is absent", path.display()))?;
     ensure!(
@@ -6317,7 +6449,7 @@ fn runtime_instance_id(transaction_id: &str) -> Result<String> {
 
 fn usage() -> &'static str {
     "Idunn deployment, admission, and continuity control plane\n\n\
-     idunn serve [runtime options]\n\
+     idunn serve [runtime options] [--host-actuator-bind ADDR]\n\
      idunn up <service|profile:name> [--state-store PATH] [--no-wait]\n\
      idunn status [--state-store PATH] [--command ID]\n\
      idunn cancel <command-id> [--state-store PATH]\n\
