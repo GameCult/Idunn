@@ -713,6 +713,12 @@ pub struct RolloutBinding {
 #[serde(rename_all = "kebab-case")]
 pub enum RolloutStrategy {
     CandidateThenPromote,
+    /// The admitted incumbent is stopped before the candidate starts. For a
+    /// workload that owns fixed host resources no route can multiplex (one
+    /// desktop, one capture device, fixed advertised ports), two incarnations
+    /// cannot overlap; the honest strategy says so instead of failing at
+    /// bind time. Only a route-less host-actuator workload may declare it.
+    StopThenStart,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1194,7 +1200,13 @@ impl OperatorBinding {
                 );
                 return self.validate_shared_tail();
             }
-            WorkloadBinding::SystemdTransient(workload) => workload,
+            WorkloadBinding::SystemdTransient(workload) => {
+                ensure!(
+                    self.rollout.strategy == RolloutStrategy::CandidateThenPromote,
+                    "a systemd-transient workload rolls out candidate-then-promote"
+                );
+                workload
+            }
         };
         let needs_state_group =
             workload.state_root.is_some() || !workload.read_write_paths.is_empty();

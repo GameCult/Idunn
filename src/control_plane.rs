@@ -30,7 +30,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::deployment::{
-    DependencyKind, OperatorBinding, RouteBinding, WorkloadBinding, capability_compatible,
+    DependencyKind, OperatorBinding, RolloutStrategy, RouteBinding, WorkloadBinding,
+    capability_compatible,
 };
 use crate::deployment_plan::{
     CompiledDeploymentPlan, DependencyProviderAuthority, SealedRelease, compile_deployment_plan,
@@ -44,7 +45,7 @@ use crate::drivers::{
 };
 use crate::host_actuator::{
     HostActuatorAccess, HostActuatorHub, HostActuatorRunnerDriver, HostActuatorWorkloadDriver,
-    IdunnHostActuatorIdentity, SharedHostActuatorHub, spawn_hub_service,
+    HostUnobservable, IdunnHostActuatorIdentity, SharedHostActuatorHub, spawn_hub_service,
 };
 
 const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
@@ -721,6 +722,15 @@ struct DeploymentTransaction {
 }
 
 impl DeploymentTransaction {
+    /// Whether this transaction's binding declares stop-then-start. A
+    /// transaction without a plan yet cannot, so it reads as false.
+    fn rollout_stops_incumbent_first(&self) -> bool {
+        self.plan
+            .as_ref()
+            .and_then(|plan| plan.parsed_inputs().ok())
+            .is_some_and(|(_, binding)| binding.rollout.strategy == RolloutStrategy::StopThenStart)
+    }
+
     fn new(
         command: &DeploymentCommand,
         target: String,
@@ -3265,8 +3275,15 @@ impl Engine {
                     && stored.value.blocks_new_target_mutation()
             });
             if blocker.is_some_and(|stored| {
-                stored.value.phase >= DeploymentPhase::Fencing
-                    && stored.value.phase < DeploymentPhase::Complete
+                let owns_from = if stored.value.rollout_stops_incumbent_first() {
+                    // The incumbent is stopped at Starting by design; a
+                    // continuity restart in that window would fight the
+                    // candidate for the same host resources.
+                    DeploymentPhase::Starting
+                } else {
+                    DeploymentPhase::Fencing
+                };
+                stored.value.phase >= owns_from && stored.value.phase < DeploymentPhase::Complete
             }) {
                 continue;
             }
@@ -3391,6 +3408,18 @@ impl Engine {
                     } else {
                         Some(observation)
                     }
+                }
+                Err(error) if error.downcast_ref::<HostUnobservable>().is_some() => {
+                    // The host cannot be asked right now (its actuator is
+                    // between sessions, or Idunn just restarted). That is
+                    // silence, not a death; counting it as one burned every
+                    // continuity attempt in the reattach window on
+                    // 2026-09-11 and left a healthy Muninn demoted.
+                    eprintln!(
+                        "Idunn cannot observe admitted {} this tick: {error:#}",
+                        current.value.target
+                    );
+                    continue;
                 }
                 Err(error) => {
                     operational_error = Some(error);
@@ -3914,6 +3943,14 @@ impl Engine {
         if current.value.workload.is_none() {
             let now = now_millis()?;
             let activation = required(&current.value.activation, "activation")?;
+            if current.value.rollout_stops_incumbent_first() {
+                let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+                if let Some(incumbent) = self.exact_incumbent(&snapshot, &current.value)? {
+                    self.workload_for(&incumbent.value.plan)?
+                        .stop(&incumbent.value.workload)
+                        .context("stopping the incumbent before the candidate starts")?;
+                }
+            }
             let observation = self
                 .workload_for(plan)?
                 .start_prepared(plan, release, installed, expected, activation)?;

@@ -299,6 +299,37 @@ impl HostActuatorEnvelope {
     }
 }
 
+/// The host could not be asked: nothing is attached under its name, or the
+/// session dropped before it answered. This is not evidence about the
+/// workload either way. Continuity must not count it as a death, and a
+/// transaction must retry it, which the phase machine already does for
+/// any error.
+#[derive(Debug)]
+pub struct HostUnobservable {
+    pub host: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for HostUnobservable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "host actuator {} is unobservable: {}",
+            self.host, self.reason
+        )
+    }
+}
+
+impl std::error::Error for HostUnobservable {}
+
+fn unobservable(host: &str, reason: impl Into<String>) -> anyhow::Error {
+    HostUnobservable {
+        host: host.into(),
+        reason: reason.into(),
+    }
+    .into()
+}
+
 /// One attached host: the session that authenticated as it and the nonce
 /// its messages carry. A host that connects again replaces this wholesale.
 struct AttachedHost {
@@ -506,10 +537,9 @@ impl HostActuatorHub {
     ) -> Result<HostActuatorReport> {
         self.service(anchors, signer)?;
         let (session, nonce, sequence) = {
-            let attached = self
-                .attached
-                .get_mut(host)
-                .with_context(|| format!("host actuator {host} is not attached"))?;
+            let Some(attached) = self.attached.get_mut(host) else {
+                return Err(unobservable(host, "not attached"));
+            };
             let sequence = attached.next_sequence;
             attached.next_sequence += 1;
             (attached.session.clone(), attached.nonce.clone(), sequence)
@@ -521,12 +551,17 @@ impl HostActuatorHub {
         loop {
             self.service(anchors, signer)?;
             let Some(attached) = self.attached.get_mut(host) else {
-                bail!("host actuator {host} detached while a request was outstanding");
+                return Err(unobservable(
+                    host,
+                    "detached while a request was outstanding",
+                ));
             };
-            ensure!(
-                attached.session.session_generation == session.session_generation,
-                "host actuator {host} reconnected while a request was outstanding"
-            );
+            if attached.session.session_generation != session.session_generation {
+                return Err(unobservable(
+                    host,
+                    "reconnected while a request was outstanding",
+                ));
+            }
             if let Some(index) = attached
                 .reports
                 .iter()
@@ -543,10 +578,9 @@ impl HostActuatorHub {
             attached
                 .reports
                 .retain(|(answered, _)| *answered > sequence);
-            ensure!(
-                Instant::now() < deadline,
-                "host actuator {host} did not answer within {timeout:?}"
-            );
+            if Instant::now() >= deadline {
+                return Err(unobservable(host, format!("no answer within {timeout:?}")));
+            }
             thread::sleep(REQUEST_POLL);
         }
     }
