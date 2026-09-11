@@ -1,9 +1,9 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,7 +44,7 @@ use crate::drivers::{
 };
 use crate::host_actuator::{
     HostActuatorAccess, HostActuatorHub, HostActuatorRunnerDriver, HostActuatorWorkloadDriver,
-    IdunnHostActuatorIdentity,
+    IdunnHostActuatorIdentity, SharedHostActuatorHub, spawn_hub_service,
 };
 
 const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
@@ -2684,7 +2684,7 @@ struct Engine {
     source: GitSourceDriver,
     docker_runner: DockerRunnerDriver,
     systemd_workload: SystemdTransientWorkloadDriver,
-    host_actuators: Option<RefCell<HostActuatorHub>>,
+    host_actuators: Option<SharedHostActuatorHub>,
 }
 
 impl Engine {
@@ -2703,13 +2703,20 @@ impl Engine {
         );
         let host_actuators = options
             .host_actuator_bind
-            .map(|bind| HostActuatorHub::bind(bind).map(RefCell::new))
+            .map(|bind| HostActuatorHub::bind(bind).map(|hub| Arc::new(Mutex::new(hub))))
             .transpose()?;
         if let Some(hub) = &host_actuators {
             eprintln!(
                 "Idunn host actuator hub listening on {}",
-                hub.borrow().local_addr()?
+                hub.lock().expect("hub mutex").local_addr()?
             );
+            let service_signer =
+                open_service_identity_at::<IdunnServiceIdentity>(&options.idunn_identity_store)
+                    .context("opening Idunn identity for the host actuator hub thread")?;
+            let bindings_dir = options.bindings_dir.clone();
+            spawn_hub_service(Arc::clone(hub), service_signer, move || {
+                host_anchors_from(&bindings_dir)
+            });
         }
         Ok(Self {
             options,
@@ -2723,12 +2730,30 @@ impl Engine {
         })
     }
 
-    /// The trust anchor of every host a binding names. A binding whose anchor
-    /// cannot be read leaves its host unattachable and is logged; the other
-    /// hosts are unaffected.
     fn host_anchors(&self) -> BTreeMap<String, ServiceIdentityTrustAnchor> {
+        host_anchors_from(&self.options.bindings_dir)
+    }
+
+    fn host_access(&self) -> Result<HostActuatorAccess<'_>> {
+        let hub = self
+            .host_actuators
+            .as_ref()
+            .context("this Idunn serves no host actuators (no --host-actuator-bind)")?;
+        Ok(HostActuatorAccess {
+            hub: Arc::clone(hub),
+            anchors: self.host_anchors(),
+            signer: &self.idunn_signer,
+        })
+    }
+}
+
+/// The trust anchor of every host a binding names. A binding whose anchor
+/// cannot be read leaves its host unattachable and is logged; the other
+/// hosts are unaffected.
+fn host_anchors_from(bindings_dir: &Path) -> BTreeMap<String, ServiceIdentityTrustAnchor> {
+    {
         let mut anchors = BTreeMap::new();
-        let bindings = match load_bindings(&self.options.bindings_dir) {
+        let bindings = match load_bindings(bindings_dir) {
             Ok(bindings) => bindings,
             Err(error) => {
                 eprintln!("Idunn cannot read bindings for host anchors: {error:#}");
@@ -2752,31 +2777,9 @@ impl Engine {
         }
         anchors
     }
+}
 
-    /// Once per tick: attach hosts that dialled in, drop hosts that went
-    /// silent. Nothing here decides anything about a target.
-    fn service_host_actuators(&self) {
-        let Some(hub) = &self.host_actuators else {
-            return;
-        };
-        let anchors = self.host_anchors();
-        if let Err(error) = hub.borrow_mut().service(&anchors, &self.idunn_signer) {
-            eprintln!("Idunn host actuator hub fault: {error:#}");
-        }
-    }
-
-    fn host_access(&self) -> Result<HostActuatorAccess<'_>> {
-        let hub = self
-            .host_actuators
-            .as_ref()
-            .context("this Idunn serves no host actuators (no --host-actuator-bind)")?;
-        Ok(HostActuatorAccess {
-            hub,
-            anchors: self.host_anchors(),
-            signer: &self.idunn_signer,
-        })
-    }
-
+impl Engine {
     /// The runner the plan's binding declares. Every runner in one binding
     /// is of one kind; the binding validated that.
     fn runner_for(&self, plan: &CompiledDeploymentPlan) -> Result<Box<dyn RunnerPort + '_>> {
@@ -3034,7 +3037,6 @@ impl Engine {
     }
 
     fn run_scheduler_tick(&self) -> Result<bool> {
-        self.service_host_actuators();
         if self.retire_one_terminal_transaction()? {
             return Ok(true);
         }

@@ -12,10 +12,10 @@
 //! Both binaries are built from this module, so the wire records are the
 //! Rust types and nothing is hand-encoded on either side.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -593,10 +593,41 @@ fn admit_hub_endpoint(_bind: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// The hub shared between the scheduler and its service thread.
+pub type SharedHostActuatorHub = Arc<Mutex<HostActuatorHub>>;
+
+/// Service the hub on its own thread so a scheduler tick that blocks on a
+/// build elsewhere does not starve every attached host into a timeout.
+/// The thread carries its own copy of Idunn's signer, opened from the same
+/// store, and reloads the bound anchors through `anchors`.
+pub fn spawn_hub_service(
+    hub: SharedHostActuatorHub,
+    signer: ServiceIdentitySigner<IdunnServiceIdentity>,
+    anchors: impl Fn() -> BTreeMap<String, ServiceIdentityTrustAnchor> + Send + 'static,
+) {
+    thread::Builder::new()
+        .name("idunn-host-actuator-hub".into())
+        .spawn(move || {
+            let mut anchors_refreshed = Instant::now();
+            let mut current = anchors();
+            loop {
+                if anchors_refreshed.elapsed() >= Duration::from_secs(5) {
+                    current = anchors();
+                    anchors_refreshed = Instant::now();
+                }
+                if let Err(error) = hub.lock().expect("hub mutex").service(&current, &signer) {
+                    eprintln!("Idunn host actuator hub fault: {error:#}");
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+        .expect("spawning the host actuator hub thread");
+}
+
 /// What the engine hands the host drivers: the hub, the anchors currently
 /// bound, and Idunn's signer.
 pub struct HostActuatorAccess<'a> {
-    pub hub: &'a RefCell<HostActuatorHub>,
+    pub hub: SharedHostActuatorHub,
     pub anchors: BTreeMap<String, ServiceIdentityTrustAnchor>,
     pub signer: &'a ServiceIdentitySigner<IdunnServiceIdentity>,
 }
@@ -608,9 +639,16 @@ impl HostActuatorAccess<'_> {
         request: &HostActuatorRequest,
         timeout: Duration,
     ) -> Result<HostActuatorReport> {
-        self.hub
-            .borrow_mut()
-            .request(host, request, timeout, &self.anchors, self.signer)
+        // The lock is held for the whole exchange. The service thread waits
+        // it out, which is fine: `request` services the socket itself while
+        // it waits, so nothing attached goes unserviced meanwhile.
+        self.hub.lock().expect("hub mutex").request(
+            host,
+            request,
+            timeout,
+            &self.anchors,
+            self.signer,
+        )
     }
 }
 
