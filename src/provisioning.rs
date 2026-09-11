@@ -49,6 +49,18 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
             let public_key = provider_health_public_key(&options)?;
             println!("{public_key}");
         }
+        "provider-health-identity-id" => {
+            println!(
+                "{}",
+                identity_id::<GameCultProviderHealthIdentity>(&options)?
+            );
+        }
+        "host-actuator-identity-id" => {
+            println!(
+                "{}",
+                identity_id::<crate::host_actuator::IdunnHostActuatorIdentity>(&options)?
+            );
+        }
         "export-provider-health-public-anchor" => export_identity_anchor::<
             GameCultProviderHealthIdentity,
         >(
@@ -125,6 +137,15 @@ fn enroll_provider_health_identity(options: &BTreeMap<String, String>) -> Result
         "private-store",
     )?)?;
     encode_public_key(&signer.entry().public_key)
+}
+
+/// The profile-derived identity id of an enrolled private store, read-only.
+/// This is the value an operator binding names as `expected_signer_identity_id`
+/// or that a host binding is keyed by; it is derived, never typed.
+fn identity_id<P: ServiceIdentityProfile>(options: &BTreeMap<String, String>) -> Result<String> {
+    require_only(options, &["private-store"])?;
+    let signer = open_service_identity_at::<P>(&path(options, "private-store")?)?;
+    Ok(signer.entry().identity_id.clone())
 }
 
 fn provider_health_public_key(options: &BTreeMap<String, String>) -> Result<String> {
