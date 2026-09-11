@@ -907,8 +907,11 @@ fn verify_artifacts(root: &Path, release: &SealedRelease) -> Result<()> {
     Ok(())
 }
 
+/// git on a Windows host may be configured to rewrite line endings on
+/// checkout; the frozen tree is byte-exact and so must the build input be.
 fn git(directory: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
+        .args(["-c", "core.autocrlf=false", "-c", "core.eol=lf"])
         .args(args)
         .current_dir(directory)
         .env_clear()
@@ -988,7 +991,9 @@ fn materialize(
         .context("reading the recipe from the fetched tree")?;
     ensure!(
         recipe == plan.recipe_blob,
-        "recipe in the fetched tree differs from the plan's recipe bytes"
+        "recipe in the fetched tree differs from the plan's recipe bytes ({} vs {} bytes)",
+        recipe.len(),
+        plan.recipe_blob.len()
     );
 
     for step in &declaration.steps {
