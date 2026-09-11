@@ -33,8 +33,8 @@ use crate::deployment_plan::{
 };
 use crate::drivers::{
     CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
-    GitSourceDriver, InstalledReleaseObservation, NginxRouteDriver, ProcessIdentity,
-    RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
+    GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
+    ProcessIdentity, RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
     SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
     WriteLeasePort,
 };
@@ -510,17 +510,6 @@ impl RoutingEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IsolationEvidence {
-    candidate_uid: u32,
-    candidate_pid_namespace_id: u64,
-    candidate_mount_namespace_id: u64,
-    incumbent_uid: Option<u32>,
-    incumbent_pid_namespace_id: Option<u64>,
-    incumbent_mount_namespace_id: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
 enum TransactionCompletion {
     Admitted { generation_id: String },
@@ -899,7 +888,7 @@ impl DeploymentTransaction {
             );
             if let Some(workload) = &self.workload {
                 ensure!(
-                    workload.runtime_instance_id == activation.runtime_instance_id,
+                    workload.runtime_instance_id() == activation.runtime_instance_id,
                     "workload belongs to another activation"
                 );
             }
@@ -1389,7 +1378,7 @@ impl AdmittedGeneration {
                 && self.expected.sealed_release_id == self.sealed_release.sealed_release_id
                 && self.activation.expected_projection_sha256
                     == self.expected.canonical_sha256()?
-                && self.activation.runtime_instance_id == self.workload.runtime_instance_id
+                && self.activation.runtime_instance_id == self.workload.runtime_instance_id()
                 && self.ready.publisher_sequence <= self.odin_publisher_sequence_cursor
                 && self.latest_odin_observation.publisher_sequence
                     == self.odin_publisher_sequence_cursor,
@@ -3983,7 +3972,7 @@ impl Engine {
                 }
                 other => other.map(|value| &value.value.workload),
             };
-            let isolation = prove_isolation(workload, incumbent_workload)?;
+            let isolation = WorkloadObservation::prove_isolation(workload, incumbent_workload)?;
             return self.persist_same_phase(current, |next| {
                 next.isolation = Some(isolation);
                 next.updated_at_unix_millis = now;
@@ -6059,56 +6048,6 @@ fn candidate_cleanup_requirement(
     }
 }
 
-fn prove_isolation(
-    candidate: &WorkloadObservation,
-    incumbent: Option<&WorkloadObservation>,
-) -> Result<IsolationEvidence> {
-    ensure!(
-        candidate.dynamic_user
-            && candidate.private_pids
-            && candidate.private_mounts
-            && candidate.process_uids[0] > 0
-            && candidate.pid_namespace_id > 0
-            && candidate.mount_namespace_id > 0,
-        "candidate lacks dynamic identity or private namespaces"
-    );
-    let evidence = if let Some(incumbent) = incumbent {
-        ensure!(
-            incumbent.dynamic_user
-                && incumbent.private_pids
-                && incumbent.private_mounts
-                && incumbent.process_uids[0] > 0
-                && incumbent.pid_namespace_id > 0
-                && incumbent.mount_namespace_id > 0,
-            "incumbent lacks admitted dynamic identity or private namespaces"
-        );
-        ensure!(
-            candidate.process_uids[0] != incumbent.process_uids[0]
-                && candidate.pid_namespace_id != incumbent.pid_namespace_id
-                && candidate.mount_namespace_id != incumbent.mount_namespace_id,
-            "candidate and incumbent are not distinct by UID, PID namespace, and mount namespace"
-        );
-        IsolationEvidence {
-            candidate_uid: candidate.process_uids[0],
-            candidate_pid_namespace_id: candidate.pid_namespace_id,
-            candidate_mount_namespace_id: candidate.mount_namespace_id,
-            incumbent_uid: Some(incumbent.process_uids[0]),
-            incumbent_pid_namespace_id: Some(incumbent.pid_namespace_id),
-            incumbent_mount_namespace_id: Some(incumbent.mount_namespace_id),
-        }
-    } else {
-        IsolationEvidence {
-            candidate_uid: candidate.process_uids[0],
-            candidate_pid_namespace_id: candidate.pid_namespace_id,
-            candidate_mount_namespace_id: candidate.mount_namespace_id,
-            incumbent_uid: None,
-            incumbent_pid_namespace_id: None,
-            incumbent_mount_namespace_id: None,
-        }
-    };
-    Ok(evidence)
-}
-
 fn sequence_requires_admission(
     latest: Option<&TopologyEvidence>,
     maximum_admitted_sequence: u64,
@@ -6398,6 +6337,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::drivers::SystemdWorkloadObservation;
 
     /// Fixed clock for the signing fixture; correlations must land inside
     /// DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS of it to authenticate.
@@ -7323,7 +7263,7 @@ mod tests {
         for stored in &snapshot.admitted {
             let value = &stored.value;
             println!(
-                "ADMITTED target={} generation={} tx={} admitted_at={} ready_seq={} ready_admitted_at={} latest_seq={} latest_admitted_at={} instance={} unit={} restart={}",
+                "ADMITTED target={} generation={} tx={} admitted_at={} ready_seq={} ready_admitted_at={} latest_seq={} latest_admitted_at={} instance={} {}",
                 value.target,
                 value.generation_id,
                 value.transaction_id,
@@ -7333,8 +7273,7 @@ mod tests {
                 value.latest_odin_observation.publisher_sequence,
                 value.latest_odin_observation.admitted_at_unix_millis,
                 value.activation.runtime_instance_id,
-                value.workload.unit,
-                value.workload.restart_policy,
+                value.workload.describe(),
             );
         }
         Ok(())
@@ -7352,7 +7291,7 @@ mod tests {
     }
 
     fn workload(uid: u32, pid_namespace_id: u64, mount_namespace_id: u64) -> WorkloadObservation {
-        WorkloadObservation {
+        WorkloadObservation::Systemd(SystemdWorkloadObservation {
             unit: format!("idunn-{uid}.service"),
             unit_description: format!("Idunn test {uid}"),
             invocation_id: format!("invocation-{uid}"),
@@ -7404,7 +7343,7 @@ mod tests {
             activation_signer_identity_id: "activation".into(),
             activation_signer_public_key: vec![1; 32],
             service_credentials: Vec::new(),
-        }
+        })
     }
 
     fn write_lease() -> IdunnProcessWriteLeaseRecord {
@@ -7956,10 +7895,13 @@ mod tests {
     #[test]
     fn candidate_and_incumbent_must_differ_in_all_three_native_boundaries() {
         let incumbent = workload(1001, 40, 50);
-        assert!(prove_isolation(&workload(1002, 41, 51), Some(&incumbent)).is_ok());
-        assert!(prove_isolation(&workload(1001, 41, 51), Some(&incumbent)).is_err());
-        assert!(prove_isolation(&workload(1002, 40, 51), Some(&incumbent)).is_err());
-        assert!(prove_isolation(&workload(1002, 41, 50), Some(&incumbent)).is_err());
+        let prove = |candidate: &WorkloadObservation| {
+            WorkloadObservation::prove_isolation(candidate, Some(&incumbent))
+        };
+        assert!(prove(&workload(1002, 41, 51)).is_ok());
+        assert!(prove(&workload(1001, 41, 51)).is_err());
+        assert!(prove(&workload(1002, 40, 51)).is_err());
+        assert!(prove(&workload(1002, 41, 50)).is_err());
     }
 
     #[test]

@@ -307,10 +307,115 @@ pub struct GitlinkBinding {
     pub origin: String,
 }
 
+/// The driver is the tag of the binding. A docker runner builds on the Idunn
+/// host inside a pinned image; a host-native runner builds on a managed host
+/// through that host's actuator, with the same allowed-program and environment
+/// contract but no container.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "driver", rename_all = "kebab-case")]
+pub enum RunnerBinding {
+    Docker(DockerRunnerBinding),
+    HostNative(HostNativeRunnerBinding),
+}
+
+impl RunnerBinding {
+    pub fn docker(&self) -> Result<&DockerRunnerBinding> {
+        match self {
+            Self::Docker(binding) => Ok(binding),
+            Self::HostNative(_) => bail!("runner is host-native, not docker"),
+        }
+    }
+
+    pub fn host_native(&self) -> Result<&HostNativeRunnerBinding> {
+        match self {
+            Self::HostNative(binding) => Ok(binding),
+            Self::Docker(_) => bail!("runner is docker, not host-native"),
+        }
+    }
+
+    pub fn affordances(&self) -> &BTreeSet<RunnerAffordance> {
+        match self {
+            Self::Docker(binding) => &binding.affordances,
+            Self::HostNative(binding) => &binding.affordances,
+        }
+    }
+
+    pub fn allowed_programs(&self) -> &BTreeSet<String> {
+        match self {
+            Self::Docker(binding) => &binding.allowed_programs,
+            Self::HostNative(binding) => &binding.allowed_programs,
+        }
+    }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::Docker(binding) => &binding.environment,
+            Self::HostNative(binding) => &binding.environment,
+        }
+    }
+
+    pub fn secret_environment_names(&self) -> Vec<&String> {
+        match self {
+            Self::Docker(binding) => binding.secret_files.keys().collect(),
+            Self::HostNative(_) => Vec::new(),
+        }
+    }
+
+    pub fn network_profile(&self) -> Option<&str> {
+        match self {
+            Self::Docker(binding) => binding.network_profile.as_deref(),
+            Self::HostNative(_) => None,
+        }
+    }
+}
+
+/// Runs each recipe step as a process on the actuator's host. Paths are the
+/// host's, validated by the actuator; Idunn on yggdrasil treats them as opaque.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RunnerBinding {
-    pub driver: RunnerDriver,
+pub struct HostNativeRunnerBinding {
+    #[serde(default)]
+    pub affordances: BTreeSet<RunnerAffordance>,
+    pub cache_root: Option<String>,
+    #[serde(default)]
+    pub allowed_programs: BTreeSet<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+}
+
+impl HostNativeRunnerBinding {
+    fn validate(&self, id: &str) -> Result<()> {
+        ensure!(
+            !self.allowed_programs.is_empty(),
+            "runner {id} has no allowed programs"
+        );
+        for program in &self.allowed_programs {
+            require_program(program, "allowed runner program")?;
+        }
+        if let Some(cache_root) = &self.cache_root {
+            require_value(cache_root, "runner cache root")?;
+        }
+        ensure!(
+            self.affordances.contains(&RunnerAffordance::BuildCache) == self.cache_root.is_some(),
+            "runner {id} cache root and build-cache affordance disagree"
+        );
+        ensure!(
+            !self.affordances.contains(&RunnerAffordance::SecretRead),
+            "host-native runner {id} cannot read secrets"
+        );
+        for name in self.environment.keys() {
+            require_environment_name(name)?;
+        }
+        for value in self.environment.values() {
+            require_value(value, "runner environment value")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DockerRunnerBinding {
     pub image: String,
     pub user: String,
     #[serde(default)]
@@ -330,16 +435,147 @@ pub struct RunnerBinding {
     pub tmpfs_mebibytes: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RunnerDriver {
-    Docker,
+/// The driver is the tag of the binding. A systemd-transient workload runs on
+/// the Idunn host; a host-actuator workload runs on a managed host through the
+/// actuator that dials in under that host's name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "driver", rename_all = "kebab-case")]
+pub enum WorkloadBinding {
+    SystemdTransient(SystemdWorkloadBinding),
+    HostActuator(HostWorkloadBinding),
+}
+
+impl WorkloadBinding {
+    pub fn systemd(&self) -> Result<&SystemdWorkloadBinding> {
+        match self {
+            Self::SystemdTransient(binding) => Ok(binding),
+            Self::HostActuator(_) => bail!("workload is host-actuator, not systemd-transient"),
+        }
+    }
+
+    pub fn host(&self) -> Result<&HostWorkloadBinding> {
+        match self {
+            Self::HostActuator(binding) => Ok(binding),
+            Self::SystemdTransient(_) => bail!("workload is systemd-transient, not host-actuator"),
+        }
+    }
+
+    pub fn declares_state_root(&self) -> bool {
+        match self {
+            Self::SystemdTransient(binding) => binding.state_root.is_some(),
+            Self::HostActuator(binding) => binding.state_root.is_some(),
+        }
+    }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::SystemdTransient(binding) => &binding.environment,
+            Self::HostActuator(binding) => &binding.environment,
+        }
+    }
+
+    pub fn secret_environment_names(&self) -> Vec<&String> {
+        match self {
+            Self::SystemdTransient(binding) => binding.secret_files.keys().collect(),
+            Self::HostActuator(binding) => binding.secret_files.keys().collect(),
+        }
+    }
+
+    pub fn argument_bindings(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::SystemdTransient(binding) => &binding.argument_bindings,
+            Self::HostActuator(binding) => &binding.argument_bindings,
+        }
+    }
+
+    fn validate_launch_environment(&self) -> Result<()> {
+        for name in self
+            .environment()
+            .keys()
+            .chain(self.secret_environment_names())
+        {
+            require_environment_name(name)?;
+            ensure!(
+                name != IDUNN_RUNTIME_BUNDLE_ENVIRONMENT
+                    && name != IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT,
+                "operator binding attempts to replace Idunn-owned workload environment"
+            );
+        }
+        for value in self.environment().values() {
+            require_value(value, "workload environment value")?;
+        }
+        for name in self.argument_bindings().keys() {
+            require_id(name, "argument binding")?;
+        }
+        for value in self.argument_bindings().values() {
+            require_value(value, "argument binding value")?;
+        }
+        ensure!(
+            !self
+                .environment()
+                .contains_key(RUNTIME_PRESENCE_IDENTITY_BINDING),
+            "runtime presence identity must be a secret source, not environment"
+        );
+        Ok(())
+    }
+}
+
+/// A workload on a managed host. Every path is the host's and is validated by
+/// the actuator that owns the host; here they are opaque non-empty values.
+/// The host's actuator is authenticated against `host_trust_anchor_store`,
+/// which is an Idunn-host path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostWorkloadBinding {
+    pub host: String,
+    pub host_trust_anchor_store: PathBuf,
+    pub release_root: String,
+    pub runtime_root: String,
+    #[serde(default)]
+    pub state_root: Option<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub secret_files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub argument_bindings: BTreeMap<String, String>,
+}
+
+impl HostWorkloadBinding {
+    fn validate(&self) -> Result<()> {
+        require_id(&self.host, "workload host")?;
+        require_absolute_path(&self.host_trust_anchor_store, "host trust anchor store")?;
+        require_value(&self.release_root, "release root")?;
+        require_value(&self.runtime_root, "runtime root")?;
+        ensure!(
+            self.release_root != self.runtime_root,
+            "host release root and runtime root are identical"
+        );
+        if let Some(state_root) = &self.state_root {
+            require_value(state_root, "state root")?;
+        }
+        for path in self.secret_files.values() {
+            require_value(path, "secret file")?;
+        }
+        let presence_identity = self
+            .secret_files
+            .get(RUNTIME_PRESENCE_IDENTITY_BINDING)
+            .context("workload has no runtime presence identity source")?;
+        ensure!(
+            self.secret_files
+                .values()
+                .filter(|path| *path == presence_identity)
+                .count()
+                == 1,
+            "runtime presence identity source is duplicated under another secret binding"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkloadBinding {
-    pub driver: WorkloadDriver,
+pub struct SystemdWorkloadBinding {
     #[serde(default)]
     pub state_group: Option<String>,
     pub unit_prefix: String,
@@ -363,12 +599,6 @@ pub struct WorkloadBinding {
     pub secret_files: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub argument_bindings: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WorkloadDriver {
-    SystemdTransient,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -846,8 +1076,26 @@ impl OperatorBinding {
             require_git_origin(&gitlink.origin, "gitlink origin")?;
         }
         ensure!(!self.runners.is_empty(), "operator binding has no runners");
+        let host_workload = matches!(self.workload, WorkloadBinding::HostActuator(_));
         for (id, runner) in &self.runners {
             require_id(id, "runner binding")?;
+            let runner = match runner {
+                RunnerBinding::HostNative(runner) => {
+                    ensure!(
+                        host_workload,
+                        "host-native runner {id} needs a host-actuator workload"
+                    );
+                    runner.validate(id)?;
+                    continue;
+                }
+                RunnerBinding::Docker(runner) => {
+                    ensure!(
+                        !host_workload,
+                        "docker runner {id} cannot build for a host-actuator workload"
+                    );
+                    runner
+                }
+            };
             require_pinned_image(&runner.image)?;
             require_container_identity(&runner.user)?;
             ensure!(
@@ -901,20 +1149,6 @@ impl OperatorBinding {
                 "runner {id} secret files and secret-read affordance disagree"
             );
         }
-        let needs_state_group =
-            self.workload.state_root.is_some() || !self.workload.read_write_paths.is_empty();
-        ensure!(
-            self.workload.state_group.is_some() == needs_state_group,
-            "a fixed state group must exist exactly when the dynamic workload has writable paths"
-        );
-        if let Some(group) = &self.workload.state_group {
-            require_identity(group, "workload state group")?;
-            ensure!(
-                !matches!(group.as_str(), "root" | "0"),
-                "ordinary Idunn workload state cannot use the root group"
-            );
-        }
-        require_id(&self.workload.unit_prefix, "workload unit prefix")?;
         require_id(&self.runtime_identity.runtime_id, "runtime id")?;
         require_id(
             &self.runtime_identity.expected_signer_identity_id,
@@ -925,15 +1159,10 @@ impl OperatorBinding {
             "trust anchor store",
         )?;
         for (label, path) in [
-            ("release root", &self.workload.release_root),
-            ("runtime root", &self.workload.runtime_root),
             ("deployment brake", &self.brakes.deployment_store),
             ("lifecycle brake", &self.brakes.lifecycle_store),
         ] {
             require_absolute_path(path, label)?;
-        }
-        if let Some(state_root) = &self.workload.state_root {
-            require_absolute_path(state_root, "state root")?;
         }
         if let Some(write_lease) = &self.process_write_lease {
             require_absolute_path(&write_lease.record_path, "process write-lease record")?;
@@ -943,25 +1172,67 @@ impl OperatorBinding {
             self.brakes.deployment_store != self.brakes.lifecycle_store,
             "deployment and lifecycle brakes are identical"
         );
+        self.workload.validate_launch_environment()?;
+        let workload = match &self.workload {
+            WorkloadBinding::HostActuator(workload) => {
+                workload.validate()?;
+                ensure!(
+                    self.process_write_lease.is_none(),
+                    "a host-actuator workload cannot hold an Idunn-host process write lease"
+                );
+                ensure!(
+                    self.route.is_none(),
+                    "a host-actuator workload cannot be routed by the Idunn host"
+                );
+                ensure!(
+                    self.placement.nodes.contains(&workload.host),
+                    "placement does not name the workload host"
+                );
+                return self.validate_shared_tail();
+            }
+            WorkloadBinding::SystemdTransient(workload) => workload,
+        };
+        let needs_state_group =
+            workload.state_root.is_some() || !workload.read_write_paths.is_empty();
         ensure!(
-            self.workload.memory_mebibytes > 0,
+            workload.state_group.is_some() == needs_state_group,
+            "a fixed state group must exist exactly when the dynamic workload has writable paths"
+        );
+        if let Some(group) = &workload.state_group {
+            require_identity(group, "workload state group")?;
+            ensure!(
+                !matches!(group.as_str(), "root" | "0"),
+                "ordinary Idunn workload state cannot use the root group"
+            );
+        }
+        require_id(&workload.unit_prefix, "workload unit prefix")?;
+        for (label, path) in [
+            ("release root", &workload.release_root),
+            ("runtime root", &workload.runtime_root),
+        ] {
+            require_absolute_path(path, label)?;
+        }
+        if let Some(state_root) = &workload.state_root {
+            require_absolute_path(state_root, "state root")?;
+        }
+        ensure!(
+            workload.memory_mebibytes > 0,
             "workload memory must be positive"
         );
         ensure!(
-            (1..=100_000).contains(&self.workload.cpu_quota_percent),
+            (1..=100_000).contains(&workload.cpu_quota_percent),
             "workload CPU quota is outside 1..=100000"
         );
-        for path in self
-            .workload
+        for path in workload
             .read_only_paths
             .iter()
-            .chain(self.workload.read_write_paths.iter())
-            .chain(self.workload.devices.iter())
+            .chain(workload.read_write_paths.iter())
+            .chain(workload.devices.iter())
         {
             require_absolute_path(path, "workload path")?;
         }
-        for path in &self.workload.read_write_paths {
-            if let Some(state_root) = &self.workload.state_root {
+        for path in &workload.read_write_paths {
+            if let Some(state_root) = &workload.state_root {
                 ensure!(
                     !paths_overlap(path, state_root),
                     "workload read-write path {} overlaps the write-lease-controlled state root",
@@ -987,8 +1258,8 @@ impl OperatorBinding {
         );
         let mut protected_paths = authority_paths;
         protected_paths.extend([
-            self.workload.release_root.clone(),
-            self.workload.runtime_root.clone(),
+            workload.release_root.clone(),
+            workload.runtime_root.clone(),
             self.runtime_identity.trust_anchor_store.clone(),
         ]);
         if let Some(route) = &self.route {
@@ -998,11 +1269,10 @@ impl OperatorBinding {
             protected_paths.push(release_authority.clone());
         }
         for authority_path in protected_paths {
-            for writable_path in self
-                .workload
+            for writable_path in workload
                 .read_write_paths
                 .iter()
-                .chain(self.workload.state_root.iter())
+                .chain(workload.state_root.iter())
             {
                 ensure!(
                     !paths_overlap(&authority_path, writable_path),
@@ -1012,45 +1282,15 @@ impl OperatorBinding {
                 );
             }
         }
-        for name in self
-            .workload
-            .environment
-            .keys()
-            .chain(self.workload.secret_files.keys())
-        {
-            require_environment_name(name)?;
-            ensure!(
-                name != IDUNN_RUNTIME_BUNDLE_ENVIRONMENT
-                    && name != IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT,
-                "operator binding attempts to replace Idunn-owned workload environment"
-            );
-        }
-        for value in self.workload.environment.values() {
-            require_value(value, "workload environment value")?;
-        }
-        for name in self.workload.argument_bindings.keys() {
-            require_id(name, "argument binding")?;
-        }
-        for value in self.workload.argument_bindings.values() {
-            require_value(value, "argument binding value")?;
-        }
-        for path in self.workload.secret_files.values() {
+        for path in workload.secret_files.values() {
             require_absolute_path(path, "secret file")?;
         }
-        ensure!(
-            !self
-                .workload
-                .environment
-                .contains_key(RUNTIME_PRESENCE_IDENTITY_BINDING),
-            "runtime presence identity must be a parent-only secret source, not environment"
-        );
-        let presence_identity = self
-            .workload
+        let presence_identity = workload
             .secret_files
             .get(RUNTIME_PRESENCE_IDENTITY_BINDING)
             .context("workload has no parent-only runtime presence identity source")?;
         ensure!(
-            self.workload
+            workload
                 .secret_files
                 .iter()
                 .filter(|(_, path)| *path == presence_identity)
@@ -1082,6 +1322,11 @@ impl OperatorBinding {
             require_absolute_path(&route.config_path, "route config")?;
             require_unit(&route.reload_unit, "route reload unit")?;
         }
+        self.validate_shared_tail()
+    }
+
+    /// The part of validation that does not depend on where the workload runs.
+    fn validate_shared_tail(&self) -> Result<()> {
         ensure!(
             self.rollout.retain_releases >= 2,
             "candidate rollout must retain at least current and prior releases"
@@ -1163,35 +1408,37 @@ impl OperatorBinding {
             "process write-lease binding must exist exactly when writable state requires it"
         );
         ensure!(
-            self.workload.state_root.is_some() == declaration.state.is_some(),
+            self.workload.declares_state_root() == declaration.state.is_some(),
             "state root binding must exist exactly when the recipe declares state"
         );
         for step in &declaration.steps {
             let binding = &self.runners[&step.runner];
             ensure!(
                 !binding
-                    .environment
+                    .environment()
                     .contains_key(&declaration.source_stamp_environment)
                     && !binding
-                        .secret_files
-                        .contains_key(&declaration.source_stamp_environment),
+                        .secret_environment_names()
+                        .contains(&&declaration.source_stamp_environment),
                 "runner cannot replace the Idunn source stamp"
             );
             ensure!(
-                binding.affordances.contains(&RunnerAffordance::SourceRead),
+                binding
+                    .affordances()
+                    .contains(&RunnerAffordance::SourceRead),
                 "runner {} cannot read the frozen source",
                 step.runner
             );
             ensure!(
-                binding.allowed_programs.contains(&step.argv[0]),
+                binding.allowed_programs().contains(&step.argv[0]),
                 "runner {} does not admit program {}",
                 step.runner,
                 step.argv[0]
             );
             let available: BTreeSet<_> = binding
-                .environment
+                .environment()
                 .keys()
-                .chain(binding.secret_files.keys())
+                .chain(binding.secret_environment_names())
                 .cloned()
                 .collect();
             ensure!(
@@ -1212,7 +1459,7 @@ impl OperatorBinding {
             let binding = &self.runners[runner_id];
             ensure!(
                 binding
-                    .affordances
+                    .affordances()
                     .contains(&RunnerAffordance::ArtifactWrite),
                 "runner {runner_id} cannot publish artifact {}",
                 artifact.id
@@ -1221,63 +1468,44 @@ impl OperatorBinding {
         for input in &declaration.external_inputs {
             let binding = &self.runners[&input.runner];
             ensure!(
-                binding.affordances.contains(&RunnerAffordance::SourceRead),
+                binding
+                    .affordances()
+                    .contains(&RunnerAffordance::SourceRead),
                 "external input {} runner cannot read the frozen source",
                 input.id
             );
             ensure!(
                 binding
-                    .affordances
+                    .affordances()
                     .contains(&RunnerAffordance::ArtifactWrite),
                 "external input {} runner cannot materialize inputs",
                 input.id
             );
             ensure!(
-                binding.network_profile.is_some(),
+                binding.network_profile().is_some(),
                 "external input {} runner has no operator-bound network profile",
                 input.id
             );
         }
-        ensure!(
-            !self
-                .workload
-                .environment
-                .contains_key(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT)
-                && !self
-                    .workload
-                    .secret_files
-                    .contains_key(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT)
-                && !self
-                    .workload
-                    .environment
-                    .contains_key(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT)
-                && !self
-                    .workload
-                    .secret_files
-                    .contains_key(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT),
-            "operator binding cannot replace Idunn-owned launch environment"
-        );
-        ensure!(
-            !self
-                .workload
-                .environment
-                .contains_key(IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT)
-                && !self
-                    .workload
-                    .secret_files
-                    .contains_key(IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT),
-            "operator binding cannot replace the Idunn-owned process write lease"
-        );
-        let mut available_environment: BTreeSet<_> = self
+        let workload_names: BTreeSet<&String> = self
             .workload
-            .environment
+            .environment()
             .keys()
-            .chain(
-                self.workload
-                    .secret_files
-                    .keys()
-                    .filter(|name| name.as_str() != RUNTIME_PRESENCE_IDENTITY_BINDING),
-            )
+            .chain(self.workload.secret_environment_names())
+            .collect();
+        for owned in [
+            IDUNN_RUNTIME_BUNDLE_ENVIRONMENT,
+            IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT,
+            IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT,
+        ] {
+            ensure!(
+                !workload_names.contains(&owned.to_string()),
+                "operator binding cannot replace Idunn-owned launch environment {owned}"
+            );
+        }
+        let mut available_environment: BTreeSet<_> = workload_names
+            .into_iter()
+            .filter(|name| name.as_str() != RUNTIME_PRESENCE_IDENTITY_BINDING)
             .cloned()
             .collect();
         available_environment.insert(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT.into());
@@ -1318,13 +1546,20 @@ impl OperatorBinding {
             })
             .collect();
         let bound_arguments: BTreeSet<_> =
-            self.workload.argument_bindings.keys().cloned().collect();
+            self.workload.argument_bindings().keys().cloned().collect();
+        let state_root: Option<String> = match &self.workload {
+            WorkloadBinding::SystemdTransient(workload) => workload
+                .state_root
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            WorkloadBinding::HostActuator(workload) => workload.state_root.clone(),
+        };
         match (
-            self.workload.state_root.as_ref(),
-            self.workload.argument_bindings.get("state_root"),
+            state_root.as_deref(),
+            self.workload.argument_bindings().get("state_root"),
         ) {
             (Some(state_root), Some(argument)) => ensure!(
-                Path::new(argument) == state_root.as_path(),
+                argument == state_root,
                 "state_root argument binding differs from the admitted workload state root"
             ),
             (Some(_), None) => bail!("stateful workload has no state_root argument binding"),
@@ -1332,7 +1567,7 @@ impl OperatorBinding {
             (None, None) => {}
         }
         ensure!(
-            required_arguments.contains("state_root") == self.workload.state_root.is_some(),
+            required_arguments.contains("state_root") == state_root.is_some(),
             "recipe state_root argument must exist exactly when the workload has a state root"
         );
         ensure!(
@@ -2074,7 +2309,7 @@ nodes = ["yggdrasil"]
             );
         let binding = OperatorBinding::parse(&binding_text).unwrap();
         binding.admit(&recipe).unwrap();
-        assert!(binding.workload.state_root.is_none());
+        assert!(!binding.workload.declares_state_root());
     }
 
     #[test]

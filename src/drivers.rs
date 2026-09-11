@@ -20,11 +20,10 @@ use uuid::Uuid;
 
 use crate::control_plane::SequenceAdmittedWarming;
 use crate::deployment::{
-    ArtifactOutput, ArtifactSource, IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT,
+    ArtifactOutput, ArtifactSource, DockerRunnerBinding, IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT,
     IDUNN_RUNTIME_BUNDLE_ENVIRONMENT, IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT, LaunchArgument,
     OperatorBinding, RUNTIME_PRESENCE_IDENTITY_BINDING, RUNTIME_PRESENCE_IDENTITY_FD_NAME,
-    RouteBinding, RouteDriver, RunnerBinding, SourceSelectionPolicy, TargetDeclaration,
-    WorkloadNetwork,
+    RouteBinding, RouteDriver, SourceSelectionPolicy, TargetDeclaration, WorkloadNetwork,
 };
 use crate::deployment_plan::{
     ArtifactReceipt, CompiledDeploymentPlan, ExternalInputMaterializationReceipt, GitlinkTreeFact,
@@ -184,8 +183,206 @@ pub struct ParentOnlyFileDescriptorObservation {
     pub sha256: String,
 }
 
+/// What a workload driver proved about the native process it started. One
+/// variant per kind of host: a systemd unit on the Idunn host, or a process
+/// on a managed host reported by that host's actuator. The wire form is
+/// untagged so a transaction persisted by the previous Idunn, which knew only
+/// the systemd shape, decodes unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkloadObservation {
+#[serde(untagged)]
+pub enum WorkloadObservation {
+    Systemd(SystemdWorkloadObservation),
+    Host(HostWorkloadObservation),
+}
+
+impl WorkloadObservation {
+    pub fn systemd(&self) -> Result<&SystemdWorkloadObservation> {
+        match self {
+            Self::Systemd(observation) => Ok(observation),
+            Self::Host(_) => bail!("workload observation is a host process, not a systemd unit"),
+        }
+    }
+
+    pub fn host(&self) -> Result<&HostWorkloadObservation> {
+        match self {
+            Self::Host(observation) => Ok(observation),
+            Self::Systemd(_) => bail!("workload observation is a systemd unit, not a host process"),
+        }
+    }
+
+    pub fn runtime_instance_id(&self) -> &str {
+        match self {
+            Self::Systemd(observation) => &observation.runtime_instance_id,
+            Self::Host(observation) => &observation.runtime_instance_id,
+        }
+    }
+
+    pub fn executable_sha256(&self) -> &str {
+        match self {
+            Self::Systemd(observation) => &observation.executable_sha256,
+            Self::Host(observation) => &observation.executable_sha256,
+        }
+    }
+
+    /// One line for a status listing: where the process is and how it is
+    /// kept, in the vocabulary of its own driver.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Systemd(observation) => format!(
+                "unit={} restart={}",
+                observation.unit, observation.restart_policy
+            ),
+            Self::Host(observation) => format!(
+                "host={} pid={} created={}",
+                observation.host, observation.process_id, observation.process_creation_time
+            ),
+        }
+    }
+
+    /// Two processes running at once must be distinct at the boundary their
+    /// host actually enforces. On the Idunn host that is UID, PID namespace
+    /// and mount namespace. On a managed host it is the process itself:
+    /// pid and creation time, which the kernel will not hand to two live
+    /// processes. An incumbent of the other kind cannot be compared and is
+    /// refused rather than assumed isolated.
+    pub fn prove_isolation(
+        candidate: &Self,
+        incumbent: Option<&Self>,
+    ) -> Result<IsolationEvidence> {
+        match (candidate, incumbent) {
+            (Self::Systemd(candidate), None) => {
+                candidate.require_private_identity("candidate")?;
+                Ok(IsolationEvidence::Linux(LinuxIsolationEvidence {
+                    candidate_uid: candidate.process_uids[0],
+                    candidate_pid_namespace_id: candidate.pid_namespace_id,
+                    candidate_mount_namespace_id: candidate.mount_namespace_id,
+                    incumbent_uid: None,
+                    incumbent_pid_namespace_id: None,
+                    incumbent_mount_namespace_id: None,
+                }))
+            }
+            (Self::Systemd(candidate), Some(Self::Systemd(incumbent))) => {
+                candidate.require_private_identity("candidate")?;
+                incumbent.require_private_identity("incumbent")?;
+                ensure!(
+                    candidate.process_uids[0] != incumbent.process_uids[0]
+                        && candidate.pid_namespace_id != incumbent.pid_namespace_id
+                        && candidate.mount_namespace_id != incumbent.mount_namespace_id,
+                    "candidate and incumbent are not distinct by UID, PID namespace, and mount namespace"
+                );
+                Ok(IsolationEvidence::Linux(LinuxIsolationEvidence {
+                    candidate_uid: candidate.process_uids[0],
+                    candidate_pid_namespace_id: candidate.pid_namespace_id,
+                    candidate_mount_namespace_id: candidate.mount_namespace_id,
+                    incumbent_uid: Some(incumbent.process_uids[0]),
+                    incumbent_pid_namespace_id: Some(incumbent.pid_namespace_id),
+                    incumbent_mount_namespace_id: Some(incumbent.mount_namespace_id),
+                }))
+            }
+            (Self::Host(candidate), None) => {
+                candidate.require_live("candidate")?;
+                Ok(IsolationEvidence::Host(HostIsolationEvidence {
+                    candidate_process_id: candidate.process_id,
+                    candidate_process_creation_time: candidate.process_creation_time,
+                    incumbent_process_id: None,
+                    incumbent_process_creation_time: None,
+                }))
+            }
+            (Self::Host(candidate), Some(Self::Host(incumbent))) => {
+                candidate.require_live("candidate")?;
+                incumbent.require_live("incumbent")?;
+                ensure!(
+                    candidate.host == incumbent.host,
+                    "candidate and incumbent are on different hosts"
+                );
+                ensure!(
+                    (candidate.process_id, candidate.process_creation_time)
+                        != (incumbent.process_id, incumbent.process_creation_time),
+                    "candidate and incumbent are the same host process"
+                );
+                Ok(IsolationEvidence::Host(HostIsolationEvidence {
+                    candidate_process_id: candidate.process_id,
+                    candidate_process_creation_time: candidate.process_creation_time,
+                    incumbent_process_id: Some(incumbent.process_id),
+                    incumbent_process_creation_time: Some(incumbent.process_creation_time),
+                }))
+            }
+            _ => {
+                bail!("candidate and incumbent were observed by different kinds of workload driver")
+            }
+        }
+    }
+}
+
+/// Isolation proof, one shape per kind of host. Untagged for the same reason
+/// as the observation: persisted Linux evidence decodes unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IsolationEvidence {
+    Linux(LinuxIsolationEvidence),
+    Host(HostIsolationEvidence),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxIsolationEvidence {
+    pub candidate_uid: u32,
+    pub candidate_pid_namespace_id: u64,
+    pub candidate_mount_namespace_id: u64,
+    pub incumbent_uid: Option<u32>,
+    pub incumbent_pid_namespace_id: Option<u64>,
+    pub incumbent_mount_namespace_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostIsolationEvidence {
+    pub candidate_process_id: u32,
+    pub candidate_process_creation_time: u64,
+    pub incumbent_process_id: Option<u32>,
+    pub incumbent_process_creation_time: Option<u64>,
+}
+
+/// A process on a managed host as its actuator proved it. `process_creation_time`
+/// is the host's own clock for process creation (Windows: FILETIME ticks); the
+/// pair with `process_id` names exactly one process for the host's lifetime.
+/// `exit_code` is `Some` once the process is gone; nothing restarts it, so an
+/// exited observation is permanently stopped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostWorkloadObservation {
+    pub host: String,
+    pub actuator_identity_id: String,
+    pub process_id: u32,
+    pub process_creation_time: u64,
+    pub session_id: u32,
+    pub user_sid: String,
+    pub executable: String,
+    pub executable_sha256: String,
+    pub command_line_sha256: String,
+    pub environment_names: Vec<String>,
+    pub environment_contract_sha256: String,
+    pub runtime_bundle: String,
+    pub runtime_instance_id: String,
+    pub activation_signer_identity_id: String,
+    pub activation_signer_public_key: Vec<u8>,
+    pub exit_code: Option<u32>,
+}
+
+impl HostWorkloadObservation {
+    fn require_live(&self, role: &str) -> Result<()> {
+        ensure!(self.process_id > 0, "{role} has no host process id");
+        ensure!(
+            self.process_creation_time > 0,
+            "{role} has no host process creation time"
+        );
+        ensure!(self.exit_code.is_none(), "{role} host process has exited");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemdWorkloadObservation {
     pub unit: String,
     pub unit_description: String,
     pub invocation_id: String,
@@ -237,6 +434,21 @@ pub struct WorkloadObservation {
     pub activation_signer_identity_id: String,
     pub activation_signer_public_key: Vec<u8>,
     pub service_credentials: Vec<ServiceCredentialObservation>,
+}
+
+impl SystemdWorkloadObservation {
+    fn require_private_identity(&self, role: &str) -> Result<()> {
+        ensure!(
+            self.dynamic_user
+                && self.private_pids
+                && self.private_mounts
+                && self.process_uids[0] > 0
+                && self.pid_namespace_id > 0
+                && self.mount_namespace_id > 0,
+            "{role} lacks dynamic identity or private namespaces"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1187,7 +1399,7 @@ impl DockerRunnerDriver {
 
     fn run_in_workspace(
         &self,
-        runner: &RunnerBinding,
+        runner: &DockerRunnerBinding,
         workspace: &Path,
         working_directory: &Path,
         argv: &[String],
@@ -1234,7 +1446,11 @@ impl DockerRunnerDriver {
         Ok(())
     }
 
-    fn base_run_args(&self, runner: &RunnerBinding, workspace: &Path) -> Result<Vec<OsString>> {
+    fn base_run_args(
+        &self,
+        runner: &DockerRunnerBinding,
+        workspace: &Path,
+    ) -> Result<Vec<OsString>> {
         let identity = container_identity(&runner.user)?;
         let mut args = vec![
             OsString::from("run"),
@@ -1287,7 +1503,7 @@ impl DockerRunnerDriver {
             .iter()
             .find(|candidate| candidate.id == input_id)
             .context("external input declaration disappeared")?;
-        let runner = &binding.runners[&input.runner];
+        let runner = binding.runners[&input.runner].docker()?;
         let workspace = &workspaces[&input.runner];
         let destination = workspace.join(&input.destination);
         ensure!(
@@ -1427,7 +1643,7 @@ impl RunnerPort for DockerRunnerDriver {
         for (runner_id, workspace) in &workspaces {
             assign_runner_tree(
                 workspace,
-                container_identity(&binding.runners[runner_id].user)?,
+                container_identity(&binding.runners[runner_id].docker()?.user)?,
             )?;
         }
 
@@ -1441,7 +1657,7 @@ impl RunnerPort for DockerRunnerDriver {
             )?);
         }
         for step in &declaration.steps {
-            let runner = &binding.runners[&step.runner];
+            let runner = binding.runners[&step.runner].docker()?;
             let workspace = &workspaces[&step.runner];
             for required in &step.required_environment {
                 ensure!(
@@ -1664,6 +1880,7 @@ impl SystemdTransientWorkloadDriver {
         self.validate_prepared_activation_credential(activation, &activation_source)?;
         let presence_source = binding
             .workload
+            .systemd()?
             .secret_files
             .get(RUNTIME_PRESENCE_IDENTITY_BINDING)
             .context("workload has no parent-only runtime presence identity source")?;
@@ -1728,7 +1945,7 @@ impl SystemdTransientWorkloadDriver {
     ) -> Result<InstalledReleaseObservation> {
         release.release.validate_against(plan)?;
         let (_, binding) = plan.parsed_inputs()?;
-        let release_root = &binding.workload.release_root;
+        let release_root = &binding.workload.systemd()?.release_root;
         fs::create_dir_all(release_root)
             .with_context(|| format!("creating release root {}", release_root.display()))?;
         let installed = release_root.join(&release.release.sealed_release_id);
@@ -1780,6 +1997,7 @@ impl SystemdTransientWorkloadDriver {
                 && installed.root
                     == binding
                         .workload
+                        .systemd()?
                         .release_root
                         .join(&release.sealed_release_id),
             "installed release observation belongs to another sealed release"
@@ -1804,6 +2022,7 @@ impl SystemdTransientWorkloadDriver {
     ) -> Result<PathBuf> {
         let bundle = binding
             .workload
+            .systemd()?
             .runtime_root
             .join(&activation.runtime_instance_id);
         fs::create_dir_all(&bundle)
@@ -1831,6 +2050,7 @@ impl SystemdTransientWorkloadDriver {
         harden_runtime_bundle(&bundle)?;
         let state_group_id = binding
             .workload
+            .systemd()?
             .state_group
             .as_deref()
             .map(resolve_group_id)
@@ -1926,7 +2146,7 @@ impl SystemdTransientWorkloadDriver {
         environment_names: &[String],
         service_credential_names: &[String],
         parent_only_file_descriptors: &[ParentOnlyFileDescriptorObservation],
-    ) -> Result<WorkloadObservation> {
+    ) -> Result<SystemdWorkloadObservation> {
         ensure!(
             service_credential_names
                 .windows(2)
@@ -2243,7 +2463,7 @@ impl SystemdTransientWorkloadDriver {
                 && linux_process_start_time(&process_root.join("stat"))? == process_start_time,
             "systemd workload identity changed during native observation"
         );
-        Ok(WorkloadObservation {
+        Ok(SystemdWorkloadObservation {
             unit: unit.to_owned(),
             unit_description,
             invocation_id,
@@ -2312,9 +2532,10 @@ impl SystemdTransientWorkloadDriver {
         for argument in &declaration.service.arguments {
             command.push(match argument {
                 LaunchArgument::Literal { value } => value.into(),
-                LaunchArgument::Binding { name } => {
-                    binding.workload.argument_bindings[name].clone().into()
-                }
+                LaunchArgument::Binding { name } => binding.workload.systemd()?.argument_bindings
+                    [name]
+                    .clone()
+                    .into(),
             });
         }
         Ok(command)
@@ -2327,10 +2548,11 @@ impl SystemdTransientWorkloadDriver {
         expected: &IdunnExpectedIncarnationRecord,
         unit: &str,
     ) -> Result<BTreeMap<String, String>> {
-        let mut environment = binding.workload.environment.clone();
+        let mut environment = binding.workload.systemd()?.environment.clone();
         let credentials_directory = Path::new("/run/credentials").join(unit);
         for name in binding
             .workload
+            .systemd()?
             .secret_files
             .keys()
             .filter(|name| name.as_str() != RUNTIME_PRESENCE_IDENTITY_BINDING)
@@ -2395,7 +2617,7 @@ impl SystemdTransientWorkloadDriver {
 
     fn validate_launch_observation(
         &self,
-        observation: &WorkloadObservation,
+        observation: &SystemdWorkloadObservation,
         declaration: &TargetDeclaration,
         binding: &OperatorBinding,
         installed: &Path,
@@ -2418,10 +2640,11 @@ impl SystemdTransientWorkloadDriver {
             observation.unit.ends_with(".service"),
             "workload unit has no service suffix"
         );
-        let expected_group = binding.workload.state_group.as_deref();
+        let expected_group = binding.workload.systemd()?.state_group.as_deref();
         let expected_group_id = expected_group.map(resolve_group_id).transpose()?;
         let regular_credential_names = binding
             .workload
+            .systemd()?
             .secret_files
             .keys()
             .filter(|name| name.as_str() != RUNTIME_PRESENCE_IDENTITY_BINDING)
@@ -2434,6 +2657,7 @@ impl SystemdTransientWorkloadDriver {
         let activation_source = self.activation_credential_source(activation)?;
         let presence_source = binding
             .workload
+            .systemd()?
             .secret_files
             .get(RUNTIME_PRESENCE_IDENTITY_BINDING)
             .context("workload has no parent-only runtime presence identity source")?;
@@ -2560,19 +2784,19 @@ impl SystemdTransientWorkloadDriver {
     }
 
     fn validate_writable_bindings(&self, binding: &OperatorBinding) -> Result<()> {
-        let Some(state_group) = binding.workload.state_group.as_deref() else {
+        let Some(state_group) = binding.workload.systemd()?.state_group.as_deref() else {
             ensure!(
-                binding.workload.state_root.is_none()
-                    && binding.workload.read_write_paths.is_empty(),
+                binding.workload.systemd()?.state_root.is_none()
+                    && binding.workload.systemd()?.read_write_paths.is_empty(),
                 "dynamic workload writable paths have no fixed state group"
             );
             return Ok(());
         };
         let state_group_id = resolve_group_id(state_group)?;
-        if let Some(state_root) = &binding.workload.state_root {
+        if let Some(state_root) = &binding.workload.systemd()?.state_root {
             validate_workload_writable_path(state_root, state_group_id, true)?;
         }
-        for path in &binding.workload.read_write_paths {
+        for path in &binding.workload.systemd()?.read_write_paths {
             validate_workload_writable_path(path, state_group_id, false)?;
         }
         Ok(())
@@ -2598,15 +2822,17 @@ impl SystemdTransientWorkloadDriver {
         ensure!(
             !binding
                 .workload
+                .systemd()?
                 .environment
                 .contains_key(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT)
                 && !binding
                     .workload
+                    .systemd()?
                     .secret_files
                     .contains_key(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT),
             "operator binding attempts to replace the Idunn runtime bundle"
         );
-        validate_service_credential_sources(&binding.workload.secret_files)?;
+        validate_service_credential_sources(&binding.workload.systemd()?.secret_files)?;
         let parent_only_open_files =
             parent_only_open_file_properties(parent_only_file_descriptors)?;
         let environment = self.launch_environment(binding, bundle, expected, unit)?;
@@ -2655,11 +2881,11 @@ impl SystemdTransientWorkloadDriver {
             )),
             OsString::from(format!(
                 "--property=MemoryMax={}M",
-                binding.workload.memory_mebibytes
+                binding.workload.systemd()?.memory_mebibytes
             )),
             OsString::from(format!(
                 "--property=CPUQuota={}%",
-                binding.workload.cpu_quota_percent
+                binding.workload.systemd()?.cpu_quota_percent
             )),
             OsString::from(format!("--working-directory={}", installed.display())),
             OsString::from(format!("--property=ReadOnlyPaths={}", installed.display())),
@@ -2668,13 +2894,13 @@ impl SystemdTransientWorkloadDriver {
         for open_file in parent_only_open_files {
             args.push(OsString::from(format!("--property=OpenFile={open_file}")));
         }
-        if let Some(state_group) = &binding.workload.state_group {
+        if let Some(state_group) = &binding.workload.systemd()?.state_group {
             args.push(OsString::from(format!("--property=Group={state_group}")));
         }
-        if binding.workload.network == WorkloadNetwork::None {
+        if binding.workload.systemd()?.network == WorkloadNetwork::None {
             args.push(OsString::from("--property=PrivateNetwork=yes"));
         }
-        if let Some(state_root) = &binding.workload.state_root {
+        if let Some(state_root) = &binding.workload.systemd()?.state_root {
             args.push(OsString::from(format!(
                 "--property=ReadWritePaths={}",
                 state_root.display()
@@ -2688,23 +2914,23 @@ impl SystemdTransientWorkloadDriver {
                 )));
             }
         }
-        for path in &binding.workload.read_only_paths {
+        for path in &binding.workload.systemd()?.read_only_paths {
             args.push(OsString::from(format!(
                 "--property=ReadOnlyPaths={}",
                 path.display()
             )));
         }
-        for path in &binding.workload.read_write_paths {
+        for path in &binding.workload.systemd()?.read_write_paths {
             args.push(OsString::from(format!(
                 "--property=ReadWritePaths={}",
                 path.display()
             )));
         }
-        if binding.workload.devices.is_empty() {
+        if binding.workload.systemd()?.devices.is_empty() {
             args.push(OsString::from("--property=PrivateDevices=yes"));
         } else {
             args.push(OsString::from("--property=DevicePolicy=closed"));
-            for device in &binding.workload.devices {
+            for device in &binding.workload.systemd()?.devices {
                 args.push(OsString::from(format!(
                     "--property=DeviceAllow={} rw",
                     device.display()
@@ -2716,6 +2942,7 @@ impl SystemdTransientWorkloadDriver {
         }
         for (name, path) in binding
             .workload
+            .systemd()?
             .secret_files
             .iter()
             .filter(|(name, _)| name.as_str() != RUNTIME_PRESENCE_IDENTITY_BINDING)
@@ -2761,7 +2988,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
             "prepared activation target differs from the operator binding"
         );
         let unit = self.unit_name(
-            &binding.workload.unit_prefix,
+            &binding.workload.systemd()?.unit_prefix,
             &proposed_activation.runtime_instance_id,
         )?;
         ensure!(
@@ -2822,12 +3049,13 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
             release_artifact(&declaration, &declaration.service.executable_artifact)?;
         let executable = installed.root.join(&executable_artifact.destination);
         let unit = self.unit_name(
-            &binding.workload.unit_prefix,
+            &binding.workload.systemd()?.unit_prefix,
             &activation.runtime_instance_id,
         )?;
         let bundle = self.prepare_runtime_bundle(&binding, expected, activation)?;
         let service_credential_names = binding
             .workload
+            .systemd()?
             .secret_files
             .keys()
             .filter(|name| name.as_str() != RUNTIME_PRESENCE_IDENTITY_BINDING)
@@ -2880,7 +3108,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
                         );
                         Ok(())
                     }) {
-                        Ok(()) => return Ok(observation),
+                        Ok(()) => return Ok(WorkloadObservation::Systemd(observation)),
                         Err(error) => last_error = Some(error),
                     }
                 }
@@ -2911,7 +3139,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
             "discarded activation target differs from its binding"
         );
         let unit = self.unit_name(
-            &binding.workload.unit_prefix,
+            &binding.workload.systemd()?.unit_prefix,
             &activation.runtime_instance_id,
         )?;
         let unit_description = format!(
@@ -2932,6 +3160,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
     ) -> Result<WorkloadObservation> {
         expected.validate()?;
         activation.validate()?;
+        let prior = prior.systemd()?;
         ensure!(
             activation.expected_projection_sha256 == expected.canonical_sha256()?
                 && activation.runtime_instance_id == prior.runtime_instance_id,
@@ -2976,10 +3205,11 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
             after_unlink == observed,
             "native workload identity changed after recovered credential cleanup"
         );
-        Ok(after_unlink)
+        Ok(WorkloadObservation::Systemd(after_unlink))
     }
 
     fn is_permanently_stopped(&self, observation: &WorkloadObservation) -> Result<bool> {
+        let observation = observation.systemd()?;
         ensure!(
             observation.restart_policy == "no",
             "workload unit does not carry the admitted Restart=no policy"
@@ -2992,6 +3222,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
     }
 
     fn stop(&self, observation: &WorkloadObservation) -> Result<()> {
+        let observation = observation.systemd()?;
         let Some(unit_observation) = self.show_unit(&observation.unit)? else {
             return Ok(());
         };
@@ -3859,8 +4090,8 @@ impl TopologyPort for CultCacheTopologyDriver {
         activation.validate()?;
         ensure!(
             activation.expected_projection_sha256 == expected.canonical_sha256()?
-                && activation.runtime_instance_id == observation.runtime_instance_id
-                && observation.executable_sha256 == expected.artifact_sha256,
+                && activation.runtime_instance_id == observation.runtime_instance_id()
+                && observation.executable_sha256() == expected.artifact_sha256,
             "observed activation does not name the Expected native process"
         );
         let key = incarnation_key(expected)?;
@@ -6141,6 +6372,7 @@ fn build_machine_id_file(workspace: &Path) -> Result<PathBuf> {
             ),
         )
         .context("writing the build machine-id")?;
+        #[cfg(unix)]
         fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444))
             .context("sealing the build machine-id")?;
     }
@@ -6837,9 +7069,95 @@ mod tests {
         Ok(())
     }
 
+    fn host_audit_observation(pid: u32, created: u64) -> HostWorkloadObservation {
+        HostWorkloadObservation {
+            host: "raven".into(),
+            actuator_identity_id: "actuator".into(),
+            process_id: pid,
+            process_creation_time: created,
+            session_id: 1,
+            user_sid: "S-1-5-21-1-2-3-1001".into(),
+            executable: "C:/GameCult/idunn/releases/muninn/x/muninn.exe".into(),
+            executable_sha256: format!("sha256-{}", "1".repeat(64)),
+            command_line_sha256: format!("sha256-{}", "2".repeat(64)),
+            environment_names: vec!["GAMECULT_IDUNN_RUNTIME_BUNDLE".into()],
+            environment_contract_sha256: format!("sha256-{}", "3".repeat(64)),
+            runtime_bundle: "C:/GameCult/idunn/runtime/muninn/x".into(),
+            runtime_instance_id: format!("sha256-{}", "a".repeat(64)),
+            activation_signer_identity_id: "activation".into(),
+            activation_signer_public_key: vec![1; 32],
+            exit_code: None,
+        }
+    }
+
+    /// The previous Idunn persisted the systemd observation alone, under both
+    /// MessagePack encodings CultCache uses. The enum must read those bytes
+    /// as the systemd variant, and a host observation must not be mistaken
+    /// for one.
+    #[test]
+    fn persisted_systemd_observations_decode_as_the_systemd_variant() -> Result<()> {
+        let systemd = systemd_audit_observation("no", 61_000);
+        for bytes in [
+            rmp_serde::to_vec(&systemd)?,
+            rmp_serde::to_vec_named(&systemd)?,
+        ] {
+            let decoded: WorkloadObservation = rmp_serde::from_slice(&bytes)?;
+            assert_eq!(decoded, WorkloadObservation::Systemd(systemd.clone()));
+        }
+        let host = host_audit_observation(4242, 133_000_000_000_000_000);
+        for bytes in [rmp_serde::to_vec(&host)?, rmp_serde::to_vec_named(&host)?] {
+            let decoded: WorkloadObservation = rmp_serde::from_slice(&bytes)?;
+            assert_eq!(decoded, WorkloadObservation::Host(host.clone()));
+        }
+        let linux = IsolationEvidence::Linux(LinuxIsolationEvidence {
+            candidate_uid: 1,
+            candidate_pid_namespace_id: 2,
+            candidate_mount_namespace_id: 3,
+            incumbent_uid: None,
+            incumbent_pid_namespace_id: None,
+            incumbent_mount_namespace_id: None,
+        });
+        let host_evidence = IsolationEvidence::Host(HostIsolationEvidence {
+            candidate_process_id: 1,
+            candidate_process_creation_time: 2,
+            incumbent_process_id: Some(3),
+            incumbent_process_creation_time: Some(4),
+        });
+        for evidence in [linux, host_evidence] {
+            for bytes in [
+                rmp_serde::to_vec(&evidence)?,
+                rmp_serde::to_vec_named(&evidence)?,
+            ] {
+                let decoded: IsolationEvidence = rmp_serde::from_slice(&bytes)?;
+                assert_eq!(decoded, evidence);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn host_isolation_is_two_live_distinct_processes_on_one_host() {
+        let live = |pid: u32, created: u64| {
+            WorkloadObservation::Host(host_audit_observation(pid, created))
+        };
+        let incumbent = live(100, 5);
+        assert!(WorkloadObservation::prove_isolation(&live(101, 6), Some(&incumbent)).is_ok());
+        assert!(WorkloadObservation::prove_isolation(&live(100, 5), Some(&incumbent)).is_err());
+        let mut exited = host_audit_observation(101, 6);
+        exited.exit_code = Some(1);
+        let exited = WorkloadObservation::Host(exited);
+        assert!(WorkloadObservation::prove_isolation(&exited, Some(&incumbent)).is_err());
+        let systemd = audit_workload_observation("no");
+        assert!(WorkloadObservation::prove_isolation(&live(101, 6), Some(&systemd)).is_err());
+    }
+
     fn audit_workload_observation(restart_policy: &str) -> WorkloadObservation {
         let uid = 61_000u32;
-        WorkloadObservation {
+        WorkloadObservation::Systemd(systemd_audit_observation(restart_policy, uid))
+    }
+
+    fn systemd_audit_observation(restart_policy: &str, uid: u32) -> SystemdWorkloadObservation {
+        SystemdWorkloadObservation {
             unit: format!("idunn-{}.service", "a".repeat(64)),
             unit_description: "Idunn test".into(),
             invocation_id: "inv".into(),
