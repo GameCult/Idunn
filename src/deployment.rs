@@ -1786,8 +1786,15 @@ fn require_leaf_path(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Paths in a binding are the Idunn host's, and the Idunn host is Linux. A
+/// host actuator re-parses the same binding on Windows to reach its own
+/// section, so "absolute" is judged by the path's own shape, not by the
+/// platform doing the judging.
 fn require_absolute_path(path: &Path, label: &str) -> Result<()> {
-    ensure!(path.is_absolute(), "{label} must be absolute");
+    ensure!(
+        path.is_absolute() || path.to_string_lossy().starts_with('/'),
+        "{label} must be absolute"
+    );
     ensure!(
         path.components()
             .all(|component| !matches!(component, Component::ParentDir)),
