@@ -439,7 +439,9 @@ The map carries Cut 9 as a placeholder that only B or C activates.
 
 Depends: Cut 9, and whether Cut 7's SKILL.md text keeps the Starfire exception.
 
-**Q-V6. Concurrency and caps on Yggdrasil.** The host policy is a typed setting.
+**Q-V6: RULED by the operator, 2026-09-22 ("That's fine"), on measured data.** `max_concurrent = 2`. Each runner is capped at 400% CPU and **12288 MiB**. The aggregate budget is 800% CPU and **24576 MiB**, so live services keep half of Yggdrasil's CPU. Measurement: Ghostlight `cargo test --workspace --no-run -j 4` peaks at 5.7 GiB in 78 s, with a 3.4 GB target. Epiphany is not yet measurable, because its pinned Ghostlight rev has a submodule pointing at the deleted `GameCult/cultcache-py`. Raise the per-runner ceiling if Epiphany measures above about 10 GiB.
+
+*History, the question as asked:* **Q-V6. Concurrency and caps on Yggdrasil.** The host policy is a typed setting.
 - A: `max_concurrent = 2`, per-runner ceiling 400% CPU and 8192 MiB, aggregate
   budget 800% and 16384 MiB. At most 8 of 16 vCPU go to verification.
 - B: 2 jobs at 6 CPU and 16 GiB each, which is the stopgap's setting (F25): 12
