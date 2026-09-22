@@ -56,18 +56,13 @@
         for name in runner.environment.keys() {
 '@
         }
-        @{
-            Id   = 'cut1-freeze-exact-recipe-check'
-            Rule = 'freeze_exact refuses when the archived recipe file differs from the recipe blob it read from the same tree.'
-            Test = 'drivers::tests::freeze_exact_rejects_a_recipe_the_archive_transforms'
-            Old  = @'
-            ensure!(
-                materialized_recipe == recipe_bytes,
-                "frozen recipe differs from the selected tree's recipe blob"
-            );
-'@
-            New  = ''
-        }
+        # cut1-freeze-exact-recipe-check retired by the F2 fix batch: after F2,
+        # freeze_exact no longer archives anything, so `materialized_recipe`
+        # and `recipe_bytes` are two raw reads of the identical blob object
+        # and are always equal by construction. No fixture reachable through
+        # freeze_exact can now make this ensure! fail (not yet reached), so a
+        # mutant dropping it would survive; the check stays as defense in
+        # depth against a materialization bug, not as a killable rule here.
         # ---- Cut 1 fix batch: Soul's 13 surviving mutants (F1), minus S8 ----
         # (S8, dropping the `validate_frozen_source` call inside `freeze_exact`,
         # is not yet reached: `harden_frozen_source` runs first and unconditionally
@@ -227,12 +222,14 @@
             Test = 'drivers::tests::freeze_exact_materializes_gitlinks'
             Old  = @'
             for (path, fact) in &gitlinks {
-                self.materialize_gitlink_archive(source, path, fact, &partial)?;
+                lfs_pointer_paths
+                    .extend(self.materialize_gitlink_raw(source, path, fact, &partial)?);
             }
 '@
             New  = @'
             for (path, fact) in gitlinks.iter().take(0) {
-                self.materialize_gitlink_archive(source, path, fact, &partial)?;
+                lfs_pointer_paths
+                    .extend(self.materialize_gitlink_raw(source, path, fact, &partial)?);
             }
 '@
         }
@@ -258,6 +255,99 @@
         }
 '@
             New  = ''
+        }
+        @{
+            Id   = 'cut1-fix-f2-revert-to-git-archive'
+            Rule = 'freeze_exact writes blobs raw from the object store; it must never revert to git archive, which applies attribute-driven transforms.'
+            Test = 'drivers::tests::freeze_exact_is_byte_exact_across_every_attribute_transform'
+            Old  = @'
+        fs::create_dir_all(destination)
+            .with_context(|| format!("creating {}", destination.display()))?;
+        let entries = self.git_tree_entries(repository, revision)?;
+        let blob_objects: Vec<String> = entries
+            .iter()
+            .filter(|entry| entry.kind == "blob")
+            .map(|entry| entry.object.clone())
+            .collect();
+        let blobs = self.read_blobs(repository, &blob_objects)?;
+        let mut lfs_pointer_paths = Vec::new();
+        for entry in &entries {
+            let target = destination.join(&entry.path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match entry.mode.as_str() {
+                "100644" | "100755" => {
+                    let content = blobs
+                        .get(&entry.object)
+                        .context("Git cat-file --batch omitted a requested blob")?;
+                    fs::write(&target, content)
+                        .with_context(|| format!("writing {}", target.display()))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = if entry.mode == "100755" { 0o755 } else { 0o644 };
+                        fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+                    }
+                    if is_lfs_pointer(content) {
+                        lfs_pointer_paths.push(entry.path.clone());
+                    }
+                }
+                "120000" => {
+                    let content = blobs
+                        .get(&entry.object)
+                        .context("Git cat-file --batch omitted a requested blob")?;
+                    let link_target = std::str::from_utf8(content)
+                        .context("frozen source symlink target is not UTF-8")?;
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(link_target, &target)
+                        .with_context(|| format!("creating symlink {}", target.display()))?;
+                }
+                "160000" => {
+                    // Gitlinks are materialized by the caller, which knows
+                    // each one's admitted origin; this entry only reserves
+                    // the directory.
+                }
+                other => bail!(
+                    "frozen source tree entry {} has an unsupported mode {other}",
+                    entry.path.display()
+                ),
+            }
+        }
+        Ok(lfs_pointer_paths)
+'@
+            New  = @'
+        fs::create_dir_all(destination)
+            .with_context(|| format!("creating {}", destination.display()))?;
+        let mut archive = self.git_command([
+            OsString::from("-C"),
+            repository.as_os_str().to_owned(),
+            OsString::from("archive"),
+            OsString::from("--format=tar"),
+            OsString::from(revision),
+        ])?;
+        archive.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut archive = archive.spawn().context("starting Git archive")?;
+        let archive_stdout = archive.stdout.take().context("Git archive has no stdout")?;
+        let mut extractor = Command::new("/bin/tar");
+        extractor
+            .args([
+                OsString::from("--extract"),
+                OsString::from("--file=-"),
+                OsString::from("--directory"),
+                destination.as_os_str().to_owned(),
+                OsString::from("--no-same-owner"),
+            ])
+            .stdin(Stdio::from(archive_stdout))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let extractor = extractor.spawn().context("starting tar extractor")?;
+        let archive_output = archive.wait_with_output().context("waiting for Git archive")?;
+        let extractor_output = extractor.wait_with_output().context("waiting for tar extractor")?;
+        ensure!(archive_output.status.success(), "Git archive failed");
+        ensure!(extractor_output.status.success(), "tar extraction failed");
+        Ok(Vec::new())
+'@
         }
     )
 }

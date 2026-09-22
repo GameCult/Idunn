@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use cultcache_rs::{
     CacheBackingStore, CultCacheEnvelope, CultCacheExpectedEnvelope, DatabaseEntry,
     SingleFileMessagePackBackingStore, TryCompareExchangeSnapshotOutcome,
@@ -702,14 +702,14 @@ fn exact_source_from(binding: &OperatorBinding) -> ExactSource {
 
 /// Fixed-argv Git source driver. It never interprets recipe text as a command
 /// and never derives source policy from the target repository. The configured
-/// identity performs every Git/network read; root Idunn extracts only exact Git
-/// object archives into a separate transaction-owned immutable store.
+/// identity performs every Git/network read; root Idunn writes only exact Git
+/// blob content into a separate transaction-owned immutable store — no
+/// `git archive`, so no attribute-driven transform runs on the way out.
 pub struct GitSourceDriver {
     pub source_cache_root: PathBuf,
     pub frozen_source_root: PathBuf,
     pub identity: Option<ProcessIdentity>,
     pub git_program: PathBuf,
-    pub tar_program: PathBuf,
 }
 
 impl GitSourceDriver {
@@ -723,7 +723,6 @@ impl GitSourceDriver {
             frozen_source_root: frozen_source_root.into(),
             identity,
             git_program: PathBuf::from("/usr/bin/git"),
-            tar_program: PathBuf::from("/usr/bin/tar"),
         }
     }
 
@@ -1045,77 +1044,189 @@ impl GitSourceDriver {
         Ok(())
     }
 
-    fn git_archive_into(
+    /// Reads every named blob object's raw bytes from `repository` through one
+    /// `git cat-file --batch` process, with no attribute-driven transform of
+    /// any kind: `--batch` never smudges, never renormalizes line endings,
+    /// and never expands `ident`/`export-subst`. The batch protocol frames
+    /// each answer with an exact byte count, so binary content is read by
+    /// that count rather than by scanning for a delimiter.
+    fn read_blobs(&self, repository: &Path, objects: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
+        let mut result = BTreeMap::new();
+        if objects.is_empty() {
+            return Ok(result);
+        }
+        let mut command = self.git_command([
+            OsString::from("-C"),
+            repository.as_os_str().to_owned(),
+            OsString::from("cat-file"),
+            OsString::from("--batch"),
+        ])?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().context("starting Git cat-file --batch")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("Git cat-file --batch has no stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Git cat-file --batch has no stdout")?;
+        let request: Vec<u8> = objects
+            .iter()
+            .flat_map(|object| {
+                let mut line = object.as_bytes().to_vec();
+                line.push(b'\n');
+                line
+            })
+            .collect();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            stdin.write_all(&request)
+            // `stdin` drops here, closing the pipe so Git sees end of input.
+        });
+        let mut reader = std::io::BufReader::new(stdout);
+        for object in objects {
+            let mut header = Vec::new();
+            reader
+                .read_until(b'\n', &mut header)
+                .context("reading a Git cat-file --batch header")?;
+            ensure!(
+                header.last() == Some(&b'\n'),
+                "Git cat-file --batch closed before answering every object"
+            );
+            header.pop();
+            let header = String::from_utf8(header)
+                .context("Git cat-file --batch header is not UTF-8")?;
+            let mut fields = header.split(' ');
+            let returned_object = fields
+                .next()
+                .context("Git cat-file --batch header names no object")?;
+            ensure!(
+                returned_object == object,
+                "Git cat-file --batch answered objects out of the requested order"
+            );
+            let kind_or_missing = fields
+                .next()
+                .context("Git cat-file --batch header is malformed")?;
+            ensure!(
+                kind_or_missing != "missing",
+                "Git object {object} is missing from the repository"
+            );
+            let size: usize = fields
+                .next()
+                .context("Git cat-file --batch header has no size")?
+                .parse()
+                .context("Git cat-file --batch size is not a number")?;
+            ensure!(
+                fields.next().is_none(),
+                "Git cat-file --batch header has extra fields"
+            );
+            let mut content = vec![0u8; size];
+            reader
+                .read_exact(&mut content)
+                .context("reading Git cat-file --batch object content")?;
+            let mut trailer = [0u8; 1];
+            reader
+                .read_exact(&mut trailer)
+                .context("reading the newline after a Git cat-file --batch object")?;
+            ensure!(
+                trailer[0] == b'\n',
+                "Git cat-file --batch object content ran past its declared size"
+            );
+            result.insert(object.clone(), content);
+        }
+        let status = child
+            .wait()
+            .context("waiting for Git cat-file --batch to exit")?;
+        writer
+            .join()
+            .map_err(|_| anyhow!("Git cat-file --batch stdin writer panicked"))?
+            .context("writing Git cat-file --batch requests")?;
+        ensure!(status.success(), "Git cat-file --batch exited with {status}");
+        Ok(result)
+    }
+
+    /// Writes every entry of `repository`'s tree at `revision` into
+    /// `destination`, byte for byte from the object store: no `git archive`,
+    /// no attribute-driven transform, no smudge or clean filter. Modes and
+    /// symlinks are preserved exactly as the tree records them. Returns the
+    /// paths, relative to `destination`, whose content is a Git LFS pointer
+    /// (LFS content itself is never fetched).
+    fn materialize_tree_raw(
         &self,
         repository: &Path,
         revision: &str,
-        prefix: Option<&Path>,
         destination: &Path,
-    ) -> Result<()> {
-        ensure!(
-            self.tar_program.is_absolute(),
-            "source archive extractor is not absolute"
-        );
-        let mut archive_args = vec![
-            OsString::from("-C"),
-            repository.as_os_str().to_owned(),
-            OsString::from("archive"),
-            OsString::from("--format=tar"),
-        ];
-        if let Some(prefix) = prefix {
-            archive_args.push(OsString::from(format!(
-                "--prefix={}/",
-                normalized_relative(prefix)?
-            )));
+    ) -> Result<Vec<PathBuf>> {
+        fs::create_dir_all(destination)
+            .with_context(|| format!("creating {}", destination.display()))?;
+        let entries = self.git_tree_entries(repository, revision)?;
+        let blob_objects: Vec<String> = entries
+            .iter()
+            .filter(|entry| entry.kind == "blob")
+            .map(|entry| entry.object.clone())
+            .collect();
+        let blobs = self.read_blobs(repository, &blob_objects)?;
+        let mut lfs_pointer_paths = Vec::new();
+        for entry in &entries {
+            let target = destination.join(&entry.path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match entry.mode.as_str() {
+                "100644" | "100755" => {
+                    let content = blobs
+                        .get(&entry.object)
+                        .context("Git cat-file --batch omitted a requested blob")?;
+                    fs::write(&target, content)
+                        .with_context(|| format!("writing {}", target.display()))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = if entry.mode == "100755" { 0o755 } else { 0o644 };
+                        fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+                    }
+                    if is_lfs_pointer(content) {
+                        lfs_pointer_paths.push(entry.path.clone());
+                    }
+                }
+                "120000" => {
+                    let content = blobs
+                        .get(&entry.object)
+                        .context("Git cat-file --batch omitted a requested blob")?;
+                    let link_target = std::str::from_utf8(content)
+                        .context("frozen source symlink target is not UTF-8")?;
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(link_target, &target)
+                        .with_context(|| format!("creating symlink {}", target.display()))?;
+                }
+                "160000" => {
+                    // Gitlinks are materialized by the caller, which knows
+                    // each one's admitted origin; this entry only reserves
+                    // the directory.
+                }
+                other => bail!(
+                    "frozen source tree entry {} has an unsupported mode {other}",
+                    entry.path.display()
+                ),
+            }
         }
-        archive_args.push(revision.into());
-        let mut archive = self.git_command(archive_args)?;
-        archive.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut archive = archive.spawn().context("starting exact Git archive")?;
-        let archive_stdout = archive.stdout.take().context("Git archive has no stdout")?;
-        let mut extractor = Command::new(&self.tar_program);
-        extractor
-            .args([
-                OsString::from("--extract"),
-                OsString::from("--file=-"),
-                OsString::from("--directory"),
-                destination.as_os_str().to_owned(),
-                OsString::from("--no-same-owner"),
-            ])
-            .stdin(Stdio::from(archive_stdout))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .env_clear()
-            .env("LANG", "C.UTF-8");
-        let extractor = extractor
-            .spawn()
-            .context("starting fixed-argv source archive extractor")?;
-        let archive_output = archive
-            .wait_with_output()
-            .context("waiting for exact Git archive")?;
-        let extractor_output = extractor
-            .wait_with_output()
-            .context("waiting for source archive extractor")?;
-        ensure!(
-            archive_output.status.success(),
-            "Git archive failed: {}",
-            String::from_utf8_lossy(&archive_output.stderr).trim()
-        );
-        ensure!(
-            extractor_output.status.success(),
-            "source archive extraction failed: {}",
-            String::from_utf8_lossy(&extractor_output.stderr).trim()
-        );
-        Ok(())
+        Ok(lfs_pointer_paths)
     }
 
-    fn materialize_gitlink_archive(
+    /// Clones a Gitlink's admitted origin at its exact recorded revision and
+    /// writes its tree raw under `destination_root.join(path)`, the same
+    /// byte-exact primitive as the superproject. Returns the materialized
+    /// LFS-pointer paths, relative to `destination_root`.
+    fn materialize_gitlink_raw(
         &self,
         source: &ExactSource,
         path: &Path,
         fact: &GitlinkTreeFact,
-        destination: &Path,
-    ) -> Result<()> {
+        destination_root: &Path,
+    ) -> Result<Vec<PathBuf>> {
         let checkout_text = source
             .checkout
             .to_str()
@@ -1160,7 +1271,7 @@ impl GitSourceDriver {
                     .any(|entry| entry.mode == "160000"),
                 "nested Gitlinks are not admitted in Idunn v1"
             );
-            self.git_archive_into(&checkout, &fact.revision, Some(path), destination)
+            self.materialize_tree_raw(&checkout, &fact.revision, &destination_root.join(path))
         })();
         let cleanup = if checkout.exists() {
             remove_tree_inside(&gitlink_root, &checkout)
@@ -1168,29 +1279,34 @@ impl GitSourceDriver {
             Ok(())
         };
         match (result, cleanup) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(lfs_pointer_paths), Ok(())) => Ok(lfs_pointer_paths
+                .into_iter()
+                .map(|relative| path.join(relative))
+                .collect()),
             (Err(error), _) => Err(error),
-            (Ok(()), Err(error)) => Err(error.context("cleaning exact Gitlink checkout")),
+            (Ok(_), Err(error)) => Err(error.context("cleaning exact Gitlink checkout")),
         }
     }
 
-    /// Fetches `source` at the exact `revision`, archives it and its Gitlinks
-    /// into a fresh root-owned immutable tree under `root/<transaction_id>`,
-    /// and returns that tree's root, its content digest, and the recipe blob
-    /// bytes the tree's own Git objects name. It derives the recipe and
-    /// Gitlink facts itself from the tree rather than trusting a caller's
+    /// Fetches `source` at the exact `revision` and writes it and its
+    /// Gitlinks, byte for byte from the Git object store, into a fresh
+    /// root-owned immutable tree under `root/<transaction_id>`. Returns that
+    /// tree's root, its content digest, the recipe blob bytes the tree's own
+    /// Git objects name, and whether any materialized file is a Git LFS
+    /// pointer (LFS content itself is never fetched). It derives the recipe
+    /// and Gitlink facts itself from the tree rather than trusting a caller's
     /// prior resolution, so it needs no `OperatorBinding` or compiled plan and
     /// is safe to call again later for a verify transaction over a different
-    /// revision of a different repository. It shares its fetch-and-archive
-    /// core with `freeze`, which additionally checks the archived recipe
-    /// against a durable resolution made at admission time.
+    /// revision of a different repository. It shares its fetch core with
+    /// `freeze`, which additionally checks the frozen recipe against a
+    /// durable resolution made at admission time.
     pub(crate) fn freeze_exact(
         &self,
         source: &ExactSource,
         revision: &str,
         transaction_id: &str,
         root: &Path,
-    ) -> Result<(PathBuf, String, Vec<u8>)> {
+    ) -> Result<(PathBuf, String, Vec<u8>, bool)> {
         require_driver_id(transaction_id, "source transaction")?;
         require_git_sha(revision, "frozen source revision")?;
         #[cfg(unix)]
@@ -1213,9 +1329,11 @@ impl GitSourceDriver {
         let partial = transaction_root.join(".partial");
         prepare_frozen_source_destination(&partial)?;
         let materialization = (|| {
-            self.git_archive_into(&source.checkout, revision, None, &partial)?;
+            let mut lfs_pointer_paths =
+                self.materialize_tree_raw(&source.checkout, revision, &partial)?;
             for (path, fact) in &gitlinks {
-                self.materialize_gitlink_archive(source, path, fact, &partial)?;
+                lfs_pointer_paths
+                    .extend(self.materialize_gitlink_raw(source, path, fact, &partial)?);
             }
             let recipe_file = partial.join(&source.recipe_path);
             let recipe_metadata = fs::symlink_metadata(&recipe_file)?;
@@ -1231,10 +1349,11 @@ impl GitSourceDriver {
             );
             harden_frozen_source(&partial)?;
             validate_frozen_source(&partial)?;
-            frozen_source_sha256(&partial)
+            let snapshot_sha256 = frozen_source_sha256(&partial)?;
+            Ok::<_, anyhow::Error>((snapshot_sha256, !lfs_pointer_paths.is_empty()))
         })();
-        let snapshot_sha256 = match materialization {
-            Ok(snapshot_sha256) => snapshot_sha256,
+        let (snapshot_sha256, contains_lfs_pointers) = match materialization {
+            Ok(outcome) => outcome,
             Err(error) => {
                 let _ = remove_frozen_transaction_root(root, transaction_id);
                 return Err(error);
@@ -1250,8 +1369,16 @@ impl GitSourceDriver {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&transaction_root, fs::Permissions::from_mode(0o500))?;
         }
-        Ok((final_root, snapshot_sha256, recipe_bytes))
+        Ok((final_root, snapshot_sha256, recipe_bytes, contains_lfs_pointers))
     }
+}
+
+/// A Git LFS pointer file's exact, well-known first line (the LFS pointer
+/// spec fixes this text). Detecting it needs no LFS tooling: the pointer is
+/// itself the blob content when LFS smudging never runs, which `read_blobs`
+/// guarantees by construction.
+fn is_lfs_pointer(content: &[u8]) -> bool {
+    content.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
 }
 
 impl SourcePort for GitSourceDriver {
@@ -1344,12 +1471,17 @@ impl SourcePort for GitSourceDriver {
         // would fetch twice for one freeze. `verify_exact_source` below needs
         // no fetch of its own: it only reads objects already local, and
         // `freeze_exact` has just made the selected revision local.
-        let (_tree_root, snapshot_sha256, recipe_bytes) = self.freeze_exact(
-            &source,
-            &resolved.facts.revision,
-            transaction_id,
-            &self.frozen_source_root,
-        )?;
+        // `contains_lfs_pointers` is the frozen result's own record that LFS
+        // content was not fetched (F2); `FrozenSourceReceipt` has no field for
+        // it yet, so it is not yet carried past this call. Promoting it to a
+        // persisted, Verse-visible fact is follow-up scope, not this fix.
+        let (_tree_root, snapshot_sha256, recipe_bytes, _contains_lfs_pointers) = self
+            .freeze_exact(
+                &source,
+                &resolved.facts.revision,
+                transaction_id,
+                &self.frozen_source_root,
+            )?;
         self.verify_exact_source(&source, &resolved)?;
         ensure!(
             recipe_bytes == resolved.recipe_bytes,
@@ -8085,9 +8217,10 @@ mod tests {
             recipe_path: PathBuf::from("deployment.toml"),
         };
 
-        let (tree_root, snapshot_sha256, recipe_bytes) =
+        let (tree_root, snapshot_sha256, recipe_bytes, contains_lfs_pointers) =
             driver.freeze_exact(&source, &revision, "txn-1", &frozen_source_root)?;
         assert_eq!(recipe_bytes, b"target = 'test'\n".to_vec());
+        assert!(!contains_lfs_pointers);
         assert!(tree_root.join("deployment.toml").is_file());
         assert!(!tree_root.join(".git").exists());
         assert!(snapshot_sha256.starts_with("sha256-"));
@@ -8096,13 +8229,20 @@ mod tests {
 
     /// Cut 1, R-Cut1-3 negative twin: an `export-subst` recipe means `git
     /// archive` writes a substituted `$Format:%H$` token into the archived
-    /// file while `git cat-file blob` (what `exact_recipe_and_gitlinks`
-    /// reads) still returns the token unexpanded, so the two byte strings the
-    /// recipe-bytes-equality check compares genuinely differ. This is the
-    /// fixture that kills a mutant which drops that check.
+    /// file. Before the F2 fix batch, `git archive` (what `freeze_exact` used
+    /// to materialize with) expanded that token while `git cat-file blob`
+    /// (what `exact_recipe_and_gitlinks` reads) returned it unexpanded, so the
+    /// two byte strings the recipe-bytes-equality check compares genuinely
+    /// differed and freeze_exact refused. After F2, `freeze_exact` no longer
+    /// archives anything — the recipe is written raw, the same as everything
+    /// else — so `export-subst` is no longer a transform at all and the
+    /// frozen recipe keeps its literal, unexpanded token. This is now a
+    /// byte-exactness positive case rather than a rejection case; the
+    /// recipe-bytes-equality check itself has no remaining fixture that can
+    /// make it fail (not yet reached — see the F2 fix-batch report).
     #[cfg(unix)]
     #[test]
-    fn freeze_exact_rejects_a_recipe_the_archive_transforms() -> Result<()> {
+    fn freeze_exact_keeps_an_export_subst_recipe_literal() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
@@ -8157,8 +8297,13 @@ mod tests {
             recipe_path: PathBuf::from("deployment.toml"),
         };
 
-        let result = driver.freeze_exact(&source, &revision, "txn-2", &frozen_source_root);
-        assert!(result.is_err(), "expected the transformed recipe to be rejected");
+        let (tree_root, _snapshot_sha256, recipe_bytes, _contains_lfs_pointers) =
+            driver.freeze_exact(&source, &revision, "txn-2", &frozen_source_root)?;
+        assert_eq!(recipe_bytes, b"target = 'test'\n# $Format:%H$\n".to_vec());
+        assert_eq!(
+            fs::read(tree_root.join("deployment.toml"))?,
+            b"target = 'test'\n# $Format:%H$\n".to_vec()
+        );
         Ok(())
     }
 
@@ -8243,11 +8388,281 @@ mod tests {
             recipe_path: PathBuf::from("deployment.toml"),
         };
 
-        let (tree_root, _snapshot_sha256, _recipe_bytes) =
+        let (tree_root, _snapshot_sha256, _recipe_bytes, contains_lfs_pointers) =
             driver.freeze_exact(&source, &revision, "txn-gitlink", &frozen_source_root)?;
+        assert!(!contains_lfs_pointers);
         let materialized = fs::read_to_string(tree_root.join("vendor/sub/lib.txt"))
             .context("reading materialized Gitlink content")?;
         assert_eq!(materialized, "vendored content\n");
+        Ok(())
+    }
+
+    /// F2 (Self's ruling, Cut 1 fix batch): `freeze_exact` writes blobs raw
+    /// from the object store, with no attribute-driven transform, across
+    /// every transform `.gitattributes` can name: `eol=crlf`, `export-ignore`,
+    /// `export-subst`, `ident`, a symlink, the executable bit, and a Gitlink.
+    /// Every frozen file's bytes are asserted equal to `git cat-file blob` at
+    /// the selected revision — the same check the recipe already gets, now
+    /// over the whole tree.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_is_byte_exact_across_every_attribute_transform() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        let sub_repo = temp.path().join("sub");
+        fs::create_dir(&sub_repo)?;
+        git_at(&sub_repo, &["init", "--initial-branch=main"])?;
+        git_at(&sub_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(&sub_repo, &["config", "user.email", "idunn-test@example.invalid"])?;
+        fs::write(sub_repo.join("lib.txt"), b"sub content\n")?;
+        git_at(&sub_repo, &["add", "--all"])?;
+        git_at(&sub_repo, &["commit", "-m", "sub fixture"])?;
+        let sub_revision = git_at(&sub_repo, &["rev-parse", "HEAD"])?;
+
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(
+            origin_repo.join(".gitattributes"),
+            b"crlf.txt eol=crlf\nignored.txt export-ignore\nsubst.txt export-subst\nident.txt ident\n",
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        fs::write(origin_repo.join("crlf.txt"), b"a\nb\n")?;
+        fs::write(origin_repo.join("ignored.txt"), b"ignored\n")?;
+        fs::write(origin_repo.join("subst.txt"), b"rev $Format:%H$\n")?;
+        fs::write(origin_repo.join("ident.txt"), b"$Id$\n")?;
+        let script = origin_repo.join("run.sh");
+        fs::write(&script, b"#!/bin/sh\nexit 0\n")?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+        symlink("deployment.toml", origin_repo.join("link"))?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(
+            &origin_repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sub_revision},vendor/sub"),
+            ],
+        )?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        for repo in [&origin_repo, &sub_repo] {
+            ensure!(
+                Command::new("/bin/chown")
+                    .args(["-R", "1000:1000"])
+                    .arg(repo)
+                    .status()?
+                    .success(),
+                "chowning the fixture repository"
+            );
+        }
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::from([(
+                PathBuf::from("vendor/sub"),
+                GitlinkBinding {
+                    origin: sub_repo.to_string_lossy().into_owned(),
+                },
+            )]),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+
+        let (tree_root, _snapshot_sha256, _recipe_bytes, contains_lfs_pointers) =
+            driver.freeze_exact(&source, &revision, "txn-byte-exact", &frozen_source_root)?;
+        assert!(!contains_lfs_pointers);
+
+        for name in [
+            "deployment.toml",
+            "crlf.txt",
+            "ignored.txt",
+            "subst.txt",
+            "ident.txt",
+            "run.sh",
+            ".gitattributes",
+        ] {
+            let output = Command::new("/usr/bin/git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(&origin_repo)
+                .args(["cat-file", "blob", &format!("{revision}:{name}")])
+                .env_clear()
+                .env("HOME", &origin_repo)
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "reading blob {name} for comparison: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let frozen = fs::read(tree_root.join(name))
+                .with_context(|| format!("reading frozen {name}"))?;
+            assert_eq!(frozen, output.stdout, "{name} is not byte-exact");
+        }
+        let script_metadata = fs::symlink_metadata(tree_root.join("run.sh"))?;
+        assert_eq!(script_metadata.uid(), 0);
+        assert_eq!(script_metadata.permissions().mode() & 0o111, 0o111);
+        assert_eq!(
+            fs::read_link(tree_root.join("link"))?,
+            PathBuf::from("deployment.toml")
+        );
+        let gitlink_output = Command::new("/usr/bin/git")
+            .args(["-c", "safe.directory=*", "-C"])
+            .arg(&sub_repo)
+            .args(["cat-file", "blob", &format!("{sub_revision}:lib.txt")])
+            .env_clear()
+            .env("HOME", &sub_repo)
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()?;
+        ensure!(
+            gitlink_output.status.success(),
+            "reading Gitlink blob for comparison: {}",
+            String::from_utf8_lossy(&gitlink_output.stderr)
+        );
+        assert_eq!(
+            fs::read(tree_root.join("vendor/sub/lib.txt"))?,
+            gitlink_output.stdout
+        );
+        Ok(())
+    }
+
+    /// The deploy-equivalence twin F2's ruling asked for: for a fixture with
+    /// only a `text eol=lf` attribute (Eve's real `packages/*/dist/**`
+    /// pattern) and no attribute that would actually transform bytes, the new
+    /// raw freeze's tree equals today's `git archive` tree exactly, so this
+    /// cut does not change deploy for a target like it. The second file in
+    /// the same fixture carries `eol=crlf` over LF-stored content, an
+    /// attribute that genuinely does transform on archive; the test asserts
+    /// the two trees diverge there, so the equivalence check has teeth rather
+    /// than trivially passing.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_matches_archive_when_untransformed_and_diverges_when_transformed() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(
+            origin_repo.join(".gitattributes"),
+            b"untransformed.txt text eol=lf\ntransformed.txt eol=crlf\n",
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        // Eve's actual shape: stored LF, `eol=lf` is a no-op transform.
+        fs::write(origin_repo.join("untransformed.txt"), b"a\nb\n")?;
+        // Stored LF, but `eol=crlf` genuinely rewrites it on checkout/archive.
+        fs::write(origin_repo.join("transformed.txt"), b"a\nb\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+        let (tree_root, _snapshot_sha256, _recipe_bytes, _contains_lfs_pointers) =
+            driver.freeze_exact(&source, &revision, "txn-equivalence", &frozen_source_root)?;
+
+        // Reconstruct today's `git archive` tree independently of production
+        // code, so this test proves equivalence against the actual old
+        // mechanism rather than against another copy of the new one.
+        let archived = temp.path().join("archived");
+        fs::create_dir(&archived)?;
+        let mut archive = Command::new("/usr/bin/git")
+            .args(["-c", "safe.directory=*", "-C"])
+            .arg(&origin_repo)
+            .args(["archive", "--format=tar", &revision])
+            .env_clear()
+            .env("HOME", &origin_repo)
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let archive_stdout = archive.stdout.take().context("git archive has no stdout")?;
+        let extractor_status = Command::new("/bin/tar")
+            .args(["--extract", "--file=-", "--directory"])
+            .arg(&archived)
+            .arg("--no-same-owner")
+            .stdin(Stdio::from(archive_stdout))
+            .status()?;
+        let archive_output = archive.wait_with_output()?;
+        ensure!(
+            archive_output.status.success(),
+            "git archive failed reconstructing the fixture tree: {}",
+            String::from_utf8_lossy(&archive_output.stderr)
+        );
+        ensure!(
+            extractor_status.success(),
+            "reconstructing the archived fixture tree failed"
+        );
+
+        assert_eq!(
+            fs::read(tree_root.join("untransformed.txt"))?,
+            fs::read(archived.join("untransformed.txt"))?,
+            "an eol=lf file over already-LF content must match today's archive exactly"
+        );
+        assert_ne!(
+            fs::read(tree_root.join("transformed.txt"))?,
+            fs::read(archived.join("transformed.txt"))?,
+            "an eol=crlf file genuinely transforms on archive, so raw and archived bytes must diverge"
+        );
         Ok(())
     }
 
@@ -9275,7 +9690,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn exact_git_archive_becomes_root_owned_immutable_source_without_git_metadata() -> Result<()> {
+    fn exact_git_blobs_become_root_owned_immutable_source_without_git_metadata() -> Result<()> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
         let temp = tempfile::tempdir()?;
@@ -9307,12 +9722,11 @@ mod tests {
             temp.path().join("frozen-source"),
             None,
         );
-        driver.git_archive_into(&repository, &revision, None, &destination)?;
-        driver.git_archive_into(
+        driver.materialize_tree_raw(&repository, &revision, &destination)?;
+        driver.materialize_tree_raw(
             &repository,
             &revision,
-            Some(Path::new("vendor/fixture")),
-            &destination,
+            &destination.join("vendor/fixture"),
         )?;
         harden_frozen_source(&destination)?;
 
