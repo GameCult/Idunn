@@ -8917,6 +8917,11 @@ mod tests {
         fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
 
         let log = temp.path().join("git-invocations.log");
+        // Pre-created and world-writable: the spy runs under the
+        // unprivileged Git identity, which cannot create a new file in this
+        // root-owned 0755 directory, only append to one that already exists.
+        fs::write(&log, b"")?;
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o666))?;
         let spy = temp.path().join("git-spy.sh");
         fs::write(
             &spy,
