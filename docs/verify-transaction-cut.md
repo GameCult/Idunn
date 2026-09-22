@@ -1547,3 +1547,58 @@ none exists and building a `CompiledDeploymentPlan` was out of budget.
   digest**, with its own tests, and **`observe_frozen` gets an end-to-end test
   against a real receipt**. A tamper check with no test of its own is the
   thing this campaign keeps finding.
+
+### The sixth fix batch landed, 2026-09-22
+
+Sonnet, two commits on `idunn/cut1-fix5` (`f873b54`, `9e572bd`).
+**183 passed, 0 failed, 2 ignored** (175 + 8). `src/drivers.rs` only: 701
+insertions, 41 deletions, no new dependencies.
+
+- **R-I8.** The wall-clock pin is gone. A `#[cfg(test)]` thread-local counter
+  records every `canonicalize()`/`symlink_metadata()` call inside the
+  resolver, and the test asserts an exact formula (`components + 2`) rather
+  than a clock. Deleting one probe call site turns it red: 52 expected
+  against 1 measured. **This is what the pin should have been from the
+  start** — deterministic under any load, where the old one was a coin toss
+  on a three-slot host.
+- **R-I9, parts 1 and 2.** The validator's mask widens `0o777` → `0o7777`, so
+  setuid, setgid and sticky are refused outright instead of masked away. The
+  digest hashes the full mode and the gid, for directories as well as files.
+  Five new tests, each killing its own mutation.
+  **A real bug surfaced while writing them:** the container's `chown` silently
+  clears a freshly-set setuid bit even when the owner does not change, so the
+  fixture had to chmod last. A fixture that sets the bit and then chowns is
+  testing nothing, and would have looked like a pass.
+- **R-I10.** The cycle fixture now asserts the error names the 40-traversal
+  ceiling rather than only `is_err()`. Rewording the message turns it red.
+- **R-I11.** Doc softened to what is true: the guard bounds at `PATH_MAX` and
+  a filesystem may refuse less.
+- **R-I12.** Comments record that the loop-tail check is the one that must
+  survive, that the Normal arm's is redundant, and that the two mutants Soul
+  identified are equivalent. No deletion, as ordered.
+- **R-I13.** `digest_tree` gains an executable-bit term, pinned and
+  mutation-killed. **The symlink-target terminator is deliberately not
+  pinned**: a real encoding collision needs a NUL inside a symlink target,
+  which `symlink(2)` cannot produce. Hands built a two-name boundary-shift
+  fixture by hand, confirmed it does not go red under the term's removal, and
+  **removed it rather than keep a test that lies about what it proves.** That
+  is the correct call. `observe_frozen` now has a real end-to-end test through
+  `compile_deployment_plan` and `freeze_exact` against a real recipe and
+  binding: it accepts an intact receipt and refuses a post-freeze tamper.
+
+**R-I9's third part was wrong, and Hands proved it against the real tool.**
+I ruled the bind mount should carry `nosuid`. Docker exposes no such
+per-bind-mount flag through either syntax — `--mount type=bind,…,nosuid` and
+`-v host:dst:nosuid` are both rejected outright. The container already runs
+with `--security-opt no-new-privileges`, which is the standard mitigation for
+this class and is process-wide rather than per-mount, so it is stronger than
+what I asked for. **The ruling is withdrawn**; the prevention was already
+there and I had not checked before ordering it.
+
+**A second fixture that would have lied.** The first `observe_frozen` test
+tampered with the recipe file, which a *different* check inside
+`observe_frozen` also catches — so it passed while the digest check was
+deleted. Hands found this by running the mutation, not by reading, and fixed
+the fixture to tamper where only the digest can see it. **A test that goes
+green for the wrong reason is the failure this campaign keeps producing**, and
+it is caught only by mutating against the final spelling of the code.
