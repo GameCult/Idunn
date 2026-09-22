@@ -342,7 +342,9 @@ ran.
 
 Depends: the Cut 2 schema, and the per-repo recipes in Cut 6.
 
-**Q-V2. What does a request carry?**
+**Q-V2: RULED A by the operator, 2026-09-22 ("agreed").** A request carries an exact 40-hex commit that can be fetched from the binding's origin, plus an optional subset of step ids, and nothing else.
+
+*History, the question as asked:* **Q-V2. What does a request carry?**
 - A: an exact 40-hex commit that is fetchable from the binding's origin (any
   branch, pushed), plus an optional subset of step ids. Nothing else.
 - B: A plus unpushed commits, pushed by the agent into an Idunn-trusted mirror
