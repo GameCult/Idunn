@@ -1054,3 +1054,20 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
 - dotnet test and npm under the hardened shape with a bridge network and a
   NuGet cache on `/cache`. Only the restore of an empty console app was probed
   (P2).
+
+## Progress (Self)
+
+- **2026-09-22: Cut 0 landed** at `2eb25b6` (docs only).
+  - Both stale "Current implementation boundary" sections are deleted.
+  - The README lists five commands.
+  - The docs now state that the build runs before the brake.
+- **2026-09-22: Cut 1 landed** at `95e15ef` (Sonnet, verified on Yggdrasil through the stopgap).
+  - Adds `ContainerSpec` and `docker_run_args`, the only Docker argv lowering in the codebase (`--cap-drop` has one site).
+  - Adds `ExactSource` and `freeze_exact`.
+  - Tests: 126 to 130. `tools/verify-mutations/cut1.psd1` kills 5/5, with M0 green.
+  - Discrepancies Hands reported:
+    - The external-input curl step now goes through the shared lowering. It gains `--workdir` and one inert environment variable.
+    - The gitlink cache directory is named by a hash of the checkout path, because `ExactSource` has no target.
+    - The size is `drivers.rs` −178/+426, against a ledger of about −90/+140. The type surface and a fourth, negative test account for the difference.
+  - **Soul's pass is dispatched.**
+- Rulings so far: Q-V1 A, Q-V2 A, Q-V3 A, Q-V4 B via `Add-Type`, Q-V5 A, Q-V7 B, Q-V8 B.
