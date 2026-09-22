@@ -1205,3 +1205,16 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
   - **S6:** validate symlinks against their final published location. Allow a dangling link whose target stays inside the root (resolving every component that exists), and refuse one that escapes. Test both.
   - **S7:** delete the case-folding refusal. The host is case-sensitive, and the partial check is inconsistent. The `.git` look-alikes are covered by S1.
   - **S9:** stream the hash.
+- **2026-09-22: the third Cut 1 fix batch landed.** Idunn `57ecd43..f540d50`, gamecult-ops `2f3c1b3` and `9d0e37e`.
+  - **S1:** fsck guards `resolve()`'s fetch, and `freeze_exact` fscks explicitly. The dup-trees fixture and all six `.git` look-alikes are refused through the production path.
+  - **S3:** both bootstrap scripts are deleted (319 lines). Callers point at the binding-install procedure. The three `checkout` templates now match the installed source root. The stale wiring assertions are gone.
+  - **S4:** the Heimdall note is corrected.
+  - **S5:** six behavioural tests.
+  - **S6:** symlinks are judged at their published location. A dangling in-root link is accepted, and the `.partial` case refuses.
+  - **S7:** the case-fold refusal is deleted.
+  - **S9:** hashing streams. Peak RSS on a 200 MiB blob falls from 232 MB to 25.4 MB.
+  - Tests: 152 to 160. Digests unchanged on all five targets, with 0 mismatches over 1,975 entries. Times run 0.96x to 1.17x.
+  - **Discrepancies to judge:**
+    - No test stands up a real HTTPS origin, so the S1 test reproduces `resolve()`'s fetch invocation and then calls the real `freeze_exact`.
+    - `test-ghostlight-yggdrasil-wiring.sh` still pins the static units and the bespoke deploy scripts. Whether that whole generation is superseded by the binding and transient-unit path is a **follow-up**, larger than this batch.
+  - **Soul's fourth pass dispatched.**
