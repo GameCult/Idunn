@@ -1359,3 +1359,61 @@ closes.**
   asserts nothing, and the boilerplate the six helpers collapse. **Delete the
   dead test rather than repairing it** - a newer test already covers its
   fixtures through a harder path.
+
+### The fifth fix batch landed, 2026-09-22
+
+Sonnet, three commits on `idunn/cut1-fix5` (`f52cefc`, `0b2ac95`, `87daa06`).
+**175 passed, 0 failed, 2 ignored** on Yggdrasil (168 baseline, +8 new, −1
+deleted). `src/drivers.rs` only: 988 insertions, 486 deletions.
+
+- **R-I1.** The dead per-component `canonicalize()` is gone. Pinned by a test
+  asserting roughly linear cost in component count; restoring the call takes
+  four times the components from 11 ms to 359 ms, about 33×, and the test goes
+  red.
+- **R-I2.** Both budget fixtures added. Under the mutation that makes the
+  budget never decrease, the 41-link fixture goes red — and **the two-link
+  cycle hangs rather than failing an assertion.** That is the correct
+  falsification for this rule: nothing but the budget bounds a cycle, so a
+  timeout is exactly what a broken budget produces.
+- **R-I3.** Digest tests for the symlink target and the executable bit; each
+  goes red when its term is deleted.
+- **R-I4.** Off-by-one fixed to `<`. Verified against the container's real
+  kernel: a 4095-byte target writes, 4096 fails `ENAMETOOLONG`. The guard now
+  refuses exactly what the kernel refuses.
+- **R-I5.** The 40-traversal ceiling is documented as matching Linux's
+  `MAXSYMLINKS`, and the error names the link and the count it reached.
+- **R-I6.** The HTTPS rig is committed, runs in about a second, and skips
+  cleanly where `openssl` or `git-http-backend` is missing. Deleting
+  `transfer.fsckObjects=true` from `resolve()`'s fetch turns it red on the
+  first hostile fixture — `resolve()` now has coverage where it had none.
+- **R-I7.** The dead `Option` and its backwards comment are gone, the
+  189-line test that asserted nothing is deleted, and the hostile-tree
+  boilerplate is collapsed into module-level helpers.
+
+**Two findings that came back the other way, both worth more than the batch.**
+
+**S5-8 was wrong, and my ruling repeated it.** Soul called three containment
+checks redundant and I ruled "delete them". Hands deleted two, hand-traced the
+third, and found that with all three gone a symlink whose entire target is
+`".."` at the root — `root/escape -> ".."` — resolves to the parent of the
+root and returns `Ok`, because no later `Normal` step ever runs to trip the
+other arm's check. **That is a containment escape**, the exact class this
+resolver exists to prevent. Hands kept the check, added
+`validate_frozen_source_symlink_refuses_a_bare_parent_reference_at_the_root`
+to pin it, and recorded the deviation in code rather than quietly keeping it.
+Deleting the surviving check makes that test fail exactly as predicted. **Both
+Soul and Self were wrong here; a Hands hand-trace caught it.**
+
+**Soul's rig was not recoverable.** The brief said to reuse
+`soul-idunn05-notes.md`, `probe5_https2.rs` and `s5-https-run.sh`. None
+survived: no session, no Yggdrasil work directory, no scratch trace. Hands
+rebuilt the rig from this map's description of it, which worked only because
+the description was detailed. **A probe that is going to be committed must be
+handed over while it still exists**, not left in a scratchpad to be
+reconstructed from prose.
+
+**Scope tradeoffs Hands named:** three commits rather than seven, because
+R-I1, R-I5 and R-I7's resolver edits sit inside one ~120-line function and
+splitting them by hand was the riskier option; and the boilerplate collapse
+touched only the three tests tied to the deleted one, leaving about fourteen
+other pre-existing sites alone to bound risk. Both judgements accepted.
