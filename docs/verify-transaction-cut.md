@@ -1235,3 +1235,13 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
   - **S4-5:** test that a legitimate in-root `..` link freezes.
   - **S4-6:** read a symlink target without buffering a whole blob, and refuse a target longer than the platform's limit.
   - **Heimdall:** record as an ops follow-up, **FU-Heimdall-Gitlink**. The binding is installed, and its gitlink names a commit GitHub does not serve. That is not this campaign's to fix, but the deploy is broken today and the operator should know.
+- **2026-09-22: the fourth Cut 1 fix batch landed** at `9475dfa` (Sonnet, on Yggdrasil). One commit, `src/drivers.rs` only, +940/-35.
+  - **S4-1:** the resolver is iterative and memoised, and counts link traversals against one budget. Soul's n=20 chain goes from **43,700 ms to effectively instant**, and it freezes, which matches S6: every hop resolves inside the root and nothing escapes.
+  - **S4-2:** the hash is pinned by two trees differing only past the first chunk. Both the zero-length-buffer and first-chunk-only mutants die.
+  - **S4-3:** each of the three guards has a test that isolates it, and all three mutants die.
+  - **S4-4:** Soul's 11 already-local hostile fixtures are committed as tests. Deleting the explicit fsck, or the freeze's own fetch flag, each fails a test.
+  - **S4-5 and S4-6:** landed.
+  - Tests 160 to 168. Digests identical on all five reachable targets over 1,109 entries. Heimdall is still unreachable for the unrelated gitlink reason.
+  - **Gap, honestly reported: `resolve()`'s own fsck flag has no test.** Reaching the real `resolve()` needs a validated binding, which needs an HTTPS origin. Rewriting the origin with `insteadOf` fails `ensure_checkout`'s own origin-equality check first, so the shortcut cannot work. **Soul has a working smart-HTTPS rig from its first pass; that is where this closes.**
+  - A note on the fsck fixtures: some hostile objects are refused by the git server's own `pack-objects` before any Idunn code runs, so they cannot serve as already-local fixtures. The test asserts that at least one fixture reaches the explicit fsck, so it cannot pass vacuously.
+  - **Soul's fifth pass dispatched**, including a judgement on the batch's size.
