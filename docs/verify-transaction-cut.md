@@ -421,7 +421,9 @@ The harness's honesty is observed, not trusted.
 
 Depends: Cut 5 in Idunn, Eureka and CultLib.
 
-**Q-V5. Is there a Windows verify host?** The QUIC win32 harness has to run on
+**Q-V5: RULED A by the operator, 2026-09-22 ("A indeed").** This campaign has no Windows verify host. Win32 jobs stay on Starfire, run by hand, one at a time, with no burners. They still write the typed CultCache report (Q-V4). Cut 9 stays a placeholder until a dedicated Windows host exists.
+
+*History, the question as asked:* **Q-V5. Is there a Windows verify host?** The QUIC win32 harness has to run on
 Windows.
 - A: none in this campaign. Win32 jobs stay on Starfire, one at a time and never
   with burners (today's SKILL.md rule), outside Idunn.
