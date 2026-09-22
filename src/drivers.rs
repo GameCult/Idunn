@@ -20,10 +20,11 @@ use uuid::Uuid;
 
 use crate::control_plane::SequenceAdmittedWarming;
 use crate::deployment::{
-    ArtifactOutput, ArtifactSource, DockerRunnerBinding, IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT,
-    IDUNN_RUNTIME_BUNDLE_ENVIRONMENT, IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT, LaunchArgument,
-    OperatorBinding, RUNTIME_PRESENCE_IDENTITY_BINDING, RUNTIME_PRESENCE_IDENTITY_FD_NAME,
-    RouteBinding, RouteDriver, SourceSelectionPolicy, TargetDeclaration, WorkloadNetwork,
+    ArtifactOutput, ArtifactSource, DockerRunnerBinding, GitlinkBinding,
+    IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT, IDUNN_RUNTIME_BUNDLE_ENVIRONMENT,
+    IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT, LaunchArgument, OperatorBinding,
+    RUNTIME_PRESENCE_IDENTITY_BINDING, RUNTIME_PRESENCE_IDENTITY_FD_NAME, RouteBinding,
+    RouteDriver, SourceSelectionPolicy, TargetDeclaration, WorkloadNetwork,
 };
 use crate::deployment_plan::{
     ArtifactReceipt, CompiledDeploymentPlan, ExternalInputMaterializationReceipt, GitlinkTreeFact,
@@ -675,6 +676,30 @@ impl RoutePreflightReceipt {
     }
 }
 
+/// The narrow shape `freeze_exact` needs to fetch and archive a repository at
+/// an exact revision. It carries no operator authority (no minimum revision,
+/// selection policy, or runners): callers that hold an `OperatorBinding`
+/// derive it with `exact_source_from`, and a future verify binding lowers to
+/// it directly. Cut 1 shares this type between deploy's freeze and (later)
+/// verify; it must not grow a second shape for the same fetch-and-archive
+/// core.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactSource {
+    pub origin: String,
+    pub checkout: PathBuf,
+    pub gitlinks: BTreeMap<PathBuf, GitlinkBinding>,
+    pub recipe_path: PathBuf,
+}
+
+fn exact_source_from(binding: &OperatorBinding) -> ExactSource {
+    ExactSource {
+        origin: binding.repository.origin.clone(),
+        checkout: binding.repository.checkout.clone(),
+        gitlinks: binding.repository.gitlinks.clone(),
+        recipe_path: binding.repository.recipe_path.clone(),
+    }
+}
+
 /// Fixed-argv Git source driver. It never interprets recipe text as a command
 /// and never derives source policy from the target repository. The configured
 /// identity performs every Git/network read; root Idunn extracts only exact Git
@@ -756,8 +781,8 @@ impl GitSourceDriver {
         Ok(value.trim().to_owned())
     }
 
-    fn ensure_checkout(&self, binding: &OperatorBinding) -> Result<()> {
-        let checkout = &binding.repository.checkout;
+    fn ensure_checkout(&self, source: &ExactSource) -> Result<()> {
+        let checkout = &source.checkout;
         if !checkout.exists() {
             self.git([
                 OsString::from("clone"),
@@ -765,7 +790,7 @@ impl GitSourceDriver {
                 OsString::from("--no-checkout"),
                 OsString::from("--origin"),
                 OsString::from("origin"),
-                binding.repository.origin.clone().into(),
+                source.origin.clone().into(),
                 checkout.as_os_str().to_owned(),
             ])?;
         }
@@ -793,7 +818,7 @@ impl GitSourceDriver {
             OsString::from("origin"),
         ])?;
         ensure!(
-            actual_origin == binding.repository.origin,
+            actual_origin == source.origin,
             "source checkout origin differs from the operator binding"
         );
         Ok(())
@@ -911,13 +936,13 @@ impl GitSourceDriver {
 
     fn exact_recipe_and_gitlinks(
         &self,
-        binding: &OperatorBinding,
+        source: &ExactSource,
         revision: &str,
     ) -> Result<(Vec<u8>, BTreeMap<PathBuf, GitlinkTreeFact>)> {
-        let entries = self.git_tree_entries(&binding.repository.checkout, revision)?;
+        let entries = self.git_tree_entries(&source.checkout, revision)?;
         let recipe = entries
             .iter()
-            .find(|entry| entry.path == binding.repository.recipe_path)
+            .find(|entry| entry.path == source.recipe_path)
             .context("selected tree has no deployment recipe")?;
         ensure!(
             matches!(recipe.mode.as_str(), "100644" | "100755") && recipe.kind == "blob",
@@ -926,7 +951,7 @@ impl GitSourceDriver {
         let recipe_bytes = self
             .git([
                 OsString::from("-C"),
-                binding.repository.checkout.as_os_str().to_owned(),
+                source.checkout.as_os_str().to_owned(),
                 OsString::from("cat-file"),
                 OsString::from("blob"),
                 recipe.object.clone().into(),
@@ -945,8 +970,7 @@ impl GitSourceDriver {
                 Ok((entry.path.clone(), entry.object.clone()))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let expected_paths = binding
-            .repository
+        let expected_paths = source
             .gitlinks
             .keys()
             .cloned()
@@ -962,25 +986,22 @@ impl GitSourceDriver {
         let gitlinks = observed_gitlinks
             .into_iter()
             .map(|(path, revision)| {
-                let origin = binding.repository.gitlinks[&path].origin.clone();
+                let origin = source.gitlinks[&path].origin.clone();
                 (path, GitlinkTreeFact { origin, revision })
             })
             .collect();
         Ok((recipe_bytes, gitlinks))
     }
 
-    fn prepare_source_root(&self, binding: &OperatorBinding) -> Result<()> {
+    fn prepare_source_root(&self, source: &ExactSource) -> Result<()> {
         #[cfg(unix)]
         ensure!(
             unsafe { libc::geteuid() } != 0 || self.identity.is_some(),
             "root Idunn must configure an unprivileged source identity"
         );
         ensure!(
-            binding
-                .repository
-                .checkout
-                .starts_with(&self.source_cache_root)
-                && binding.repository.checkout != self.source_cache_root,
+            source.checkout.starts_with(&self.source_cache_root)
+                && source.checkout != self.source_cache_root,
             "repository checkout is outside Idunn's source authority root"
         );
         ensure_source_directory(&self.source_cache_root, self.identity)?;
@@ -991,24 +1012,19 @@ impl GitSourceDriver {
         ensure_source_directory(&self.source_cache_root.join(".home"), self.identity)?;
         ensure_source_directory_tree(
             &self.source_cache_root,
-            binding
-                .repository
+            source
                 .checkout
                 .parent()
                 .context("repository checkout has no parent directory")?,
             self.identity,
         )?;
-        self.ensure_checkout(binding)
+        self.ensure_checkout(source)
     }
 
-    fn verify_exact_source(
-        &self,
-        binding: &OperatorBinding,
-        resolved: &ResolvedSource,
-    ) -> Result<()> {
+    fn verify_exact_source(&self, source: &ExactSource, resolved: &ResolvedSource) -> Result<()> {
         let actual_tree = self.git_text([
             OsString::from("-C"),
-            binding.repository.checkout.as_os_str().to_owned(),
+            source.checkout.as_os_str().to_owned(),
             OsString::from("rev-parse"),
             OsString::from(format!("{}^{{tree}}", resolved.facts.revision)),
         ])?;
@@ -1017,7 +1033,7 @@ impl GitSourceDriver {
             "selected revision no longer resolves to the frozen source tree"
         );
         let (recipe_bytes, gitlinks) =
-            self.exact_recipe_and_gitlinks(binding, &resolved.facts.revision)?;
+            self.exact_recipe_and_gitlinks(source, &resolved.facts.revision)?;
         ensure!(
             recipe_bytes == resolved.recipe_bytes,
             "selected recipe object differs from the durable source resolution"
@@ -1095,15 +1111,21 @@ impl GitSourceDriver {
 
     fn materialize_gitlink_archive(
         &self,
-        binding: &OperatorBinding,
+        source: &ExactSource,
         path: &Path,
         fact: &GitlinkTreeFact,
         destination: &Path,
     ) -> Result<()> {
-        let gitlink_root = self
-            .source_cache_root
-            .join(".gitlinks")
-            .join(&binding.target);
+        let checkout_text = source
+            .checkout
+            .to_str()
+            .context("repository checkout path is not UTF-8")?;
+        let checkout_key = sha256_id(checkout_text.as_bytes());
+        let gitlink_root = self.source_cache_root.join(".gitlinks").join(
+            checkout_key
+                .strip_prefix("sha256-")
+                .unwrap_or(&checkout_key),
+        );
         ensure_source_directory_tree(&self.source_cache_root, &gitlink_root, self.identity)?;
         let checkout = gitlink_root.join(format!("{}-{}", fact.revision, Uuid::new_v4()));
         let result = (|| {
@@ -1151,6 +1173,85 @@ impl GitSourceDriver {
             (Ok(()), Err(error)) => Err(error.context("cleaning exact Gitlink checkout")),
         }
     }
+
+    /// Fetches `source` at the exact `revision`, archives it and its Gitlinks
+    /// into a fresh root-owned immutable tree under `root/<transaction_id>`,
+    /// and returns that tree's root, its content digest, and the recipe blob
+    /// bytes the tree's own Git objects name. It derives the recipe and
+    /// Gitlink facts itself from the tree rather than trusting a caller's
+    /// prior resolution, so it needs no `OperatorBinding` or compiled plan and
+    /// is safe to call again later for a verify transaction over a different
+    /// revision of a different repository. It shares its fetch-and-archive
+    /// core with `freeze`, which additionally checks the archived recipe
+    /// against a durable resolution made at admission time.
+    pub(crate) fn freeze_exact(
+        &self,
+        source: &ExactSource,
+        revision: &str,
+        transaction_id: &str,
+        root: &Path,
+    ) -> Result<(PathBuf, String, Vec<u8>)> {
+        require_driver_id(transaction_id, "source transaction")?;
+        require_git_sha(revision, "frozen source revision")?;
+        #[cfg(unix)]
+        ensure!(
+            unsafe { libc::geteuid() } == 0 && self.identity.is_some(),
+            "freezing source requires root Idunn with an unprivileged Git identity"
+        );
+        self.prepare_source_root(source)?;
+        self.git([
+            OsString::from("-C"),
+            source.checkout.as_os_str().to_owned(),
+            OsString::from("fetch"),
+            OsString::from("--no-tags"),
+            OsString::from("origin"),
+            OsString::from(revision),
+        ])
+        .context("fetching the durable exact source revision")?;
+        let (recipe_bytes, gitlinks) = self.exact_recipe_and_gitlinks(source, revision)?;
+        let transaction_root = prepare_frozen_transaction_root(root, transaction_id)?;
+        let partial = transaction_root.join(".partial");
+        prepare_frozen_source_destination(&partial)?;
+        let materialization = (|| {
+            self.git_archive_into(&source.checkout, revision, None, &partial)?;
+            for (path, fact) in &gitlinks {
+                self.materialize_gitlink_archive(source, path, fact, &partial)?;
+            }
+            let recipe_file = partial.join(&source.recipe_path);
+            let recipe_metadata = fs::symlink_metadata(&recipe_file)?;
+            ensure!(
+                recipe_metadata.is_file() && !recipe_metadata.file_type().is_symlink(),
+                "frozen deployment recipe is not a regular file"
+            );
+            let materialized_recipe =
+                fs::read(&recipe_file).context("reading frozen deployment recipe")?;
+            ensure!(
+                materialized_recipe == recipe_bytes,
+                "frozen recipe differs from the selected tree's recipe blob"
+            );
+            harden_frozen_source(&partial)?;
+            validate_frozen_source(&partial)?;
+            frozen_source_sha256(&partial)
+        })();
+        let snapshot_sha256 = match materialization {
+            Ok(snapshot_sha256) => snapshot_sha256,
+            Err(error) => {
+                let _ = remove_frozen_transaction_root(root, transaction_id);
+                return Err(error);
+            }
+        };
+        let snapshot_component = snapshot_sha256
+            .strip_prefix("sha256-")
+            .expect("generated frozen source digest");
+        let final_root = transaction_root.join(snapshot_component);
+        fs::rename(&partial, &final_root).context("publishing immutable frozen source")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&transaction_root, fs::Permissions::from_mode(0o500))?;
+        }
+        Ok((final_root, snapshot_sha256, recipe_bytes))
+    }
 }
 
 impl SourcePort for GitSourceDriver {
@@ -1165,7 +1266,8 @@ impl SourcePort for GitSourceDriver {
             selected_at_unix_millis > 0,
             "source selection has no timestamp"
         );
-        self.prepare_source_root(binding)?;
+        let source = exact_source_from(binding);
+        self.prepare_source_root(&source)?;
         let fetched_ref = Self::admitted_ref_name(binding, resolution_id)?;
         self.git([
             OsString::from("-C"),
@@ -1195,7 +1297,7 @@ impl SourcePort for GitSourceDriver {
             OsString::from(format!("{revision}^{{tree}}")),
         ])?;
         require_git_sha(&source_tree, "selected source tree")?;
-        let (recipe_bytes, gitlinks) = self.exact_recipe_and_gitlinks(binding, &revision)?;
+        let (recipe_bytes, gitlinks) = self.exact_recipe_and_gitlinks(&source, &revision)?;
         let facts = SourceSelectionFacts {
             schema: SOURCE_SELECTION_FACTS_SCHEMA.into(),
             origin: binding.repository.origin.clone(),
@@ -1236,64 +1338,28 @@ impl SourcePort for GitSourceDriver {
             unsafe { libc::geteuid() } == 0 && self.identity.is_some(),
             "freezing source requires root Idunn with an unprivileged Git identity"
         );
-        self.prepare_source_root(&binding)?;
+        let source = exact_source_from(&binding);
+        self.prepare_source_root(&source)?;
         self.git([
             OsString::from("-C"),
-            binding.repository.checkout.as_os_str().to_owned(),
+            source.checkout.as_os_str().to_owned(),
             OsString::from("fetch"),
             OsString::from("--no-tags"),
             OsString::from("origin"),
             resolved.facts.revision.clone().into(),
         ])
         .context("fetching the durable exact source revision")?;
-        self.verify_exact_source(&binding, &resolved)?;
-        let transaction_root =
-            prepare_frozen_transaction_root(&self.frozen_source_root, transaction_id)?;
-        let partial = transaction_root.join(".partial");
-        prepare_frozen_source_destination(&partial)?;
-        let materialization = (|| {
-            self.git_archive_into(
-                &binding.repository.checkout,
-                &resolved.facts.revision,
-                None,
-                &partial,
-            )?;
-            for (path, fact) in &resolved.facts.gitlinks {
-                self.materialize_gitlink_archive(&binding, path, fact, &partial)?;
-            }
-            let recipe_path = partial.join(&resolved.facts.recipe_path);
-            let recipe_metadata = fs::symlink_metadata(&recipe_path)?;
-            ensure!(
-                recipe_metadata.is_file() && !recipe_metadata.file_type().is_symlink(),
-                "frozen deployment recipe is not a regular file"
-            );
-            let materialized_recipe =
-                fs::read(&recipe_path).context("reading frozen deployment recipe")?;
-            ensure!(
-                materialized_recipe == resolved.recipe_bytes,
-                "frozen recipe differs from the durable source resolution"
-            );
-            harden_frozen_source(&partial)?;
-            validate_frozen_source(&partial)?;
-            frozen_source_sha256(&partial)
-        })();
-        let snapshot_sha256 = match materialization {
-            Ok(snapshot_sha256) => snapshot_sha256,
-            Err(error) => {
-                let _ = remove_frozen_transaction_root(&self.frozen_source_root, transaction_id);
-                return Err(error);
-            }
-        };
-        let snapshot_component = snapshot_sha256
-            .strip_prefix("sha256-")
-            .expect("generated frozen source digest");
-        let final_root = transaction_root.join(snapshot_component);
-        fs::rename(&partial, &final_root).context("publishing immutable frozen source")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&transaction_root, fs::Permissions::from_mode(0o500))?;
-        }
+        self.verify_exact_source(&source, &resolved)?;
+        let (_tree_root, snapshot_sha256, recipe_bytes) = self.freeze_exact(
+            &source,
+            &resolved.facts.revision,
+            transaction_id,
+            &self.frozen_source_root,
+        )?;
+        ensure!(
+            recipe_bytes == resolved.recipe_bytes,
+            "frozen recipe differs from the durable source resolution"
+        );
         let receipt = FrozenSourceReceipt {
             transaction_id: transaction_id.to_owned(),
             plan_id: plan.plan_id.clone(),
@@ -1362,6 +1428,258 @@ impl SourcePort for GitSourceDriver {
     }
 }
 
+/// The network a container step is admitted to. `None` and `Bridge` are today's
+/// only lowered profiles; `Named` carries an operator-supplied Docker network
+/// name forward unchanged, matching the binding's free-form
+/// `network_profile` before this cut.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContainerNetwork {
+    None,
+    Bridge,
+    Named(String),
+}
+
+impl ContainerNetwork {
+    fn docker_value(&self) -> &str {
+        match self {
+            ContainerNetwork::None => "none",
+            ContainerNetwork::Bridge => "bridge",
+            ContainerNetwork::Named(name) => name,
+        }
+    }
+}
+
+/// Cut 2 adds `Unconfined`. This cut declares only the variant every runner
+/// gets today, so a seccomp override is not yet reached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContainerSeccomp {
+    Default,
+}
+
+/// A secret bound into the container's environment from a root-owned,
+/// exact-group-bound file, resolved and validated by `ContainerSpec::for_step`
+/// before the container ever runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SecretMount {
+    pub env_name: String,
+    pub host_path: PathBuf,
+    pub container_path: String,
+}
+
+/// A Docker container's full admission shape: the binding's affordances, plus
+/// the step's resolved environment. It is deliberately a plain struct with no
+/// binding or recipe types in it, so `docker_run_args` can lower it with no
+/// filesystem effects and no knowledge of `DockerRunnerBinding`, and so a
+/// future verify runner binding can build one directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContainerSpec {
+    pub image: String,
+    pub user: String,
+    pub network: ContainerNetwork,
+    pub seccomp: ContainerSeccomp,
+    pub memory_mebibytes: u32,
+    pub cpu_quota_percent: u32,
+    pub pids_limit: u32,
+    pub tmpfs_mebibytes: u32,
+    pub cache_root: Option<PathBuf>,
+    pub secret_mounts: Vec<SecretMount>,
+    pub environment: Vec<(String, String)>,
+}
+
+impl ContainerSpec {
+    /// The one constructor: a runner binding, the step's required environment
+    /// names, and the source stamp pair. Cache-root and secret validation
+    /// happen here, against the filesystem, before `docker_run_args` ever
+    /// runs; that function stays pure.
+    pub(crate) fn for_step(
+        runner: &DockerRunnerBinding,
+        required_environment: &std::collections::BTreeSet<String>,
+        source_stamp: (&str, &str),
+    ) -> Result<Self> {
+        let identity = container_identity(&runner.user)?;
+        if let Some(cache_root) = &runner.cache_root {
+            ensure_runner_cache_root(cache_root, identity)?;
+        }
+        let mut environment = vec![(source_stamp.0.to_owned(), source_stamp.1.to_owned())];
+        let mut secret_mounts = Vec::new();
+        for name in required_environment {
+            if let Some(value) = runner.environment.get(name) {
+                environment.push((name.clone(), value.clone()));
+            } else if let Some(path) = runner.secret_files.get(name) {
+                validate_runner_secret(path, identity)?;
+                secret_mounts.push(SecretMount {
+                    env_name: name.clone(),
+                    host_path: path.clone(),
+                    container_path: format!("/run/idunn/secrets/{name}"),
+                });
+            } else {
+                bail!("runner lacks declared step environment {name}")
+            }
+        }
+        let network = match runner.network_profile.as_deref() {
+            None | Some("none") => ContainerNetwork::None,
+            Some("bridge") => ContainerNetwork::Bridge,
+            Some(other) => ContainerNetwork::Named(other.to_owned()),
+        };
+        Ok(ContainerSpec {
+            image: runner.image.clone(),
+            user: runner.user.clone(),
+            network,
+            seccomp: ContainerSeccomp::Default,
+            memory_mebibytes: runner.memory_mebibytes,
+            cpu_quota_percent: runner.cpu_quota_percent,
+            pids_limit: runner.pids_limit,
+            tmpfs_mebibytes: runner.tmpfs_mebibytes,
+            cache_root: runner.cache_root.clone(),
+            secret_mounts,
+            environment,
+        })
+    }
+}
+
+/// Lowers `spec` into the exact `docker run` argv for `argv` running in
+/// `workspace` at `working_directory`. Pure: it performs no filesystem
+/// effects and validates nothing that requires the filesystem (the caller
+/// validates the cache root and every secret through `ContainerSpec::for_step`
+/// before calling this). It still needs the per-workspace machine-id file's
+/// path, which `build_machine_id` computes without touching the filesystem;
+/// the caller is responsible for having materialized that file with
+/// `build_machine_id_file` first.
+pub(crate) fn docker_run_args(
+    spec: &ContainerSpec,
+    workspace: &Path,
+    working_directory: &Path,
+    argv: &[String],
+) -> Result<Vec<OsString>> {
+    ensure!(!argv.is_empty(), "runner command is empty");
+    let mut args = vec![
+        OsString::from("run"),
+        OsString::from("--rm"),
+        OsString::from("--network"),
+        OsString::from(spec.network.docker_value()),
+        OsString::from("--memory"),
+        OsString::from(format!("{}m", spec.memory_mebibytes)),
+        OsString::from("--cpus"),
+        OsString::from(format!(
+            "{:.2}",
+            f64::from(spec.cpu_quota_percent) / 100.0
+        )),
+        OsString::from("--mount"),
+        bind_mount(workspace, "/workspace", false)?,
+        OsString::from("--user"),
+        OsString::from(&spec.user),
+        OsString::from("--cap-drop"),
+        OsString::from("ALL"),
+        OsString::from("--security-opt"),
+        OsString::from("no-new-privileges"),
+    ];
+    match spec.seccomp {
+        ContainerSeccomp::Default => {}
+    }
+    args.extend([
+        OsString::from("--read-only"),
+        OsString::from("--pids-limit"),
+        OsString::from(spec.pids_limit.to_string()),
+        OsString::from("--tmpfs"),
+        OsString::from(format!(
+            "/tmp:rw,nosuid,nodev,noexec,size={}m",
+            spec.tmpfs_mebibytes
+        )),
+        OsString::from("--mount"),
+        bind_mount(
+            &PathBuf::from("/run/idunn/build-machine-ids").join(build_machine_id(workspace)?),
+            "/etc/machine-id",
+            true,
+        )?,
+    ]);
+    if let Some(cache_root) = &spec.cache_root {
+        args.push(OsString::from("--mount"));
+        args.push(bind_mount(cache_root, "/cache", false)?);
+    }
+    args.push(OsString::from("--workdir"));
+    args.push(OsString::from(format!(
+        "/workspace/{}",
+        normalized_relative(working_directory)?
+    )));
+    for (name, value) in &spec.environment {
+        args.push(OsString::from("--env"));
+        args.push(OsString::from(format!("{name}={value}")));
+    }
+    for mount in &spec.secret_mounts {
+        args.push(OsString::from("--env"));
+        args.push(OsString::from(format!(
+            "{}={}",
+            mount.env_name, mount.container_path
+        )));
+        args.push(OsString::from("--mount"));
+        args.push(bind_mount(&mount.host_path, &mount.container_path, true)?);
+    }
+    args.push(spec.image.clone().into());
+    args.extend(argv.iter().map(OsString::from));
+    Ok(args)
+}
+
+/// The outcome of one step run in a workspace, for a caller that observes
+/// exit status and a bounded stderr tail rather than bailing on failure. This
+/// is the shape a verify transaction needs (Cut 4): every step runs, whether
+/// it fails or not, and the caller decides. `DockerRunnerDriver::docker`
+/// keeps deploy's own bail-on-failure semantics; `run_step` below is additive
+/// and not yet reached from `materialize`.
+#[derive(Debug)]
+pub(crate) struct StepOutcome {
+    pub status: std::process::ExitStatus,
+    pub stderr_tail: String,
+}
+
+/// One method that runs a lowered step in a workspace. `DockerRunnerDriver`
+/// implements it with today's blocking `Command::output()` semantics; a
+/// verify worker (Cut 4) can run the same lowering under a deadline without
+/// touching `docker_run_args` or `ContainerSpec`.
+pub(crate) trait StepPort {
+    fn run_step(
+        &self,
+        spec: &ContainerSpec,
+        workspace: &Path,
+        working_directory: &Path,
+        argv: &[String],
+    ) -> Result<StepOutcome>;
+}
+
+impl StepPort for DockerRunnerDriver {
+    fn run_step(
+        &self,
+        spec: &ContainerSpec,
+        workspace: &Path,
+        working_directory: &Path,
+        argv: &[String],
+    ) -> Result<StepOutcome> {
+        ensure!(
+            self.docker_program.is_absolute(),
+            "Docker runner program is not absolute"
+        );
+        let args = docker_run_args(spec, workspace, working_directory, argv)?;
+        let output = Command::new(&self.docker_program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| {
+                format!("starting Docker runner {}", self.docker_program.display())
+            })?;
+        Ok(StepOutcome {
+            status: output.status,
+            stderr_tail: String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .rev()
+                .take(4096)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect(),
+        })
+    }
+}
+
 /// Docker is only a runner substrate. Recipe argv stays an argv vector, the
 /// operator binding selects the exact image/network/mount affordances, and the
 /// driver returns complete materialization receipts rather than build truth by
@@ -1419,83 +1737,11 @@ impl DockerRunnerDriver {
             "runner program {} is not operator-bound",
             argv[0]
         );
-        let mut args = self.base_run_args(runner, workspace)?;
-        args.extend([
-            OsString::from("--workdir"),
-            OsString::from(format!(
-                "/workspace/{}",
-                normalized_relative(working_directory)?
-            )),
-            OsString::from("--env"),
-            OsString::from(format!("{}={}", source_stamp.0, source_stamp.1)),
-        ]);
-        for name in required_environment {
-            if let Some(value) = runner.environment.get(name) {
-                args.push(OsString::from("--env"));
-                args.push(OsString::from(format!("{name}={value}")));
-            } else if let Some(path) = runner.secret_files.get(name) {
-                validate_runner_secret(path, container_identity(&runner.user)?)?;
-                args.push(OsString::from("--env"));
-                args.push(OsString::from(format!("{name}=/run/idunn/secrets/{name}")));
-                args.push(OsString::from("--mount"));
-                args.push(bind_mount(
-                    path,
-                    &format!("/run/idunn/secrets/{name}"),
-                    true,
-                )?);
-            } else {
-                bail!("runner lacks declared step environment {name}")
-            }
-        }
-        args.push(runner.image.clone().into());
-        args.extend(argv.iter().map(OsString::from));
+        build_machine_id_file(workspace)?;
+        let spec = ContainerSpec::for_step(runner, required_environment, source_stamp)?;
+        let args = docker_run_args(&spec, workspace, working_directory, argv)?;
         self.docker(args)?;
         Ok(())
-    }
-
-    fn base_run_args(
-        &self,
-        runner: &DockerRunnerBinding,
-        workspace: &Path,
-    ) -> Result<Vec<OsString>> {
-        let identity = container_identity(&runner.user)?;
-        let mut args = vec![
-            OsString::from("run"),
-            OsString::from("--rm"),
-            OsString::from("--network"),
-            OsString::from(runner.network_profile.as_deref().unwrap_or("none")),
-            OsString::from("--memory"),
-            OsString::from(format!("{}m", runner.memory_mebibytes)),
-            OsString::from("--cpus"),
-            OsString::from(format!(
-                "{:.2}",
-                f64::from(runner.cpu_quota_percent) / 100.0
-            )),
-            OsString::from("--mount"),
-            bind_mount(workspace, "/workspace", false)?,
-            OsString::from("--user"),
-            OsString::from(&runner.user),
-            OsString::from("--cap-drop"),
-            OsString::from("ALL"),
-            OsString::from("--security-opt"),
-            OsString::from("no-new-privileges"),
-            OsString::from("--read-only"),
-            OsString::from("--pids-limit"),
-            OsString::from(runner.pids_limit.to_string()),
-            OsString::from("--tmpfs"),
-            OsString::from(format!(
-                "/tmp:rw,nosuid,nodev,noexec,size={}m",
-                runner.tmpfs_mebibytes
-            )),
-            OsString::from("--mount"),
-            bind_mount(&build_machine_id_file(workspace)?, "/etc/machine-id", true)?,
-        ];
-        if let Some(cache_root) = &runner.cache_root {
-            ensure_runner_cache_root(cache_root, identity)?;
-            args.push(OsString::from("--mount"));
-            args.push(bind_mount(cache_root, "/cache", false)?);
-        }
-        Ok(args)
     }
 
     fn materialize_external_input(
@@ -1520,21 +1766,23 @@ impl DockerRunnerDriver {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut args = self.base_run_args(runner, workspace)?;
-        args.extend([
-            runner.image.clone().into(),
-            OsString::from("curl"),
-            OsString::from("--fail"),
-            OsString::from("--location"),
-            OsString::from("--proto"),
-            OsString::from("=https"),
-            OsString::from("--output"),
-            OsString::from(format!(
-                "/workspace/{}",
-                normalized_relative(&input.destination)?
-            )),
-            input.url.clone().into(),
-        ]);
+        build_machine_id_file(workspace)?;
+        let spec = ContainerSpec::for_step(
+            runner,
+            &std::collections::BTreeSet::new(),
+            ("IDUNN_EXTERNAL_INPUT_ID", input.id.as_str()),
+        )?;
+        let curl_argv = vec![
+            "curl".to_owned(),
+            "--fail".to_owned(),
+            "--location".to_owned(),
+            "--proto".to_owned(),
+            "=https".to_owned(),
+            "--output".to_owned(),
+            format!("/workspace/{}", normalized_relative(&input.destination)?),
+            input.url.clone(),
+        ];
+        let args = docker_run_args(&spec, workspace, Path::new("."), &curl_argv)?;
         self.docker(args)?;
         let bytes = fs::read(&destination).with_context(|| {
             format!(
@@ -7380,6 +7628,250 @@ mod tests {
             String::from_utf8_lossy(&output.stderr).trim()
         );
         Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    fn fixture_docker_runner_binding() -> DockerRunnerBinding {
+        DockerRunnerBinding {
+            image: "eureka-verify-rust".to_owned(),
+            user: "65532:65532".to_owned(),
+            affordances: Default::default(),
+            cache_root: None,
+            allowed_programs: std::collections::BTreeSet::from(["cargo".to_owned()]),
+            environment: BTreeMap::new(),
+            secret_files: BTreeMap::new(),
+            network_profile: None,
+            memory_mebibytes: 8192,
+            cpu_quota_percent: 250,
+            pids_limit: 512,
+            tmpfs_mebibytes: 256,
+        }
+    }
+
+    /// Cut 1, R-Cut1-1: `docker_run_args` lowers a `ContainerSpec` to an exact
+    /// argv. Pinned byte for byte so a revert (dropping `--cap-drop ALL`), a
+    /// loosening (defaulting the network to `bridge` instead of `none`), or a
+    /// function-of-input change (`--cpus` computed as `quota/50` instead of
+    /// `quota/100`, which this fixture's `cpu_quota_percent = 250` catches:
+    /// `2.50` against `5.00`) all fail this test.
+    #[cfg(unix)]
+    #[test]
+    fn container_spec_lowers_to_exact_docker_argv() -> Result<()> {
+        let workspace = PathBuf::from("/var/lib/gamecult/idunn/staging/txn-1/.runner-rust");
+        let runner = fixture_docker_runner_binding();
+        let spec = ContainerSpec::for_step(
+            &runner,
+            &std::collections::BTreeSet::new(),
+            ("IDUNN_SOURCE_REVISION", "abc123"),
+        )?;
+        let argv = vec!["cargo".to_owned(), "test".to_owned(), "--lib".to_owned()];
+        let args = docker_run_args(&spec, &workspace, Path::new("build"), &argv)?;
+
+        let machine_id = build_machine_id(&workspace)?;
+        let expected: Vec<OsString> = [
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--network".to_owned(),
+            "none".to_owned(),
+            "--memory".to_owned(),
+            "8192m".to_owned(),
+            "--cpus".to_owned(),
+            "2.50".to_owned(),
+            "--mount".to_owned(),
+            format!("type=bind,src={},dst=/workspace", workspace.display()),
+            "--user".to_owned(),
+            "65532:65532".to_owned(),
+            "--cap-drop".to_owned(),
+            "ALL".to_owned(),
+            "--security-opt".to_owned(),
+            "no-new-privileges".to_owned(),
+            "--read-only".to_owned(),
+            "--pids-limit".to_owned(),
+            "512".to_owned(),
+            "--tmpfs".to_owned(),
+            "/tmp:rw,nosuid,nodev,noexec,size=256m".to_owned(),
+            "--mount".to_owned(),
+            format!(
+                "type=bind,src=/run/idunn/build-machine-ids/{machine_id},dst=/etc/machine-id,readonly"
+            ),
+            "--workdir".to_owned(),
+            "/workspace/build".to_owned(),
+            "--env".to_owned(),
+            "IDUNN_SOURCE_REVISION=abc123".to_owned(),
+            "eureka-verify-rust".to_owned(),
+            "cargo".to_owned(),
+            "test".to_owned(),
+            "--lib".to_owned(),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(args, expected);
+        Ok(())
+    }
+
+    /// Cut 1, R-Cut1-2 (F6): the only environment a step's container receives
+    /// is the source stamp plus the names it lists in `required_environment`.
+    /// The fixture binding carries a variable the step does not name; its
+    /// mutant is a `ContainerSpec::for_step` that copies every binding
+    /// `environment` entry instead of only the required ones.
+    #[test]
+    fn required_environment_is_the_only_environment() -> Result<()> {
+        let mut runner = fixture_docker_runner_binding();
+        runner.environment = BTreeMap::from([
+            ("USED".to_owned(), "1".to_owned()),
+            ("UNUSED".to_owned(), "2".to_owned()),
+        ]);
+        let required = std::collections::BTreeSet::from(["USED".to_owned()]);
+        let spec =
+            ContainerSpec::for_step(&runner, &required, ("IDUNN_SOURCE_REVISION", "abc123"))?;
+        assert_eq!(
+            spec.environment,
+            vec![
+                ("IDUNN_SOURCE_REVISION".to_owned(), "abc123".to_owned()),
+                ("USED".to_owned(), "1".to_owned()),
+            ]
+        );
+        assert!(spec.secret_mounts.is_empty());
+        Ok(())
+    }
+
+    /// Cut 1, R-Cut1-3: `freeze_exact` archives an exact revision through the
+    /// new entry point (no `OperatorBinding` or compiled plan), and the
+    /// archived recipe file must equal the recipe blob it read from the same
+    /// tree. Reuses the bare-repository fixture pattern from
+    /// `exact_git_archive_becomes_root_owned_immutable_source_without_git_metadata`.
+    /// Its mutant skips the "materialized recipe equals the tree blob" check.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_is_byte_exact_and_recipe_checked() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        // The unprivileged identity below clones this fixture as a local
+        // path, which puts Git's ownership check in play: a real origin is a
+        // network remote with no local uid to compare against, but this
+        // fixture is a directory this (root) test process just created. Hand
+        // it to the unprivileged identity so the clone sees itself as owner,
+        // the way a real remote never has to.
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+
+        let (tree_root, snapshot_sha256, recipe_bytes) =
+            driver.freeze_exact(&source, &revision, "txn-1", &frozen_source_root)?;
+        assert_eq!(recipe_bytes, b"target = 'test'\n".to_vec());
+        assert!(tree_root.join("deployment.toml").is_file());
+        assert!(!tree_root.join(".git").exists());
+        assert!(snapshot_sha256.starts_with("sha256-"));
+        Ok(())
+    }
+
+    /// Cut 1, R-Cut1-3 negative twin: an `export-subst` recipe means `git
+    /// archive` writes a substituted `$Format:%H$` token into the archived
+    /// file while `git cat-file blob` (what `exact_recipe_and_gitlinks`
+    /// reads) still returns the token unexpanded, so the two byte strings the
+    /// recipe-bytes-equality check compares genuinely differ. This is the
+    /// fixture that kills a mutant which drops that check.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_rejects_a_recipe_the_archive_transforms() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(
+            origin_repo.join(".gitattributes"),
+            b"deployment.toml export-subst\n",
+        )?;
+        fs::write(
+            origin_repo.join("deployment.toml"),
+            b"target = 'test'\n# $Format:%H$\n",
+        )?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+
+        let result = driver.freeze_exact(&source, &revision, "txn-2", &frozen_source_root);
+        assert!(result.is_err(), "expected the transformed recipe to be rejected");
+        Ok(())
     }
 
     fn expected() -> IdunnExpectedIncarnationRecord {
