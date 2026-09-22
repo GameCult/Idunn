@@ -58,25 +58,6 @@ and health. CultMesh carries typed projections between them.
   decide Ghostlight or CodexConnector deployment before either target is
   promoted through this design.
 
-### Current implementation boundary
-
-`deployment.rs` and `deployment_plan.rs` are the deterministic contract
-foundation only. They parse one strict source declaration and one root-admitted
-operator binding from the exact raw blobs retained by the compiled plan, check
-private source-selection facts, derive managed providers from validated Expected
-documents, and content-address a sealed release. They do not yet
-drive Git, runners, systemd, nginx, brakes, CultCache, CultMesh, or the legacy
-Idunn supervisor.
-
-The full operator binding, compiled plan, source facts, and sealed release
-are private Idunn control-plane state. They contain host paths and operational
-bindings and must never be published as Odin topology. Only the sanitized
-`ExpectedIncarnation` projection is shaped for later CultMesh publication. It
-is derived only from a sealed release validated against its compiled plan and
-names both content addresses and the executable artifact digest. Present and
-Ready remain Odin-owned correlations over independently verified runtime
-evidence; the deployment-plan module deliberately does not model them.
-
 ## The three truths Odin exposes
 
 For each workload incarnation, Odin keeps three distinct observations:
@@ -212,6 +193,15 @@ Idunn alone issues a fenced one-shot migration grant bound to the exact source,
 artifact, state schema generation, and deployment incarnation. A target
 migration never receives general deployment or lifecycle authority.
 
+The full operator binding, compiled plan, source facts, and sealed release are
+private Idunn control-plane state. They contain host paths and operational
+bindings and are never published as Odin topology. Only the sanitized
+`ExpectedIncarnation` projection is shaped for CultMesh publication. It is
+derived only from a sealed release validated against its compiled plan and
+names both content addresses and the executable artifact digest. Present and
+Ready remain Odin-owned correlations over independently verified runtime
+evidence; the deployment-plan module deliberately does not model them.
+
 ## Initial drivers and replaceable boundary
 
 The first Yggdrasil implementation uses:
@@ -271,6 +261,12 @@ For a singleton incarnation:
    state, not readiness.
 11. Clear the promotion fence only after route adoption is observed, then drain
     and stop the incumbent.
+
+Sealing resolves the source, freezes it, runs every recipe step, and installs
+the release before the deployment brake is consulted at all (`advance_sealing`).
+The brake gates step 5, the first Verse-visible change: publishing the
+candidate's Expected incarnation on the move into `Starting`. Build and test
+already run unbraked, inside the sealing phase.
 
 The state-write lease and route membership are distinct authorities. Fencing
 the incumbent does not grant the candidate or change the route. Granting the

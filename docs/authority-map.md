@@ -199,15 +199,3 @@ Idunn ensures one compatible Odin exists, publishes the desired fleet, resolves
 typed capability dependencies, admits candidates, waits for independently
 observed presence and readiness, and promotes routes only when the required
 graph conditions hold.
-
-## Current implementation boundary
-
-`crates/idunn-daemon/src/deployment.rs` and `deployment_plan.rs` implement the
-deterministic declaration, binding, plan, release, and Expected contracts.
-`drivers.rs` implements the narrow source resolution/freeze, runner, systemd,
-write-lease, topology, and route actuator ports. The transaction engine still
-must persist and sequence the compiled plan, frozen-source receipt, sealed
-release, activation, lease, readiness, route, and admitted generation. Driver
-ports are consequences, not a second deployment controller; runtime integration
-must not recreate target catalogs, raw deployment commands, root Git inspection,
-or a second admission opinion.

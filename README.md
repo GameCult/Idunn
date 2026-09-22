@@ -31,13 +31,15 @@ Two binaries land in `target/release/`:
 | `idunn` | the daemon — keepalive supervision, deployment actuation, health |
 | `idunn-provision` | operator tooling — brake status, identity enrolment, provisioning |
 
-Idunn's CLI is **declarative**. There are three commands and no imperative
+Idunn's CLI is **declarative**. There are five commands and no imperative
 escape hatch — you cannot hand it a shell string to run:
 
 ```bash
-idunn serve  [runtime options]                      # the control plane
-idunn up     <service|profile:name> [--no-wait]     # request a deployment
-idunn status [--command ID]                         # read what happened
+idunn serve    [runtime options]                      # the control plane
+idunn up       <service|profile:name> [--no-wait]     # request a deployment
+idunn status   [--command ID]                         # read what happened
+idunn cancel   <command-id>                           # cancel a pending command
+idunn validate --recipe PATH [--binding PATH]         # offline admission check
 ```
 
 A test, `cli_exposes_only_declarative_commands`, asserts that
@@ -194,8 +196,8 @@ purpose; Idunn discovers no authority implicitly.
 | [`docs/authority-map.md`](docs/authority-map.md) | authority map, repository declaration, operator binding, release foundation, promotion and continuity |
 | [`docs/deployment-authority.md`](docs/deployment-authority.md) | the deployment transaction in depth |
 | [`docs/signed-daemon-health-authority.md`](docs/signed-daemon-health-authority.md) | signed health admission and trust bindings |
-| [`docs/guide.md`](docs/guide.md) | the **previous** generation's keepalive daemon — still what runs on yggdrasil, kept for the migration; its commands no longer work |
-| [`deploy/legacy/`](deploy/legacy/) | the shell actuator that generation used, and what replaced each part of it |
+| [`docs/guide.md`](docs/guide.md) | the **previous** generation's keepalive daemon — no longer runs anywhere, kept for migration history; its commands no longer work |
+| [`deploy/legacy/`](deploy/legacy/) | the shell actuator that generation used, no longer running, and what replaced each part of it |
 
 ## Platform
 
