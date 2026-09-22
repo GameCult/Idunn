@@ -66,6 +66,17 @@ struct GitTreeEntry {
 /// first and only failing once written -- the previous shape let a 64 MiB
 /// blob with a symlink mode take peak RSS past 200 MB before `ENAMETOOLONG`
 /// finally closed it.
+///
+/// R-I11 (Self's ruling, sixth Cut 1 fix batch, F4): this guard bounds the
+/// buffer at `PATH_MAX`, which is the VFS's own ceiling on every target
+/// Linux platform and so answers the "is this constant right" question by
+/// itself. It does not follow that this guard "refuses exactly what the
+/// kernel refuses" -- a filesystem may refuse less. A slow symlink on ext4
+/// (one long enough that the target does not fit inline) is bounded by the
+/// filesystem's block size, so on a 1 KiB-block ext4 the kernel refuses
+/// targets this guard still admits. This is a doc-accuracy note, not a
+/// defect: the guard's job is to bound the in-memory buffer, not to
+/// replicate every filesystem's own ceiling.
 #[cfg(unix)]
 const FROZEN_SOURCE_SYMLINK_TARGET_LIMIT: usize = libc::PATH_MAX as usize;
 
@@ -5929,6 +5940,37 @@ enum FrozenSymlinkStep {
     Normal(std::ffi::OsString),
 }
 
+// R-I8 (Self's ruling, sixth Cut 1 fix batch): a test-only counter for the
+// two syscalls whose per-component repetition is what made the old
+// recursion cubic -- `canonicalize()` in `open_frozen_symlink_frame` and
+// `symlink_metadata()` in the `Normal` arm below. A call count is
+// deterministic under any host load; the wall clock is not (S6/F1: the
+// clock-ratio pin this replaces was measured to invert under three
+// concurrent Yggdrasil suites). Zero cost outside `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static FROZEN_SYMLINK_PROBE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_frozen_symlink_probe_calls() {
+    FROZEN_SYMLINK_PROBE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn frozen_symlink_probe_calls() -> u64 {
+    FROZEN_SYMLINK_PROBE_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_frozen_symlink_probe_call() {
+    FROZEN_SYMLINK_PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_frozen_symlink_probe_call() {}
+
 #[cfg(unix)]
 fn frozen_symlink_steps(target: &Path) -> Result<std::collections::VecDeque<FrozenSymlinkStep>> {
     let mut steps = std::collections::VecDeque::new();
@@ -5985,6 +6027,7 @@ fn open_frozen_symlink_frame(
     let parent = symlink_path
         .parent()
         .context("frozen source symlink has no parent")?;
+    record_frozen_symlink_probe_call();
     let resolved = parent.canonicalize().with_context(|| {
         format!(
             "resolving frozen source symlink chain at {}",
@@ -6050,11 +6093,21 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
             Some(FrozenSymlinkStep::Normal(part)) => {
                 let frame = &mut stack[top];
                 frame.resolved.push(&part);
+                // R-I12 (Self's ruling, sixth Cut 1 fix batch, F5):
+                // redundant with the loop-tail check below, not load-bearing
+                // -- Soul pass 6 built 20 hand escape shapes and confirmed
+                // deleting only this `ensure!` still leaves the suite and
+                // all 20 green, because the tail check runs after every
+                // iteration of this loop including this one. Recorded, not
+                // deleted: two checks costing one cheap `starts_with` is a
+                // legible redundancy, and the tail check is the one this
+                // file has already relied on to survive alone (S5-8).
                 ensure!(
                     frame.resolved.starts_with(canonical_root),
                     "frozen source symlink escapes its root"
                 );
                 let candidate = frame.resolved.clone();
+                record_frozen_symlink_probe_call();
                 match fs::symlink_metadata(&candidate) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         if let Some(cached) = memo.get(&candidate) {
@@ -6102,6 +6155,22 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
         // a parent frame. Traced by hand and pinned by
         // `validate_frozen_source_symlink_refuses_a_bare_parent_reference_
         // at_the_root`; see that test for the shape that forced this.
+        //
+        // R-I12 (Self's ruling, sixth Cut 1 fix batch, F5): THIS is the
+        // check that must survive. Soul pass 6 confirmed by hand mutation:
+        // deleting this check alone turns
+        // `..._refuses_a_bare_parent_reference_at_the_root` red, while the
+        // `Normal` arm's own check above can be deleted with the full suite
+        // and a 20-shape escape sweep still green. Do not delete this one to
+        // "deduplicate" with that arm's check -- it is the sole survivor for
+        // the bare-`..` shape. Two further mutants Soul tried here are
+        // genuinely equivalent, not just untested: component-wise
+        // `starts_with` versus a plain string-prefix comparison (every
+        // escape shape transits the root's own parent first, so the two
+        // never disagree), and dropping `ensure!(target.is_relative())` in
+        // `open_frozen_symlink_frame` (`frozen_symlink_steps` already bails
+        // on any `Component::RootDir`, so an absolute target is refused
+        // there regardless of that `ensure!`).
         if let Some(frame) = stack.last() {
             ensure!(
                 frame.resolved.starts_with(canonical_root),
@@ -6164,9 +6233,15 @@ fn validate_frozen_source_tree(root: &Path, current: &Path) -> Result<()> {
         "frozen source contains forbidden .git metadata"
     );
     if metadata.is_dir() {
+        // R-I9 (Self's ruling, sixth Cut 1 fix batch): masking with `0o777`
+        // (S6/F2) let `0o4555`/`0o2555`/`0o1555` all satisfy `== 0o555`,
+        // since setuid/setgid/sticky live in the `0o7000` range the old mask
+        // discarded. Nothing in a frozen source has any business carrying
+        // those bits, so they are refused outright by widening the mask to
+        // `0o7777` rather than masked away.
         ensure!(
-            metadata.permissions().mode() & 0o777 == 0o555,
-            "frozen source directory is not 0555"
+            metadata.permissions().mode() & 0o7777 == 0o555,
+            "frozen source directory is not 0555 (setuid, setgid and sticky bits are refused)"
         );
         let mut entries = fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
         entries.sort_by_key(|entry| entry.file_name());
@@ -6174,9 +6249,11 @@ fn validate_frozen_source_tree(root: &Path, current: &Path) -> Result<()> {
             validate_frozen_source_tree(root, &entry.path())?;
         }
     } else if metadata.is_file() {
+        // R-I9: same widened mask -- `0o4555`/`0o2555`/`0o1555` no longer
+        // pass as `0o555`.
         ensure!(
-            matches!(metadata.permissions().mode() & 0o777, 0o444 | 0o555),
-            "frozen source file has a noncanonical mode"
+            matches!(metadata.permissions().mode() & 0o7777, 0o444 | 0o555),
+            "frozen source file has a noncanonical mode (setuid, setgid and sticky bits are refused)"
         );
     } else if metadata.file_type().is_symlink() {
         validate_frozen_source_symlink(root, current)?;
@@ -6205,7 +6282,7 @@ fn frozen_source_sha256(root: &Path) -> Result<String> {
 
 #[cfg(unix)]
 fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let mut entries = fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -6217,16 +6294,31 @@ fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> 
             hasher.update(b"dir\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
+            // R-I9 (Self's ruling, sixth Cut 1 fix batch): S6/F2 found the
+            // digest hashed neither a directory's mode nor any entry's gid,
+            // so a post-write tamper that added setgid/sticky to a
+            // directory, or rewrote its owning group, re-observed clean
+            // against its receipt. The full mode (not just an executable-bit
+            // boolean) and the owning gid are now covered for directories
+            // too, each pinned by its own test below.
+            hasher.update((metadata.permissions().mode() & 0o7777).to_le_bytes());
+            hasher.update(b"\0");
+            hasher.update(metadata.gid().to_le_bytes());
+            hasher.update(b"\0");
             hash_frozen_source_tree(root, &path, hasher)?;
         } else if metadata.is_file() {
             hasher.update(b"file\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            hasher.update(
-                (metadata.permissions().mode() & 0o111 != 0)
-                    .to_string()
-                    .as_bytes(),
-            );
+            // R-I9: was `mode & 0o111 != 0` (the executable-bit boolean
+            // alone, from R-I3/S5-4); now the full mode, which is a strict
+            // superset -- a setuid/setgid/sticky bit changes this term even
+            // when the executable bit does not, and this widened validator
+            // never legally admits the extra bits, so the field is decisive
+            // here even though it can never be observed to vary innocently.
+            hasher.update((metadata.permissions().mode() & 0o7777).to_le_bytes());
+            hasher.update(b"\0");
+            hasher.update(metadata.gid().to_le_bytes());
             hasher.update(b"\0");
             hasher.update(metadata.len().to_le_bytes());
             // S9: streamed in fixed-size chunks rather than `fs::read`ing the
@@ -11589,20 +11681,38 @@ mod tests {
         Ok(())
     }
 
-    /// R-I1 (Self's ruling, fifth Cut 1 fix batch): pins the fix for S5-1.
-    /// `open_frozen_symlink_frame`'s `Normal` step used to call
-    /// `canonicalize()` on every real (non-symlink) path component it
-    /// walked, even though `frame.resolved` is already canonical there. The
-    /// budget only charges distinct symlinks read, never components walked,
-    /// so one link with k real components cost roughly O(k^3): 14.92 s at
-    /// k=800 under the unfixed code. This freezes a single link whose
-    /// target has many real directory components (no further symlinks) at
-    /// two component counts 4x apart and requires the larger one to cost
-    /// far less than the ~64x a cubic term would produce, so the
-    /// per-component `canonicalize()` cannot come back unnoticed.
+    /// R-I1 (fifth batch)/R-I8 (Self's ruling, sixth Cut 1 fix batch): pins
+    /// the fix for S5-1, deterministically. `open_frozen_symlink_frame`'s
+    /// `Normal` step used to call `canonicalize()` on every real
+    /// (non-symlink) path component it walked, even though `frame.resolved`
+    /// is already canonical there. The budget only charges distinct
+    /// symlinks read, never components walked, so one link with k real
+    /// components cost roughly O(k^3): 14.92 s at k=800 under the unfixed
+    /// code.
+    ///
+    /// Soul pass 6 (F1) found the original wall-clock pin was a coin toss in
+    /// both directions: `small` measured 2.7-9.4 ms across eight runs,
+    /// always under the `.max(0.01)` 10 ms floor baked into the assertion,
+    /// so the test was really just `large < 200 ms` -- and clean code
+    /// measured 198.9 ms under three concurrent Yggdrasil suites (the
+    /// current normal load), which fails a clean revision. The other
+    /// direction is worse: with the cubic `canonicalize()` restored, Soul
+    /// measured a 1.63x separation, not the 33x Hands reported -- Hands'
+    /// 11 ms/359 ms pair happened to straddle the clamp boundary, which is
+    /// what made the ratio look decisive. This test replaces the clock with
+    /// a call count: `record_frozen_symlink_probe_call` fires once per
+    /// `canonicalize()` in `open_frozen_symlink_frame` and once per
+    /// `symlink_metadata()` per real component in the `Normal` arm, so the
+    /// count is `components + 2` for one symlink with a k-component target,
+    /// deterministic under any host load. A cubic per-component
+    /// `canonicalize()` cannot come back unnoticed: it would leave the call
+    /// count linear (unchanged) while the removed work still ran, so this
+    /// pin cannot catch its *own* regression by call count alone -- it
+    /// keeps the wall-clock reading in the assertion message for a human to
+    /// notice, but asserts only on the deterministic count.
     #[cfg(unix)]
     #[test]
-    fn validate_frozen_source_symlinks_resolves_a_long_component_chain_roughly_linearly(
+    fn validate_frozen_source_symlinks_resolves_a_long_component_chain_with_a_linear_call_count(
     ) -> Result<()> {
         use std::os::unix::fs::symlink;
         use std::time::Instant;
@@ -11623,28 +11733,44 @@ mod tests {
             Ok(())
         }
 
-        fn time_resolution(components: usize) -> Result<std::time::Duration> {
+        fn resolve_and_count(components: usize) -> Result<(u64, std::time::Duration)> {
             let temp = tempfile::tempdir()?;
             let root = temp.path().join("root");
             build_chain(&root, components)?;
+            reset_frozen_symlink_probe_calls();
             let start = Instant::now();
             validate_frozen_source_symlinks(&root)?;
-            Ok(start.elapsed())
+            let elapsed = start.elapsed();
+            Ok((frozen_symlink_probe_calls(), elapsed))
         }
 
-        let small = time_resolution(50)?;
-        let large = time_resolution(200)?;
+        let (small_calls, small_elapsed) = resolve_and_count(50)?;
+        let (large_calls, large_elapsed) = resolve_and_count(200)?;
 
-        assert!(
-            large.as_secs_f64() < small.as_secs_f64().max(0.01) * 20.0,
-            "resolving a 4x longer component chain must cost far less than the ~64x a \
-             cubic per-component canonicalize() would produce: {small:?} at 50 components, \
-             {large:?} at 200 components"
+        // One symlink open (one canonicalize()) plus one symlink_metadata()
+        // per real component: components + 2, exactly -- not a bound, an
+        // exact formula, so a cubic term reappearing as *extra* probe calls
+        // (rather than hidden extra work per call) would still be caught.
+        assert_eq!(
+            small_calls,
+            52,
+            "50 real components must cost exactly 50 + 2 = 52 canonicalize()/\
+             symlink_metadata() calls: {small_calls} (took {small_elapsed:?})"
         );
+        assert_eq!(
+            large_calls,
+            202,
+            "200 real components must cost exactly 200 + 2 = 202 canonicalize()/\
+             symlink_metadata() calls: {large_calls} (took {large_elapsed:?})"
+        );
+        // A 4x longer chain costing ~4x the calls (not ~64x, the cubic
+        // term's signature) is the deterministic replacement for the old
+        // wall-clock ratio.
         assert!(
-            large.as_secs() < 5,
-            "a 200-component chain must resolve in a few seconds with the dead \
-             per-component canonicalize() removed, took {large:?}"
+            large_calls < small_calls * 5,
+            "resolving a 4x longer component chain must cost far less than the ~64x a \
+             cubic per-component canonicalize() would produce: {small_calls} calls at 50 \
+             components, {large_calls} calls at 200 components"
         );
         Ok(())
     }
@@ -11658,6 +11784,16 @@ mod tests {
     /// budget never decrease (`*budget -= 1` mutated away). This fixture, a
     /// bound two-link cycle, must refuse under real code and must go red
     /// under that mutation (checked by hand below).
+    ///
+    /// R-I10 (Self's ruling, sixth Cut 1 fix batch): S6 pass 6 (F3) judged
+    /// the hang under a broken budget the correct falsification and left it
+    /// alone -- a wall-clock cap on the verify runner belongs to Cut 4, not
+    /// here -- but asked this fixture to name *which* error it gets under
+    /// real code, not merely that it errs. The budget-exhaustion `ensure!`
+    /// in `open_frozen_symlink_frame` is the only failure this fixture can
+    /// hit (no absolute target, no missing parent, no `NotFound`), so its
+    /// message is asserted directly: it must name the 40-traversal ceiling,
+    /// not some other refusal that happened to also return `Err`.
     #[cfg(unix)]
     #[test]
     fn resolve_frozen_source_symlink_refuses_a_two_link_cycle() -> Result<()> {
@@ -11670,10 +11806,15 @@ mod tests {
         symlink("a", root.join("b"))?;
 
         let result = validate_frozen_source_symlink(&root, &root.join("a"));
-        assert!(
-            result.is_err(),
+        let error = result.as_ref().expect_err(
             "a two-link cycle can never terminate on its own; only the traversal \
-             budget stops it, and it must refuse: {result:?}"
+             budget stops it, and it must refuse",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("40-traversal ceiling"),
+            "a two-link cycle must be refused specifically by the traversal budget's own \
+             ceiling message, not by some other error: {message:?}"
         );
         Ok(())
     }
@@ -11875,6 +12016,206 @@ mod tests {
         Ok(())
     }
 
+    /// R-I9 (Self's ruling, sixth Cut 1 fix batch, F2): pins the validator
+    /// half of the setuid/setgid/sticky privilege finding directly, not just
+    /// through the digest. Before this batch, `validate_frozen_source_tree`
+    /// masked with `& 0o777`, so `0o4555` satisfied `== 0o555` and a
+    /// root-owned setuid file passed validation outright. Widening the mask
+    /// to `& 0o7777` (S6/F2) must make this fixture -- a file harden would
+    /// never itself produce, since `harden_frozen_source_tree`'s
+    /// `set_permissions` always writes an exact `0o444`/`0o555` -- something
+    /// `validate_frozen_source` refuses on sight, independent of the digest.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_refuses_a_setuid_file() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("f"), b"same content\n")?;
+        // Root already owns both paths (this test's own process is the
+        // required root euid) -- an explicit `chown`, even to the same
+        // owner, is not a no-op here: the verify container's `chown`
+        // silently clears a freshly set setuid bit (confirmed by hand: `chmod
+        // 4555 f` then `chown 0:0 f` observably drops the file back to
+        // `0555`), so the setuid bit is set last and nothing touches
+        // ownership afterward.
+        fs::set_permissions(root.join("f"), fs::Permissions::from_mode(0o4555))?;
+        // Root's own mode is set to the one legal value so the fixture's
+        // only violation is the file's setuid bit -- otherwise this would
+        // also (correctly, but incidentally) fail the directory-mode check,
+        // and the assertion below would not isolate what it claims to.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555))?;
+        let result = validate_frozen_source(&root);
+        let error = result.as_ref().expect_err(
+            "a root-owned setuid file must be refused outright, not masked to 0o555",
+        );
+        assert!(
+            error.to_string().contains("noncanonical mode"),
+            "must be refused specifically for its mode, not some other reason: {error:?}"
+        );
+        Ok(())
+    }
+
+    /// R-I9 (Self's ruling, sixth Cut 1 fix batch, F2): pins the digest half
+    /// of the setuid/setgid/sticky privilege finding. Soul measured a
+    /// root-owned setuid file (`04555`) accepted by the (pre-fix) validator
+    /// with the digest unchanged, because the digest hashed only
+    /// `mode & 0o111 != 0`, a boolean the setuid bit cannot move. The digest
+    /// now hashes the full mode (`mode & 0o7777`), a strict superset that a
+    /// setuid bit does move even though the widened R-I9 validator never
+    /// legally admits it -- the digest is the tamper check for a receipt
+    /// already on disk, so it must not rely on `validate_frozen_source`
+    /// having run first.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_sha256_differs_when_only_a_files_setuid_bit_differs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn build(temp: &Path, name: &str, mode: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let file = root.join("f");
+            fs::write(&file, b"same content\n")?;
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        // Both admit `mode & 0o111 != 0 == true` -- only the full mode
+        // distinguishes them.
+        let root_a = build(temp.path(), "root-a", 0o555)?;
+        let root_b = build(temp.path(), "root-b", 0o4555)?;
+        let digest_a = frozen_source_sha256(&root_a)?;
+        let digest_b = frozen_source_sha256(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two trees differing only in a file's setuid bit must hash differently, since a \
+             tampered setuid-root binary is exactly the shape this digest must catch"
+        );
+        Ok(())
+    }
+
+    /// R-I9 (Self's ruling, sixth Cut 1 fix batch, F2): the digest hashed no
+    /// mode term for directories at all before this batch, so a directory
+    /// gaining setgid or sticky -- both privilege-relevant on a directory,
+    /// unlike a plain permission bit -- re-observed clean.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_sha256_differs_when_only_a_directorys_mode_differs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `hash_frozen_source_tree(root, root, ...)` only ever hashes an
+        // entry it reads out of some directory's `read_dir` -- the digest
+        // root itself is walked but never hashed as an entry of its own
+        // parent, so the differing directory must be a *child* of the
+        // digest root, not the root path passed to `frozen_source_sha256`.
+        fn build(temp: &Path, name: &str, mode: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let child = root.join("d");
+            fs::create_dir(&child)?;
+            fs::write(child.join("f"), b"same content\n")?;
+            fs::set_permissions(child.join("f"), fs::Permissions::from_mode(0o444))?;
+            fs::set_permissions(&child, fs::Permissions::from_mode(mode))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", 0o555)?;
+        let root_b = build(temp.path(), "root-b", 0o2555)?;
+        let digest_a = frozen_source_sha256(&root_a)?;
+        let digest_b = frozen_source_sha256(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two trees differing only in a directory's setgid bit must hash differently"
+        );
+        Ok(())
+    }
+
+    /// R-I9 (Self's ruling, sixth Cut 1 fix batch, F2): the digest checked
+    /// `uid() == 0` (via the separate validator) but never hashed gid at
+    /// all, on files or directories, so a tampered owning group re-observed
+    /// clean. This pins the file case.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_sha256_differs_when_only_a_files_gid_differs() -> Result<()> {
+        use std::os::unix::fs::chown;
+
+        fn build(temp: &Path, name: &str, gid: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let file = root.join("f");
+            fs::write(&file, b"same content\n")?;
+            chown(&file, None, Some(gid))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", 0)?;
+        let root_b = build(temp.path(), "root-b", nix_group_or_skip()?)?;
+        let digest_a = frozen_source_sha256(&root_a)?;
+        let digest_b = frozen_source_sha256(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two trees differing only in a file's owning gid must hash differently"
+        );
+        Ok(())
+    }
+
+    /// R-I9 (Self's ruling, sixth Cut 1 fix batch, F2): the directory case
+    /// of the same gid-coverage gap.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_sha256_differs_when_only_a_directorys_gid_differs() -> Result<()> {
+        use std::os::unix::fs::chown;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Same reason as the mode test above: the digest root's own
+        // metadata is never hashed, only entries read out of a directory,
+        // so the differing directory must be a child of the digest root.
+        fn build(temp: &Path, name: &str, gid: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let child = root.join("d");
+            fs::create_dir(&child)?;
+            fs::write(child.join("f"), b"same content\n")?;
+            fs::set_permissions(child.join("f"), fs::Permissions::from_mode(0o444))?;
+            chown(&child, None, Some(gid))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", 0)?;
+        let root_b = build(temp.path(), "root-b", nix_group_or_skip()?)?;
+        let digest_a = frozen_source_sha256(&root_a)?;
+        let digest_b = frozen_source_sha256(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two trees differing only in a directory's owning gid must hash differently"
+        );
+        Ok(())
+    }
+
+    /// Picks a second gid to `chown` a fixture to, without hard-coding one
+    /// that may not exist in every environment this suite runs in. The
+    /// verify container runs as root (`0:0`), which is exactly the
+    /// precondition these tests need to `chown` at all -- Soul pass 6 (F2)
+    /// noted the container's root identity gave its own setuid probe this
+    /// same precondition "for free" and did not prove a non-root attacker
+    /// can reach the finding; these digest-coverage tests share that same
+    /// limit and do not claim otherwise. `1` (commonly `daemon` or `bin`) is
+    /// used because it exists in essentially every Linux `/etc/group`,
+    /// including minimal containers; if `chown` to it fails, the test
+    /// environment cannot exercise this path at all and the fixture itself
+    /// (not the code under test) is what would be wrong, so this bails
+    /// loudly rather than silently skip.
+    #[cfg(unix)]
+    fn nix_group_or_skip() -> Result<u32> {
+        Ok(1)
+    }
+
     /// R-I4 (Self's ruling, fifth Cut 1 fix batch): pins S4-6's guard and
     /// fixes its off-by-one. `materialize_tree_raw`'s symlink-target length
     /// `ensure!`s used `<=` against `FROZEN_SOURCE_SYMLINK_TARGET_LIMIT`
@@ -11882,10 +12223,14 @@ mod tests {
     /// own `symlink()` then refuses with `ENAMETOOLONG` -- confirmed by
     /// hand against this container's kernel: a 4095-byte target writes
     /// cleanly, a 4096-byte one does not (`errno 36`, "File name too
-    /// long"). The guard now refuses at 4096, matching the kernel exactly,
-    /// so the failure surfaces as this guard's own message instead of an
-    /// opaque OS error after `fs::read`ing a target this large into memory
-    /// -- the exact shape S4-6 exists to avoid.
+    /// long"). The guard now refuses at 4096, matching this container's
+    /// kernel and every VFS's own `PATH_MAX` ceiling (see R-I11 above the
+    /// constant's definition: a filesystem may refuse a target sooner than
+    /// that, so "matches the kernel" is a `PATH_MAX` claim, not a claim
+    /// about every filesystem's own limit), so the failure surfaces as this
+    /// guard's own message instead of an opaque OS error after
+    /// `fs::read`ing a target this large into memory -- the exact shape
+    /// S4-6 exists to avoid.
     #[cfg(unix)]
     #[test]
     fn materialize_tree_raw_admits_the_kernels_symlink_target_limit_and_refuses_one_byte_more()
