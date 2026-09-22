@@ -1417,3 +1417,133 @@ R-I1, R-I5 and R-I7's resolver edits sit inside one ~120-line function and
 splitting them by hand was the riskier option; and the boilerplate collapse
 touched only the three tests tied to the deleted one, leaving about fourteen
 other pre-existing sites alone to bound risk. Both judgements accepted.
+
+## Soul pass 6 on Cut 1's fifth fix batch, 2026-09-22
+
+Opus. Counts reproduced independently four times on Yggdrasil: 175 passed, 0
+failed, 2 ignored (the 2 are unrelated `control_plane.rs` live-store tests).
+13 hand-built mutations, 6 of them not plain reverts.
+
+**Verdict: five of seven rulings hold under attack. R-I1's pin and R-I3's
+coverage promise are not delivered.** The containment argument — where the
+pass was told to be most suspicious — survived everything Soul could invent.
+
+- **F1, CONFIRMED, medium. R-I1's pin is a wall-clock assertion wearing a
+  ratio's clothes.** `drivers.rs:11636-11642` reads
+  `large < small.max(0.01) * 20.0`. In all eight runs `small` was 2.7–9.4 ms,
+  always under the 10 ms floor, so the clamp fires and the test is simply
+  `large < 200 ms`. Clean code measured 63.2 … **198.9 ms**, the last with
+  three concurrent suites in one container — which is exactly the three-slot
+  Yggdrasil now in use. **A loaded slot turns a clean revision red**, and
+  under Cut 4 that is a false `verify` verdict on unattended work. The other
+  direction is worse: with the `canonicalize` restored Soul measured
+  324.9–377.3 ms, a separation of **1.63×, not the 33× Hands reported**.
+  Hands' 11 ms / 359 ms pair straddled the clamp boundary, which is what made
+  the ratio look decisive. A host 1.7× faster and the mutant survives.
+- **F2, CONFIRMED, medium, and it is a privilege finding.** R-I3 is not met:
+  **setuid, setgid, sticky and gid are all fields the validator permits to
+  vary and the digest does not cover.** The validator masks `& 0o777`, so
+  `0o4555` satisfies `== 0o555`, and it checks `uid() == 0` but never gid.
+  The digest hashes only `mode & 0o111 != 0` for files and nothing for
+  directories. Measured on a real root-owned 0555 tree: setuid file `04555`
+  accepted, digest unchanged; setgid file, setgid dir, sticky dir, gid 12345
+  — all the same. `observe_frozen` is exactly these two calls, so **a frozen
+  source whose binary has been made setuid-root re-observes clean against its
+  receipt**, and the tree is bind-mounted into runner containers with no
+  `nosuid` while the workload runs as `65532:65532`. `harden_frozen_source_tree`
+  normalises modes at write time, so this is post-write tamper — which is
+  precisely what the digest exists to catch.
+- **F3, CONFIRMED, low-medium. The cycle fixture's hang is real and nothing
+  bounds it.** Under the budget mutation, `timeout -s KILL 90` returned 137.
+  `cargo test` has no per-test timeout and the stopgap has no wall-clock cap;
+  each traversal pushes a frame, so it grows toward the 12 GiB cap. Hands'
+  argument that the hang is the correct falsification stands — **the missing
+  piece is a wall-clock cap on the verify runner, which belongs to Cut 4**,
+  not a change to this test. Separately the fixture asserts only `is_err()`,
+  not which error.
+- **F4, PLAUSIBLE, informational.** "Refuses exactly what the kernel refuses"
+  is slightly overstated. `libc::PATH_MAX` is per-target and `< PATH_MAX`
+  matches the VFS rule on all of them, so the constant is not merely correct
+  in this container — the platform question answers itself. But the ceiling
+  that actually applies is the filesystem's: an ext4 slow symlink is bounded
+  by block size, so on a 1 KiB-block filesystem the kernel refuses targets
+  this guard admits. Doc accuracy, not a defect.
+- **F5, informational, and it runs the opposite way to S5-8.** Two
+  containment checks remain where one suffices, and deleting the **Normal**
+  arm's leaves the suite and a 20-shape escape sweep green — because
+  `frame.resolved` mutates only inside the match and the tail check runs after
+  every iteration. **Deleting the tail check alone turns the bare-`..` test
+  red.** If anyone revisits this, `:6105` is the one that must survive. Two
+  further mutants are genuinely equivalent: component-wise `starts_with`
+  versus string-prefix (every escape transits the root's parent first), and
+  dropping `ensure!(target.is_relative())` (`frozen_symlink_steps` bails on
+  `Component::RootDir` regardless).
+- **F6, informational, outside the batch.** `digest_tree` — the **artifact**
+  digest — still has the exact blindness R-I3 just fixed for frozen source:
+  no executable-bit term, no `\0` after the symlink target. No ruling covered
+  it, so it must not be assumed fixed by association. Also: **no test calls
+  `observe_frozen` at all**; its tamper check is exercised only through its
+  two constituents.
+
+**Promises that held, with numbers.** R-I1's *behaviour* claim confirmed by
+reading plus call-site check: both production entries discard the resolved
+path, so removal cannot change an answer any consumer sees. R-I2's 41-link
+fixture dies under two different mutations, including moving the ceiling to
+400 — the constant is pinned, not just the direction. R-I3's symlink-target
+and exec-bit tests each die under their own term's deletion. R-I4's test dies
+under the reverted comparison. R-I5's message names the link and yields 41
+where it fires. **R-I6's rig ran, it did not skip**: 1.09 s, and deleting
+`transfer.fsckObjects=true` from `resolve()`'s own fetch turns it red, so the
+refusal is genuinely fsck's. Since `validate` requires an `https://` origin,
+an HTTPS rig is structurally the only way `resolve()` can be covered — the
+"only coverage" claim is correct. R-I7's deleted 189-line test had exactly
+the first seven of the eleven fixtures that replaced it; nothing real was
+lost, and the collapse is faithful at every site.
+
+**Containment, built by Soul rather than inherited.** Twenty shapes — bare
+`..`, `../..`, `./..`, `../.`, `././././..`, real-dir-then-two-up,
+nonexistent-then-two-up, three-up from depth 2, absolute target, absolute
+in-root target, link-to-escaping-link, link through an escaping dir-link,
+out-and-back-by-name, sibling-root prefix confusion, memoised-then-escape,
+dangling-then-escape, plus four that must be accepted. **All correct. No
+escape.**
+
+**Did the addition buy its keep?** Production 7900 → 7947 lines, and the logic
+is net-negative; the +47 is R-I5 and R-I7 justification comments. Tests 4472 →
+4927 net, about 830 gross against −189 dead test and −190 boilerplate. Yes.
+
+**What Soul could not run:** no non-Linux check of R-I4 (the path is
+`#[cfg(unix)]` and the other arms bail, so F4 is reasoning rather than
+measurement); the container runs as root, so F2's probe got its
+"root-owned" precondition free and **did not prove a non-root attacker can
+reach it**; and no end-to-end `observe_frozen` against a real receipt, because
+none exists and building a `CompiledDeploymentPlan` was out of budget.
+
+### Self's rulings for the sixth fix batch, 2026-09-22
+
+- **R-I8 (F1). Replace the timing pin with a deterministic one.** Count the
+  `canonicalize`/`symlink_metadata` calls through a test-only counter and
+  assert the count, not the clock. A wall-clock assertion on a host that runs
+  three jobs at once is a coin toss in both directions, and Cut 4 turns a
+  false red into a false `verify` verdict on unattended work. **Hands'
+  reported 33× was an artifact of the clamp**, not a measurement — that goes
+  in the record, because the number is what made the pin look adequate.
+- **R-I9 (F2). A frozen source may not carry setuid, setgid or sticky at
+  all.** The validator refuses them outright rather than masking them away;
+  nothing in a frozen source has any business with them. **The digest covers
+  the full mode and the owning gid**, not `& 0o111`, and covers directories
+  as well as files. Each term gets a test that fails when it is removed.
+  Additionally, **the bind mount gets `nosuid`** — defence in depth, since the
+  digest is a detection and the mount flag is a prevention, and the cost is a
+  mount option.
+- **R-I10 (F3). The wall-clock cap is Cut 4's**, recorded as a requirement on
+  the verify runner: no step runs unbounded. It is not a reason to weaken this
+  fixture. The fixture does gain an assertion on **which** error it got.
+- **R-I11 (F4). Soften the claim to what is true**: the guard bounds the
+  buffer at `PATH_MAX` and the filesystem may refuse less. Doc only.
+- **R-I12 (F5). Record that `:6105` must survive**, in a comment at the check
+  itself. The two equivalent mutants are recorded as equivalent. No deletion.
+- **R-I13 (F6). `digest_tree` gets the same treatment as the frozen-source
+  digest**, with its own tests, and **`observe_frozen` gets an end-to-end test
+  against a real receipt**. A tamper check with no test of its own is the
+  thing this campaign keeps finding.
