@@ -1,0 +1,1033 @@
+# Idunn verify transaction: cut map
+
+Status: cut map, Imagination pass 1 (Opus), 2026-09-22. Nothing has landed.
+There is no separate target document yet. Until Self writes one, the ends are
+the operator ruling below plus section 2 of this map. This document owns the
+means.
+
+Ruling (operator, 2026-09-22, "go for it"): **Idunn owns verification.** A verify
+transaction takes a repository, an exact revision and a declared verify recipe.
+It materializes the revision in a capped Docker runner on the declared host,
+runs test and mutation steps, and returns a typed verdict. It seals no artifact
+and installs nothing, so it sits outside the deployment brake.
+
+Open: operator questions Q-V1 to Q-V10 (section 4). No cut from Cut 2 onward may
+be briefed to Hands until Q-V1, Q-V2, Q-V4, Q-V7 and Q-V8 are ruled. Cuts 0 and 1
+depend on no ruling.
+
+Heads read for this map:
+
+| Repo | HEAD | Notes |
+|---|---|---|
+| `F:\Projects\Idunn` | `5b3f646` (= origin/main) | clean |
+| `F:\Projects\gamecult-ops` | `6a5c16c` | |
+| `F:\Projects\CultLib` | `d0480a7` (main) | `scripts/mutate-dotnet.ps1` exists only on `cultnet/selection-cut1` (pushed, `0714492`) |
+| `GameCult/Eureka` (`~/.claude/skills/eureka`) | `266faf5` | `tools/eureka-mutations.ps1` has an uncommitted 8+/2- edit in the working tree |
+| Yggdrasil `/usr/local/bin/idunn` | unknown revision | installed 2026-09-11 12:44; its usage text shows the five-command CLI. It predates `5b3f646` (2026-09-13) |
+
+---
+
+## 1. Body facts
+
+Each fact below was read at the heads above. "Probe" means it was run on
+Yggdrasil in a container capped at `--cpus=4 --memory=8g` and niced, and then
+cleaned up.
+
+### 1.1 Recipes, bindings, steps
+
+- F1. `RecipeStep` is at `src/deployment.rs:53-64`: `id`, `phase`, `runner`,
+  `argv`, `working_directory` (default `.`), and `required_environment`.
+  `RecipePhase` is `Prepare|Test|Build|Acceptance` at `:70-77`. The Eyes pass
+  gave both ranges one line early.
+- F2. **Nothing reads `RecipePhase`.** It is parsed and never consumed. A grep
+  of `src/` finds no use outside the enum. `DockerRunnerDriver::materialize`
+  runs every step in file order (`src/drivers.rs:1662-1684`), and Ghostlight's
+  recipe interleaves `test`, `build`, `prepare` and `acceptance` steps in file
+  order. No existing mechanism selects steps by phase, so "run the
+  Test/Acceptance-phase steps" has nothing to build on.
+- F3. `TargetDeclaration` requires `artifacts` and `service`
+  (`deployment.rs:32-33`, and `:762` rejects a declaration with no artifacts).
+  `service` must require `GAMECULT_IDUNN_RUNTIME_BUNDLE` (`:864-869`). A repo
+  with no daemon, such as CultLib, Huginn or Eureka, cannot state a deploy
+  recipe. `OperatorBinding` also requires `workload`, `runtime_identity`,
+  `brakes`, `rollout` and `placement` (`:266-283`). **Verify cannot reuse
+  either document.**
+- F4. The program allowlist is **per runner and on the binding side**:
+  `DockerRunnerBinding.allowed_programs` (`deployment.rs:429`), validated as
+  bare executable names (`:1126-1132`, `require_program` `:1728-1735`). It is
+  checked at admission (`admit`, `:1447-1453`) and again at run time
+  (`drivers.rs:1416-1420`). It is not a global list. The recipe writes the argv
+  and the binding admits `argv[0]`.
+- F5. Docker caps come from the binding: `memory_mebibytes` and
+  `cpu_quota_percent` (`deployment.rs:436-437`), lowered to `--memory` and
+  `--cpus` (`drivers.rs:1468-1476`). The same call also sets `--network`
+  (binding `network_profile`, default `none`), `--cap-drop ALL`,
+  `no-new-privileges`, `--read-only`, `--pids-limit`, a `noexec` `/tmp` tmpfs,
+  and a per-workspace `/etc/machine-id` (`drivers.rs:1456-1499`). **There is no
+  seccomp setting and no timeout.**
+- F6. The only environment a step receives is the source stamp plus the names
+  it lists in `required_environment`. Binding environment is never ambient
+  (`drivers.rs:1429-1450`).
+- F7. `docker()` calls `Command::output()` (`drivers.rs:1392-1396`). It has
+  **no deadline**. Output is buffered in memory, thrown away on success, and on
+  failure appears only inside the `bail!` message.
+- F8. Each runner gets a scratch **copy** of the frozen tree
+  (`drivers.rs:1631-1636`, `copy_tree`), owned by the container user
+  (`assign_runner_tree`, `:1649-1654`). Every step of that runner runs in that
+  workspace. Mutating the source in place therefore touches only the scratch
+  copy.
+- F9. External inputs (`https` URL plus `sha256`) are fetched by `curl` inside
+  the runner image and checked against their digest (`drivers.rs:1501-1559`).
+  This is the existing way to bring a pinned harness from outside the tree.
+- F10. Existing binding practice (`gamecult-ops/idunn/yggdrasil/bindings/ghostlight.toml.in`):
+  runners use `network_profile = "bridge"` for registry access plus a
+  `cache_root`. Ghostlight's `rust-acceptance` runner uses
+  `network_profile = "host"` and `secret_files`, so that it can reach the live
+  connector at `127.0.0.1:4103`.
+
+### 1.2 Source
+
+- F11. The deploy source path fetches the binding's `admitted_ref` and requires
+  the selected revision to be an ancestor of it and a descendant of
+  `minimum_revision` (`drivers.rs:1157-1219`, `:810-852`). `freeze` fetches the
+  exact revision by SHA, runs `git archive | tar` into a root-owned tree, and
+  hashes it (`:1221-1304`). Git runs with `env_clear`, `GIT_CONFIG_NOSYSTEM=1`,
+  and as the unprivileged `idunn` uid (`:705-726`). These primitives are typed
+  against `OperatorBinding` and `CompiledDeploymentPlan`.
+- F12. CultLib `.gitattributes` has `* text=auto` and no `export-ignore`,
+  `export-subst`, `eol=crlf` or `filter=`, so an archive on Linux is the stored
+  blob. The Eureka scar about `git archive` concerns byte comparison against a
+  Windows worktree, and it does not bite here. The frozen tree is compared only
+  with itself.
+
+### 1.3 Control plane
+
+- F13. The CLI has **five** commands: `serve`, `up`, `status`, `cancel`,
+  `validate` (`control_plane.rs:1479-1500`, `parse` `:1541-1553`, `usage`
+  `:6489-6499`). The README (`README.md:33-40`) says three, which is stale.
+  `cli_exposes_only_declarative_commands` is at `:7577-7586`.
+- F14. `idunn up` writes a `DeploymentCommand` straight into the local
+  `control.cc` by compare-exchange (`submit`, `:2434-2502`). **There is no
+  remote request surface.** An agent on Starfire reaches it only through
+  `ssh ygg sudo …`. `control.cc` on Yggdrasil is `root:root 0640`.
+- F15. **The scheduler is one thread.** `serve` loops over `run_scheduler_tick`
+  (`:3004-3019`, `:3048-3055`). Sealing calls
+  `self.runner_for(plan)?.materialize(...)` synchronously (`:3847-3852`), so
+  every Docker build blocks continuity supervision for its whole duration.
+  `gamecult-ops/runbooks/idunn-host-raven.md` says so: "the Idunn tick blocks
+  on it the way it blocks on a docker build." A 30-to-60-minute mutation
+  harness run through this path would suspend daemon survival for every target.
+- F16. **The deployment brake is consulted after the build, not before it.** In
+  `advance_sealing`, resolve, freeze, `materialize` (which runs every recipe
+  step) and `install` all happen at `:3786-3866`. The brake is checked only when
+  moving to `Starting` (`:3868-3897`, "The candidate's Expected is published in
+  Starting, after the brake"). So the Eyes claim that every build or test sits
+  inside a transaction that needs the brake is true only in the sense that
+  builds happen inside Deploy transactions. **Builds and tests already run
+  without brake authorization.** The brake gates the first Verse-visible change.
+- F17. The host-actuator hub (`--host-actuator-bind 10.77.0.1:17890`) is a
+  signed CultNet RUDP channel. Managed hosts dial in, and Idunn sends them
+  requests such as `Materialize` (`host_actuator.rs:91`,
+  `HostActuatorRunnerDriver` `:697-736`). It carries no client requests.
+- F18. Terminal deploy transactions move to `history.cc`
+  (`archive_terminal_transaction`, `control_plane.rs:2193`). On Yggdrasil,
+  `history.cc` is 10 MB. `/var/lib/gamecult/idunn/staging` holds 382 entries
+  and 4.1 GiB, and nothing prunes it. Verify must own its own cleanup and must
+  not add to this.
+
+### 1.4 Doctrine and docs
+
+- F19. `README.md:3-10`: "Idunn decides two things and nothing else." Verify is
+  a third charter item, and the README must say so.
+- F20. **`docs/deployment-authority.md:61-78` "Current implementation boundary"
+  is stale.** It says `deployment.rs` and `deployment_plan.rs` "do not yet drive
+  Git, runners, systemd, nginx, brakes, CultCache, CultMesh". `drivers.rs` has
+  done all of that for weeks. Its second paragraph, that private plan state is
+  never published and only `ExpectedIncarnation` is Verse-shaped, is still true
+  and belongs under "Typed deployment state".
+- F21. **`docs/authority-map.md:203-213` "Current implementation boundary" is
+  also stale.** It names the Odin-era path `crates/idunn-daemon/src/` and says
+  "The transaction engine still must persist and sequence …", which it now does.
+- F22. `README.md:204` says `docs/guide.md` describes the generation "still what
+  runs on yggdrasil". That is false: probe of `systemctl show idunn-yggdrasil`
+  shows the new generation's `idunn serve` running.
+- F23. `gamecult-ops/scripts/request-idunn-bounded-redeploy-yggdrasil.sh` calls
+  `idunn redeploy --daemon …`. The installed binary has no `redeploy` command
+  (probe of its usage text), so the script is dead and is **not** the current
+  pattern. The current pattern is `idunn up` followed by
+  `idunn-provision deployment-brake-release`
+  (`runbooks/idunn-host-raven.md`, "Deploy Muninn to Raven").
+- F24. Build placement (`gamecult-ops/inventory.md:559-566`): build on or for the
+  target's host. Yggdrasil has 16 vCPU and 62 GiB and carries live services, so
+  state the core count and duration before a large build. Probe: load average
+  0.38, 52 GiB available, `/` at 15% of 2 TB, `/srv/build` 53 GiB.
+
+### 1.5 Harnesses and existing verification
+
+- F25. The Eureka stopgap is already live. It is
+  `~/.claude/skills/eureka/tools/stopgap/ygg-verify.sh` (91 lines) plus
+  `rust.Dockerfile` (9 lines). It pushes to a bare mirror
+  `~/eureka-verify/repos/<name>.git`, runs **one free `bash -c` string** as root
+  in a container capped at `--cpus 6 --memory 16g`, niced, with 2 flock slots,
+  and uses the shared volumes `eureka-cargo-registry` and `eureka-nuget`. On
+  Yggdrasil it has left `~/eureka-verify/{harness,repos/Huginn.git,work,slot-1.lock}`
+  and the image `eureka-verify-rust`, whose `FROM` is a tag and not a digest. It
+  is named in `SKILL.md:417-424` and `references/changelog.md:5-35`. Note that
+  its caps are 6 CPU and 16 GiB, not the brief's 4 CPU and 8 GiB.
+- F26. There is a second, older verification authority:
+  `gamecult-ops/scripts/deploy-epiphany-yggdrasil.sh:171-208`. It writes text
+  "test receipts" for the legacy generation and greps them. CultLib's GitHub
+  Actions are a third: `.github/workflows/cultnet-interop.yml` runs on
+  `windows-latest`, and `cultmesh-portability.yml` runs an OS matrix.
+- F27. The three harnesses have three exit conventions and **none writes a
+  typed summary**:
+  - `eureka-mutations.ps1` throws when a mutant is not killed (`:542-546`).
+  - `mutate-dotnet.ps1` (on the branch only) exits non-zero.
+  - `mutate-cultmesh.mjs` exits 2 when entries were skipped.
+- F28. The linux-x64 native QUIC mutation needs
+  `--security-opt seccomp=unconfined`, because TSan re-executes under
+  `setarch -R`. It also needs the image built from the digest-pinned
+  `scripts/quic-native-linux-dev.Dockerfile`, and it runs as a two-command
+  `bash -lc` string (`scripts/quic-native-linux-dev.Dockerfile:1-25`,
+  `scripts/mutate-cultmesh.mjs:40-60`).
+- F29. The Eureka harness is published at `github.com/GameCult/Eureka`
+  (`tools/eureka-mutations.ps1`). It is not in any target repo.
+
+### 1.6 Probes (Yggdrasil, capped, cleaned up)
+
+- P1. The Idunn baseline at `5b3f646` in `rust:1.95-bookworm`, using the
+  README's method (`/etc/machine-id` mounted), capped at 4 CPU and 8 GiB:
+  `cargo test --lib` gives **126 passed, 0 failed, 2 ignored**. The ignored
+  tests are `live_committing_record_is_unstuck_by_the_replacement_gate` and
+  `live_store_inventory`. The test profile compiled in 31.9 s with a warm
+  registry.
+- P2. Idunn-shaped hardening (all of F5, user `65532:65532`, network `none`):
+  - pwsh 7.5.3 **crashes** at start with no writable `HOME` (a stack in
+    `GetPolicySettingFromConfigFile`).
+  - With `HOME=/workspace/.home` it works, and an in-place file write under
+    `/workspace` succeeds.
+  - `dotnet` 10.0.400 runs, and `dotnet new console` restores.
+  - node 24.14.1 runs.
+- P3. A **locally built** image can be pinned. `docker image inspect` reports
+  `RepoDigests` equal to the image id under this Docker's image store, and
+  `docker run eureka-verify-rust@sha256:<id>` runs. So `require_pinned_image`
+  (`deployment.rs:1841-1847`) admits images built on Yggdrasil without a
+  registry.
+
+---
+
+## 2. Doctrine placement and the campaign authority map
+
+**What verify is.** A verify transaction changes no artifact, revision,
+configuration, schema, unit or authority binding of any managed target. It
+installs nothing, publishes nothing to the Verse, and restarts nothing. It is
+therefore **neither deployment nor continuity**, and neither brake governs it.
+The doctrine says a target brake may gate only Idunn's mutation of that target,
+and verify mutates no target, so **no brake may gate verify**. F16 shows that
+the Body already treats build and test as unbraked: the deployment brake gates
+the Verse-visible change, not the build.
+
+**What governs it instead.** Verify spends shared host resources beside live
+services, so its governor is a **resource authority**: the typed host verify
+policy (Cut 2). That policy holds concurrency, per-runner ceilings, aggregate
+budget, and a suspend switch (`max_concurrent = 0`). This is not a brake. It
+names no target and cannot touch deployment or continuity.
+
+**The survival invariant extends.** Idunn must be able to start, recover,
+observe and report while verify is absent, broken, overloaded or wedged. F15
+makes that a structural requirement: verify must never execute on the
+scheduler thread. The recommended form (Q-V8) is a separate process with its
+own stores, which the survival process never opens.
+
+**Verdicts are evidence, not admission.** No Idunn decision reads a verdict.
+Deployment does not consult verify; that coupling is out of scope.
+
+### Authority map (campaign level)
+
+- **Owner:** the Idunn verify worker (`idunn verify-serve`; see Q-V8). It alone
+  decides what ran, in what runner, under what limits, and what the verdict is.
+- **Inputs:**
+  - verify request and cancel records from the request store;
+  - verify bindings (operator);
+  - the host verify policy (operator);
+  - exact Git objects fetched by SHA from the binding's origin;
+  - the verify recipe blob at that revision;
+  - step exit status, deadline expiry, and mutation report files.
+- **Outputs:** verify transactions and verdicts in the verdict store, step logs
+  under the log root, and the CLI's status, log and wait output.
+- **Derived state:**
+  - mutation counts are derived by Idunn from report entries, never supplied by
+    the harness;
+  - the `--wait` exit code is derived from the verdict;
+  - CLI status text is display only;
+  - logs are evidence, never read back to decide anything.
+- **Forbidden writers:**
+  - Eureka agents running builds, tests or harnesses on Starfire (apart from
+    the Windows exception, Q-V5);
+  - ad hoc containers on Yggdrasil: the stopgap's `docker run`, and any
+    hand-launched test container;
+  - request-supplied argv, images, caps, network, environment or secrets;
+  - recipe-supplied images, network, caps, secrets or seccomp;
+  - the deploy scheduler, which must never read or write verify stores;
+  - the verify worker writing `control.cc`, the topology, brake stores,
+    bindings, release roots or deploy source checkouts.
+- **Shared paths:**
+  - one container-spec lowering and one step-execution primitive, used by both
+    deploy materialize and verify (Cut 1);
+  - one exact-revision freeze primitive (Cut 1);
+  - CLI submission, cancel and restart recovery all go through the same
+    request, transaction and cancel record types.
+- **Deletion line:** Cut 7 deletes the stopgap (`tools/stopgap/`, the SKILL.md
+  text, and `~/eureka-verify` plus its volumes and image on Yggdrasil).
+
+**Rejected path: verify as a Deploy transaction that stops before Starting.**
+It looks smaller, but it fails three ways:
+1. It needs a `TargetDeclaration` with a service (F3).
+2. It runs on the blocking scheduler (F15).
+3. It would put verify records into `control.cc`, which every survival decision
+   reads.
+
+---
+
+## 3. Step 0b: identity, lifecycle and authority per persistent kind
+
+| Kind | What names it | What happens to it over time | Who decides |
+|---|---|---|---|
+| **Verify recipe** `gamecult.idunn.verify_recipe.v1` | `(repo id, revision, recipe_path)`, content-addressed by `recipe_blob_sha256`. Step ids are unique within the recipe. | Immutable per revision. Read once at resolve. Its bytes are retained in the transaction, so the verdict names exactly what ran. Changing it means committing a new revision. | The repository authors capability: steps, argv, working dir, timeouts, required env names, report declaration, external inputs. It cannot name an image, network, caps, seccomp or secrets. |
+| **Verify binding** `gamecult.idunn.verify_binding.v1` | `repo` field, which must equal the file stem of `/etc/gamecult/idunn/verify/bindings/<repo>.toml`. This namespace is **separate from deploy targets**: a different directory, schema and record types, so `odin` the verify repo and `odin` the deploy target never collide. | Edited by the operator from the gamecult-ops template. Read at each admission. Bytes and sha256 are snapshotted into the transaction, so a later edit never changes a running or finished transaction. | Operator (installed as root, from gamecult-ops). |
+| **Host verify policy** `gamecult.idunn.verify_host_policy.v1` | Singleton per host at `/etc/gamecult/idunn/verify/host.toml`. Its `host` field must equal the worker's configured host name. | Re-read on each admission pass. Changes apply to new admissions only; running jobs keep the limits they were admitted under. `max_concurrent = 0` suspends admission. | Operator. |
+| **Verify request** `idunn.verify_request` (v1), in the **request store** | `verify-<uuid v4>`, minted by the CLI. The same id becomes the transaction key. | Write-once. Consumed when the worker creates a transaction with the same id. Retired with that transaction to history. A request whose binding is missing is sealed `Rejected`, not left resident. | The requester (agent or operator) chooses the repo, a 40-hex revision, an optional step subset, and `requested_by`. Nothing privileged. |
+| **Verify cancel** `idunn.verify_cancel` (v1), in the request store | Keyed by `verify_id`. | Write-once. The worker observes it: a queued transaction is sealed `Cancelled`, and a running one has its step container killed and is sealed `Cancelled`. The CLI refuses to cancel an unknown or terminal id. | Requester. |
+| **Verify transaction / verdict** `idunn.verify_transaction` (v1), in the **verdict store** | `verify_id`. | Phases: `Admitted → Frozen → Running{step} → Terminal`. Terminal is one of `Passed`, `Failed`, `Error{kind}`, `TimedOut{step}`, `Cancelled`, `Interrupted`, `Rejected`. **Terminal is immutable.** It moves to the verify history store after `resident_terminal` newer terminals, and history is pruned to `history_limit`. **No resume:** a transaction that is not terminal when the worker starts is sealed `Interrupted`. | The verify worker is the only writer. |
+| **Step outcome** (embedded in the transaction) | `(verify_id, step id)`. | Set once when the step ends: exit status, duration, deadline, log reference, optional decoded mutation report. Steps after a failed step are `NotRun`. | Worker. |
+| **Step log** | `<log_root>/<verify_id>/<step>.log`. | Combined stdout and stderr, written while the step runs and capped at `log_byte_cap`. At step end its `sha256`, `bytes_kept`, `bytes_total` and `truncated` are recorded. Deleted when its transaction leaves history. | Worker. |
+| **Mutation report** `gamecult.eureka.mutation_report.v1` (JSON at the xenos boundary; see Q-V4) | `(verify_id, step id)`, read from the step-declared path. | Read once after the step exits, decoded strictly, and embedded as a typed record. The source file dies with the workspace. | The harness produces entries. Idunn decodes them, derives the counts, and cross-checks them against the exit status. |
+| **Frozen tree and runner workspaces** | `<workspace_root>/<verify_id>/{frozen,runner-<id>}`. | Created at `Frozen` and `Running`, deleted when the transaction goes terminal. At worker start, any directory whose id is terminal or unknown is deleted. | Worker. |
+| **Step container** | name `idunn-verify-<verify_id>-<step>`, label `gamecult.idunn.verify=<verify_id>`. | Runs with `--rm`, and is killed on deadline, cancel or worker restart. Any container carrying the label with no live transaction is an orphan, and the worker kills it. | Worker. |
+| **Verify source checkout** | `<verify_source_root>/<repo>`, a partial clone of the binding origin. **Separate from deploy checkouts** (F11), so fetching arbitrary branch SHAs never touches deploy refs. | A persistent cache that fetches by SHA. Recreated if its origin differs from the binding. | Worker, as the `idunn` uid. |
+| **Runner images** | `name@sha256:<digest>` pinned in the verify binding (P3). | Built from a committed Dockerfile whose `FROM` is digest-pinned. Changed only by editing the binding. | Operator (Q-V10). |
+| **Verify stores** | `/var/lib/gamecult/idunn-verify/requests.cc` (requests and cancels) and `/var/lib/gamecult/idunn-verify/verify.cc` plus `verify-history.cc` (transactions). | The request store is written by the CLI and read by the worker. The verdict store is written only by the worker and readable by the requester group. The deploy daemon never opens either. | Worker owns the verdict store; requesters own only request and cancel records (Q-V7). |
+
+No cell is empty. The identity rule that the rest of the map depends on: **the
+request id, transaction id, workspace directory, log directory and container
+label are all one `verify_id`.** One id, so cleanup and orphan detection are
+exact.
+
+---
+
+## 4. Operator questions
+
+Each question gives its options, a recommendation, and what depends on it. The
+answers gate Cut 2 onward.
+
+**Q-V1. Where do verify recipes live?**
+- A: in the repository, at a binding-named path (suggested
+  `deployment/idunn/verify.toml`, beside the deploy recipe), read from the exact
+  revision being verified. Privilege lives in a separate operator verify binding
+  (gamecult-ops template, installed on the host). This is the same split as
+  deploy.
+- B: in gamecult-ops bindings only. The operator authors every step.
+- C: in the request.
+
+**Recommended: A.** A Hands pass can then add a mutation-suite step in the same
+commit as the rule it pins, and the suite is committed, rerunnable and named in
+the verdict. This is the skill's "a probe that is the only thing defending a
+rule must be committed" rule, enforced by the substrate. B turns every new
+suite into an ops commit and decouples steps from the code they test. C is the
+escape hatch the README forbids. A branch can weaken its own recipe, but the
+verdict records the recipe blob and each step's argv, so Soul sees exactly what
+ran.
+
+Depends: the Cut 2 schema, and the per-repo recipes in Cut 6.
+
+**Q-V2. What does a request carry?**
+- A: an exact 40-hex commit that is fetchable from the binding's origin (any
+  branch, pushed), plus an optional subset of step ids. Nothing else.
+- B: A plus unpushed commits, pushed by the agent into an Idunn-trusted mirror
+  (the stopgap's model).
+- C: a branch name resolved at request time.
+
+**Recommended: A.** Eureka already requires every Hands commit to be pushed, and
+`cultnet/selection-cut1` is on origin. B creates a second source authority, an
+agent-writable repository that Idunn would trust. C makes a verdict unreplayable.
+
+In-place mutation fits: each runner works on a scratch copy (F8), and Idunn
+additionally re-hashes the frozen files after every report-bearing step (Cut 4,
+R-V14).
+
+Depends: Cut 3 request validation, and the Cut 4 fetch.
+
+**Q-V3. How does the allowlist admit `pwsh`, `node` and `bash` without
+becoming an escape hatch?**
+- A: keep the allowlist per runner on the binding side (F4). A request names
+  only step ids. Argv is authored in the recipe at the verified revision and
+  admitted against the binding. The binding may list `pwsh`, `node`, `bash`,
+  `cargo`, `dotnet`, `cmake` or `npm` as the operator sees fit.
+- B: A, but forbid shell interpreters in verify allowlists.
+- C: pin each step's argv in the binding.
+
+**Recommended: A.** The escape hatch the README forbids is **command text
+supplied by the requester**, and A makes that unrepresentable. A program name
+confines nothing: `cargo test` already runs arbitrary `build.rs` code. The
+confinement is the container and the binding, which for verify means no
+secrets, no host network, capped resources, and read-only root (Cut 2, R-V1 and
+R-V2).
+
+B buys nothing, because `pwsh -Command` and `node -e` are shells. The QUIC
+native job needs no shell string: it becomes two steps, `bash
+scripts/build-quic-native.sh` and `node scripts/mutate-cultmesh.mjs native`. C
+duplicates the recipe.
+
+Depends: the Cut 2 admit rules.
+
+**Q-V4. What shape is the verdict, and how does mutation data reach it?**
+
+The verdict records, for each step: exit status, duration, admitted deadline,
+and a log reference (path, sha256, kept and total bytes, truncated flag), never
+inline log text. For a mutation step it also records a typed report: control
+`Green|Red`, and entries `{id, verdict: Killed|Survived|NoVerdict|Skipped}`,
+with the counts derived by Idunn.
+
+How the report gets in:
+- A: the step declares `report = { schema = "gamecult.eureka.mutation_report.v1", path = "…" }`.
+  The harness writes a strict JSON file there, the xenos boundary, because
+  PowerShell has no CultCache runtime. Idunn decodes it with
+  `deny_unknown_fields` into a typed record and persists it as CultCache.
+- B: harnesses write CultCache `.cc` directly. This needs a CultCache runtime in
+  PowerShell, which does not exist.
+- C: Idunn parses harness stdout.
+
+**Recommended: A.** C makes Idunn a text parser for three formats (F27). With A,
+Idunn also cross-checks the report against the exit status. Exit 0 with a
+survivor, or exit non-zero with a clean report, becomes `Error{ReportContradictsExit}`.
+The harness's honesty is observed, not trusted.
+
+Depends: Cut 5 in Idunn, Eureka and CultLib.
+
+**Q-V5. Is there a Windows verify host?** The QUIC win32 harness has to run on
+Windows.
+- A: none in this campaign. Win32 jobs stay on Starfire, one at a time and never
+  with burners (today's SKILL.md rule), outside Idunn.
+- B: Raven, through the host actuator, with a new `VerifyStep` request. Raven is
+  human-used and streams, and `idunn-host.exe` is itself built on Starfire
+  (runbook).
+- C: a dedicated Windows box or VM. Which one?
+- D: GitHub Actions `windows-latest`, which CultLib already uses (F26). Its
+  results are outside Idunn and untyped.
+
+**Recommended: A for this campaign.** Ask again once a dedicated host exists.
+The map carries Cut 9 as a placeholder that only B or C activates.
+
+Depends: Cut 9, and whether Cut 7's SKILL.md text keeps the Starfire exception.
+
+**Q-V6. Concurrency and caps on Yggdrasil.** The host policy is a typed setting.
+- A: `max_concurrent = 2`, per-runner ceiling 400% CPU and 8192 MiB, aggregate
+  budget 800% and 16384 MiB. At most 8 of 16 vCPU go to verification.
+- B: 2 jobs at 6 CPU and 16 GiB each, which is the stopgap's setting (F25): 12
+  vCPU.
+- C: 1 job at 8 CPU and 16 GiB.
+
+**Recommended: A.** It leaves half the host to live services, it matches the
+cap in the operator's brief, and P1 shows Idunn's own suite compiles in about
+32 s at 4 CPU.
+
+Depends: the Cut 6 host policy values only. The mechanism is in Cut 2 and Cut 4
+whatever the answer.
+
+**Q-V7. How does a pipeline agent on Starfire reach Idunn?**
+- A: `ssh ygg sudo -n idunn verify …` as `gamecultadmin`, which has full
+  passwordless sudo (probe).
+- B: a dedicated `eureka` account on Yggdrasil with an SSH key, member of group
+  `idunn-verify`, and **no sudo**. The request store is `root:idunn-verify 0660`,
+  so the CLI can only submit or cancel. The verdict store is
+  `root:idunn-verify 0640`, readable only.
+- C: a signed CultNet request surface, which is a new protocol.
+
+**Recommended: B.** A works on day one, but with root an agent can still start
+ad hoc containers, so the forbidden writer is forbidden only by prose. B makes
+it structural: the account can request, read verdicts and read logs (`log_root`
+group-readable), and nothing else. C is out of scope. F17 shows there is no
+client surface to reuse.
+
+Depends: the Cut 3 store split and modes, Cut 6 provisioning, and the Cut 7
+negative checks.
+
+**Q-V8. What process topology?**
+- A: a verify thread inside `idunn serve`.
+- B: a separate unit, `idunn-verify.service`, running `idunn verify-serve` from
+  the same binary. It has its own stores and lock, and narrower
+  `ReadWritePaths`: its own roots and `/srv/build` cache only, with no
+  `/etc/systemd/system`, `/etc/nginx`, `/etc/ufw`, target roots or
+  `idunn-authority`.
+
+**Recommended: B.** A new process has to earn its keep by protecting a named
+invariant, and B protects daemon survival. It gives failure and resource
+isolation: a wedged `docker`, a panic, or a hung pump cannot stall or kill the
+survival loop (F15). It also gives privilege isolation for code from arbitrary
+branches: the process driving those containers cannot write units, routes or
+firewall rules. B adds one unit file and one subcommand, and no new binary.
+
+Depends: Cuts 4 and 6.
+
+**Q-V9. May a verify runner be bound with `seccomp = "unconfined"`?** CultLib's
+linux native TSan mutation requires it (F28).
+- A: yes, as an explicit per-runner binding field (default `default`), echoed
+  into the verdict.
+- B: no. Native linux mutation stays outside verify.
+
+**Recommended: A.** Under B the stopgap cannot die whole, because that job would
+need an ad hoc container forever. Only runners the operator names get it, and
+the binding is root-installed.
+
+Depends: the Cut 2 schema, Cut 6 CultLib binding, and Cut 7 completeness.
+
+**Q-V10. Who builds runner images?**
+- A: the operator, or a Hands pass the operator approves, builds each image once
+  on Yggdrasil from a committed Dockerfile with a digest-pinned `FROM`, and pins
+  `name@sha256:<id>` in the gamecult-ops verify binding (P3). The images are
+  rust+pwsh (a new Dockerfile in gamecult-ops `docker/`), the dotnet SDK
+  (upstream, pinned), node (upstream, pinned), and CultLib `quic-native-linux-dev`.
+- B: Idunn builds images declared by the binding, which is a new build
+  authority.
+
+**Recommended: A.** Image building is a rare privileged ops act like installing
+a binding, and B grows Idunn for a job that happens a few times a year.
+
+Depends: Cut 6.
+
+---
+
+## 5. Cuts
+
+All Idunn work is on `F:\Projects\Idunn`, branch `verify/cutN` from `main`, one
+cut per branch, merged after Soul. **Idunn builds and tests run only on
+Yggdrasil** (build host = Yggdrasil, target platform = linux-x64). Until Cut 6
+is installed, Hands and Soul use the stopgap, which the brief explicitly allows
+until its deletion line:
+
+```
+ygg-verify.sh /f/Projects/Idunn <sha> rust:1.95-bookworm 'cargo test --lib'
+```
+
+It needs `/etc/machine-id` mounted, which requires one stopgap edit, or the
+README's `docker run … -v /etc/machine-id:/etc/machine-id:ro` form in
+`~/eureka-verify/<name>`, capped at `--cpus=4 --memory=8g`. Mutation suites use
+`eureka-verify-rust` plus `tools/eureka-mutations.ps1`. The suite files are
+committed under `tools/verify-mutations/` in the Idunn repo. The baseline is
+P1: 126 passed and 2 ignored.
+
+### Cut 0. Kill the stale docs (subtraction, docs only)
+
+- **Repo/branch:** Idunn `verify/cut0`. Depends on nothing.
+- **Deletes first:**
+  - `docs/authority-map.md:203-213`, the whole "Current implementation boundary"
+    section (11 lines).
+  - `docs/deployment-authority.md:61-78`, the whole section (18 lines). Its
+    second paragraph (`:71-78`) moves to the end of "Typed deployment state"
+    (`:186-214`), reworded in the present tense.
+- **Per-file changes:**
+  - `README.md:33-40`: the CLI has five commands. List `cancel` and `validate`.
+  - `README.md:204`: the `guide.md` row says the previous generation **no longer
+    runs anywhere** and the file is kept for migration history. Settle the
+    `deploy/legacy` row the same way.
+  - `docs/deployment-authority.md`: under "Candidate promotion" (or `:20` "Authority
+    map"), add one sentence of present truth. Sealing resolves, freezes, runs
+    every recipe step and installs before the deployment brake is consulted.
+    The brake gates `Starting`, the first Verse-visible change. Cite
+    `advance_sealing`.
+- **Not in this cut:** the dead gamecult-ops script (F23) and the Raven
+  runbook's brake sentence. Both are recorded in section 8 as follow-ups in
+  their own repo.
+- **Verification:**
+  - negative: `rg -n "do not yet\s*$|drive Git, runners" docs/` gives 0 hits,
+    and `rg -n "crates/idunn-daemon" docs/` gives 0 hits (both tested against
+    HEAD: they hit `deployment-authority.md:67-68` and `authority-map.md:205`
+    only);
+  - operator: none. Soul reads `advance_sealing` against the new sentence.
+- **Ledger:** −29 lines, +~12.
+
+### Cut 1. One step primitive and one freeze primitive (behaviour-preserving refactor)
+
+- **Repo/branch:** Idunn `verify/cut1`. Depends on Cut 0 being merged, for doc
+  hygiene only.
+- **Deletes first:**
+  - The argv assembly inside `DockerRunnerDriver::run_in_workspace` and
+    `base_run_args` (`drivers.rs:1407-1499`) as a driver-private shape. It is
+    replaced by the pure lowering below, and no second copy may remain.
+  - The `OperatorBinding`/`CompiledDeploymentPlan` coupling of the fetch-and-archive
+    core of `GitSourceDriver::freeze` (`:1221-1304`).
+- **Adds:**
+  - `ContainerSpec`: a plain struct with `image`, `user`, `network`
+    (`None|Bridge|Named(String)`), `seccomp` (`Default` only in this cut),
+    `memory_mebibytes`, `cpu_quota_percent`, `pids_limit`, `tmpfs_mebibytes`,
+    `cache_root`, `secret_mounts`, and `environment` as ordered pairs. It has
+    one constructor from `DockerRunnerBinding` plus the step's required
+    environment and the source stamp.
+  - `fn docker_run_args(spec, workspace, working_directory, argv) -> Vec<OsString>`.
+    It is **pure**, with no filesystem effects: the cache-root and secret
+    validation stays in the caller, before the call.
+  - A `StepPort` trait with one method that runs a lowered step in a workspace
+    and returns a `StepOutcome { status, stderr_tail }`. `DockerRunnerDriver`
+    implements it with today's blocking `output()` semantics.
+  - `ExactSource { origin, checkout, gitlinks, recipe_path }` and
+    `GitSourceDriver::freeze_exact(&ExactSource, revision, transaction_id, root) -> (tree_root, snapshot_sha256, recipe_bytes)`.
+    `freeze` delegates to it.
+- **Per-file changes:**
+  - `drivers.rs:1407-1455` becomes: build a `ContainerSpec`, call
+    `docker_run_args`, call `docker`. The error text is unchanged.
+  - `drivers.rs:1501-1559` (external input) uses the same lowering with argv
+    `curl …`.
+  - `drivers.rs:1221-1304`: `freeze` computes an `ExactSource` from the plan's
+    binding and calls `freeze_exact`. The checks are unchanged:
+    `verify_exact_source`, the recipe-bytes equality, hardening.
+- **Authority map:** no ownership change. It creates the shared paths that
+  Cut 4 must use: there is to be no second docker-argv builder and no second
+  archive path.
+- **Verification:**
+  - builds: `cargo test --lib` on Yggdrasil stays 126 passed, 2 ignored.
+  - `container_spec_lowers_to_exact_docker_argv` pins the full argv as an exact
+    vector: `--network none` by default, `--cap-drop ALL`, `no-new-privileges`,
+    `--read-only`, pids, the noexec tmpfs, the machine-id mount, `--cpus` as
+    `quota/100` to 2 dp, and `--memory` as `Nm`. It must kill:
+    - the revert mutant: drop `--cap-drop ALL`;
+    - the loosening mutant: default network `bridge`;
+    - a function-of-input mutant: `--cpus` = `quota/50`, with a probe at
+      `cpu_quota_percent = 250`, where `2.50` and `5.00` differ.
+  - `required_environment_is_the_only_environment` pins F6. Its mutant passes
+    every binding `environment` entry, and the fixture has a binding variable
+    the step does not name.
+  - `freeze_exact_is_byte_exact_and_recipe_checked` reuses the existing git
+    fixture (`drivers.rs:8409` `exact_git_archive_becomes_root_owned_immutable_source_without_git_metadata`)
+    through the new entry point. Its mutant skips the recipe-bytes equality.
+  - negative: `rg -n '"--cap-drop"' src/` gives exactly 1 hit (verified to
+    collide with nothing else at HEAD: 1 hit today, `drivers.rs:1478` in `base_run_args`).
+- **Ledger:** about −90 +140 in Idunn, including 3 tests. Net positive only by
+  the tests.
+
+### Cut 2. Verify declarations and host policy (pure types, no execution)
+
+- **Repo/branch:** Idunn `verify/cut2`. Depends on Cut 1 and on Q-V1, Q-V3, Q-V6
+  (mechanism only) and Q-V9.
+- **Adds:** a new module `src/verify.rs`, with no I/O except parse.
+  - `VerifyRecipe` (`schema`, `repo`, `source_stamp_environment`,
+    `required_gitlinks`, `external_inputs: Vec<ExternalInput>` reusing
+    `deployment.rs:79-87`, `steps: Vec<VerifyStep>`). Unknown fields are
+    denied. It has no artifacts, service, state or provides, and those fields
+    are unrepresentable.
+  - `VerifyStep` (`id`, `runner`, `argv`, `working_directory`,
+    `required_environment`, `timeout_seconds: u32`,
+    `report: Option<ReportDeclaration { schema, path }>`). It has **no
+    `phase`**: every verify step is a test step, and `RecipePhase` stays
+    deploy-only (F2).
+  - `VerifyBinding` (`schema`, `repo`, `repository: { origin, checkout,
+    recipe_path, gitlinks }`, `runners: BTreeMap<String, VerifyRunnerBinding>`).
+  - `VerifyRunnerBinding` (`image`, `user`, `allowed_programs`, `environment`,
+    `cache_root`, `network: VerifyNetwork { None, Bridge }`,
+    `seccomp: Seccomp { Default, Unconfined }`, `memory_mebibytes`,
+    `cpu_quota_percent`, `pids_limit`, `tmpfs_mebibytes`, `max_step_seconds`).
+    It has **no `secret_files` field**. It lowers to `ContainerSpec` (Cut 1),
+    and `ContainerSpec.seccomp` gains `Unconfined`, which lowers to
+    `--security-opt seccomp=unconfined`.
+  - `VerifyHostPolicy` (`schema`, `host`, `max_concurrent`,
+    `cpu_budget_percent`, `memory_budget_mebibytes`,
+    `runner_cpu_ceiling_percent`, `runner_memory_ceiling_mebibytes`,
+    `log_byte_cap`, `resident_terminal`, `history_limit`, `workspace_root`,
+    `log_root`, `source_root`).
+  - `VerifyBinding::admit(&VerifyRecipe, &VerifyHostPolicy)`.
+  - `idunn validate --verify-recipe PATH [--verify-binding PATH] [--host-policy PATH]`,
+    which extends `validate` at `control_plane.rs:1507-1539`. It stays offline
+    and opens no store.
+- **Rules. Each has a test that fails under its own mutant:**
+  - **R-V1. A verify runner can hold no secret.** `verify_binding_rejects_secret_files`
+    parses a binding carrying `secret_files` and expects an error. Its mutants
+    remove `deny_unknown_fields`, and add `#[serde(default)] secret_files`
+    while ignoring it.
+  - **R-V2. The network is `none` or `bridge`.**
+    `verify_runner_rejects_host_network` covers `"host"` and
+    `"container:odin"`. Its mutant adds `Named(String)` to `VerifyNetwork`.
+  - **R-V3. `argv[0]` must be in *that* runner's allowlist.**
+    `verify_admit_checks_the_steps_own_runner`. The fixture has two runners
+    with disjoint programs (`rust: [cargo]`, `web: [node]`) and a step
+    `runner = rust, argv = [node, …]`. The revert mutant drops the check. The
+    loosening mutant checks against the union of all runners' programs, and
+    this fixture is the one that kills it.
+  - **R-V4. A step's timeout must not exceed its runner's `max_step_seconds`.**
+    Probes sit at `max` (admitted) and `max + 1` (rejected). The loosening
+    mutants are `<= max * 2` and a comparison against the largest
+    `max_step_seconds` of any runner. The fixture gives runners different
+    maxima.
+  - **R-V5. Each runner's caps must not exceed the host policy ceilings.** The
+    CPU and memory ceilings get separate fixtures with different numbers. The
+    mutant swaps them, comparing memory against the CPU ceiling.
+  - **R-V6. The recipe's runners must equal the binding's runners exactly**, as
+    deploy's rule at `deployment.rs:1426-1430`. Mutants: subset instead of
+    equality, in both directions.
+  - **R-V7. A report path must be relative and inside the workspace, and the
+    schema must be known.** Rejects `../x`, `/abs`, and unknown schema
+    `gamecult.eureka.mutation_report.v2`.
+  - **R-V8. Idunn owns `HOME` and the source stamp.** The binding `environment`
+    may not name `HOME` or `recipe.source_stamp_environment`, and a step may
+    not list `HOME` in `required_environment`. The Cut 4 runner always sets
+    `HOME=/workspace/.idunn-home`, because P2 shows pwsh dies without it.
+  - **R-V9. The recipe cannot declare deploy fields.** A recipe carrying
+    `[[artifacts]]` or `[service]` is rejected.
+- **Verification:**
+  - builds: Yggdrasil, `cargo test --lib`.
+  - The mutation suite `tools/verify-mutations/cut2.psd1` covers R-V1 to R-V9
+    and runs through `eureka-mutations.ps1` in `eureka-verify-rust` on
+    Yggdrasil, stopgap era. It needs a no-op control.
+  - negative: `rg -n "secret" src/verify.rs` finds only the rejection test's
+    fixture text.
+- **Ledger:** about +450 lines, including tests, in one new module.
+
+### Cut 3. Stores, records and CLI (no worker)
+
+- **Repo/branch:** Idunn `verify/cut3`. Depends on Cut 2 and on Q-V2 and Q-V7.
+- **Adds:**
+  - In `src/verify.rs` or a sibling `verify_store.rs`: records
+    `VerifyRequest` (`idunn.verify_request`, v1: `verify_id`, `repo`,
+    `revision`, `steps: BTreeSet<String>` where empty means all,
+    `requested_by`, `requested_at_unix_millis`), `VerifyCancel`
+    (`idunn.verify_cancel`, v1), and `VerifyTransaction`
+    (`idunn.verify_transaction`, v1: id, request, phase, binding bytes and
+    sha256, recipe bytes and sha256, frozen snapshot sha256, per-step
+    `StepOutcome`, `terminal: Option<VerifyTerminal>`, timestamps).
+  - The CLI commands:
+    - `idunn verify <repo> --revision <40-hex> [--step ID]... [--requested-by NAME] [--no-wait] [--timeout-seconds N] [--request-store PATH] [--verdict-store PATH]`
+    - `idunn verify-status [--id ID] [--verdict-store PATH]`
+    - `idunn verify-log --id ID --step STEP [--log-root PATH]`
+    - `idunn verify-cancel ID [--request-store PATH]`
+  - Store paths default to `/var/lib/gamecult/idunn-verify/{requests.cc,verify.cc}`.
+- **Rules:**
+  - **R-V10. A request can carry nothing privileged.** Extend
+    `cli_exposes_only_declarative_commands` (`control_plane.rs:7577`) with
+    `verify x --revision <sha> --command "sh -c"`, `--argv`, `--image`,
+    `--cpus`, `--memory`, `--network`, `--env` and `--seccomp`, each expected
+    to be rejected. The mutant makes the verify parser ignore unknown flags.
+  - **R-V11. The revision is exactly 40 lowercase hex.** Probes: 39, 41,
+    uppercase, a 7-character prefix, and `HEAD`. The loosening mutant is
+    `len >= 7`.
+  - **R-V12. The CLI writes only the request store.**
+    `verify_submit_touches_only_the_request_store`: after submitting into a
+    tempdir, the verdict-store path does not exist and its mtime is unchanged.
+    The mutant has the CLI pre-create a `Admitted` transaction.
+  - **R-V13. Cancel refuses unknown and terminal ids.** The terminal fixture
+    comes from a hand-built verdict store.
+  - Exit codes for `idunn verify` in wait mode. This is a **rule, not a
+    display**, because agents branch on it:
+    `Passed → 0`, `Failed → 1`, `Error/Interrupted/Rejected → 3`,
+    `TimedOut → 4`, `Cancelled → 5`, and wait timeout `→ 6`.
+    `verify_wait_exit_code_is_derived_from_the_verdict` is a table test. The
+    mutant maps `TimedOut → 1`.
+- **Verification:** Yggdrasil `cargo test --lib`. Mutation suite
+  `tools/verify-mutations/cut3.psd1`. Negative:
+  `rg -n "verify" src/control_plane.rs` finds only parse and dispatch lines.
+  No `Engine` method may reference verify types (checked by reading `impl Engine`).
+- **Ledger:** about +350.
+
+### Cut 4. The verify worker (`idunn verify-serve`)
+
+- **Repo/branch:** Idunn `verify/cut4`. Depends on Cut 3 and on Q-V8. This map
+  assumes B, a separate process. If the ruling is A, only the entry point
+  changes: a thread spawned beside the hub. Every rule below still holds.
+- **Adds:**
+  - `idunn verify-serve --host NAME --policy PATH --bindings-dir PATH --request-store PATH --verdict-store PATH --source-uid N --source-gid N`.
+    It takes its own `ProcessLock` (`control_plane.rs:2637`) on the verdict
+    store.
+  - The loop, per pass:
+    1. Read the host policy.
+    2. Observe cancels.
+    3. Admit queued requests, oldest first, while `running < max_concurrent`
+       and the running jobs' CPU and memory plus the candidate's stay within
+       budget. The candidate's figure is the sum over the runners its selected
+       steps use.
+    4. Each admitted transaction runs on **its own thread**:
+       - fetch the exact SHA into the verify source checkout with
+         `ExactSource`, as the source uid, and **refuse any origin other than
+         the binding's**;
+       - read the recipe blob at that revision, parse it, and run `admit`;
+       - `freeze_exact`;
+       - create per-runner workspace copies and materialize external inputs;
+       - run the selected steps in recipe order.
+  - **Detached step execution.** This is a new `StepPort` implementation for
+    verify. It spawns `docker run --rm --name idunn-verify-<id>-<step> --label gamecult.idunn.verify=<id> …`
+    with stdout and stderr piped into a pump that writes the log up to
+    `log_byte_cap` and counts the rest. It polls `try_wait` against the
+    admitted deadline. At the deadline or on cancel it runs
+    `docker kill <name>`. The argv comes from Cut 1's `docker_run_args`, plus
+    the Cut 2 seccomp flag.
+  - Recovery at start:
+    - every non-terminal transaction is sealed `Interrupted`;
+    - `docker ps -a --filter label=gamecult.idunn.verify` orphans are killed;
+    - workspace directories whose id is terminal or unknown are deleted.
+  - Retention: resident terminals over `resident_terminal` move to
+    `verify-history.cc`, history is pruned to `history_limit`, and the log
+    directories of pruned ids are removed.
+  - A unit file `deploy/idunn-verify.service`: `User=root`,
+    `ProtectSystem=full`, `ProtectHome=yes`, `PrivateTmp=yes`,
+    `ReadWritePaths=/var/lib/gamecult/idunn-verify /srv/build/idunn-verify`,
+    and `ReadOnlyPaths=/etc/gamecult/idunn/verify`. It has **no** systemd,
+    nginx, ufw, target or authority paths. `Wants=docker.service`.
+- **Authority map:**
+  - Owner: `verify-serve`.
+  - Forbidden writers: `idunn serve`, which never opens `/var/lib/gamecult/idunn-verify`;
+    and `verify-serve`, which is denied `control.cc`, topology, brakes and
+    `/etc/systemd/system` by the unit and never names them in code.
+  - Shared paths: `docker_run_args` and `freeze_exact` from Cut 1.
+  - Deletion line: none in this cut.
+- **Rules. Unit tests use a fake `StepPort` and a fake container observer. The
+  pipeline smoke uses real Docker on Yggdrasil.**
+  - **R-V14. After each report-bearing step, the frozen files in that runner's
+    workspace must hash to the frozen snapshot**, computed over exactly the
+    paths in the frozen tree, so `target/` and `node_modules` are ignored. A
+    mismatch seals `Error{RestoreViolated{path}}` and skips the remaining
+    steps. The fixture flips one byte of a file without changing its length.
+    The revert mutant skips the check. The loosening mutant compares only the
+    file count or sizes; the length-preserving fixture kills it.
+  - **R-V15. The deadline handed to the step port equals the step's admitted
+    `timeout_seconds`.** It is observed at the call site, where the rule is
+    decided, and the fake port records the value. Probes at 7 s and 1800 s.
+    Mutants: a constant 1800; `timeout * 2`; `min(timeout, 600)`, which is a
+    function of the input and dies at the 1800 probe; and `max(timeout, 60)`,
+    which dies at the 7 probe.
+  - **R-V16. At most `max_concurrent` transactions run, and CPU and memory
+    budgets hold.** Table fixtures at the boundary: `running == max` means no
+    admission, and a candidate that would exceed CPU but not memory, and vice
+    versa, is refused. Mutants: `<` to `<=`; budget counted per repository
+    instead of per host; memory checked against the CPU budget.
+  - **R-V17. A worker start seals every non-terminal transaction `Interrupted`
+    and kills the labelled orphans.** The mutant resumes `Running`
+    transactions. A second fixture has a labelled container whose id is
+    unknown.
+  - **R-V18. Stop at the first failed step.** Later steps are `NotRun`, and a
+    failed step's verdict is `Failed`, never `Error`. Infrastructure faults are
+    `Error{kind}`: fetch, image, docker, report decode, restore. Mutants: run
+    every step; map a non-zero exit to `Error`.
+  - **R-V19. Fetch only from the binding origin.** A fixture origin mismatch in
+    the verify checkout triggers a re-clone or a refusal, never a fetch.
+  - **R-V20. Terminal is immutable.** Replacing a terminal record fails. The
+    mutant lets `persist` overwrite.
+  - **R-V21. The workspace is removed at terminal.** The mutant is `KEEP`
+    semantics.
+  - Survival isolation (negative, structural):
+    - `rg -n "idunn-verify|verify_store|VerifyTransaction" src/control_plane.rs`
+      finds nothing inside `impl Engine` or `fn serve`;
+    - the unit diff shows `idunn-yggdrasil.service` unchanged;
+    - `systemctl stop idunn-verify` leaves `idunn-yggdrasil` active, and a
+      deliberately corrupted `verify.cc` crashes only `idunn-verify` (operator
+      check at Cut 6).
+- **Verification:**
+  - Yggdrasil `cargo test --lib`, and mutation suite `cut4.psd1` (stopgap era).
+  - Pipeline smoke on Yggdrasil in a scratch root: a throwaway local bare repo
+    with a two-step verify recipe (`true`, then `sh -c 'exit 3'`), a tempdir
+    policy, and `alpine@sha256` pinned by P3. Expect `Failed`, step 2 exit 3,
+    both logs present with sha256, the workspace gone, and no container with
+    the label left.
+  - A second smoke with `sleep 30` and `timeout_seconds = 3` expects
+    `TimedOut` and the container killed.
+- **Ledger:** about +650, the largest cut. It is justified because it is the
+  capability itself, and no smaller owner exists. The deploy scheduler is
+  single-threaded by design (F15).
+
+### Cut 5. Typed mutation reports (three repositories, three commits)
+
+- **Depends:** Cut 4 and Q-V4.
+- **5a. Idunn** `verify/cut5`:
+  - `MutationReport { control: Control{Green,Red}, entries: Vec<MutationEntry{ id, verdict: Killed|Survived|NoVerdict|Skipped }> }`,
+    decoded strictly (`deny_unknown_fields`) from the step's declared path. The
+    counts are derived in Idunn, and a JSON `counts` field is rejected as
+    unknown.
+  - **R-V22. A report-bearing step passes only if exit is 0, the control is
+    Green, and there are zero Survived, NoVerdict and Skipped entries.** Exit 0
+    with any of those non-zero is `Error{ReportContradictsExit}`, and so is a
+    non-zero exit with a clean report. A missing or malformed report is
+    `Error{Report}`, never `Failed`. Table test mutants: treat Skipped as
+    passing, which is exactly F27's mutate-cultmesh "skipped is covered by
+    nothing" lesson; trust the exit code alone; count `NoVerdict` as killed.
+  - **R-V23. Entry ids are unique and the Control entry is not an entry.** The
+    fixture has a duplicate id.
+- **5b. Eureka** `GameCult/Eureka`: `tools/eureka-mutations.ps1` gains
+  `-Report <path>`. It writes the report with temp-then-rename **before**
+  exiting or throwing, including on a red control. The report is UTF-8 without
+  BOM, because P2's pwsh writes a BOM with `Out-File`, so it uses
+  `[IO.File]::WriteAllBytes`. Commit the pending working-tree edit first or
+  separately, because it is not this cut's.
+- **5c. CultLib**: `scripts/mutate-cultmesh.mjs` gains `--report <path>`
+  (main). `scripts/mutate-dotnet.ps1` gains `-Report` **on
+  `cultnet/selection-cut1`**, where it lives, and lands with that branch.
+- **Verification:**
+  - Idunn on Yggdrasil.
+  - Each harness is run under verify once Cut 6 is installed. Before that, run
+    them with the stopgap, with one no-op-only suite per harness proving that
+    the report round-trips through Idunn's decoder via
+    `idunn validate --mutation-report PATH`, a small offline decode added in 5a.
+- **Ledger:** about +150 in Idunn, about +40 per harness.
+
+### Cut 6. Install, bind, recipe
+
+- **Depends:** Cuts 4 and 5a, and Q-V6, Q-V7, Q-V9 and Q-V10. The build host is
+  Yggdrasil (`rust:1.95-bookworm`, `--cpus=4 --memory=8g`, niced, about 1 min
+  warm). The install path is the existing
+  `gamecult-ops/scripts/install-idunn-yggdrasil-release.sh`. It is extended to
+  install `idunn-verify.service` too, or given a sibling
+  `install-idunn-verify-yggdrasil.sh`.
+- **gamecult-ops adds:**
+  - `idunn/yggdrasil/verify/host.toml` (the Q-V6 values);
+  - `idunn/yggdrasil/verify/bindings/{idunn,cultlib,huginn,eureka}.toml.in`,
+    with image digests as `PROVISIONED_*_IMAGE_DIGEST` tokens, like the
+    existing signer tokens;
+  - `docker/verify-rust-pwsh.Dockerfile` (digest-pinned `FROM`, pwsh from
+    tarball with a sha256 check);
+  - a runbook `runbooks/idunn-verify-yggdrasil.md`: install, account, images,
+    how to read verdicts, and how to suspend (`max_concurrent = 0`).
+- **Yggdrasil:**
+  - groups `idunn-verify`;
+  - the `eureka` account and key, if Q-V7 is B;
+  - roots `/var/lib/gamecult/idunn-verify` (`root:idunn-verify 2750`, with the
+    request store at 0660) and `/srv/build/idunn-verify/cache/{cargo,nuget,npm}`;
+  - images built and pinned.
+- **Recipes (one commit per repo):**
+  - `Idunn: deployment/idunn/verify.toml`: `test-lib` = `cargo test --lib`,
+    plus one step per committed mutation suite.
+  - CultLib: `test-rust`, `test-dotnet`, `test-ts`, `mutate-cultmesh-shared`,
+    `build-quic-native-linux` then `mutate-cultmesh-native` on the `quic-native`
+    runner, which is `seccomp = "unconfined"` under Q-V9.
+  - Huginn, as its campaign needs.
+- **Verification:**
+  - operator: `idunn verify idunn --revision <cut5 sha>` gives `Passed`, and
+    `verify-log` shows 126 passed. On the same host, `systemctl stop idunn-verify`
+    leaves `systemctl is-active idunn-yggdrasil` active. Corrupt a copy of
+    `verify.cc` (swap the store path) and confirm only `idunn-verify` fails.
+  - As the `eureka` user: `sudo -n true` fails, `docker ps` is denied, and
+    `idunn verify` works.
+  - The first Soul pass that runs **through verify**, not the stopgap, is this
+    cut's Soul pass.
+
+### Cut 7. Eureka moves to `idunn verify`; the stopgap dies (deletion line)
+
+- **Repo:** `GameCult/Eureka` plus the Yggdrasil host. Depends on Cut 6 passing
+  its Soul pass.
+- **Deletes first:**
+  - `tools/stopgap/ygg-verify.sh` (91 lines) and `tools/stopgap/rust.Dockerfile`
+    (9 lines), with the directory;
+  - `SKILL.md:417-424`, replaced by the verify rule. Heavy verification goes
+    through `idunn verify` on Yggdrasil: exact pushed SHA, recipe steps,
+    verdict exit codes, and `verify-log` for evidence. The Starfire exception
+    stays only for Windows-only jobs, per Q-V5.
+- **Adds:**
+  - `references/briefs.md` Hands and Soul templates gain the verify
+    instruction. SKILL.md says "Every Hands and Soul brief says so", but
+    `briefs.md` names no verification host today, a gap found in this pass.
+  - A changelog entry. The 2026-09-22 entry stays as history.
+- **Yggdrasil cleanup:**
+  - `rm -rf ~/eureka-verify`;
+  - `docker volume rm eureka-cargo-registry eureka-nuget`;
+  - `docker image rm eureka-verify-rust`, unless Q-V10's image reused the tag
+    (it must not: the new image is `gamecult/verify-rust-pwsh`).
+- **Negative proof that the stopgap is dead:**
+  - `rg -n "ygg-verify|eureka-verify|stopgap" ~/.claude/skills/eureka --glob '!**/changelog.md'`
+    gives 0 hits. Tested at HEAD, this currently hits `SKILL.md:420` and the
+    two stopgap files only.
+  - `ssh ygg 'test ! -e ~/eureka-verify'` succeeds.
+  - `ssh ygg 'sudo docker volume ls -q | grep -c "^eureka-"'` returns 0.
+  - `ssh ygg 'sudo docker ps -a --format "{{.Names}}"'` lists only the known
+    services plus `idunn-verify-*`.
+  - If Q-V7 is B, it becomes structural: the agent account cannot run docker at
+    all, so there is no ad hoc container it could start.
+
+### Cut 9 (placeholder). Windows verify host
+
+This cut is activated only by Q-V5 B or C. If B, it is a new
+`HostActuatorRequest::VerifyStep` variant and a host-native verify runner, with
+the same rules R-V14 to R-V22 lowered for the actuator. Its build host would be
+Windows, and `idunn-host.exe` is built on Starfire today, which the load
+budget now forbids for heavy builds. That tension belongs to the operator.
+
+---
+
+## 6. Not in scope
+
+- Deploying Eureka artifacts, or any deploy change to managed targets.
+- General CI for every GameCult repository. What comes free is that any repo
+  with a verify recipe and binding can be verified. Adding recipes beyond
+  Idunn, CultLib, Huginn and Eureka is not in this campaign.
+- Deploy consulting verdicts, meaning "admit only verified revisions".
+- Converting deploy's blocking materialize to the detached step port. F15 is a
+  real survival defect, but it is deploy's, and it is recorded in section 8.
+- A CultMesh or Eve projection of verify status. By doctrine it is the proper
+  operator surface, and it is recorded as a follow-up. The CLI is the interface
+  for now.
+- Resuming interrupted verifies, memoizing verdicts by `(repo, revision,
+  recipe, step)`, and running steps in parallel within one transaction.
+- Deleting `RecipePhase` from deploy (F2). It is decorative, but removing it
+  changes `gamecult.idunn.target_declaration.v1` because unknown fields are
+  denied, so it is a deploy schema bump.
+
+---
+
+## 7. Subtraction ledger and build budget
+
+| Cut | Removed | Added | Deps / targets / formats | Build host → target |
+|---|---|---|---|---|
+| 0 | 29 doc lines | ~12 doc lines | — | none |
+| 1 | ~90 (argv builders, plan-typed freeze core) | ~140 incl. 3 tests | — | Yggdrasil → linux-x64 |
+| 2 | 0 | ~450 incl. tests | +3 schemas (recipe, binding, host policy) | Yggdrasil → linux-x64 |
+| 3 | 0 | ~350 | +3 record types, +2 stores, +4 CLI verbs | Yggdrasil → linux-x64 |
+| 4 | 0 | ~650 | +1 subcommand, +1 unit; **no new binary, crate or dependency** | Yggdrasil → linux-x64 |
+| 5 | 0 | ~150 Idunn, ~40 × 3 harnesses | +1 xenos JSON schema (report) | Yggdrasil → linux-x64 (Idunn); harnesses need no build |
+| 6 | 0 | ~150 config + runbook, 1 Dockerfile, 3–4 recipes | +1 image build (rust+pwsh) plus pinned upstream images | Yggdrasil builds the image |
+| 7 | 100 lines (stopgap), ~8 SKILL lines; Yggdrasil: `~/eureka-verify` (14 MB), 2 volumes, 641 MB image | ~15 skill/brief lines | −1 ad hoc runner path, −1 free-string command surface | none |
+
+The net is about +1,900 lines. This is a positive delta bought for an
+explicitly requested capability, and each part of it has a reason:
+
+- Verify retires three verification paths: the stopgap, workstation runs, and
+  (by follow-up) the Epiphany text receipts.
+- It makes one of them structurally impossible (Q-V7 B).
+- The cheaper-looking alternative routes through the survival scheduler (§2,
+  rejected path).
+
+Hands may escalate a miss, with an argument, on Cut 4 especially.
+
+Build budget: every Idunn build is one crate, the `idunn` package, profile
+`test` (plus `release` in Cut 6), with no features and target linux-x64. It is
+built on Yggdrasil in `rust:1.95-bookworm` at 4 CPU and 8 GiB, niced, with the
+cargo registry cached. Measured warm test compile: 31.9 s (P1). Its footprint
+is one `target/` per workspace (no `target/` is shared between checkouts),
+deleted with the workspace. Nothing is compiled on Starfire in any cut.
+
+---
+
+## 8. Follow-ups outside this campaign
+
+- **Deploy materialize blocks the survival tick** (F15;
+  `control_plane.rs:3847`, runbook `idunn-host-raven.md`). Move deploy steps
+  onto Cut 4's detached step port. This can wait because it is today's
+  behaviour, and verify no longer adds to it.
+- **The Raven runbook says the deployment brake prevents building during a
+  stream** (`runbooks/idunn-host-raven.md`, "Known edges"). F16 shows the build
+  precedes the brake. The fix is in gamecult-ops. It can wait because it is doc
+  truth, not behaviour.
+- **`scripts/request-idunn-bounded-redeploy-yggdrasil.sh` is dead** (F23). Delete
+  it in gamecult-ops. It can wait because nothing can execute it successfully.
+- **Epiphany's legacy test receipts** (`deploy-epiphany-yggdrasil.sh:171-208`)
+  become a verify verdict when Epiphany moves to the new generation.
+- **`/var/lib/gamecult/idunn/staging` has no retention** (F18: 382 entries,
+  4.1 GiB). Deploy owns this.
+- **Verify status as a CultMesh/Eve projection** (doctrine).
+
+## 9. What this pass could not probe
+
+- The exact revision of the installed `/usr/local/bin/idunn`. It has no version
+  stamp. It predates `5b3f646`.
+- Whether GitHub serves `git fetch origin <sha>` for a SHA reachable only from a
+  non-default branch, under the verify source driver's uid and filtered clone. I
+  expect yes, since GitHub allows fetching reachable SHAs, but it is unprobed.
+  Cut 4's smoke must include one fetch from `cultnet/selection-cut1`.
+- CultLib's native TSan mutation inside Idunn's hardening, meaning
+  `--read-only`, `--cap-drop ALL`, user 65532 and a noexec `/tmp`, combined with
+  `seccomp=unconfined`. `setarch -R` may need more than seccomp relaxation.
+  This is the first Cut 6 smoke and may reopen Q-V9.
+- dotnet test and npm under the hardened shape with a bridge network and a
+  NuGet cache on `/cache`. Only the restore of an empty console app was probed
+  (P2).
