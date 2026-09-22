@@ -1245,3 +1245,117 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
   - **Gap, honestly reported: `resolve()`'s own fsck flag has no test.** Reaching the real `resolve()` needs a validated binding, which needs an HTTPS origin. Rewriting the origin with `insteadOf` fails `ensure_checkout`'s own origin-equality check first, so the shortcut cannot work. **Soul has a working smart-HTTPS rig from its first pass; that is where this closes.**
   - A note on the fsck fixtures: some hostile objects are refused by the git server's own `pack-objects` before any Idunn code runs, so they cannot serve as already-local fixtures. The test asserts that at least one fixture reaches the explicit fsck, so it cannot pass vacuously.
   - **Soul's fifth pass dispatched**, including a judgement on the batch's size.
+
+## Soul pass 5 on Cut 1's fourth fix batch, 2026-09-22
+
+Range `f540d50..9475dfa`, all runs on Yggdrasil (`eureka-verify-rust:471272061cc0`,
+4 CPUs / 12 GiB). Baseline at `9475dfa`: 168 passed, 0 failed, 2 ignored.
+
+**Verdict: Cut 1 closes on mechanism.** Soul could not falsify any claim the
+batch made. The resolver rewrite is correct on every shape it could build,
+memoisation is sound and pinned, the fsck path holds against a real
+smart-HTTPS origin, and the digests are unchanged across five real targets
+with 1,975 entries hash-compared against `ls-tree` and zero mismatches. What
+survives is a bill, not a blocker.
+
+- **S5-1, medium. S4-1 is half fixed, and the line that costs the time is
+  dead.** `drivers.rs:6039-6042` calls `canonicalize()` per path component.
+  The budget charges distinct symlinks read and never charges components
+  walked, so one link with k real components costs roughly O(k^3): 7.35 ms at
+  k=50, 255 ms at k=200, **14.92 s at k=800**, extrapolating to about four
+  minutes at the `PATH_MAX` ceiling. Through the production walk, depth 400 x
+  40 links took **78.6 s**. `frame.resolved` is already canonical there, so
+  the call cannot change the answer: replacing the four lines with
+  `stack[top].resolved = candidate;` leaves 168/168 green. **This restores
+  S4-1's own failure scenario at a lower exponent** - a push adding 40
+  symlinks with long targets wedges the scheduler thread, twice.
+- **S5-2, medium. The traversal budget is the resolver's only termination
+  guarantee and nothing tests it.** `MAX_LINK_TRAVERSALS` to `u32::MAX` leaves
+  168/168 green. `cargo mutants --in-diff` found 16 mutants, 11 caught, 3
+  unviable, **2 missed, both on `:5963`**, each making the budget never
+  decrease. Cycles are refused *only* by the budget - memoisation cannot help,
+  because in-progress frames are never inserted. One character turns a
+  two-link cycle in a bound repository into an unbounded loop on the scheduler
+  thread.
+- **S5-3, low-medium. The digest is blind to symlink targets.** Deleting the
+  target from the hash at `:6205` leaves 168/168 green. Since `observe_frozen`
+  compares `frozen_source_sha256` against the receipt, repointing every
+  symlink in a frozen tree to another in-root path passes both containment and
+  the digest. S4-2's test has one regular file and no symlink.
+- **S5-4, low. The digest is blind to the executable bit.** Deleting the
+  `0o111` term leaves 168/168 green, and `validate_frozen_source` accepts both
+  `0444` and `0555`, so a frozen file can be made executable undetected.
+- **S5-5, low. S4-6 landed with no test, and the batch note called it
+  landed.** Both `ensure!`s replaced with `true` leave 168/168 green. The
+  mechanism does hold - a 64 MiB blob at mode `120000` is refused with VmHWM
+  unchanged - but the threshold is off by one: 4095 bytes is admitted by the
+  guard, written, then refused downstream.
+- **S5-6, low-medium. A legitimate target through more than 39 symlinked
+  components is now refused**, where `f540d50` accepted it. The old recursion
+  charged each sibling depth 1, so the ceiling never fired for that shape.
+  Fail-closed, undeclared, and the error names no link.
+- **S5-7, low. `resolve()` is still unpinned and has no test at all.** Soul
+  settled the mechanism on a real rig - self-signed CA, `git-http-backend`
+  behind TLS, a validated binding, a clean `--filter=blob:none` clone, then
+  `main` moved onto a hostile commit. As shipped: clean admitted, duplicate
+  trees refused, `.GIT` refused. With the flag deleted: both admitted. **The
+  gap is a test gap, not a mechanism gap.**
+- **S5-8, informational. Four containment checks where one suffices**, each
+  surviving deletion alone because the loop tail covers all three arms; only
+  `:6021-6024` earns its place. `FrozenSymlinkFrame::symlink_path` is an
+  `Option` only ever constructed as `Some`, and its doc comment says the
+  opposite.
+- **S5-9. 940 lines, about 400 nameable as deletion.** The 189-line
+  `resolve_style_fetch_then_freeze_exact_refuses_hostile_trees` asserts
+  nothing today: its only assertion sits in an `Ok(_)` arm that pass 4 showed
+  is never taken, and a newer test runs the same seven fixtures plus four more
+  through a harder unguarded fetch. About 190 further lines are boilerplate
+  six module-level helpers would collapse.
+
+**Promises that held, with numbers.** S4-1's headline (n=20 chain 43,700 ms to
+instant, and it freezes); S4-2's zero-buffer and first-chunk-only mutants both
+killed; all three of S4-3's guards killed by isolating tests; S4-4's explicit
+fsck and its own fetch flag killed. Memoisation is sound: making the memo
+never hit kills the n=20 test, and no stale answer was found by probe or by
+reading. Seven of the eight earlier link shapes reproduce identically. The
+budget is per call and that is fine: 31,200 symlinks validate in 8.65 s,
+linear at about 11 ms per link.
+
+**FU-Heimdall-Gitlink has cleared upstream.** Heimdall froze end to end:
+`e0618f7f`, 10.07 s, 945 entries, 0 mismatches; `vendor/CultLib @ b6b1d9c6`
+serves again. No Idunn change caused the break or the fix. **The ops follow-up
+closes.**
+
+### Self's rulings for the fifth fix batch, 2026-09-22
+
+- **R-I1 (S5-1). Delete `drivers.rs:6039-6042`.** Soul proved the call cannot
+  change the answer and that deleting it leaves the suite green. This is not
+  an optimisation, it is removing dead code that costs cubic time. **Then pin
+  the cost**: a test that freezes a link with a long component chain and fails
+  if it is not linear-ish, so the term cannot come back unnoticed.
+- **R-I2 (S5-2). The budget gets the two fixtures Soul specified**: a
+  two-link cycle that must refuse, and 41 distinct links that must refuse.
+  Both must die under their own mutation - a budget that never decreases must
+  turn them red. cargo-mutants missed both mutants on that line, which is
+  exactly why a hand check belongs here.
+- **R-I3 (S5-3, S5-4). The digest covers everything a tamper could change**:
+  symlink targets and the executable bit, each with a test that fails when its
+  term is removed. A digest that is the tamper check must not be blind to a
+  field the validator permits to vary.
+- **R-I4 (S5-5). S4-6 gets its test, and the off-by-one is fixed** so the
+  guard refuses exactly what the kernel refuses. The batch note is corrected:
+  "landed" must not mean "landed unpinned".
+- **R-I5 (S5-6). Keep the 40-traversal ceiling** - it matches the kernel's own
+  `ELOOP` limit, and a fail-closed refusal at that boundary is the right
+  behaviour. **But declare it**: the limit is documented, and the error names
+  the link and the count it reached. My earlier ruling said "keep S6's
+  behaviour exactly"; this is a deliberate, narrow departure from it, recorded
+  as such rather than left as drift.
+- **R-I6 (S5-7). Commit the rig.** It buys the only coverage `resolve()` has
+  and runs in 1.5 s. It **skips** rather than fails when `openssl` or
+  `git-http-backend` is missing, since neither is guaranteed on a workstation.
+- **R-I7 (S5-8, S5-9). Take the deletion.** The three redundant containment
+  checks, the dead `Option` and its wrong comment, the 189-line test that
+  asserts nothing, and the boilerplate the six helpers collapse. **Delete the
+  dead test rather than repairing it** - a newer test already covers its
+  fixtures through a harder path.
