@@ -58,6 +58,93 @@ struct GitTreeEntry {
     path: PathBuf,
 }
 
+/// F2/F3 layer (a): refuses a tree before anything is written from it. Two
+/// distinct leaf entries may not case-fold to the same path (a
+/// case-insensitive filesystem would collapse them), and no leaf entry's
+/// path may be a case-folded ancestor of another leaf's path: a symlink or
+/// file entry named `a` sharing a root with a tree entry that recurses to
+/// `a/pwn` is exactly the shape `git hash-object --literally` can construct
+/// (two entries literally named `a` in one raw tree object) and that
+/// `ls-tree -r` then lists as both a leaf `a` and a leaf `a/pwn`. Refusing it
+/// here, before `materialize_tree_raw` ever runs, is layer (a); the writer
+/// itself (`ensure_frozen_directory`) is layer (b) and never trusts this
+/// check alone.
+fn refuse_conflicting_tree_entries(entries: &[GitTreeEntry]) -> Result<()> {
+    let mut by_lowercase: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for entry in entries {
+        let lowered = entry.path.to_string_lossy().to_lowercase();
+        if let Some(existing) = by_lowercase.insert(lowered, entry.path.clone()) {
+            ensure!(
+                existing == entry.path,
+                "Git tree paths {} and {} collide case-insensitively",
+                existing.display(),
+                entry.path.display()
+            );
+        }
+    }
+    for entry in entries {
+        for ancestor in entry.path.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            let lowered = ancestor.to_string_lossy().to_lowercase();
+            if let Some(colliding) = by_lowercase.get(&lowered) {
+                bail!(
+                    "Git tree entry {} aliases path {} used by another entry",
+                    entry.path.display(),
+                    colliding.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// F2/F3 layer (b): the only way `materialize_tree_raw` is allowed to obtain
+/// a directory to write into. `path` must already be a directory this
+/// function created earlier in the same freeze (tracked in `created_dirs`,
+/// seeded with `root` by the caller), or must not exist yet at all. Anything
+/// else already at `path` — a symlink, a file, or a directory this freeze did
+/// not itself create — is refused outright rather than traversed, which is
+/// what a plain `fs::create_dir_all` would silently do through a symlink.
+fn ensure_frozen_directory(
+    root: &Path,
+    created_dirs: &mut std::collections::HashSet<PathBuf>,
+    path: &Path,
+) -> Result<()> {
+    if created_dirs.contains(path) {
+        return Ok(());
+    }
+    ensure!(
+        path.starts_with(root),
+        "frozen source path {} escapes its root",
+        path.display()
+    );
+    let parent = path
+        .parent()
+        .context("frozen source path has no parent")?;
+    ensure_frozen_directory(root, created_dirs, parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => bail!(
+            "frozen source writer refuses to write through an existing {} at {}",
+            if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.is_dir() {
+                "directory this freeze did not create"
+            } else {
+                "file"
+            },
+            path.display()
+        ),
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).with_context(|| format!("creating {}", path.display()))?;
+        }
+        Err(error) => return Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+    created_dirs.insert(path.to_path_buf());
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedSource {
     pub facts: SourceSelectionFacts,
@@ -930,6 +1017,7 @@ impl GitSourceDriver {
             entries.windows(2).all(|pair| pair[0].path != pair[1].path),
             "Git tree emits a path twice"
         );
+        refuse_conflicting_tree_entries(&entries)?;
         Ok(entries)
     }
 
@@ -1044,16 +1132,94 @@ impl GitSourceDriver {
         Ok(())
     }
 
-    /// Reads every named blob object's raw bytes from `repository` through one
-    /// `git cat-file --batch` process, with no attribute-driven transform of
-    /// any kind: `--batch` never smudges, never renormalizes line endings,
-    /// and never expands `ident`/`export-subst`. The batch protocol frames
-    /// each answer with an exact byte count, so binary content is read by
-    /// that count rather than by scanning for a delimiter.
-    fn read_blobs(&self, repository: &Path, objects: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
-        let mut result = BTreeMap::new();
+    /// F1: fetches every object in `objects` in one bulk round trip, instead
+    /// of letting a partial (`blob:none`) clone lazily fetch each missing
+    /// blob one at a time when `stream_blobs` later reads it. `--stdin`
+    /// (Git 2.36+) takes the object list off argv, so this holds for
+    /// thousands of objects without an argv-length limit. Objects the
+    /// checkout already has are asked for again; Git answers from the local
+    /// pack without a network round trip for those, which is cheap next to
+    /// the round trips this replaces. `transfer.fsckObjects=true` is layer
+    /// (a) of F2/F3: Git itself refuses a fetched tree with duplicate names
+    /// before any of it reaches disk, independent of `refuse_conflicting_tree_entries`.
+    fn bulk_fetch_objects(&self, repository: &Path, objects: &[String]) -> Result<()> {
         if objects.is_empty() {
-            return Ok(result);
+            return Ok(());
+        }
+        // A repository with no `origin` remote is necessarily self-contained
+        // (every real checkout this driver creates has one); skip the fetch
+        // rather than fail on a repository that already holds everything.
+        let has_origin = self
+            .git([
+                OsString::from("-C"),
+                repository.as_os_str().to_owned(),
+                OsString::from("remote"),
+                OsString::from("get-url"),
+                OsString::from("origin"),
+            ])
+            .is_ok();
+        if !has_origin {
+            return Ok(());
+        }
+        let mut command = self.git_command([
+            OsString::from("-c"),
+            OsString::from("transfer.fsckObjects=true"),
+            OsString::from("-C"),
+            repository.as_os_str().to_owned(),
+            OsString::from("fetch"),
+            OsString::from("--no-tags"),
+            OsString::from("--no-write-fetch-head"),
+            OsString::from("--stdin"),
+            OsString::from("origin"),
+        ])?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().context("starting bulk Git fetch")?;
+        let mut stdin = child.stdin.take().context("bulk Git fetch has no stdin")?;
+        let request: Vec<u8> = objects
+            .iter()
+            .flat_map(|object| {
+                let mut line = object.as_bytes().to_vec();
+                line.push(b'\n');
+                line
+            })
+            .collect();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(&request) });
+        let output = child
+            .wait_with_output()
+            .context("waiting for bulk Git fetch to exit")?;
+        let write_result = writer
+            .join()
+            .map_err(|_| anyhow!("bulk Git fetch stdin writer panicked"))?;
+        write_result.context("writing bulk Git fetch requests")?;
+        ensure!(
+            output.status.success(),
+            "bulk Git fetch exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(())
+    }
+
+    /// Streams every named blob object's raw bytes from `repository` through
+    /// one `git cat-file --batch` process, with no attribute-driven
+    /// transform of any kind, calling `on_object(object, reader, size)` once
+    /// per object **in request order** with a reader positioned at exactly
+    /// `size` bytes of that object's content; `on_object` must consume all
+    /// of it. F9: stderr is drained on a dedicated thread and the child is
+    /// waited on unconditionally, on every return path including an error
+    /// from `on_object`, so a failure here never leaves a zombie process or
+    /// a stalled pipe.
+    fn stream_blobs(
+        &self,
+        repository: &Path,
+        objects: &[String],
+        mut on_object: impl FnMut(&str, &mut dyn Read, usize) -> Result<()>,
+    ) -> Result<()> {
+        if objects.is_empty() {
+            return Ok(());
         }
         let mut command = self.git_command([
             OsString::from("-C"),
@@ -1074,6 +1240,10 @@ impl GitSourceDriver {
             .stdout
             .take()
             .context("Git cat-file --batch has no stdout")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("Git cat-file --batch has no stderr")?;
         let request: Vec<u8> = objects
             .iter()
             .flat_map(|object| {
@@ -1086,66 +1256,74 @@ impl GitSourceDriver {
             stdin.write_all(&request)
             // `stdin` drops here, closing the pipe so Git sees end of input.
         });
-        let mut reader = std::io::BufReader::new(stdout);
-        for object in objects {
-            let mut header = Vec::new();
-            reader
-                .read_until(b'\n', &mut header)
-                .context("reading a Git cat-file --batch header")?;
-            ensure!(
-                header.last() == Some(&b'\n'),
-                "Git cat-file --batch closed before answering every object"
-            );
-            header.pop();
-            let header = String::from_utf8(header)
-                .context("Git cat-file --batch header is not UTF-8")?;
-            let mut fields = header.split(' ');
-            let returned_object = fields
-                .next()
-                .context("Git cat-file --batch header names no object")?;
-            ensure!(
-                returned_object == object,
-                "Git cat-file --batch answered objects out of the requested order"
-            );
-            let kind_or_missing = fields
-                .next()
-                .context("Git cat-file --batch header is malformed")?;
-            ensure!(
-                kind_or_missing != "missing",
-                "Git object {object} is missing from the repository"
-            );
-            let size: usize = fields
-                .next()
-                .context("Git cat-file --batch header has no size")?
-                .parse()
-                .context("Git cat-file --batch size is not a number")?;
-            ensure!(
-                fields.next().is_none(),
-                "Git cat-file --batch header has extra fields"
-            );
-            let mut content = vec![0u8; size];
-            reader
-                .read_exact(&mut content)
-                .context("reading Git cat-file --batch object content")?;
-            let mut trailer = [0u8; 1];
-            reader
-                .read_exact(&mut trailer)
-                .context("reading the newline after a Git cat-file --batch object")?;
-            ensure!(
-                trailer[0] == b'\n',
-                "Git cat-file --batch object content ran past its declared size"
-            );
-            result.insert(object.clone(), content);
-        }
+        let stderr_reader = std::thread::spawn(move || -> Vec<u8> {
+            let mut buffer = Vec::new();
+            let _ = stderr.read_to_end(&mut buffer);
+            buffer
+        });
+        let body: Result<()> = (|| {
+            let mut reader = std::io::BufReader::new(stdout);
+            for object in objects {
+                let mut header = Vec::new();
+                reader
+                    .read_until(b'\n', &mut header)
+                    .context("reading a Git cat-file --batch header")?;
+                ensure!(
+                    header.last() == Some(&b'\n'),
+                    "Git cat-file --batch closed before answering every object"
+                );
+                header.pop();
+                let header = String::from_utf8(header)
+                    .context("Git cat-file --batch header is not UTF-8")?;
+                let mut fields = header.split(' ');
+                let returned_object = fields
+                    .next()
+                    .context("Git cat-file --batch header names no object")?;
+                ensure!(
+                    returned_object == object,
+                    "Git cat-file --batch answered objects out of the requested order"
+                );
+                let kind_or_missing = fields
+                    .next()
+                    .context("Git cat-file --batch header is malformed")?;
+                ensure!(
+                    kind_or_missing != "missing",
+                    "Git object {object} is missing from the repository"
+                );
+                let size: usize = fields
+                    .next()
+                    .context("Git cat-file --batch header has no size")?
+                    .parse()
+                    .context("Git cat-file --batch size is not a number")?;
+                ensure!(
+                    fields.next().is_none(),
+                    "Git cat-file --batch header has extra fields"
+                );
+                on_object(object, &mut reader, size)?;
+                let mut trailer = [0u8; 1];
+                reader
+                    .read_exact(&mut trailer)
+                    .context("reading the newline after a Git cat-file --batch object")?;
+                ensure!(
+                    trailer[0] == b'\n',
+                    "Git cat-file --batch object content ran past its declared size"
+                );
+            }
+            Ok(())
+        })();
+        let stderr_bytes = stderr_reader.join().unwrap_or_default();
+        let write_result = writer.join().map_err(|_| anyhow!("Git cat-file --batch stdin writer panicked"));
         let status = child
             .wait()
             .context("waiting for Git cat-file --batch to exit")?;
-        writer
-            .join()
-            .map_err(|_| anyhow!("Git cat-file --batch stdin writer panicked"))?
-            .context("writing Git cat-file --batch requests")?;
-        ensure!(status.success(), "Git cat-file --batch exited with {status}");
-        Ok(result)
+        body?;
+        write_result?.context("writing Git cat-file --batch requests")?;
+        ensure!(
+            status.success(),
+            "Git cat-file --batch exited with {status}: {}",
+            String::from_utf8_lossy(&stderr_bytes).trim()
+        );
+        Ok(())
     }
 
     /// Writes every entry of `repository`'s tree at `revision` into
@@ -1154,58 +1332,44 @@ impl GitSourceDriver {
     /// symlinks are preserved exactly as the tree records them. Returns the
     /// paths, relative to `destination`, whose content is a Git LFS pointer
     /// (LFS content itself is never fetched).
+    ///
+    /// F1: blobs are bulk-fetched once (`bulk_fetch_objects`) and then
+    /// streamed straight to their destination file (`stream_blobs`), never
+    /// held whole in memory. F2/F3 layer (b): every directory this writes
+    /// into is created by `ensure_frozen_directory`, which never treats an
+    /// existing symlink or foreign directory as traversable, and every
+    /// symlink entry is written only in the final pass, after every
+    /// directory and regular file this tree needs already exists — so
+    /// nothing written earlier can ever be reached back out through a
+    /// symlink this call creates.
     fn materialize_tree_raw(
         &self,
         repository: &Path,
         revision: &str,
         destination: &Path,
+        frozen_root: &Path,
+        created_dirs: &mut std::collections::HashSet<PathBuf>,
     ) -> Result<Vec<PathBuf>> {
-        fs::create_dir_all(destination)
-            .with_context(|| format!("creating {}", destination.display()))?;
+        ensure_frozen_directory(frozen_root, created_dirs, destination)?;
         let entries = self.git_tree_entries(repository, revision)?;
-        let blob_objects: Vec<String> = entries
-            .iter()
-            .filter(|entry| entry.kind == "blob")
-            .map(|entry| entry.object.clone())
-            .collect();
-        let blobs = self.read_blobs(repository, &blob_objects)?;
-        let mut lfs_pointer_paths = Vec::new();
+
+        // Pass 1: every directory this tree needs, before any file or
+        // symlink content is written. No symlink exists yet at this point,
+        // so nothing here can traverse one.
         for entry in &entries {
             let target = destination.join(&entry.path);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
             match entry.mode.as_str() {
-                "100644" | "100755" => {
-                    let content = blobs
-                        .get(&entry.object)
-                        .context("Git cat-file --batch omitted a requested blob")?;
-                    fs::write(&target, content)
-                        .with_context(|| format!("writing {}", target.display()))?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = if entry.mode == "100755" { 0o755 } else { 0o644 };
-                        fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
-                    }
-                    if is_lfs_pointer(content) {
-                        lfs_pointer_paths.push(entry.path.clone());
-                    }
-                }
-                "120000" => {
-                    let content = blobs
-                        .get(&entry.object)
-                        .context("Git cat-file --batch omitted a requested blob")?;
-                    let link_target = std::str::from_utf8(content)
-                        .context("frozen source symlink target is not UTF-8")?;
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(link_target, &target)
-                        .with_context(|| format!("creating symlink {}", target.display()))?;
+                "100644" | "100755" | "120000" => {
+                    let parent = target
+                        .parent()
+                        .context("frozen source tree entry has no parent")?;
+                    ensure_frozen_directory(frozen_root, created_dirs, parent)?;
                 }
                 "160000" => {
                     // Gitlinks are materialized by the caller, which knows
-                    // each one's admitted origin; this entry only reserves
-                    // the directory.
+                    // each one's admitted origin; reserve the directory now
+                    // so the caller's own writer has somewhere safe to land.
+                    ensure_frozen_directory(frozen_root, created_dirs, &target)?;
                 }
                 other => bail!(
                     "frozen source tree entry {} has an unsupported mode {other}",
@@ -1213,19 +1377,164 @@ impl GitSourceDriver {
                 ),
             }
         }
+
+        // Pass 2: bulk-fetch every blob this tree needs in one round trip
+        // (F1), then stream each one to disk. Regular files are written
+        // directly; symlink targets are tiny path strings, buffered here and
+        // written in Pass 3, last.
+        let mut object_order: Vec<String> = Vec::new();
+        let mut entries_by_object: std::collections::HashMap<&str, Vec<&GitTreeEntry>> =
+            std::collections::HashMap::new();
+        for entry in entries.iter().filter(|entry| entry.kind == "blob") {
+            entries_by_object
+                .entry(entry.object.as_str())
+                .or_insert_with(|| {
+                    object_order.push(entry.object.clone());
+                    Vec::new()
+                })
+                .push(entry);
+        }
+        self.bulk_fetch_objects(repository, &object_order)?;
+
+        let mut lfs_pointer_paths = Vec::new();
+        let mut symlink_targets: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+        self.stream_blobs(repository, &object_order, |object, reader, size| {
+            let group = entries_by_object
+                .get(object)
+                .context("Git cat-file --batch answered an object nobody requested")?;
+            let (first, rest) = group
+                .split_first()
+                .expect("every requested object groups at least one entry");
+            let write_file = |entry: &GitTreeEntry, content: &[u8]| -> Result<()> {
+                let target = destination.join(&entry.path);
+                fs::write(&target, content).with_context(|| format!("writing {}", target.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = if entry.mode == "100755" { 0o755 } else { 0o644 };
+                    fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+                }
+                Ok(())
+            };
+            match first.mode.as_str() {
+                "100644" | "100755" => {
+                    let target = destination.join(&first.path);
+                    let mut file = fs::File::create(&target)
+                        .with_context(|| format!("writing {}", target.display()))?;
+                    let mut remaining = size;
+                    let mut buffer = [0u8; 65536];
+                    let mut peek: Vec<u8> = Vec::new();
+                    while remaining > 0 {
+                        let want = buffer.len().min(remaining);
+                        reader
+                            .read_exact(&mut buffer[..want])
+                            .context("reading Git cat-file --batch object content")?;
+                        if peek.len() < 128 {
+                            let take = (128 - peek.len()).min(want);
+                            peek.extend_from_slice(&buffer[..take]);
+                        }
+                        file.write_all(&buffer[..want])
+                            .with_context(|| format!("writing {}", target.display()))?;
+                        remaining -= want;
+                    }
+                    drop(file);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = if first.mode == "100755" { 0o755 } else { 0o644 };
+                        fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+                    }
+                    let is_lfs = is_lfs_pointer(&peek);
+                    if is_lfs {
+                        lfs_pointer_paths.push(first.path.clone());
+                    }
+                    for extra in rest {
+                        match extra.mode.as_str() {
+                            "100644" | "100755" => {
+                                let extra_target = destination.join(&extra.path);
+                                fs::copy(&target, &extra_target).with_context(|| {
+                                    format!("writing {}", extra_target.display())
+                                })?;
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let mode = if extra.mode == "100755" { 0o755 } else { 0o644 };
+                                    fs::set_permissions(&extra_target, fs::Permissions::from_mode(mode))?;
+                                }
+                                if is_lfs {
+                                    lfs_pointer_paths.push(extra.path.clone());
+                                }
+                            }
+                            "120000" => {
+                                symlink_targets.insert(extra.path.clone(), fs::read(&target)?);
+                            }
+                            other => bail!(
+                                "frozen source tree entry {} has an unsupported mode {other}",
+                                extra.path.display()
+                            ),
+                        }
+                    }
+                }
+                "120000" => {
+                    let mut content = vec![0u8; size];
+                    reader
+                        .read_exact(&mut content)
+                        .context("reading Git cat-file --batch object content")?;
+                    symlink_targets.insert(first.path.clone(), content.clone());
+                    for extra in rest {
+                        match extra.mode.as_str() {
+                            "120000" => {
+                                symlink_targets.insert(extra.path.clone(), content.clone());
+                            }
+                            "100644" | "100755" => write_file(extra, &content)?,
+                            other => bail!(
+                                "frozen source tree entry {} has an unsupported mode {other}",
+                                extra.path.display()
+                            ),
+                        }
+                    }
+                }
+                other => bail!(
+                    "frozen source tree entry {} has an unsupported mode {other}",
+                    first.path.display()
+                ),
+            }
+            Ok(())
+        })?;
+
+        // Pass 3: symlinks, last. Every directory this tree needs already
+        // exists from Pass 1, and no symlink this call creates existed
+        // before this point.
+        for (relative_path, content) in symlink_targets {
+            let target = destination.join(&relative_path);
+            let link_target = std::str::from_utf8(&content)
+                .context("frozen source symlink target is not UTF-8")?;
+            ensure!(
+                fs::symlink_metadata(&target).is_err(),
+                "frozen source writer refuses to overwrite an existing entry at {}",
+                target.display()
+            );
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(link_target, &target)
+                .with_context(|| format!("creating symlink {}", target.display()))?;
+        }
         Ok(lfs_pointer_paths)
     }
 
     /// Clones a Gitlink's admitted origin at its exact recorded revision and
     /// writes its tree raw under `destination_root.join(path)`, the same
-    /// byte-exact primitive as the superproject. Returns the materialized
-    /// LFS-pointer paths, relative to `destination_root`.
+    /// byte-exact primitive as the superproject, sharing the superproject's
+    /// `created_dirs` bookkeeping so a Gitlink can never alias a path the
+    /// superproject (or an earlier Gitlink) already wrote. Returns the
+    /// materialized LFS-pointer paths, relative to `destination_root`.
     fn materialize_gitlink_raw(
         &self,
         source: &ExactSource,
         path: &Path,
         fact: &GitlinkTreeFact,
         destination_root: &Path,
+        frozen_root: &Path,
+        created_dirs: &mut std::collections::HashSet<PathBuf>,
     ) -> Result<Vec<PathBuf>> {
         let checkout_text = source
             .checkout
@@ -1250,6 +1559,8 @@ impl GitSourceDriver {
                 checkout.as_os_str().to_owned(),
             ])?;
             self.git([
+                OsString::from("-c"),
+                OsString::from("transfer.fsckObjects=true"),
                 OsString::from("-C"),
                 checkout.as_os_str().to_owned(),
                 OsString::from("fetch"),
@@ -1271,7 +1582,13 @@ impl GitSourceDriver {
                     .any(|entry| entry.mode == "160000"),
                 "nested Gitlinks are not admitted in Idunn v1"
             );
-            self.materialize_tree_raw(&checkout, &fact.revision, &destination_root.join(path))
+            self.materialize_tree_raw(
+                &checkout,
+                &fact.revision,
+                &destination_root.join(path),
+                frozen_root,
+                created_dirs,
+            )
         })();
         let cleanup = if checkout.exists() {
             remove_tree_inside(&gitlink_root, &checkout)
@@ -1316,6 +1633,8 @@ impl GitSourceDriver {
         );
         self.prepare_source_root(source)?;
         self.git([
+            OsString::from("-c"),
+            OsString::from("transfer.fsckObjects=true"),
             OsString::from("-C"),
             source.checkout.as_os_str().to_owned(),
             OsString::from("fetch"),
@@ -1329,11 +1648,19 @@ impl GitSourceDriver {
         let partial = transaction_root.join(".partial");
         prepare_frozen_source_destination(&partial)?;
         let materialization = (|| {
+            let mut created_dirs = std::collections::HashSet::new();
+            created_dirs.insert(partial.clone());
             let mut lfs_pointer_paths =
-                self.materialize_tree_raw(&source.checkout, revision, &partial)?;
+                self.materialize_tree_raw(&source.checkout, revision, &partial, &partial, &mut created_dirs)?;
             for (path, fact) in &gitlinks {
-                lfs_pointer_paths
-                    .extend(self.materialize_gitlink_raw(source, path, fact, &partial)?);
+                lfs_pointer_paths.extend(self.materialize_gitlink_raw(
+                    source,
+                    path,
+                    fact,
+                    &partial,
+                    &partial,
+                    &mut created_dirs,
+                )?);
             }
             let recipe_file = partial.join(&source.recipe_path);
             let recipe_metadata = fs::symlink_metadata(&recipe_file)?;
@@ -1347,8 +1674,13 @@ impl GitSourceDriver {
                 materialized_recipe == recipe_bytes,
                 "frozen recipe differs from the selected tree's recipe blob"
             );
+            // F4: one hardening pass, last, sets and validates the frozen
+            // tree's ownership, modes and symlinks in the same walk. A
+            // separate, later `validate_frozen_source` re-walk was a
+            // redundant duplicate of exactly this check; it stays only as
+            // the read-only re-check `observe_frozen` uses on a tree it did
+            // not just write.
             harden_frozen_source(&partial)?;
-            validate_frozen_source(&partial)?;
             let snapshot_sha256 = frozen_source_sha256(&partial)?;
             Ok::<_, anyhow::Error>((snapshot_sha256, !lfs_pointer_paths.is_empty()))
         })();
@@ -1375,8 +1707,8 @@ impl GitSourceDriver {
 
 /// A Git LFS pointer file's exact, well-known first line (the LFS pointer
 /// spec fixes this text). Detecting it needs no LFS tooling: the pointer is
-/// itself the blob content when LFS smudging never runs, which `read_blobs`
-/// guarantees by construction.
+/// itself the blob content when LFS smudging never runs, which
+/// `stream_blobs` guarantees by construction.
 fn is_lfs_pointer(content: &[u8]) -> bool {
     content.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
 }
@@ -1889,17 +2221,19 @@ impl DockerRunnerDriver {
             .iter()
             .find(|candidate| candidate.id == artifact_id)
             .context("artifact declaration disappeared")?;
-        let source_path = match artifact.source_kind {
-            ArtifactSource::RunnerOutput => workspaces
-                .get(
-                    artifact
-                        .runner
-                        .as_deref()
-                        .context("runner artifact lost its runner")?,
-                )
-                .context("runner workspace is absent")?
-                .join(&artifact.source),
-            ArtifactSource::WorktreeTree => source.root.join(&artifact.source),
+        let (containment_root, source_path) = match artifact.source_kind {
+            ArtifactSource::RunnerOutput => {
+                let workspace = workspaces
+                    .get(
+                        artifact
+                            .runner
+                            .as_deref()
+                            .context("runner artifact lost its runner")?,
+                    )
+                    .context("runner workspace is absent")?;
+                (workspace.clone(), workspace.join(&artifact.source))
+            }
+            ArtifactSource::WorktreeTree => (source.root.clone(), source.root.join(&artifact.source)),
         };
         ensure!(source_path.exists(), "declared artifact output is absent");
         let destination = staging_root.join(&artifact.destination);
@@ -1907,7 +2241,7 @@ impl DockerRunnerDriver {
             destination.starts_with(staging_root),
             "artifact destination escaped its release staging root"
         );
-        copy_artifact(&source_path, &destination)?;
+        copy_artifact(&containment_root, &source_path, &destination)?;
         let (sha256, size_bytes) = digest_artifact(&destination)?;
         if let Some(expected) = &artifact.expected_sha256 {
             ensure!(
@@ -5512,36 +5846,26 @@ fn harden_frozen_source_tree(root: &Path, current: &Path) -> Result<()> {
     Ok(())
 }
 
+/// F5: a lexical, component-counting check is not enough once the chain
+/// passes back through another symlink. The fixture `D -> .`, `L ->
+/// D/D/../../../../../../etc/passwd` resolves inside the root by naive
+/// `..`-counting (each `D` looks like one ordinary path component to a
+/// counter), but the filesystem resolves `D` to a fresh copy of the root on
+/// every hop, so the real target is `/etc/passwd`. Asking the filesystem to
+/// resolve the whole chain, the same way anything that later opens the link
+/// will, is exact where counting is not.
 #[cfg(unix)]
 fn validate_frozen_source_symlink(root: &Path, path: &Path) -> Result<()> {
     let target = fs::read_link(path)?;
     ensure!(target.is_relative(), "frozen source symlink is absolute");
-    let parent = path
-        .parent()
-        .context("frozen source symlink has no parent")?;
-    let mut components = parent
-        .strip_prefix(root)?
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(value) => Some(value.to_os_string()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    for component in target.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(value) => components.push(value.to_os_string()),
-            std::path::Component::ParentDir => {
-                ensure!(
-                    components.pop().is_some(),
-                    "frozen source symlink escapes its root"
-                );
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                bail!("frozen source symlink is absolute")
-            }
-        }
-    }
+    let canonical_root = root.canonicalize().context("resolving frozen source root")?;
+    let canonical_target = path.canonicalize().with_context(|| {
+        format!("resolving frozen source symlink chain at {}", path.display())
+    })?;
+    ensure!(
+        canonical_target.starts_with(&canonical_root),
+        "frozen source symlink escapes its root"
+    );
     Ok(())
 }
 
@@ -6817,15 +7141,30 @@ fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn copy_artifact(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
+/// F5: `source` may name a path reached through an intermediate symlink a
+/// runner's own build output created (`fs::symlink_metadata` follows every
+/// path component but the last, so a symlinked directory earlier in `source`
+/// would otherwise be followed transparently). `root` is resolved and
+/// checked to contain the fully resolved `source` with the same
+/// whole-chain-aware resolver `validate_frozen_source_symlink` uses, before
+/// anything is read from it.
+pub(crate) fn copy_artifact(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+    let canonical_root = root.canonicalize().context("resolving artifact root")?;
+    let canonical_source = source
+        .canonicalize()
+        .with_context(|| format!("resolving artifact source {}", source.display()))?;
+    ensure!(
+        canonical_source.starts_with(&canonical_root),
+        "artifact source escapes its root"
+    );
+    let metadata = fs::symlink_metadata(&canonical_source)?;
     if metadata.is_dir() {
-        copy_tree(source, destination)
+        copy_tree(&canonical_source, destination)
     } else if metadata.is_file() {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(source, destination)?;
+        fs::copy(&canonical_source, destination)?;
         Ok(())
     } else {
         bail!("artifact output is not a regular file or directory")
@@ -9722,11 +10061,15 @@ mod tests {
             temp.path().join("frozen-source"),
             None,
         );
-        driver.materialize_tree_raw(&repository, &revision, &destination)?;
+        let mut created_dirs = std::collections::HashSet::new();
+        created_dirs.insert(destination.clone());
+        driver.materialize_tree_raw(&repository, &revision, &destination, &destination, &mut created_dirs)?;
         driver.materialize_tree_raw(
             &repository,
             &revision,
             &destination.join("vendor/fixture"),
+            &destination,
+            &mut created_dirs,
         )?;
         harden_frozen_source(&destination)?;
 

@@ -1063,7 +1063,7 @@ fn materialize(
             destination.starts_with(&staging),
             "artifact destination escaped its staging root"
         );
-        copy_artifact(&source_path, &destination)?;
+        copy_artifact(&source, &source_path, &destination)?;
         let (sha256, size_bytes) = digest_artifact(&destination)?;
         if let Some(expected) = &artifact.expected_sha256 {
             ensure!(
