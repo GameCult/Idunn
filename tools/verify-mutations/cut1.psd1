@@ -68,5 +68,196 @@
 '@
             New  = ''
         }
+        # ---- Cut 1 fix batch: Soul's 13 surviving mutants (F1), minus S8 ----
+        # (S8, dropping the `validate_frozen_source` call inside `freeze_exact`,
+        # is not yet reached: `harden_frozen_source` runs first and unconditionally
+        # forces the exact permissions and symlink-escape check `validate_frozen_source`
+        # re-derives, so no fixture reachable through `freeze_exact` today can make
+        # `validate_frozen_source` fail where `harden_frozen_source` did not already
+        # fail first. This is a design-redundancy finding, not a coverage gap; see
+        # the fix-batch report.)
+        @{
+            Id   = 'cut1-fix-cap-drop-only-on-bridge'
+            Rule = '--cap-drop ALL is present on every network branch, not only the default.'
+            Test = 'drivers::tests::docker_run_args_pins_every_network_branch'
+            Old  = @'
+    match spec.seccomp {
+        ContainerSeccomp::Default => {}
+    }
+    args.extend([
+'@
+            New  = @'
+    match spec.seccomp {
+        ContainerSeccomp::Default => {}
+    }
+    if spec.network == ContainerNetwork::Bridge {
+        args.retain(|a| a != "--cap-drop" && a != "ALL");
+    }
+    args.extend([
+'@
+        }
+        @{
+            Id   = 'cut1-fix-read-only-dropped-on-named'
+            Rule = '--read-only is present on every network branch, including a Named network.'
+            Test = 'drivers::tests::docker_run_args_pins_every_network_branch'
+            Old  = @'
+    args.extend([
+        OsString::from("--read-only"),
+        OsString::from("--pids-limit"),
+'@
+            New  = @'
+    if !matches!(spec.network, ContainerNetwork::Named(_)) {
+        args.push(OsString::from("--read-only"));
+    }
+    args.extend([
+        OsString::from("--pids-limit"),
+'@
+        }
+        @{
+            Id   = 'cut1-fix-cpus-round-half'
+            Rule = '--cpus is cpu_quota_percent / 100 to two decimal places, not rounded to the nearest 0.5.'
+            Test = 'drivers::tests::docker_run_args_pins_cpu_quota_across_the_range'
+            Old  = @'
+        OsString::from(format!(
+            "{:.2}",
+            f64::from(spec.cpu_quota_percent) / 100.0
+        )),
+'@
+            New  = @'
+        OsString::from(format!(
+            "{:.2}",
+            (f64::from(spec.cpu_quota_percent) / 100.0 * 2.0).round() / 2.0
+        )),
+'@
+        }
+        @{
+            Id   = 'cut1-fix-cpus-floor-50'
+            Rule = '--cpus is cpu_quota_percent / 100 exactly, not the quota floored to the nearest 50 first.'
+            Test = 'drivers::tests::docker_run_args_pins_cpu_quota_across_the_range'
+            Old  = @'
+        OsString::from(format!(
+            "{:.2}",
+            f64::from(spec.cpu_quota_percent) / 100.0
+        )),
+'@
+            New  = @'
+        OsString::from(format!(
+            "{:.2}",
+            f64::from(spec.cpu_quota_percent / 50 * 50) / 100.0
+        )),
+'@
+        }
+        @{
+            Id   = 'cut1-fix-env-prefix-passthrough'
+            Rule = 'ContainerSpec::for_step copies only the exact required environment names, never a binding entry that merely starts with one.'
+            Test = 'drivers::tests::required_environment_rejects_prefix_and_ambient_passthrough'
+            Old  = @'
+            if let Some(value) = runner.environment.get(name) {
+                environment.push((name.clone(), value.clone()));
+            } else if let Some(path) = runner.secret_files.get(name) {
+'@
+            New  = @'
+            for (k, v) in &runner.environment {
+                if k != name && k.starts_with(name.as_str()) {
+                    environment.push((k.clone(), v.clone()));
+                }
+            }
+            if let Some(value) = runner.environment.get(name) {
+                environment.push((name.clone(), value.clone()));
+            } else if let Some(path) = runner.secret_files.get(name) {
+'@
+        }
+        @{
+            Id   = 'cut1-fix-ambient-gamecult-idunn-env'
+            Rule = 'ContainerSpec::for_step never admits a binding environment entry ambiently by its GAMECULT_/IDUNN_ prefix.'
+            Test = 'drivers::tests::required_environment_rejects_prefix_and_ambient_passthrough'
+            Old  = @'
+        let mut environment = vec![(source_stamp.0.to_owned(), source_stamp.1.to_owned())];
+        let mut secret_mounts = Vec::new();
+'@
+            New  = @'
+        let mut environment = vec![(source_stamp.0.to_owned(), source_stamp.1.to_owned())];
+        let mut secret_mounts = Vec::new();
+        for (k, v) in &runner.environment {
+            if k.starts_with("GAMECULT_") || k.starts_with("IDUNN_") {
+                environment.push((k.clone(), v.clone()));
+            }
+        }
+'@
+        }
+        @{
+            Id   = 'cut1-fix-secret-mount-writable'
+            Rule = 'A secret mount is bound read-only.'
+            Test = 'drivers::tests::docker_run_args_mounts_secrets_read_only'
+            Old  = @'
+        args.push(bind_mount(&mount.host_path, &mount.container_path, true)?);
+'@
+            New  = @'
+        args.push(bind_mount(&mount.host_path, &mount.container_path, false)?);
+'@
+        }
+        @{
+            Id   = 'cut1-fix-explicit-none-is-bridge'
+            Rule = 'An explicit network_profile = "none" lowers to ContainerNetwork::None, never Bridge.'
+            Test = 'drivers::tests::explicit_none_network_profile_is_none_not_bridge'
+            Old  = @'
+            None | Some("none") => ContainerNetwork::None,
+'@
+            New  = @'
+            None => ContainerNetwork::None,
+            Some("none") => ContainerNetwork::Bridge,
+'@
+        }
+        @{
+            Id   = 'cut1-fix-cache-mount-extra-parent'
+            Rule = 'A cache root adds exactly one --mount, never a second mount of its parent directory.'
+            Test = 'drivers::tests::docker_run_args_mounts_cache_root_exactly_once'
+            Old  = @'
+        args.push(bind_mount(cache_root, "/cache", false)?);
+'@
+            New  = @'
+        args.push(bind_mount(cache_root, "/cache", false)?);
+        args.push(OsString::from("--mount"));
+        args.push(bind_mount(cache_root.parent().unwrap(), "/cache-parent", false)?);
+'@
+        }
+        @{
+            Id   = 'cut1-fix-freeze-skips-gitlinks'
+            Rule = 'freeze_exact materializes every declared Gitlink.'
+            Test = 'drivers::tests::freeze_exact_materializes_gitlinks'
+            Old  = @'
+            for (path, fact) in &gitlinks {
+                self.materialize_gitlink_archive(source, path, fact, &partial)?;
+            }
+'@
+            New  = @'
+            for (path, fact) in gitlinks.iter().take(0) {
+                self.materialize_gitlink_archive(source, path, fact, &partial)?;
+            }
+'@
+        }
+        @{
+            Id   = 'cut1-fix-secret-validation-skipped'
+            Rule = 'ContainerSpec::for_step validates a secret file before mounting it.'
+            Test = 'drivers::tests::container_spec_for_step_validates_secret_files'
+            Old  = @'
+                validate_runner_secret(path, identity)?;
+                secret_mounts.push(SecretMount {
+'@
+            New  = @'
+                secret_mounts.push(SecretMount {
+'@
+        }
+        @{
+            Id   = 'cut1-fix-cache-root-validation-skipped'
+            Rule = 'ContainerSpec::for_step validates the cache root before admitting it.'
+            Test = 'drivers::tests::container_spec_for_step_validates_cache_root'
+            Old  = @'
+        if let Some(cache_root) = &runner.cache_root {
+            ensure_runner_cache_root(cache_root, identity)?;
+        }
+'@
+            New  = ''
+        }
     )
 }

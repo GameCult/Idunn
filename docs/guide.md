@@ -8,8 +8,9 @@
 > every command line in this document — `idunn --swarm-profile ...` returns
 > `unknown Idunn command`.
 >
-> That generation is still what runs on yggdrasil, which is why this is here
-> rather than deleted. For the current model read the [README](../README.md);
+> That generation no longer runs anywhere; the current binary and its
+> `idunn serve` generation are what runs on Yggdrasil. This file is kept for
+> migration history. For the current model read the [README](../README.md);
 > for the route from one to the other read [migration.md](migration.md).
 >
 > Its durable content — what a daemon must publish, and why keepalive is not

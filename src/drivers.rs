@@ -1340,22 +1340,17 @@ impl SourcePort for GitSourceDriver {
         );
         let source = exact_source_from(&binding);
         self.prepare_source_root(&source)?;
-        self.git([
-            OsString::from("-C"),
-            source.checkout.as_os_str().to_owned(),
-            OsString::from("fetch"),
-            OsString::from("--no-tags"),
-            OsString::from("origin"),
-            resolved.facts.revision.clone().into(),
-        ])
-        .context("fetching the durable exact source revision")?;
-        self.verify_exact_source(&source, &resolved)?;
+        // `freeze_exact` fetches the exact revision itself; fetching here too
+        // would fetch twice for one freeze. `verify_exact_source` below needs
+        // no fetch of its own: it only reads objects already local, and
+        // `freeze_exact` has just made the selected revision local.
         let (_tree_root, snapshot_sha256, recipe_bytes) = self.freeze_exact(
             &source,
             &resolved.facts.revision,
             transaction_id,
             &self.frozen_source_root,
         )?;
+        self.verify_exact_source(&source, &resolved)?;
         ensure!(
             recipe_bytes == resolved.recipe_bytes,
             "frozen recipe differs from the durable source resolution"
@@ -1503,6 +1498,10 @@ impl ContainerSpec {
         let mut environment = vec![(source_stamp.0.to_owned(), source_stamp.1.to_owned())];
         let mut secret_mounts = Vec::new();
         for name in required_environment {
+            ensure!(
+                name != source_stamp.0,
+                "runner cannot bind step environment {name}, which collides with the Idunn source stamp"
+            );
             if let Some(value) = runner.environment.get(name) {
                 environment.push((name.clone(), value.clone()));
             } else if let Some(path) = runner.secret_files.get(name) {
@@ -1617,67 +1616,6 @@ pub(crate) fn docker_run_args(
     args.push(spec.image.clone().into());
     args.extend(argv.iter().map(OsString::from));
     Ok(args)
-}
-
-/// The outcome of one step run in a workspace, for a caller that observes
-/// exit status and a bounded stderr tail rather than bailing on failure. This
-/// is the shape a verify transaction needs (Cut 4): every step runs, whether
-/// it fails or not, and the caller decides. `DockerRunnerDriver::docker`
-/// keeps deploy's own bail-on-failure semantics; `run_step` below is additive
-/// and not yet reached from `materialize`.
-#[derive(Debug)]
-pub(crate) struct StepOutcome {
-    pub status: std::process::ExitStatus,
-    pub stderr_tail: String,
-}
-
-/// One method that runs a lowered step in a workspace. `DockerRunnerDriver`
-/// implements it with today's blocking `Command::output()` semantics; a
-/// verify worker (Cut 4) can run the same lowering under a deadline without
-/// touching `docker_run_args` or `ContainerSpec`.
-pub(crate) trait StepPort {
-    fn run_step(
-        &self,
-        spec: &ContainerSpec,
-        workspace: &Path,
-        working_directory: &Path,
-        argv: &[String],
-    ) -> Result<StepOutcome>;
-}
-
-impl StepPort for DockerRunnerDriver {
-    fn run_step(
-        &self,
-        spec: &ContainerSpec,
-        workspace: &Path,
-        working_directory: &Path,
-        argv: &[String],
-    ) -> Result<StepOutcome> {
-        ensure!(
-            self.docker_program.is_absolute(),
-            "Docker runner program is not absolute"
-        );
-        let args = docker_run_args(spec, workspace, working_directory, argv)?;
-        let output = Command::new(&self.docker_program)
-            .args(&args)
-            .stdin(Stdio::null())
-            .output()
-            .with_context(|| {
-                format!("starting Docker runner {}", self.docker_program.display())
-            })?;
-        Ok(StepOutcome {
-            status: output.status,
-            stderr_tail: String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .chars()
-                .rev()
-                .take(4096)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect(),
-        })
-    }
 }
 
 /// Docker is only a runner substrate. Recipe argv stays an argv vector, the
@@ -7735,6 +7673,356 @@ mod tests {
         Ok(())
     }
 
+    /// Cut 1 fix batch, F1: `required_environment_is_the_only_environment`
+    /// only pinned the exact-name case. The prefix-passthrough mutant (S3a)
+    /// copies any binding environment entry whose name merely starts with a
+    /// required name; the ambient mutant (S3b) copies any `GAMECULT_*` or
+    /// `IDUNN_*` binding entry regardless of whether it is required. This
+    /// fixture's binding carries both `USEDLONGER` (a prefix collision with
+    /// the required `USED`) and `GAMECULT_AMBIENT` / `IDUNN_AMBIENT`, and the
+    /// expected environment excludes every one of them.
+    #[test]
+    fn required_environment_rejects_prefix_and_ambient_passthrough() -> Result<()> {
+        let mut runner = fixture_docker_runner_binding();
+        runner.environment = BTreeMap::from([
+            ("USED".to_owned(), "1".to_owned()),
+            ("USEDLONGER".to_owned(), "prefix-collision".to_owned()),
+            ("GAMECULT_AMBIENT".to_owned(), "ambient".to_owned()),
+            ("IDUNN_AMBIENT".to_owned(), "ambient".to_owned()),
+        ]);
+        let required = std::collections::BTreeSet::from(["USED".to_owned()]);
+        let spec =
+            ContainerSpec::for_step(&runner, &required, ("IDUNN_SOURCE_REVISION", "abc123"))?;
+        assert_eq!(
+            spec.environment,
+            vec![
+                ("IDUNN_SOURCE_REVISION".to_owned(), "abc123".to_owned()),
+                ("USED".to_owned(), "1".to_owned()),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Cut 1 fix batch, Stamp override: a runner cannot bind a step
+    /// environment name that collides with the Idunn source stamp, even when
+    /// the binding names it and the step requires it. This is enforced at
+    /// `ContainerSpec::for_step`, the one place every runner's environment is
+    /// assembled, rather than only at deploy's separate `admit` check.
+    #[test]
+    fn container_spec_for_step_refuses_stamp_override() {
+        let mut runner = fixture_docker_runner_binding();
+        runner.environment = BTreeMap::from([("STAMP".to_owned(), "override".to_owned())]);
+        let required = std::collections::BTreeSet::from(["STAMP".to_owned()]);
+        let result = ContainerSpec::for_step(&runner, &required, ("STAMP", "abc123"));
+        assert!(
+            result.is_err(),
+            "expected a runner binding to be refused when it can override the source stamp"
+        );
+    }
+
+    /// Cut 1 fix batch, F1: `docker_run_args` pins the argv exactly for every
+    /// network branch, not only the default `None` case. The prior test's
+    /// mutants that survived here were `--cap-drop ALL` dropped only when the
+    /// network is `bridge` (S1) and `--read-only` dropped only when the
+    /// network is `Named` (S5 covers the explicit-`none`-becomes-`bridge`
+    /// loosening separately below). Every branch must carry every security
+    /// flag identically; only `--network` differs.
+    #[cfg(unix)]
+    #[test]
+    fn docker_run_args_pins_every_network_branch() -> Result<()> {
+        let workspace = PathBuf::from("/var/lib/gamecult/idunn/staging/txn-net/.runner-rust");
+        let runner = fixture_docker_runner_binding();
+        let argv = vec!["cargo".to_owned(), "test".to_owned()];
+        let machine_id = build_machine_id(&workspace)?;
+
+        let base = |network: &str| -> Vec<OsString> {
+            [
+                "run".to_owned(),
+                "--rm".to_owned(),
+                "--network".to_owned(),
+                network.to_owned(),
+                "--memory".to_owned(),
+                "8192m".to_owned(),
+                "--cpus".to_owned(),
+                "2.50".to_owned(),
+                "--mount".to_owned(),
+                format!("type=bind,src={},dst=/workspace", workspace.display()),
+                "--user".to_owned(),
+                "65532:65532".to_owned(),
+                "--cap-drop".to_owned(),
+                "ALL".to_owned(),
+                "--security-opt".to_owned(),
+                "no-new-privileges".to_owned(),
+                "--read-only".to_owned(),
+                "--pids-limit".to_owned(),
+                "512".to_owned(),
+                "--tmpfs".to_owned(),
+                "/tmp:rw,nosuid,nodev,noexec,size=256m".to_owned(),
+                "--mount".to_owned(),
+                format!(
+                    "type=bind,src=/run/idunn/build-machine-ids/{machine_id},dst=/etc/machine-id,readonly"
+                ),
+                "--workdir".to_owned(),
+                "/workspace/build".to_owned(),
+                "--env".to_owned(),
+                "IDUNN_SOURCE_REVISION=abc123".to_owned(),
+                "eureka-verify-rust".to_owned(),
+                "cargo".to_owned(),
+                "test".to_owned(),
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect()
+        };
+
+        for (profile, expected_network) in
+            [(None, "none"), (Some("bridge"), "bridge"), (Some("odin-verse"), "odin-verse")]
+        {
+            let mut r = runner.clone();
+            r.network_profile = profile.map(str::to_owned);
+            let spec = ContainerSpec::for_step(
+                &r,
+                &std::collections::BTreeSet::new(),
+                ("IDUNN_SOURCE_REVISION", "abc123"),
+            )?;
+            let args = docker_run_args(&spec, &workspace, Path::new("build"), &argv)?;
+            assert_eq!(args, base(expected_network), "network branch {profile:?}");
+        }
+        Ok(())
+    }
+
+    /// Cut 1 fix batch, F1, S5: an explicit `network_profile = "none"` must
+    /// lower to `ContainerNetwork::None`, not `Bridge`.
+    #[test]
+    fn explicit_none_network_profile_is_none_not_bridge() -> Result<()> {
+        let mut runner = fixture_docker_runner_binding();
+        runner.network_profile = Some("none".to_owned());
+        let spec = ContainerSpec::for_step(
+            &runner,
+            &std::collections::BTreeSet::new(),
+            ("IDUNN_SOURCE_REVISION", "abc123"),
+        )?;
+        assert_eq!(spec.network, ContainerNetwork::None);
+        Ok(())
+    }
+
+    /// Cut 1 fix batch, F1, S2a/S2b/S2c: `--cpus` is pinned across a range of
+    /// quotas that a round-to-nearest-0.5 mutant, a floor-to-50 mutant, and a
+    /// round-to-integer mutant each compute differently from the true
+    /// `quota / 100`.
+    #[test]
+    fn docker_run_args_pins_cpu_quota_across_the_range() -> Result<()> {
+        let workspace = PathBuf::from("/var/lib/gamecult/idunn/staging/txn-cpu/.runner-rust");
+        let argv = vec!["cargo".to_owned(), "test".to_owned()];
+        for (quota, expected) in [
+            (100u32, "1.00"),
+            (150, "1.50"),
+            (250, "2.50"),
+            (333, "3.33"),
+            (800, "8.00"),
+        ] {
+            let mut runner = fixture_docker_runner_binding();
+            runner.cpu_quota_percent = quota;
+            let spec = ContainerSpec::for_step(
+                &runner,
+                &std::collections::BTreeSet::new(),
+                ("IDUNN_SOURCE_REVISION", "abc123"),
+            )?;
+            let args = docker_run_args(&spec, &workspace, Path::new("."), &argv)?;
+            let cpus_index = args
+                .iter()
+                .position(|a| a == OsStr::new("--cpus"))
+                .expect("--cpus flag present");
+            assert_eq!(
+                args[cpus_index + 1],
+                OsString::from(expected),
+                "quota {quota}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Cut 1 fix batch, F1, S6: a cache root adds exactly one `--mount` for
+    /// `/cache`, never a second mount of the cache's parent directory. This
+    /// fixture asserts the full argv, so any extra mount breaks equality.
+    #[cfg(unix)]
+    #[test]
+    fn docker_run_args_mounts_cache_root_exactly_once() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        // Left uncreated: `ensure_runner_cache_root` creates it itself, owned
+        // by the runner's exact identity at mode 0700.
+        let cache = temp.path().join("cache");
+
+        let workspace = PathBuf::from("/var/lib/gamecult/idunn/staging/txn-cache/.runner-rust");
+        let argv = vec!["cargo".to_owned(), "test".to_owned()];
+        let machine_id = build_machine_id(&workspace)?;
+
+        // Absent: no cache mount at all.
+        let mut runner = fixture_docker_runner_binding();
+        let spec = ContainerSpec::for_step(
+            &runner,
+            &std::collections::BTreeSet::new(),
+            ("IDUNN_SOURCE_REVISION", "abc123"),
+        )?;
+        let args = docker_run_args(&spec, &workspace, Path::new("."), &argv)?;
+        assert!(
+            !args.iter().any(|a| a == OsStr::new("/cache") || a.to_string_lossy().contains("dst=/cache")),
+            "no cache mount expected when cache_root is absent"
+        );
+
+        // Present: exactly one mount, of the cache root itself.
+        runner.cache_root = Some(cache.clone());
+        let spec = ContainerSpec::for_step(
+            &runner,
+            &std::collections::BTreeSet::new(),
+            ("IDUNN_SOURCE_REVISION", "abc123"),
+        )?;
+        let args = docker_run_args(&spec, &workspace, Path::new("."), &argv)?;
+        let expected: Vec<OsString> = [
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--network".to_owned(),
+            "none".to_owned(),
+            "--memory".to_owned(),
+            "8192m".to_owned(),
+            "--cpus".to_owned(),
+            "2.50".to_owned(),
+            "--mount".to_owned(),
+            format!("type=bind,src={},dst=/workspace", workspace.display()),
+            "--user".to_owned(),
+            "65532:65532".to_owned(),
+            "--cap-drop".to_owned(),
+            "ALL".to_owned(),
+            "--security-opt".to_owned(),
+            "no-new-privileges".to_owned(),
+            "--read-only".to_owned(),
+            "--pids-limit".to_owned(),
+            "512".to_owned(),
+            "--tmpfs".to_owned(),
+            "/tmp:rw,nosuid,nodev,noexec,size=256m".to_owned(),
+            "--mount".to_owned(),
+            format!(
+                "type=bind,src=/run/idunn/build-machine-ids/{machine_id},dst=/etc/machine-id,readonly"
+            ),
+            "--mount".to_owned(),
+            format!("type=bind,src={},dst=/cache", cache.display()),
+            "--workdir".to_owned(),
+            "/workspace/".to_owned(),
+            "--env".to_owned(),
+            "IDUNN_SOURCE_REVISION=abc123".to_owned(),
+            "eureka-verify-rust".to_owned(),
+            "cargo".to_owned(),
+            "test".to_owned(),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(args, expected);
+        Ok(())
+    }
+
+    /// Cut 1 fix batch, F1, S4: a secret mount's bind is read-only. This
+    /// fixture also exercises `for_step`'s live secret validation, so it
+    /// doubles as the positive twin of S9 below.
+    #[cfg(unix)]
+    #[test]
+    fn docker_run_args_mounts_secrets_read_only() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let secret = temp.path().join("secret.cc");
+        fs::write(&secret, b"s").unwrap();
+        ensure!(
+            Command::new("/bin/chown")
+                .arg("0:65532")
+                .arg(&secret)
+                .status()?
+                .success(),
+            "chowning fixture secret"
+        );
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o440))?;
+
+        let mut runner = fixture_docker_runner_binding();
+        runner.secret_files = BTreeMap::from([("A_SECRET".to_owned(), secret.clone())]);
+        let required = std::collections::BTreeSet::from(["A_SECRET".to_owned()]);
+        let spec = ContainerSpec::for_step(&runner, &required, ("IDUNN_SOURCE_REVISION", "abc123"))?;
+        let workspace = PathBuf::from("/var/lib/gamecult/idunn/staging/txn-secret/.runner-rust");
+        let args = docker_run_args(
+            &spec,
+            &workspace,
+            Path::new("."),
+            &vec!["cargo".to_owned(), "test".to_owned()],
+        )?;
+        let secret_text = secret.display().to_string();
+        let mount = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .find(|a| a.starts_with("type=bind") && a.contains(&secret_text))
+            .expect("secret mount present");
+        assert!(mount.ends_with(",readonly"), "secret mount must be read-only: {mount}");
+        Ok(())
+    }
+
+    /// Cut 1 fix batch, F1, S9: `ContainerSpec::for_step` must call
+    /// `validate_runner_secret`, not merely mount whatever path the binding
+    /// names. This fixture's secret file has the wrong mode (`0644` instead
+    /// of the required `0440`), so the real validator refuses it; a mutant
+    /// that skips the call would let this through.
+    #[cfg(unix)]
+    #[test]
+    fn container_spec_for_step_validates_secret_files() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let secret = temp.path().join("secret.cc");
+        fs::write(&secret, b"s").unwrap();
+        ensure!(
+            Command::new("/bin/chown")
+                .arg("0:65532")
+                .arg(&secret)
+                .status()?
+                .success(),
+            "chowning fixture secret"
+        );
+        // Wrong: group-writable/world-readable, not the required 0440.
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644))?;
+
+        let mut runner = fixture_docker_runner_binding();
+        runner.secret_files = BTreeMap::from([("A_SECRET".to_owned(), secret)]);
+        let required = std::collections::BTreeSet::from(["A_SECRET".to_owned()]);
+        let result = ContainerSpec::for_step(&runner, &required, ("IDUNN_SOURCE_REVISION", "abc123"));
+        assert!(result.is_err(), "expected an invalid secret file to be refused");
+        Ok(())
+    }
+
+    /// Cut 1 fix batch, F1, S10: `ContainerSpec::for_step` must call
+    /// `ensure_runner_cache_root`. This fixture's cache root sits under a
+    /// world-writable parent, which the real validator refuses; a mutant
+    /// that skips the call would let this through.
+    #[cfg(unix)]
+    #[test]
+    fn container_spec_for_step_validates_cache_root() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let bad_parent = temp.path().join("bad-parent");
+        fs::create_dir(&bad_parent)?;
+        // Wrong: world-writable, not root-owned-and-nonwritable.
+        fs::set_permissions(&bad_parent, fs::Permissions::from_mode(0o777))?;
+
+        let mut runner = fixture_docker_runner_binding();
+        runner.cache_root = Some(bad_parent.join("cache"));
+        let result = ContainerSpec::for_step(
+            &runner,
+            &std::collections::BTreeSet::new(),
+            ("IDUNN_SOURCE_REVISION", "abc123"),
+        );
+        assert!(result.is_err(), "expected an unsafe cache root parent to be refused");
+        Ok(())
+    }
+
     /// Cut 1, R-Cut1-3: `freeze_exact` archives an exact revision through the
     /// new entry point (no `OperatorBinding` or compiled plan), and the
     /// archived recipe file must equal the recipe blob it read from the same
@@ -7871,6 +8159,95 @@ mod tests {
 
         let result = driver.freeze_exact(&source, &revision, "txn-2", &frozen_source_root);
         assert!(result.is_err(), "expected the transformed recipe to be rejected");
+        Ok(())
+    }
+
+    /// Cut 1 fix batch, F5, S7: `freeze_exact` must materialize every
+    /// declared Gitlink, not silently skip the loop. This fixture archives a
+    /// main repository with one Gitlink and asserts the child's own file
+    /// lands at the Gitlink's path in the frozen tree; a mutant that skips
+    /// the Gitlink loop leaves that path absent.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_materializes_gitlinks() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        let sub_repo = temp.path().join("sub");
+        fs::create_dir(&sub_repo)?;
+        git_at(&sub_repo, &["init", "--initial-branch=main"])?;
+        git_at(&sub_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(&sub_repo, &["config", "user.email", "idunn-test@example.invalid"])?;
+        fs::write(sub_repo.join("lib.txt"), b"vendored content\n")?;
+        git_at(&sub_repo, &["add", "--all"])?;
+        git_at(&sub_repo, &["commit", "-m", "sub fixture"])?;
+        let sub_revision = git_at(&sub_repo, &["rev-parse", "HEAD"])?;
+
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(
+            &origin_repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sub_revision},vendor/sub"),
+            ],
+        )?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        for repo in [&origin_repo, &sub_repo] {
+            ensure!(
+                Command::new("/bin/chown")
+                    .args(["-R", "1000:1000"])
+                    .arg(repo)
+                    .status()?
+                    .success(),
+                "chowning the fixture repository"
+            );
+        }
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::from([(
+                PathBuf::from("vendor/sub"),
+                GitlinkBinding {
+                    origin: sub_repo.to_string_lossy().into_owned(),
+                },
+            )]),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+
+        let (tree_root, _snapshot_sha256, _recipe_bytes) =
+            driver.freeze_exact(&source, &revision, "txn-gitlink", &frozen_source_root)?;
+        let materialized = fs::read_to_string(tree_root.join("vendor/sub/lib.txt"))
+            .context("reading materialized Gitlink content")?;
+        assert_eq!(materialized, "vendored content\n");
         Ok(())
     }
 
