@@ -1173,3 +1173,35 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
   - Tests go from 142 to 152. cut1 is 28/28 killed.
   - **Operator step, outside this campaign:** the Ghostlight and CodexConnector bindings still carry a placeholder `expected_signer_identity_id`. The scripts print the derived key.
   - **Soul's third pass dispatched.**
+- **2026-09-22: Soul's third pass on Cut 1** (Opus, on Yggdrasil).
+  - **Held:**
+    - 152 tests pass. cut1 killed 26/26 before its deletion; the commit message said 28.
+    - Speed is 1.0 to 1.3x across the five targets, and the digests are identical.
+    - A Forgejo origin works, and so does protocol v2 without `allowAnySHA1InWant`.
+    - Freezing 30k files plus a 200 MiB blob takes two fetches.
+    - Duplicate, alias and gitlink attacks are refused, and nothing is written outside the root.
+    - The chain resolver works for cycles, depth, and `copy_artifact`.
+  - **Cut 1 does not close.**
+  - **S1, medium-high:** `resolve()`'s fetch (`drivers.rs:1735`) has no fsck, so fsck never sees the main repo's trees. The claim "not yet reached" is false. Two sibling trees both named `d` freeze merged. fsck-rejected names freeze too: `.GIT`, `git~1`, `.git.` and `.git` with a zero-width non-joiner or a trailing space, `/` inside a name, and zero-padded modes.
+  - **S2, medium:** both bootstraps print `provider-health-public-key`, but the binding needs the identity id (`provider-health-identity-id`).
+  - **S3, medium:** neither bootstrap can work. The `ghostlight`, `codex-connector` and `odin` templates set `checkout = /srv/build/idunn-sources/*`, but the installed unit uses `--source-root /var/lib/gamecult/idunn/sources`, and the host's `odin.toml` already uses that. The two scripts contradict each other about `codex-connector.service`. v1 provisioning remains in both. The wiring test pins the old unit text.
+  - **S4, low:** Heimdall's binding *is* installed on Yggdrasil, so the runbook note is wrong about the host.
+  - **S5, low:** these guards are unpinned:
+    - root ownership (X04);
+    - an exact duplicate path (X06);
+    - case-sensitive ancestor alias (X08);
+    - `ensure_frozen_directory` containment (X09);
+    - pass 1 `create_dir_all` (X10);
+    - `copy_artifact` containment (X11).
+  - **S6, low:** a symlink is validated against `.partial` but published after the rename. Dangling in-root links are now refused, where the old lexical check accepted them.
+  - **S7, low:** the case-folding refusal is partial and inconsistent (files only, `to_lowercase`). The host is case-sensitive ext4.
+  - **S9, low, pre-existing:** `hash_frozen_source_tree` reads each file whole. A 200 MiB file costs 232 MB of RSS.
+- **Self's rulings for the third Cut 1 fix batch, 2026-09-22:**
+  - **S1:** fsck guards every fetch that brings the main repository's objects. That is `resolve()` as well as `freeze_exact`. Independently, `freeze_exact` also runs fsck on the selected tree, so that objects already present in the local store are checked too. Refuse every `.git` look-alike by name, case-insensitively and under fsck's own rules, even though the host is case-sensitive, because a frozen tree can be copied elsewhere. Fixtures: Soul's `dup-trees` fixture and each look-alike. Each must refuse through the production path (`resolve`, then `freeze`), not a hand-built fetch.
+  - **S2:** fixed in the S3 deletion.
+  - **S3: delete both bootstrap scripts.** Nothing true is left in them, which is the F7 ruling applied. Point every caller at the binding-install procedure, which includes the `provider-health-identity-id` step. **Correct the `ghostlight`, `codex-connector` and `odin` templates to the source root the installed unit uses** (`/var/lib/gamecult/idunn/sources/*`), matching the host's installed `odin.toml`. Delete the wiring test's assertions on old unit text, or the whole test if nothing true remains. This is gamecult-ops hygiene the campaign exposed, and it lands in the same batch.
+  - **S4:** correct the Heimdall runbook note. The binding is installed on the host and absent from the repo.
+  - **S5:** a behavioural test for each guard, through `freeze_exact` wherever the guard is reachable from there. No mutation suite.
+  - **S6:** validate symlinks against their final published location. Allow a dangling link whose target stays inside the root (resolving every component that exists), and refuse one that escapes. Test both.
+  - **S7:** delete the case-folding refusal. The host is case-sensitive, and the partial check is inconsistent. The `.git` look-alikes are covered by S1.
+  - **S9:** stream the hash.
