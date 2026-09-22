@@ -58,6 +58,17 @@ struct GitTreeEntry {
     path: PathBuf,
 }
 
+/// S4-6 (Self's ruling, fourth Cut 1 fix batch): the largest symlink target
+/// `materialize_tree_raw` will ever buffer in memory, matching the
+/// platform's own path length limit (`PATH_MAX` on Linux). A blob recorded
+/// with mode `120000` is refused outright once it is bigger than any real
+/// symlink target could ever be, instead of being read whole into memory
+/// first and only failing once written -- the previous shape let a 64 MiB
+/// blob with a symlink mode take peak RSS past 200 MB before `ENAMETOOLONG`
+/// finally closed it.
+#[cfg(unix)]
+const FROZEN_SOURCE_SYMLINK_TARGET_LIMIT: usize = libc::PATH_MAX as usize;
+
 /// F2/F3 layer (b): the only way `materialize_tree_raw` is allowed to obtain
 /// a directory to write into. `path` must already be a directory this
 /// function created earlier in the same freeze (tracked in `created_dirs`,
@@ -1437,6 +1448,14 @@ impl GitSourceDriver {
                                 }
                             }
                             "120000" => {
+                                let target_len = fs::symlink_metadata(&target)
+                                    .with_context(|| format!("inspecting {}", target.display()))?
+                                    .len() as usize;
+                                ensure!(
+                                    target_len <= FROZEN_SOURCE_SYMLINK_TARGET_LIMIT,
+                                    "frozen source symlink target for {} exceeds the platform's path length limit ({target_len} > {FROZEN_SOURCE_SYMLINK_TARGET_LIMIT} bytes)",
+                                    extra.path.display()
+                                );
                                 symlink_targets.insert(extra.path.clone(), fs::read(&target)?);
                             }
                             other => bail!(
@@ -1447,6 +1466,11 @@ impl GitSourceDriver {
                     }
                 }
                 "120000" => {
+                    ensure!(
+                        size <= FROZEN_SOURCE_SYMLINK_TARGET_LIMIT,
+                        "frozen source symlink target for {} exceeds the platform's path length limit ({size} > {FROZEN_SOURCE_SYMLINK_TARGET_LIMIT} bytes)",
+                        first.path.display()
+                    );
                     let mut content = vec![0u8; size];
                     reader
                         .read_exact(&mut content)
@@ -5874,80 +5898,176 @@ fn harden_frozen_source_tree(root: &Path, current: &Path) -> Result<()> {
 /// being checked at every step. A dangling link is accepted exactly when
 /// every component that exists stays inside the root; one whose real or
 /// lexical remainder ever leaves the root is refused, dangling or not.
+///
+/// S4-1 (Self's ruling, fourth Cut 1 fix batch): the previous shape recursed
+/// once per path component and re-resolved every shared prefix from
+/// scratch, so a tree of `n` tiny self-doubling symlinks
+/// (`a0 -> .`, `ak -> a{k-1}/a{k-1}`) cost `2^n` real filesystem
+/// resolutions -- `MAX_HOPS` bounded chain DEPTH, not the WORK spent getting
+/// there. This is now an explicit iterative walk: one work stack of frames
+/// stands in for the old call stack (so nested symlink expansion never
+/// recurses in Rust), each already-resolved symlink is memoised by its own
+/// path the first time it is followed, and `MAX_LINK_TRAVERSALS` charges
+/// every *distinct* symlink actually read against one shared budget for the
+/// whole resolution -- a memoised hit costs nothing. A chain of `n` distinct
+/// symlinks, doubling or not, now costs O(n) real reads no matter how many
+/// times its target text repeats a name.
 #[cfg(unix)]
-fn resolve_frozen_source_symlink(
+enum FrozenSymlinkStep {
+    CurDir,
+    ParentDir,
+    Normal(std::ffi::OsString),
+}
+
+#[cfg(unix)]
+fn frozen_symlink_steps(target: &Path) -> Result<std::collections::VecDeque<FrozenSymlinkStep>> {
+    let mut steps = std::collections::VecDeque::new();
+    for component in target.components() {
+        steps.push_back(match component {
+            std::path::Component::CurDir => FrozenSymlinkStep::CurDir,
+            std::path::Component::ParentDir => FrozenSymlinkStep::ParentDir,
+            std::path::Component::Normal(part) => FrozenSymlinkStep::Normal(part.to_owned()),
+            _ => bail!("frozen source symlink target has a non-normal path component"),
+        });
+    }
+    Ok(steps)
+}
+
+/// One in-progress symlink expansion on the explicit work stack.
+/// `symlink_path` is `None` only for the outermost frame, the one resolving
+/// the caller's own starting path rather than a nested symlink this walk
+/// met along the way; every other frame's `symlink_path` is memoised under
+/// its own key once the frame finishes.
+#[cfg(unix)]
+struct FrozenSymlinkFrame {
+    symlink_path: Option<PathBuf>,
+    resolved: PathBuf,
+    remaining: std::collections::VecDeque<FrozenSymlinkStep>,
+}
+
+/// Reads and charges one symlink's target against the shared traversal
+/// budget, returning the frame that will walk its (already-decoded) steps.
+/// Shared by the outermost call and by every nested symlink the nesting walk
+/// discovers -- the two call sites the old recursion covered with the same
+/// function.
+#[cfg(unix)]
+fn open_frozen_symlink_frame(
     canonical_root: &Path,
-    path: &Path,
-    hops: u32,
-) -> Result<PathBuf> {
-    const MAX_HOPS: u32 = 40;
+    symlink_path: &Path,
+    budget: &mut u32,
+) -> Result<FrozenSymlinkFrame> {
     ensure!(
-        hops < MAX_HOPS,
-        "frozen source symlink chain exceeds the hop limit"
+        *budget > 0,
+        "frozen source symlink chain exceeds the traversal budget"
     );
-    let target = fs::read_link(path)?;
+    *budget -= 1;
+    let target = fs::read_link(symlink_path)?;
     ensure!(target.is_relative(), "frozen source symlink is absolute");
-    let parent = path
+    let parent = symlink_path
         .parent()
         .context("frozen source symlink has no parent")?;
-    let mut resolved = parent.canonicalize().with_context(|| {
-        format!("resolving frozen source symlink chain at {}", path.display())
+    let resolved = parent.canonicalize().with_context(|| {
+        format!(
+            "resolving frozen source symlink chain at {}",
+            symlink_path.display()
+        )
     })?;
     ensure!(
         resolved.starts_with(canonical_root),
         "frozen source symlink escapes its root"
     );
-    for component in target.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
+    Ok(FrozenSymlinkFrame {
+        symlink_path: Some(symlink_path.to_path_buf()),
+        resolved,
+        remaining: frozen_symlink_steps(&target)?,
+    })
+}
+
+#[cfg(unix)]
+fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<PathBuf> {
+    // Total distinct symlinks this one resolution may read, matching the old
+    // `MAX_HOPS` chain-depth bound in spirit: a memoised re-visit is free, so
+    // this is now a bound on real work rather than on nesting depth.
+    const MAX_LINK_TRAVERSALS: u32 = 40;
+    let mut budget = MAX_LINK_TRAVERSALS;
+    let mut memo: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
+    let mut stack: Vec<FrozenSymlinkFrame> =
+        vec![open_frozen_symlink_frame(canonical_root, path, &mut budget)?];
+
+    loop {
+        let top = stack.len() - 1;
+        match stack[top].remaining.pop_front() {
+            None => {
+                let frame = stack.pop().expect("resolver stack is never empty");
+                if let Some(symlink_path) = frame.symlink_path {
+                    memo.insert(symlink_path, frame.resolved.clone());
+                }
+                match stack.last_mut() {
+                    None => return Ok(frame.resolved),
+                    Some(parent) => parent.resolved = frame.resolved,
+                }
+            }
+            Some(FrozenSymlinkStep::CurDir) => {}
+            Some(FrozenSymlinkStep::ParentDir) => {
+                let frame = &mut stack[top];
                 ensure!(
-                    resolved.pop() && resolved.starts_with(canonical_root),
+                    frame.resolved.pop() && frame.resolved.starts_with(canonical_root),
                     "frozen source symlink escapes its root"
                 );
             }
-            std::path::Component::Normal(part) => {
-                resolved.push(part);
+            Some(FrozenSymlinkStep::Normal(part)) => {
+                let frame = &mut stack[top];
+                frame.resolved.push(&part);
                 ensure!(
-                    resolved.starts_with(canonical_root),
+                    frame.resolved.starts_with(canonical_root),
                     "frozen source symlink escapes its root"
                 );
-                match fs::symlink_metadata(&resolved) {
+                let candidate = frame.resolved.clone();
+                match fs::symlink_metadata(&candidate) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
-                        resolved = resolve_frozen_source_symlink(canonical_root, &resolved, hops + 1)?;
+                        if let Some(cached) = memo.get(&candidate) {
+                            stack[top].resolved = cached.clone();
+                        } else {
+                            stack.push(open_frozen_symlink_frame(
+                                canonical_root,
+                                &candidate,
+                                &mut budget,
+                            )?);
+                        }
                     }
                     Ok(_) => {
-                        resolved = resolved.canonicalize().with_context(|| {
-                            format!("resolving frozen source symlink chain at {}", resolved.display())
+                        let real = candidate.canonicalize().with_context(|| {
+                            format!("resolving frozen source symlink chain at {}", candidate.display())
                         })?;
+                        stack[top].resolved = real;
                     }
                     Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
                         // Nothing exists here yet: the remaining components,
-                        // including this one, are appended lexically below
-                        // (no real symlink can hide along a path nothing on
-                        // disk has reached), and containment is still
-                        // enforced on every step that follows.
+                        // including this one, are appended lexically (no real
+                        // symlink can hide along a path nothing on disk has
+                        // reached), and containment is still enforced on
+                        // every step that follows.
                     }
                     Err(error) => {
                         return Err(error)
-                            .with_context(|| format!("inspecting {}", resolved.display()));
+                            .with_context(|| format!("inspecting {}", candidate.display()));
                     }
                 }
             }
-            _ => bail!("frozen source symlink target has a non-normal path component"),
         }
-        ensure!(
-            resolved.starts_with(canonical_root),
-            "frozen source symlink escapes its root"
-        );
+        if let Some(frame) = stack.last() {
+            ensure!(
+                frame.resolved.starts_with(canonical_root),
+                "frozen source symlink escapes its root"
+            );
+        }
     }
-    Ok(resolved)
 }
 
 #[cfg(unix)]
 fn validate_frozen_source_symlink(root: &Path, path: &Path) -> Result<()> {
     let canonical_root = root.canonicalize().context("resolving frozen source root")?;
-    resolve_frozen_source_symlink(&canonical_root, path, 0).map(|_| ())
+    resolve_frozen_source_symlink(&canonical_root, path).map(|_| ())
 }
 
 /// S6: run once, against the tree's real, final published path -- after the
@@ -11462,6 +11582,791 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // S4-1 (Self's ruling, fourth Cut 1 fix batch): the symlink resolver
+    // used to recurse per path component and cost 2^n real filesystem
+    // resolutions for an n-link self-doubling chain. Rewritten iteratively
+    // with memoised per-symlink resolution and a single shared traversal
+    // budget.
+    // -----------------------------------------------------------------
+
+    /// Soul's `a0 -> .`, `ak -> a{k-1}/a{k-1}` fixture at n=20 took 43.7 s
+    /// under the old recursive resolver. Every `ak` ultimately resolves to
+    /// the frozen root itself (never dangling) and nothing in the chain
+    /// ever leaves the root (never escaping), so per S6 -- "a dangling
+    /// in-root link freezes, an escape refuses" -- this chain must FREEZE
+    /// (accept), and the memoised iterative walk must do it in under a
+    /// second.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_symlinks_resolves_an_n20_doubling_chain_in_under_a_second() -> Result<()>
+    {
+        use std::os::unix::fs::symlink;
+        use std::time::Instant;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        symlink(".", root.join("a0"))?;
+        for k in 1..=20usize {
+            symlink(format!("a{}/a{}", k - 1, k - 1), root.join(format!("a{k}")))?;
+        }
+
+        let start = Instant::now();
+        let result = validate_frozen_source_symlinks(&root);
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "an n=20 self-doubling chain that never dangles or escapes the root must freeze, \
+             per S6, not refuse: {result:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 1,
+            "an n=20 chain must resolve in under a second with a memoised iterative walk, took {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    /// S4-5 (Self's ruling, fourth Cut 1 fix batch): every existing S6 test
+    /// naming `..` is a refusal (an escape). `cargo-mutants` found that
+    /// deleting the `Component::ParentDir` match arm entirely -- so it falls
+    /// through to the `_ => bail!` catch-all -- still leaves the suite
+    /// green, because nothing proves a `..` that stays inside the root once
+    /// resolved is actually accepted, not merely never exercised.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_symlink_accepts_a_legitimate_in_root_parent_reference() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("deployment.toml"), b"target = 'test'\n")?;
+        fs::create_dir_all(root.join("sub/deep"))?;
+        let link = root.join("sub/deep/l");
+        symlink("../../deployment.toml", &link)?;
+
+        validate_frozen_source_symlink(&root, &link)?;
+        let canonical_root = root.canonicalize()?;
+        let resolved = resolve_frozen_source_symlink(&canonical_root, &link)?;
+        assert_eq!(
+            resolved,
+            canonical_root.join("deployment.toml"),
+            "a `..` chain that stays inside the root must resolve to the real in-root target"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // S4-2 (Self's ruling, fourth Cut 1 fix batch): the S9 streamed hash had
+    // no behavioural pin. Deleting the read buffer's size (hashing zero
+    // bytes of every file) or flipping the loop's exit test (hashing only
+    // the first 64 KiB) both left the suite green.
+    // -----------------------------------------------------------------
+
+    /// Two trees whose only difference is the trailing byte past the first
+    /// 64 KiB chunk must hash differently: this kills both the
+    /// zero-length-buffer mutant (hashes nothing, so the two digests
+    /// collide) and the first-chunk-only mutant (stops after the first
+    /// read, so the differing tail is never hashed).
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_sha256_differs_when_only_content_past_the_first_chunk_differs() -> Result<()> {
+        fn build(temp: &Path, byte: u8) -> Result<PathBuf> {
+            let root = temp.join(format!("root-{byte}"));
+            fs::create_dir(&root)?;
+            // One 64 KiB chunk of identical bytes, plus a tail that only
+            // this build's caller-chosen byte ever touches.
+            let mut content = vec![b'a'; (1 << 16) + 4096];
+            *content.last_mut().expect("content is non-empty") = byte;
+            fs::write(root.join("big.bin"), &content)?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), b'A')?;
+        let root_b = build(temp.path(), b'B')?;
+        let digest_a = frozen_source_sha256(&root_a)?;
+        let digest_b = frozen_source_sha256(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two trees differing only past the first 64 KiB chunk must hash differently"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // S4-3 (Self's ruling, fourth Cut 1 fix batch): three of the five S5
+    // tests did not kill their own guard, because another refusal fired
+    // first along the same call path. Each of these isolates its guard so
+    // that only deleting *that* guard changes the outcome.
+    // -----------------------------------------------------------------
+
+    /// S4-3, the duplicate-path guard: `git_tree_entries`'s own
+    /// `entries.windows(2).all(|pair| pair[0].path != pair[1].path)` sits
+    /// behind `freeze_exact`'s explicit `fsck --strict`, whose
+    /// `duplicateEntries` check refuses the identical raw tree first --
+    /// which is why the shipped `freeze_exact_refuses_an_exact_duplicate_
+    /// leaf_path` test survives deleting this guard. Calling
+    /// `git_tree_entries` directly, the one call site that runs before any
+    /// fsck exists, leaves only this guard able to refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn git_tree_entries_refuses_a_tree_that_emits_a_path_twice() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn hash_object(repo: &Path, content: &[u8]) -> Result<String> {
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(repo)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(content)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        }
+        fn literal_tree(repo: &Path, entries: &[(&str, &str, &str)]) -> Result<String> {
+            let hex = |s: &str| -> Vec<u8> {
+                (0..20)
+                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                    .collect()
+            };
+            let mut raw = Vec::new();
+            for (mode, name, sha) in entries {
+                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+                raw.extend(hex(sha));
+            }
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(repo)
+                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(&raw)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object --literally failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        }
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(&origin_repo, &["config", "user.email", "idunn-test@example.invalid"])?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "root"])?;
+        let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: format!("file://{}", origin_repo.display()),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+        // Established on the clean root commit first, exactly like a real
+        // deploy target's checkout by the time a hostile push lands.
+        driver.prepare_source_root(&source)?;
+
+        // Two literal blob entries sharing the leaf path "same.txt": exactly
+        // what the windows(2) check pins, and exactly the shape
+        // `freeze_exact_refuses_an_exact_duplicate_leaf_path` uses. Two
+        // same-named TREE entries with different children would not do: Git
+        // `ls-tree -r` flattens into that tree, so it never emits one leaf
+        // path twice -- it would just list both trees' distinct contents.
+        let a = hash_object(&origin_repo, b"a\n")?;
+        let b = hash_object(&origin_repo, b"b\n")?;
+        let hostile_tree = literal_tree(
+            &origin_repo,
+            &[
+                ("100644", "deployment.toml", &recipe_blob),
+                ("100644", "same.txt", &a),
+                ("100644", "same.txt", &b),
+            ],
+        )?;
+        let git_owned = |args: &[&str]| -> Result<String> {
+            let output = Command::new("git")
+                .args([
+                    "-c", "safe.directory=*",
+                    "-c", "user.name=Idunn Test",
+                    "-c", "user.email=idunn-test@example.invalid",
+                    "-C",
+                ])
+                .arg(&origin_repo)
+                .args(args)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        let hostile_commit =
+            git_owned(&["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"])?;
+        git_owned(&["update-ref", "refs/heads/main", &hostile_commit])?;
+
+        // The hostile objects land already-local through an UNGUARDED fetch
+        // (no `transfer.fsckObjects=true`), exactly like Soul's probe A: no
+        // fsck of any kind has touched them by the time `git_tree_entries`
+        // runs.
+        driver.git([
+            OsString::from("-C"),
+            source.checkout.as_os_str().to_owned(),
+            OsString::from("fetch"),
+            OsString::from("--force"),
+            OsString::from("--no-tags"),
+            OsString::from("origin"),
+            OsString::from("+refs/heads/main:refs/idunn/resolutions/s4-3-x06/r1"),
+        ])?;
+
+        let result = driver.git_tree_entries(&source.checkout, &hostile_commit);
+        assert!(
+            result.is_err(),
+            "a raw tree that emits the same path twice must be refused by git_tree_entries \
+             itself, with no fsck anywhere in this call path"
+        );
+        Ok(())
+    }
+
+    /// S4-3, `ensure_frozen_directory`'s own containment check
+    /// (`path.starts_with(root)`): the existing test only reaches a path
+    /// whose full ancestor chain terminates at a real, untracked directory
+    /// (the temp dir), so deleting the check still bails on "an existing
+    /// directory this freeze did not create" -- a different guard catches
+    /// it, and the mutant survives. Pre-seeding `created_dirs` with a real
+    /// directory outside the root -- exactly what a second, independent
+    /// bookkeeping pass could look like -- lets the walk short-circuit past
+    /// that other guard, so only the containment check stands between this
+    /// call and actually creating a directory outside the frozen root.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_frozen_directory_containment_guard_is_load_bearing_on_its_own() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let outside_parent = temp.path().join("outside");
+        fs::create_dir(&outside_parent)?;
+        let target = outside_parent.join("child");
+
+        let mut created_dirs = std::collections::HashSet::new();
+        created_dirs.insert(root.clone());
+        created_dirs.insert(outside_parent.clone());
+
+        let result = ensure_frozen_directory(&root, &mut created_dirs, &target);
+        assert!(
+            result.is_err(),
+            "a path outside the root must be refused even when its parent is already tracked"
+        );
+        assert!(!target.exists(), "nothing outside the root may be created");
+        Ok(())
+    }
+
+    /// S4-3, the writer's creation call: pass 1 must use `fs::create_dir`,
+    /// which requires its immediate parent to already exist, never
+    /// `fs::create_dir_all`, which silently manufactures every missing
+    /// ancestor. The existing test only reaches a path whose parent
+    /// `ensure_frozen_directory` itself just created moments earlier, so the
+    /// two calls behave identically there. Pre-seeding `created_dirs` with a
+    /// parent bookkeeping claims already exists but that was never actually
+    /// created on disk makes the two calls diverge: `create_dir` must fail
+    /// closed; `create_dir_all` would silently manufacture it and
+    /// everything under it.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_frozen_directory_create_call_does_not_silently_backfill_a_missing_parent() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let phantom_parent = root.join("phantom");
+        let target = phantom_parent.join("child");
+
+        let mut created_dirs = std::collections::HashSet::new();
+        created_dirs.insert(root.clone());
+        // Bookkeeping lies: claims this parent already exists, but nothing
+        // ever created it on disk.
+        created_dirs.insert(phantom_parent.clone());
+
+        let result = ensure_frozen_directory(&root, &mut created_dirs, &target);
+        assert!(
+            result.is_err(),
+            "creating a directory whose tracked parent does not actually exist on disk must \
+             fail closed, not silently backfill it"
+        );
+        assert!(
+            !phantom_parent.exists(),
+            "a missing tracked parent must not be silently created"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // S4-4 (Self's ruling, fourth Cut 1 fix batch): all three S1 fsck
+    // guards were unpinned. `freeze_exact`'s explicit fsck, `resolve()`'s
+    // fetch fsck flag, and `freeze_exact`'s own fetch fsck flag each need a
+    // fixture where deleting exactly that guard -- and no other -- changes
+    // the outcome.
+    // -----------------------------------------------------------------
+
+    /// Builds an origin repository with a clean root commit, then a second,
+    /// hostile commit on top of it, without ever touching the driver.
+    /// Mirrors Soul's probe A fixtures exactly: dup-trees, six `.git`
+    /// look-alikes, an unsorted tree, mode 120000 on a tree, mode 040000 on
+    /// a blob, and a zero-padded mode.
+    #[cfg(unix)]
+    #[allow(clippy::type_complexity)]
+    fn s4_4_hostile_fixtures()
+    -> Vec<(&'static str, Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>)> {
+        fn hash_object(repo: &Path, content: &[u8]) -> Result<String> {
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(repo)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(content)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        }
+        fn literal_tree(repo: &Path, entries: &[(&str, &str, &str)]) -> Result<String> {
+            let hex = |s: &str| -> Vec<u8> {
+                (0..20)
+                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                    .collect()
+            };
+            let mut raw = Vec::new();
+            for (mode, name, sha) in entries {
+                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+                raw.extend(hex(sha));
+            }
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(repo)
+                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(&raw)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object --literally failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        }
+        fn dotgit_lookalike(repo: &Path, recipe: &str, name: &str) -> Result<Vec<(String, String, String)>> {
+            let cfg = hash_object(repo, b"[core]\n\tfsmonitor = touch /tmp/s4-4-pwned\n")?;
+            let inner = literal_tree(repo, &[("100644", "config", &cfg)])?;
+            let mut entries = vec![
+                ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
+                ("40000".to_owned(), name.to_owned(), inner),
+            ];
+            entries.sort_by(|a, b| a.1.cmp(&b.1));
+            Ok(entries)
+        }
+
+        vec![
+            (
+                "dup-trees",
+                Box::new(|repo: &Path, recipe: &str| {
+                    let x = hash_object(repo, b"x\n")?;
+                    let y = hash_object(repo, b"y\n")?;
+                    let tx = literal_tree(repo, &[("100644", "x", &x)])?;
+                    let ty = literal_tree(repo, &[("100644", "y", &y)])?;
+                    Ok(vec![
+                        ("40000".into(), "d".into(), tx),
+                        ("40000".into(), "d".into(), ty),
+                        ("100644".into(), "deployment.toml".into(), recipe.into()),
+                    ])
+                }) as Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>,
+            ),
+            (".GIT", Box::new(|r: &Path, c: &str| dotgit_lookalike(r, c, ".GIT"))),
+            (".Git", Box::new(|r: &Path, c: &str| dotgit_lookalike(r, c, ".Git"))),
+            ("git~1", Box::new(|r: &Path, c: &str| dotgit_lookalike(r, c, "git~1"))),
+            (".git.", Box::new(|r: &Path, c: &str| dotgit_lookalike(r, c, ".git."))),
+            (".git-zwnj", Box::new(|r: &Path, c: &str| dotgit_lookalike(r, c, ".git\u{200c}"))),
+            (".git-space", Box::new(|r: &Path, c: &str| dotgit_lookalike(r, c, ".git "))),
+            (
+                "unsorted-tree",
+                Box::new(|repo: &Path, recipe: &str| {
+                    let z = hash_object(repo, b"z\n")?;
+                    let a = hash_object(repo, b"a\n")?;
+                    Ok(vec![
+                        ("100644".into(), "z.txt".into(), z),
+                        ("100644".into(), "a.txt".into(), a),
+                        ("100644".into(), "deployment.toml".into(), recipe.into()),
+                    ])
+                }),
+            ),
+            (
+                "symlink-mode-on-tree",
+                Box::new(|repo: &Path, recipe: &str| {
+                    let blob = hash_object(repo, b"inner\n")?;
+                    let inner = literal_tree(repo, &[("100644", "f", &blob)])?;
+                    let mut entries = vec![
+                        ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
+                        ("120000".to_owned(), "lnk".to_owned(), inner),
+                    ];
+                    entries.sort_by(|a, b| a.1.cmp(&b.1));
+                    Ok(entries)
+                }),
+            ),
+            (
+                "dir-mode-on-blob",
+                Box::new(|repo: &Path, recipe: &str| {
+                    let blob = hash_object(repo, b"notatree\n")?;
+                    let mut entries = vec![
+                        ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
+                        ("40000".to_owned(), "d".to_owned(), blob),
+                    ];
+                    entries.sort_by(|a, b| a.1.cmp(&b.1));
+                    Ok(entries)
+                }),
+            ),
+            (
+                "mode-0100644-zero-padded",
+                Box::new(|repo: &Path, recipe: &str| {
+                    let blob = hash_object(repo, b"pad\n")?;
+                    let mut entries = vec![
+                        ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
+                        ("0100644".to_owned(), "padded.txt".to_owned(), blob),
+                    ];
+                    entries.sort_by(|a, b| a.1.cmp(&b.1));
+                    Ok(entries)
+                }),
+            ),
+        ]
+    }
+
+    /// S4-4, `freeze_exact`'s explicit fsck (the guard S1 added because a
+    /// fetch by exact revision never re-transfers, and so never re-checks,
+    /// an object the checkout already holds). Each fixture's checkout is
+    /// established on the clean root commit first, then the hostile objects
+    /// are brought in with an UNGUARDED fetch -- already local, exactly as
+    /// Soul's probe A found them -- before `freeze_exact` itself runs.
+    /// Deleting the explicit fsck block must fail every one of these.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_refuses_already_local_hostile_objects_via_its_own_fsck() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut exercised = 0;
+        for (index, (label, build)) in s4_4_hostile_fixtures().into_iter().enumerate() {
+            let temp = tempfile::tempdir()?;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+            let origin_repo = temp.path().join("origin");
+            fs::create_dir(&origin_repo)?;
+            git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+            git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+            git_at(&origin_repo, &["config", "user.email", "idunn-test@example.invalid"])?;
+            fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+            git_at(&origin_repo, &["add", "--all"])?;
+            git_at(&origin_repo, &["commit", "-m", "root"])?;
+            let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+            let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
+            ensure!(
+                Command::new("/bin/chown")
+                    .args(["-R", "1000:1000"])
+                    .arg(&origin_repo)
+                    .status()?
+                    .success(),
+                "chowning the fixture origin repository"
+            );
+
+            let source_cache_root = temp.path().join("source-cache");
+            let frozen_source_root = temp.path().join("frozen-source");
+            fs::create_dir(&frozen_source_root)?;
+            fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+            let identity = ProcessIdentity {
+                uid: 1000,
+                gid: 1000,
+            };
+            let driver = GitSourceDriver::new(
+                source_cache_root.clone(),
+                frozen_source_root.clone(),
+                Some(identity),
+            );
+            let source = ExactSource {
+                origin: format!("file://{}", origin_repo.display()),
+                checkout: source_cache_root.join("checkout"),
+                gitlinks: BTreeMap::new(),
+                recipe_path: PathBuf::from("deployment.toml"),
+            };
+            // The checkout is established on the good root commit first, so
+            // the hostile objects only ever arrive through the next fetch,
+            // never the initial clone.
+            driver.prepare_source_root(&source)?;
+
+            let entries = build(&origin_repo, &recipe_blob)
+                .with_context(|| format!("building the {label} fixture"))?;
+            let entry_refs: Vec<(&str, &str, &str)> = entries
+                .iter()
+                .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
+                .collect();
+            let hex = |s: &str| -> Vec<u8> {
+                (0..20)
+                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                    .collect()
+            };
+            let mut raw = Vec::new();
+            for (mode, name, sha) in &entry_refs {
+                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+                raw.extend(hex(sha));
+            }
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(&origin_repo)
+                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(&raw)?;
+            let tree_output = child.wait_with_output()?;
+            ensure!(tree_output.status.success(), "git hash-object --literally failed");
+            let hostile_tree = String::from_utf8(tree_output.stdout)?.trim().to_owned();
+
+            let git_owned = |args: &[&str]| -> Result<String> {
+                let output = Command::new("git")
+                    .args([
+                        "-c", "safe.directory=*",
+                        "-c", "user.name=Idunn Test",
+                        "-c", "user.email=idunn-test@example.invalid",
+                        "-C",
+                    ])
+                    .arg(&origin_repo)
+                    .args(args)
+                    .output()?;
+                ensure!(
+                    output.status.success(),
+                    "git {:?} failed: {}",
+                    args,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+            };
+            let hostile_commit =
+                git_owned(&["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"])?;
+            git_owned(&["update-ref", "refs/heads/main", &hostile_commit])?;
+
+            // Unguarded fetch: no `transfer.fsckObjects=true`. Most of
+            // Soul's fixtures land already local this way, exactly like her
+            // probe A; a few (an object whose mode disagrees with its own
+            // type, e.g. mode 040000 naming a blob) make the server's own
+            // pack-objects refuse to serve them at all, guarded or not --
+            // Soul recorded this too ("refused earlier, at the fetch"). That
+            // is a stronger outcome than this test needs to prove, so it is
+            // treated the same as an already-local refusal, not a test
+            // failure: only a fixture that actually lands gets to exercise
+            // freeze_exact's own explicit fsck.
+            let landed = driver
+                .git([
+                    OsString::from("-C"),
+                    source.checkout.as_os_str().to_owned(),
+                    OsString::from("fetch"),
+                    OsString::from("--force"),
+                    OsString::from("--no-tags"),
+                    OsString::from("origin"),
+                    OsString::from(format!("+refs/heads/main:refs/idunn/resolutions/s4-4a/r{index}")),
+                ])
+                .is_ok();
+
+            if landed {
+                exercised += 1;
+                let result =
+                    driver.freeze_exact(&source, &hostile_commit, "txn-s4-4a", &frozen_source_root);
+                assert!(
+                    result.is_err(),
+                    "{label}: already-local hostile objects must still be refused by \
+                     freeze_exact's own explicit fsck"
+                );
+            }
+        }
+        assert!(
+            exercised > 0,
+            "at least one fixture must actually land already-local and exercise freeze_exact's \
+             own explicit fsck, or this test proves nothing"
+        );
+        Ok(())
+    }
+
+    /// S4-4, `freeze_exact`'s own fetch fsck flag (`-c
+    /// transfer.fsckObjects=true` on the fetch immediately before the
+    /// explicit fsck block). Here the hostile revision is fetched for the
+    /// first time by `freeze_exact` itself, so if this flag is what refuses
+    /// it, the error surfaces at the fetch -- distinct from the explicit
+    /// fsck's own error, which never gets a chance to run. Asserting on
+    /// which context wraps the error is what makes this guard, and not the
+    /// explicit fsck sitting right after it, the one this test kills.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_refuses_a_never_local_hostile_revision_at_its_own_fetch() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(&origin_repo, &["config", "user.email", "idunn-test@example.invalid"])?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "root"])?;
+        let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
+
+        let cfg = Command::new("git")
+            .args(["-c", "safe.directory=*", "-C"])
+            .arg(&origin_repo)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"[core]\n\tfsmonitor = touch /tmp/s4-4c-pwned\n")?;
+                child.wait_with_output()
+            })?;
+        ensure!(cfg.status.success(), "git hash-object failed");
+        let cfg_blob = String::from_utf8(cfg.stdout)?.trim().to_owned();
+
+        let hex = |s: &str| -> Vec<u8> {
+            (0..20)
+                .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let write_tree = |entries: &[(&str, &str, &str)]| -> Result<String> {
+            let mut raw = Vec::new();
+            for (mode, name, sha) in entries {
+                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+                raw.extend(hex(sha));
+            }
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(&origin_repo)
+                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(&raw)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object --literally failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        let inner = write_tree(&[("100644", "config", &cfg_blob)])?;
+        let mut top_entries = vec![
+            ("100644".to_owned(), "deployment.toml".to_owned(), recipe_blob.clone()),
+            ("40000".to_owned(), ".git".to_owned(), inner),
+        ];
+        top_entries.sort_by(|a, b| a.1.cmp(&b.1));
+        let top_refs: Vec<(&str, &str, &str)> = top_entries
+            .iter()
+            .map(|(m, n, s)| (m.as_str(), n.as_str(), s.as_str()))
+            .collect();
+        let hostile_tree = write_tree(&top_refs)?;
+
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+        let git_owned = |args: &[&str]| -> Result<String> {
+            let output = Command::new("git")
+                .args([
+                    "-c", "safe.directory=*",
+                    "-c", "user.name=Idunn Test",
+                    "-c", "user.email=idunn-test@example.invalid",
+                    "-C",
+                ])
+                .arg(&origin_repo)
+                .args(args)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        let hostile_commit =
+            git_owned(&["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"])?;
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: format!("file://{}", origin_repo.display()),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+        // A fresh checkout on the clean root commit -- `refs/heads/main`
+        // still points at it, not at the hostile commit -- established
+        // before the hostile commit is admitted anywhere. Only after this
+        // clone succeeds does `main` move, so the hostile commit has never
+        // been fetched by anything, guarded or not, and `freeze_exact`'s own
+        // fetch is the first thing to ever see it.
+        driver.prepare_source_root(&source)?;
+        git_owned(&["update-ref", "refs/heads/main", &hostile_commit])?;
+
+        let result =
+            driver.freeze_exact(&source, &hostile_commit, "txn-s4-4c", &frozen_source_root);
+        let error = result.expect_err("a never-local hostile revision must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("fetching the durable exact source revision"),
+            "expected the refusal to come from freeze_exact's own guarded fetch, got: {rendered}"
+        );
         Ok(())
     }
 }
