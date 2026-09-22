@@ -1071,3 +1071,36 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
     - The size is `drivers.rs` −178/+426, against a ledger of about −90/+140. The type surface and a fourth, negative test account for the difference.
   - **Soul's pass is dispatched.**
 - Rulings so far: Q-V1 A, Q-V2 A, Q-V3 A, Q-V4 B via `Add-Type`, Q-V5 A, Q-V7 B, Q-V8 B.
+- **2026-09-22: Soul on Cuts 0–1** (Opus, on Yggdrasil).
+  - **Held.**
+    - Behaviour is preserved. A fake-docker probe over 8 real call paths found the security flags byte-identical and in order.
+    - Only the declared differences appeared, plus one extra: secret environment variables are reordered (F4). That is harmless in Docker and is **accepted, now declared**.
+    - The numbers reproduce: tests 126 to 130, and cut1 5/5. Both needed a machine-id; see F10, fixed in the stopgap at Eureka `2fdc056`.
+  - **F1 (high): the argv test pins only the default runner path.** Thirteen of 14 mutants survive, including:
+    - `--cap-drop ALL` dropped only on `bridge`;
+    - `--cpus` rounded to 0.5;
+    - environment passthrough by prefix;
+    - ambient `GAMECULT_*`/`IDUNN_*` environment;
+    - writable secret mounts;
+    - explicit `none` lowered to `bridge`;
+    - `--read-only` dropped on a named network;
+    - an extra mount of the cache's parent;
+    - the secret and cache-root validation calls removed.
+  - **F2 (medium): `freeze_exact` is `git archive`, so it is not byte-exact.** Non-recipe files come through with `eol=crlf` applied, `export-ignore` dropped, `export-subst` and `ident` expanded, and LFS left as pointers. The recipe check does catch transforms on the recipe itself. The test asserts no byte-exactness at all.
+  - **F3:** deploy's `freeze` fetches twice.
+  - **F5:** the gitlink loop is untested; skipping it survives.
+  - **F7:** `StepPort` and `StepOutcome` are dead code, and `run_step` duplicates `docker()`.
+  - **F8:** the `--cap-drop` negative check also matches a test.
+  - **F9:**
+    - `docs/guide.md:11` is still stale.
+    - These gamecult-ops files still route through the dead `idunn redeploy` script: `runbooks/odin-yggdrasil.md:88`, `ghostlight-dungeon-yggdrasil.md:134,243`, `heimdall-discord-launch.md:125,144`, `epiphany-yggdrasil-deploy.md:156`, and the `bootstrap-ghostlight-yggdrasil.sh` and `bootstrap-codex-connector-yggdrasil.sh` scripts.
+  - **Pre-existing:** a binding environment variable with the source stamp's name overrides the stamp.
+- **Self's rulings for the Cut 1 fix batch, 2026-09-22:**
+  - **F1.** The lowering is pinned on every branch: network `none`, `bridge` and named; cache present and absent; secrets present; required environment present; a range of CPU quotas (100, 150, 250, 333, 800). Every Soul mutant becomes an entry and must die. The validation calls are pinned by tests that go through `ContainerSpec::for_step`.
+  - **F2. The frozen tree is the commit's blobs, exactly.** Blobs are written raw from the object store (`ls-tree -r -z` plus `cat-file --batch`), with no attribute transforms. Modes and symlinks are preserved as the tree records them, and gitlinks are handled as today. LFS content is **not fetched**: a pointer is the blob, and the verdict records that the tree contains LFS pointers. Verifying an LFS repository's real content is a follow-up. **Deploy shares this freeze, so its behaviour would change.** Before changing it, Hands surveys the `.gitattributes` of every Idunn deploy target (the target repos named in the gamecult-ops bindings) for `export-ignore`, `export-subst`, `ident`, `eol`/`text`, `filter` and LFS. If any deploy target depends on an archive transform, **stop and report**: that is a fork for the operator. The test asserts byte equality against `cat-file` for every file of a fixture that has CRLF, `export-ignore`, `export-subst`, `ident`, a symlink, the executable bit and a gitlink.
+  - **F3:** `freeze` fetches once.
+  - **F5:** add a gitlink test and entry.
+  - **F7:** delete the dead `StepPort`/`StepOutcome`. There is one Docker spawn path; `run_step` goes through `docker()`.
+  - **F8:** make the negative check `rg` over `src/` excluding `#[cfg(test)]`, or state its hit count.
+  - **F9:** fix `guide.md:11`, and repoint every listed gamecult-ops runbook and bootstrap script at the current procedure (`idunn up` plus a brake release, as in `runbooks/idunn-host-raven.md`), or delete the steps. Delete the dead script.
+  - **Stamp override:** refuse a binding environment variable whose name collides with the source stamp.
