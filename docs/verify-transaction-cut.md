@@ -1116,3 +1116,33 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
   - **Follow-up:** `freeze_exact` returns an LFS-pointer flag that `FrozenSourceReceipt` does not carry yet. It must reach the verify verdict (Cut 2/4).
   - **Recorded, not this cut's:** `test-voidbot-swarm-yggdrasil.sh` fails on `add-daemon-health-trust-binding`. That failure is pre-existing.
   - **Soul's pass dispatched.**
+- **2026-09-22: Soul on the Cut 1 fix batch** (Opus, on Yggdrasil). **Cut 1 does not close.**
+  - **Held.**
+    - 142 tests; cut1 17/17 killed.
+    - Byte-exact on a 3,026-entry fixture: 0 mismatches, against 7 on the old commit. The fixture covers CRLF, export-*, ident, LFS, the three symlink kinds, the executable bit, a gitlink carrying attributes, hostile names, and 6 MB and empty files.
+    - Hostile trees are refused.
+    - **Deploy equivalence: identical digests on all five live targets.**
+    - F3: one fetch.
+    - The stamp refusal holds.
+    - No live `redeploy` remains.
+  - **F1 (high): the raw freeze is 40 to 80 times slower on real targets.** Ghostlight takes 412 s against 5.3 s, Heimdall 457 s against 8.5 s, Odin 90 s against 2.2 s. `cat-file --batch` on the blobless checkout (`drivers.rs:788,1053,1245`) fetches missing blobs lazily in small packs. `read_blobs` also holds the whole tree in memory.
+  - **F2 (high, new regression): a tree with duplicate or aliased names makes root write outside the frozen root.** A symlink `a` pointing outward plus a subtree `a/pwn` gives a root-owned `pwn` outside the root, left behind after the freeze fails. `fs::write`, `symlink` and `create_dir_all` follow symlinks and run before hardening (`:1173-1203`, `:1350`). The old tar path refused this tree. The fetch does not set `transfer.fsckObjects`.
+  - **F3 (medium):** by the same mechanism, the recipe check *can* fail, and a single alias silently freezes the wrong content. The "not yet reached" claim is false.
+  - **F4 (medium):** no test pins the hardening. Removing both `harden_frozen_source` and `validate_frozen_source` from `freeze_exact` survives all 142 tests. The two calls are redundant.
+  - **F5 (medium, pre-existing):** a symlink chain (`D -> .`, `L -> D/D/../../../etc/passwd`) passes the lexical check (`:5516`) and resolves to `/etc/passwd`.
+  - **F6 (medium):** unpinned combinations. A named network plus a cache drops `--read-only` (N1). A secret mount becomes writable when a plain environment variable is present (N2). The stamp is dropped when a secret and a plain variable are both present (N3). The LFS flag is never set (N5).
+  - **F7 (medium):** `bootstrap-ghostlight-yggdrasil.sh` and `bootstrap-codex-connector-yggdrasil.sh` still provision the previous generation (`/srv/odin/deploy-manifests`, `daemon-health-trust.cc`, `/srv/ghostlight/current`, the old identity store). Only their last line changed, and neither has a brake release.
+  - **F8 (low):** `heimdall-discord-launch.md` says `idunn up heimdall`, but Heimdall has no installed binding.
+  - **F9 (low):** `read_blobs` never drains stderr, and its error paths leave zombie processes.
+- **Self's rulings for the second Cut 1 fix batch, 2026-09-22:**
+  - **F1:** fetch the exact commit's whole tree in **one bulk fetch** (depth 1, no blob filter), then read blobs locally. Stream to disk rather than holding the tree in memory. Target: within twice the old times on the five live targets, measured on Yggdrasil at the host's git version if the container can match it. Otherwise say which version you measured with.
+  - **F2 and F3: two layers, both required.**
+    - Fetch with `transfer.fsckObjects=true` (or run fsck on the fetched tree) and refuse duplicate, aliased and case-folding-colliding entries before anything is written.
+    - The writer never follows a link: each parent component must be a real directory created by the freeze itself, and symlinks are written last.
+    - Fixtures: Soul's duplicate-name and alias trees. Nothing is written outside the root, and the error is refused by name.
+  - **F4:** keep one hardening pass, the one that runs last, and pin it. Tests assert that absolute, escaping and chained symlinks are refused and that modes are root-owned 0444/0555. Its removal must die.
+  - **F5:** the symlink check resolves the full chain inside the root; a lexical check is not enough. The chain fixture must refuse.
+  - **F6:** pin N1, N2, N3 and N5 (the flag is set and tested). Carrying the flag into `FrozenSourceReceipt` stays in Cut 2/4.
+  - **F7:** delete the previous generation's provisioning steps from both bootstrap scripts. Keep only what is true under the v2 bindings, and add the brake-release step. If a script has nothing true left, delete it and point to the binding-install runbook.
+  - **F8:** mark the Heimdall runbook step as gated on installing its binding.
+  - **F9:** drain stderr and wait on the child on every path.
