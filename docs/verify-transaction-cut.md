@@ -361,7 +361,9 @@ R-V14).
 
 Depends: Cut 3 request validation, and the Cut 4 fetch.
 
-**Q-V3. How does the allowlist admit `pwsh`, `node` and `bash` without
+**Q-V3: RULED A by the operator, 2026-09-22 ("A is fine").** Each runner has an allowlist on the binding side, and a request names only step ids. The command line comes from the recipe at the verified revision and is admitted against the binding. The confinement is the container and the binding.
+
+*History, the question as asked:* **Q-V3. How does the allowlist admit `pwsh`, `node` and `bash` without
 becoming an escape hatch?**
 - A: keep the allowlist per runner on the binding side (F4). A request names
   only step ids. Argv is authored in the recipe at the verified revision and
