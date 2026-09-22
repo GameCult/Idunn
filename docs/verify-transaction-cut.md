@@ -469,7 +469,9 @@ client surface to reuse.
 Depends: the Cut 3 store split and modes, Cut 6 provisioning, and the Cut 7
 negative checks.
 
-**Q-V8. What process topology?**
+**Q-V8: RULED B by the operator, 2026-09-22 ("agreed").** Verify runs as a separate unit, `idunn-verify.service`, which runs `idunn verify-serve` from the same binary. It has its own stores and lock, and its `ReadWritePaths` are narrowed to its own roots and the `/srv/build` cache. It protects daemon survival and privilege isolation.
+
+*History, the question as asked:* **Q-V8. What process topology?**
 - A: a verify thread inside `idunn serve`.
 - B: a separate unit, `idunn-verify.service`, running `idunn verify-serve` from
   the same binary. It has its own stores and lock, and narrower
