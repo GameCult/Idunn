@@ -871,6 +871,8 @@ impl GitSourceDriver {
         let checkout = &source.checkout;
         if !checkout.exists() {
             self.git([
+                OsString::from("-c"),
+                OsString::from("transfer.fsckObjects=true"),
                 OsString::from("clone"),
                 OsString::from("--filter=blob:none"),
                 OsString::from("--no-checkout"),
@@ -1550,6 +1552,8 @@ impl GitSourceDriver {
         let checkout = gitlink_root.join(format!("{}-{}", fact.revision, Uuid::new_v4()));
         let result = (|| {
             self.git([
+                OsString::from("-c"),
+                OsString::from("transfer.fsckObjects=true"),
                 OsString::from("clone"),
                 OsString::from("--filter=blob:none"),
                 OsString::from("--no-checkout"),
@@ -9003,6 +9007,54 @@ mod tests {
             &origin_repo,
             &["config", "user.email", "idunn-test@example.invalid"],
         )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "good"])?;
+        let good = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            // `file://`, not a plain path: a plain local path triggers Git's
+            // optimized same-filesystem clone, which never runs the
+            // pack/transfer code path `transfer.fsckObjects` gates. `file://`
+            // forces the real transfer, the same one a real remote gets, so
+            // this fixture also exercises F2 layer (a)'s fsck defense.
+            origin: format!("file://{}", origin_repo.display()),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+
+        // Freeze the earlier, good commit first, while `main` still points
+        // at it: this is what actually creates the checkout, through
+        // `ensure_checkout`'s own (also fsck-guarded) clone. The malformed
+        // commit built below moves `main` only after this call, so it is
+        // fetched into an *already-existing* checkout: only the explicit,
+        // per-revision `fetch` in `freeze_exact` -- not the initial clone --
+        // is what has to refuse it. That isolates this fixture to the one
+        // fetch F2 layer (a)'s fsck flag actually guards.
+        driver.freeze_exact(&source, &good, "txn-good", &frozen_source_root)?;
+
         let recipe = hash_object(&origin_repo, b"target = 'test'\n")?;
         let pwn = hash_object(&origin_repo, b"written through a symlink by root\n")?;
         let link = hash_object(&origin_repo, outside.to_string_lossy().as_bytes())?;
@@ -9050,8 +9102,75 @@ mod tests {
         let output = child.wait_with_output()?;
         ensure!(output.status.success(), "git hash-object --literally failed");
         let tree = String::from_utf8(output.stdout)?.trim().to_owned();
-        let commit = git_at(&origin_repo, &["commit-tree", &tree, "-m", "dup"])?;
-        git_at(&origin_repo, &["update-ref", "refs/heads/main", &commit])?;
+        // Not `git_at`: the repository is already chowned to the
+        // unprivileged identity above, and this process is root, so plain
+        // `git` here refuses it as "dubious ownership" without `safe.directory`.
+        let git_owned = |args: &[&str]| -> Result<String> {
+            let output = Command::new("git")
+                .args([
+                    "-c", "safe.directory=*",
+                    "-c", "user.name=Idunn Test",
+                    "-c", "user.email=idunn-test@example.invalid",
+                    "-C",
+                ])
+                .arg(&origin_repo)
+                .args(args)
+                .output()?;
+            ensure!(output.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        let commit = git_owned(&["commit-tree", &tree, "-m", "dup"])?;
+        git_owned(&["update-ref", "refs/heads/main", &commit])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let result = driver.freeze_exact(&source, &commit, "txn-dup", &frozen_source_root);
+        assert!(
+            result.is_err(),
+            "a tree with a leaf entry aliasing another entry's ancestor must be refused"
+        );
+        assert!(
+            !outside.join("pwn").exists(),
+            "the writer must never place content outside the frozen root, even on refusal"
+        );
+        Ok(())
+    }
+
+    /// F2 (Self's ruling, second Cut 1 fix batch), isolated from the writer:
+    /// two regular files whose names differ only by case are two distinct,
+    /// individually valid Git blobs -- `git fsck` accepts them, and the
+    /// writer places both side by side without ever colliding on a
+    /// case-sensitive filesystem. Nothing but `refuse_conflicting_tree_entries`
+    /// stands between this tree and a successful freeze, so this fixture
+    /// pins that check on its own, decoupled from fsck and from the writer's
+    /// own defenses.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_refuses_a_case_folding_collision_between_two_regular_files() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        fs::write(origin_repo.join("README.txt"), b"upper\n")?;
+        fs::write(origin_repo.join("readme.txt"), b"lower\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
         ensure!(
             Command::new("/bin/chown")
                 .args(["-R", "1000:1000"])
@@ -9080,16 +9199,62 @@ mod tests {
             gitlinks: BTreeMap::new(),
             recipe_path: PathBuf::from("deployment.toml"),
         };
-
-        let result = driver.freeze_exact(&source, &commit, "txn-dup", &frozen_source_root);
+        let result = driver.freeze_exact(&source, &revision, "txn-case", &frozen_source_root);
         assert!(
             result.is_err(),
-            "a tree with a leaf entry aliasing another entry's ancestor must be refused"
+            "two paths that differ only by case must be refused, not silently coexist"
         );
+        Ok(())
+    }
+
+    /// F3 (Self's ruling, second Cut 1 fix batch), isolated from every layer
+    /// above it: `ensure_frozen_directory` is the writer's own primitive, and
+    /// it must refuse a path that already has *something* at it -- even a
+    /// plain pre-existing directory this call did not itself create --
+    /// rather than reuse it. Calling it directly, with a pre-seeded root a
+    /// real freeze would never produce, is what proves the writer itself
+    /// carries this invariant rather than relying on `refuse_conflicting_tree_entries`
+    /// upstream or a write-order accident downstream to prevent the same
+    /// outcome.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_frozen_directory_refuses_an_existing_entry_it_did_not_create() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
+
+        // A directory nobody's `created_dirs` bookkeeping knows about.
+        let foreign_dir = root.join("foreign");
+        fs::create_dir(&foreign_dir)?;
+        let mut created_dirs = std::collections::HashSet::new();
+        created_dirs.insert(root.clone());
         assert!(
-            !outside.join("pwn").exists(),
-            "the writer must never place content outside the frozen root, even on refusal"
+            ensure_frozen_directory(&root, &mut created_dirs, &foreign_dir).is_err(),
+            "a pre-existing directory this call did not create must be refused, not reused"
         );
+
+        // A symlink standing where a directory is wanted.
+        let link_dir = root.join("link");
+        symlink("/tmp", &link_dir)?;
+        let mut created_dirs = std::collections::HashSet::new();
+        created_dirs.insert(root.clone());
+        assert!(
+            ensure_frozen_directory(&root, &mut created_dirs, &link_dir).is_err(),
+            "a symlink standing where a directory is wanted must be refused"
+        );
+
+        // The positive case: an absent path is created and remembered.
+        let fresh_dir = root.join("fresh");
+        let mut created_dirs = std::collections::HashSet::new();
+        created_dirs.insert(root.clone());
+        ensure_frozen_directory(&root, &mut created_dirs, &fresh_dir)?;
+        assert!(fresh_dir.is_dir());
+        assert!(created_dirs.contains(&fresh_dir));
+        // Calling it again for the same, now-tracked path is a no-op.
+        ensure_frozen_directory(&root, &mut created_dirs, &fresh_dir)?;
         Ok(())
     }
 

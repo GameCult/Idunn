@@ -297,35 +297,31 @@
         @{
             Id   = 'cut1-fix-f1-no-bulk-fetch'
             Rule = 'materialize_tree_raw bulk-fetches every blob it needs once, before reading any of them, rather than letting cat-file --batch lazily fetch them one at a time.'
-            Test = 'drivers::tests::freeze_exact_is_byte_exact_and_recipe_checked'
+            Test = 'drivers::tests::freeze_exact_bulk_fetches_every_blob_in_one_round_trip'
             Old  = @'
         self.bulk_fetch_objects(repository, &object_order)?;
 '@
             New  = ''
         }
-        @{
-            Id   = 'cut1-fix-f2-no-fsck-on-fetch'
-            Rule = 'the exact-revision fetch enables transfer.fsckObjects, so Git itself refuses a fetched tree with duplicate names.'
-            Test = 'drivers::tests::freeze_exact_refuses_a_duplicate_named_tree_that_would_write_outside_its_root'
-            Old  = @'
-        self.git([
-            OsString::from("-c"),
-            OsString::from("transfer.fsckObjects=true"),
-            OsString::from("-C"),
-            source.checkout.as_os_str().to_owned(),
-            OsString::from("fetch"),
-'@
-            New  = @'
-        self.git([
-            OsString::from("-C"),
-            source.checkout.as_os_str().to_owned(),
-            OsString::from("fetch"),
-'@
-        }
+        # cut1-fix-f2-no-fsck-on-fetch: not yet reached. `transfer.fsckObjects`
+        # on the explicit fetch was meant to be an independent layer-(a)
+        # defense beside `refuse_conflicting_tree_entries`, but every tree
+        # constructible with `git hash-object --literally` that fsck's
+        # `duplicateEntries` check rejects also has a literal duplicate path
+        # or a case-folded ancestor collision that `refuse_conflicting_tree_entries`
+        # rejects first and unconditionally, before the fetch's fsck result
+        # can matter. No fixture built from this crate's own tools has yet
+        # separated the two. The flag stays (fsck's other structural checks
+        # are broader than this crate's own parser, and a future weakening of
+        # `refuse_conflicting_tree_entries` should still be caught here), but
+        # it is not pinned by a mutation entry until a fixture reaches it: for
+        # example a tree that is well-formed by this crate's own rules (no
+        # duplicate or aliased path) but that fsck refuses for an unrelated
+        # structural reason.
         @{
             Id   = 'cut1-fix-f2-no-alias-refusal'
             Rule = 'git_tree_entries refuses a tree where one entry aliases another (a leaf name that is also another leaf''s ancestor, case-folded).'
-            Test = 'drivers::tests::freeze_exact_refuses_a_duplicate_named_tree_that_would_write_outside_its_root'
+            Test = 'drivers::tests::freeze_exact_refuses_a_case_folding_collision_between_two_regular_files'
             Old  = @'
         refuse_conflicting_tree_entries(&entries)?;
 '@
@@ -334,7 +330,7 @@
         @{
             Id   = 'cut1-fix-f3-writer-follows-existing-entries'
             Rule = 'ensure_frozen_directory never treats a path that already exists as safe to write through; only a directory this freeze itself created may be reused.'
-            Test = 'drivers::tests::freeze_exact_refuses_a_duplicate_named_tree_that_would_write_outside_its_root'
+            Test = 'drivers::tests::ensure_frozen_directory_refuses_an_existing_entry_it_did_not_create'
             Old  = @'
     match fs::symlink_metadata(path) {
         Ok(metadata) => bail!(
