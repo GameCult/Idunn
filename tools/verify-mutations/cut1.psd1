@@ -261,92 +261,177 @@
             Rule = 'freeze_exact writes blobs raw from the object store; it must never revert to git archive, which applies attribute-driven transforms.'
             Test = 'drivers::tests::freeze_exact_is_byte_exact_across_every_attribute_transform'
             Old  = @'
-        fs::create_dir_all(destination)
-            .with_context(|| format!("creating {}", destination.display()))?;
+        ensure_frozen_directory(frozen_root, created_dirs, destination)?;
         let entries = self.git_tree_entries(repository, revision)?;
-        let blob_objects: Vec<String> = entries
-            .iter()
-            .filter(|entry| entry.kind == "blob")
-            .map(|entry| entry.object.clone())
-            .collect();
-        let blobs = self.read_blobs(repository, &blob_objects)?;
-        let mut lfs_pointer_paths = Vec::new();
-        for entry in &entries {
-            let target = destination.join(&entry.path);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            match entry.mode.as_str() {
-                "100644" | "100755" => {
-                    let content = blobs
-                        .get(&entry.object)
-                        .context("Git cat-file --batch omitted a requested blob")?;
-                    fs::write(&target, content)
-                        .with_context(|| format!("writing {}", target.display()))?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = if entry.mode == "100755" { 0o755 } else { 0o644 };
-                        fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
-                    }
-                    if is_lfs_pointer(content) {
-                        lfs_pointer_paths.push(entry.path.clone());
-                    }
-                }
-                "120000" => {
-                    let content = blobs
-                        .get(&entry.object)
-                        .context("Git cat-file --batch omitted a requested blob")?;
-                    let link_target = std::str::from_utf8(content)
-                        .context("frozen source symlink target is not UTF-8")?;
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(link_target, &target)
-                        .with_context(|| format!("creating symlink {}", target.display()))?;
-                }
-                "160000" => {
-                    // Gitlinks are materialized by the caller, which knows
-                    // each one's admitted origin; this entry only reserves
-                    // the directory.
-                }
-                other => bail!(
-                    "frozen source tree entry {} has an unsupported mode {other}",
-                    entry.path.display()
-                ),
-            }
-        }
-        Ok(lfs_pointer_paths)
 '@
             New  = @'
-        fs::create_dir_all(destination)
-            .with_context(|| format!("creating {}", destination.display()))?;
-        let mut archive = self.git_command([
+        ensure_frozen_directory(frozen_root, created_dirs, destination)?;
+        {
+            let mut archive = self.git_command([
+                OsString::from("-C"),
+                repository.as_os_str().to_owned(),
+                OsString::from("archive"),
+                OsString::from("--format=tar"),
+                OsString::from(revision),
+            ])?;
+            archive.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut archive = archive.spawn().context("starting Git archive")?;
+            let archive_stdout = archive.stdout.take().context("Git archive has no stdout")?;
+            let mut extractor = Command::new("/bin/tar");
+            extractor
+                .args([
+                    OsString::from("--extract"),
+                    OsString::from("--file=-"),
+                    OsString::from("--directory"),
+                    destination.as_os_str().to_owned(),
+                    OsString::from("--no-same-owner"),
+                ])
+                .stdin(Stdio::from(archive_stdout))
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            let extractor = extractor.spawn().context("starting tar extractor")?;
+            let archive_output = archive.wait_with_output().context("waiting for Git archive")?;
+            let extractor_output = extractor.wait_with_output().context("waiting for tar extractor")?;
+            ensure!(archive_output.status.success(), "Git archive failed");
+            ensure!(extractor_output.status.success(), "tar extraction failed");
+            return Ok(Vec::new());
+        }
+        #[allow(unreachable_code)]
+        let entries = self.git_tree_entries(repository, revision)?;
+'@
+        }
+        @{
+            Id   = 'cut1-fix-f1-no-bulk-fetch'
+            Rule = 'materialize_tree_raw bulk-fetches every blob it needs once, before reading any of them, rather than letting cat-file --batch lazily fetch them one at a time.'
+            Test = 'drivers::tests::freeze_exact_is_byte_exact_and_recipe_checked'
+            Old  = @'
+        self.bulk_fetch_objects(repository, &object_order)?;
+'@
+            New  = ''
+        }
+        @{
+            Id   = 'cut1-fix-f2-no-fsck-on-fetch'
+            Rule = 'the exact-revision fetch enables transfer.fsckObjects, so Git itself refuses a fetched tree with duplicate names.'
+            Test = 'drivers::tests::freeze_exact_refuses_a_duplicate_named_tree_that_would_write_outside_its_root'
+            Old  = @'
+        self.git([
+            OsString::from("-c"),
+            OsString::from("transfer.fsckObjects=true"),
             OsString::from("-C"),
-            repository.as_os_str().to_owned(),
-            OsString::from("archive"),
-            OsString::from("--format=tar"),
-            OsString::from(revision),
-        ])?;
-        archive.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut archive = archive.spawn().context("starting Git archive")?;
-        let archive_stdout = archive.stdout.take().context("Git archive has no stdout")?;
-        let mut extractor = Command::new("/bin/tar");
-        extractor
-            .args([
-                OsString::from("--extract"),
-                OsString::from("--file=-"),
-                OsString::from("--directory"),
-                destination.as_os_str().to_owned(),
-                OsString::from("--no-same-owner"),
-            ])
-            .stdin(Stdio::from(archive_stdout))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let extractor = extractor.spawn().context("starting tar extractor")?;
-        let archive_output = archive.wait_with_output().context("waiting for Git archive")?;
-        let extractor_output = extractor.wait_with_output().context("waiting for tar extractor")?;
-        ensure!(archive_output.status.success(), "Git archive failed");
-        ensure!(extractor_output.status.success(), "tar extraction failed");
-        Ok(Vec::new())
+            source.checkout.as_os_str().to_owned(),
+            OsString::from("fetch"),
+'@
+            New  = @'
+        self.git([
+            OsString::from("-C"),
+            source.checkout.as_os_str().to_owned(),
+            OsString::from("fetch"),
+'@
+        }
+        @{
+            Id   = 'cut1-fix-f2-no-alias-refusal'
+            Rule = 'git_tree_entries refuses a tree where one entry aliases another (a leaf name that is also another leaf''s ancestor, case-folded).'
+            Test = 'drivers::tests::freeze_exact_refuses_a_duplicate_named_tree_that_would_write_outside_its_root'
+            Old  = @'
+        refuse_conflicting_tree_entries(&entries)?;
+'@
+            New  = ''
+        }
+        @{
+            Id   = 'cut1-fix-f3-writer-follows-existing-entries'
+            Rule = 'ensure_frozen_directory never treats a path that already exists as safe to write through; only a directory this freeze itself created may be reused.'
+            Test = 'drivers::tests::freeze_exact_refuses_a_duplicate_named_tree_that_would_write_outside_its_root'
+            Old  = @'
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => bail!(
+'@
+            New  = @'
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(metadata) => bail!(
+'@
+        }
+        @{
+            Id   = 'cut1-fix-f4-harden-pass-removed'
+            Rule = 'freeze_exact hardens the frozen tree (root-owned 0444/0555, symlinks refused if they escape) before it is ever published.'
+            Test = 'drivers::tests::freeze_exact_refuses_an_absolute_or_escaping_symlink'
+            Old  = @'
+            harden_frozen_source(&partial)?;
+            let snapshot_sha256 = frozen_source_sha256(&partial)?;
+'@
+            New  = @'
+            let snapshot_sha256 = frozen_source_sha256(&partial)?;
+'@
+        }
+        @{
+            Id   = 'cut1-fix-f5-lexical-symlink-check'
+            Rule = 'a frozen-source symlink is validated by resolving its whole chain on the filesystem, not by lexically counting ".." components.'
+            Test = 'drivers::tests::freeze_exact_refuses_a_symlink_chain_that_escapes_through_a_self_referential_directory'
+            Old  = @'
+    let canonical_root = root.canonicalize().context("resolving frozen source root")?;
+    let canonical_target = path.canonicalize().with_context(|| {
+        format!("resolving frozen source symlink chain at {}", path.display())
+    })?;
+    ensure!(
+        canonical_target.starts_with(&canonical_root),
+        "frozen source symlink escapes its root"
+    );
+'@
+            New  = @'
+    let _ = root;
+    let _ = path;
+'@
+        }
+        @{
+            Id   = 'cut1-fix-n1-readonly-dropped-named-plus-cache'
+            Rule = '--read-only is present on a Named network even when a cache root is also mounted.'
+            Test = 'drivers::tests::docker_run_args_keeps_read_only_with_a_named_network_and_a_cache_root'
+            Old  = @'
+        args.push(bind_mount(cache_root, "/cache", false)?);
+'@
+            New  = @'
+        args.push(bind_mount(cache_root, "/cache", false)?);
+        if matches!(spec.network, ContainerNetwork::Named(_)) {
+            args.retain(|a| a != "--read-only");
+        }
+'@
+        }
+        @{
+            Id   = 'cut1-fix-n2-secret-writable-with-plain-env'
+            Rule = 'a secret mount is read-only regardless of how many plain environment entries the runner also carries.'
+            Test = 'drivers::tests::docker_run_args_keeps_secret_mounts_read_only_alongside_plain_environment'
+            Old  = @'
+        args.push(bind_mount(&mount.host_path, &mount.container_path, true)?);
+'@
+            New  = @'
+        args.push(bind_mount(&mount.host_path, &mount.container_path, spec.environment.len() == 1)?);
+'@
+        }
+        @{
+            Id   = 'cut1-fix-n3-stamp-dropped-with-secret-and-env'
+            Rule = 'the Idunn source stamp is never dropped from ContainerSpec::for_step''s environment, no matter what else the runner carries.'
+            Test = 'drivers::tests::container_spec_for_step_keeps_the_source_stamp_with_a_secret_and_plain_environment'
+            Old  = @'
+        let network = match runner.network_profile.as_deref() {
+'@
+            New  = @'
+        if !secret_mounts.is_empty() && environment.len() > 1 {
+            environment.remove(0);
+        }
+        let network = match runner.network_profile.as_deref() {
+'@
+        }
+        @{
+            Id   = 'cut1-fix-n5-lfs-flag-never-set'
+            Rule = 'a Git LFS pointer file materialized into a frozen tree is recorded in the returned LFS-pointer list.'
+            Test = 'drivers::tests::freeze_exact_sets_the_lfs_pointer_flag_for_a_pointer_file'
+            Old  = @'
+                    if is_lfs {
+                        lfs_pointer_paths.push(first.path.clone());
+                    }
+'@
+            New  = @'
+                    let _ = is_lfs;
 '@
         }
     )

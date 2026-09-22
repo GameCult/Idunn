@@ -8436,6 +8436,144 @@ mod tests {
         Ok(())
     }
 
+    /// F6/N1 (Soul, second Cut 1 fix batch): `--read-only` is present on a
+    /// Named network runner even when a cache root is also mounted. Neither
+    /// branch alone exercised this combination before.
+    #[cfg(unix)]
+    #[test]
+    fn docker_run_args_keeps_read_only_with_a_named_network_and_a_cache_root() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let cache = temp.path().join("cache");
+        let mut runner = fixture_docker_runner_binding();
+        runner.network_profile = Some("build-net".to_owned());
+        runner.cache_root = Some(cache);
+        let spec = ContainerSpec::for_step(
+            &runner,
+            &std::collections::BTreeSet::new(),
+            ("IDUNN_SOURCE_REVISION", "abc123"),
+        )?;
+        let workspace = PathBuf::from("/var/lib/gamecult/idunn/staging/txn-n1/.runner-rust");
+        let args = docker_run_args(&spec, &workspace, Path::new("."), &vec!["cargo".to_owned(), "test".to_owned()])?;
+        assert!(
+            args.iter().any(|a| a == OsStr::new("--read-only")),
+            "a Named network plus a cache root must not drop --read-only: {args:?}"
+        );
+        Ok(())
+    }
+
+    /// F6/N2 (Soul, second Cut 1 fix batch): a secret mount stays read-only
+    /// even when the runner also carries a plain environment entry.
+    #[cfg(unix)]
+    #[test]
+    fn docker_run_args_keeps_secret_mounts_read_only_alongside_plain_environment() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let secret = temp.path().join("secret.cc");
+        fs::write(&secret, b"s").unwrap();
+        ensure!(
+            Command::new("/bin/chown").arg("0:65532").arg(&secret).status()?.success(),
+            "chowning fixture secret"
+        );
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o440))?;
+
+        let mut runner = fixture_docker_runner_binding();
+        runner.secret_files = BTreeMap::from([("A_SECRET".to_owned(), secret.clone())]);
+        runner.environment = BTreeMap::from([("PLAIN_ONE".to_owned(), "x".to_owned())]);
+        let required = std::collections::BTreeSet::from(["A_SECRET".to_owned(), "PLAIN_ONE".to_owned()]);
+        let spec = ContainerSpec::for_step(&runner, &required, ("IDUNN_SOURCE_REVISION", "abc123"))?;
+        let workspace = PathBuf::from("/var/lib/gamecult/idunn/staging/txn-n2/.runner-rust");
+        let args = docker_run_args(&spec, &workspace, Path::new("."), &vec!["cargo".to_owned(), "test".to_owned()])?;
+        let secret_text = secret.display().to_string();
+        let mount = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .find(|a| a.starts_with("type=bind") && a.contains(&secret_text))
+            .expect("secret mount present");
+        assert!(
+            mount.ends_with(",readonly"),
+            "a plain environment entry must not make a secret mount writable: {mount}"
+        );
+        Ok(())
+    }
+
+    /// F6/N3 (Soul, second Cut 1 fix batch): the Idunn source stamp survives
+    /// as the container's environment even when the runner carries both a
+    /// secret and a plain environment entry.
+    #[cfg(unix)]
+    #[test]
+    fn container_spec_for_step_keeps_the_source_stamp_with_a_secret_and_plain_environment() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let secret = temp.path().join("secret.cc");
+        fs::write(&secret, b"s").unwrap();
+        ensure!(
+            Command::new("/bin/chown").arg("0:65532").arg(&secret).status()?.success(),
+            "chowning fixture secret"
+        );
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o440))?;
+
+        let mut runner = fixture_docker_runner_binding();
+        runner.secret_files = BTreeMap::from([("A_SECRET".to_owned(), secret)]);
+        runner.environment = BTreeMap::from([("PLAIN_ONE".to_owned(), "x".to_owned())]);
+        let required = std::collections::BTreeSet::from(["A_SECRET".to_owned(), "PLAIN_ONE".to_owned()]);
+        let spec = ContainerSpec::for_step(&runner, &required, ("IDUNN_SOURCE_REVISION", "abc123"))?;
+        assert_eq!(
+            spec.environment.first(),
+            Some(&("IDUNN_SOURCE_REVISION".to_owned(), "abc123".to_owned())),
+            "the source stamp must survive alongside a secret and a plain environment entry"
+        );
+        Ok(())
+    }
+
+    /// F6/N5 (Soul, second Cut 1 fix batch): `freeze_exact` records that the
+    /// frozen tree contains a Git LFS pointer, and the pointer bytes
+    /// themselves -- never the real LFS content, which is never fetched --
+    /// are what land on disk.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_sets_the_lfs_pointer_flag_for_a_pointer_file() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(&origin_repo, &["config", "user.email", "idunn-test@example.invalid"])?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:0000000000000000000000000000000000000000000000000000000000000000\nsize 3\n";
+        fs::write(origin_repo.join("lfs.bin"), pointer)?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        ensure!(
+            Command::new("/bin/chown").args(["-R", "1000:1000"]).arg(&origin_repo).status()?.success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity { uid: 1000, gid: 1000 };
+        let driver = GitSourceDriver::new(source_cache_root.clone(), frozen_source_root.clone(), Some(identity));
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+        let (tree_root, _snapshot_sha256, _recipe_bytes, contains_lfs_pointers) =
+            driver.freeze_exact(&source, &revision, "txn-lfs", &frozen_source_root)?;
+        assert!(contains_lfs_pointers, "an LFS pointer file must set the flag");
+        assert_eq!(fs::read(tree_root.join("lfs.bin"))?, pointer);
+        Ok(())
+    }
+
     /// Cut 1 fix batch, F1, S9: `ContainerSpec::for_step` must call
     /// `validate_runner_secret`, not merely mount whatever path the binding
     /// names. This fixture's secret file has the wrong mode (`0644` instead
@@ -8733,6 +8871,358 @@ mod tests {
         let materialized = fs::read_to_string(tree_root.join("vendor/sub/lib.txt"))
             .context("reading materialized Gitlink content")?;
         assert_eq!(materialized, "vendored content\n");
+        Ok(())
+    }
+
+    /// F1 (Self's ruling, second Cut 1 fix batch): every blob a frozen tree
+    /// needs is fetched in one bulk round trip, not lazily one object at a
+    /// time as `cat-file --batch` reads them. A spy standing in for
+    /// `/usr/bin/git` records every invocation; exactly one of them is the
+    /// bulk `fetch --stdin` call.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_bulk_fetches_every_blob_in_one_round_trip() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        for i in 0..8 {
+            fs::write(origin_repo.join(format!("f{i}.txt")), format!("file {i}\n"))?;
+        }
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+
+        let log = temp.path().join("git-invocations.log");
+        let spy = temp.path().join("git-spy.sh");
+        fs::write(
+            &spy,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nexec /usr/bin/git \"$@\"\n",
+                log.display()
+            ),
+        )?;
+        fs::set_permissions(&spy, fs::Permissions::from_mode(0o755))?;
+
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let mut driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        driver.git_program = spy;
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+
+        driver.freeze_exact(&source, &revision, "txn-bulk", &frozen_source_root)?;
+        let log_text = fs::read_to_string(&log).unwrap_or_default();
+        let bulk_fetches = log_text
+            .lines()
+            .filter(|line| line.contains("fetch") && line.contains("--stdin"))
+            .count();
+        assert_eq!(
+            bulk_fetches, 1,
+            "expected exactly one bulk --stdin fetch; invocations:\n{log_text}"
+        );
+        Ok(())
+    }
+
+    /// F2/F3 (Self's rulings, second Cut 1 fix batch): a tree with two
+    /// entries literally named `a` at the same level -- one a symlink
+    /// pointing outside the frozen root, one a subtree holding `pwn` -- must
+    /// be refused before anything is written, not partially materialized.
+    /// `git hash-object --literally` builds the tree directly, bypassing the
+    /// checks `git mktree` would apply, the same construction Soul's probe
+    /// used to find the regression this pins.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_refuses_a_duplicate_named_tree_that_would_write_outside_its_root() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        let hash_object = |repo: &Path, content: &[u8]| -> Result<String> {
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(repo)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(content)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+
+        let outside = temp.path().join("outside-root-owned");
+        fs::create_dir(&outside)?;
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755))?;
+
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        let recipe = hash_object(&origin_repo, b"target = 'test'\n")?;
+        let pwn = hash_object(&origin_repo, b"written through a symlink by root\n")?;
+        let link = hash_object(&origin_repo, outside.to_string_lossy().as_bytes())?;
+        let subtree_output = Command::new("git")
+            .args(["-c", "safe.directory=*", "-C"])
+            .arg(&origin_repo)
+            .args(["mktree"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write as _;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(format!("100644 blob {pwn}\tpwn\n").as_bytes())?;
+                child.wait_with_output()
+            })?;
+        ensure!(subtree_output.status.success(), "git mktree failed");
+        let subtree = String::from_utf8(subtree_output.stdout)?.trim().to_owned();
+
+        let hex = |s: &str| -> Vec<u8> {
+            (0..20)
+                .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let mut raw = Vec::new();
+        for (mode, name, sha) in [
+            ("120000", "a", &link),
+            ("40000", "a", &subtree),
+            ("100644", "deployment.toml", &recipe),
+        ] {
+            raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+            raw.extend(hex(sha));
+        }
+        let mut child = Command::new("git")
+            .args(["-c", "safe.directory=*", "-C"])
+            .arg(&origin_repo)
+            .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(&raw)?;
+        let output = child.wait_with_output()?;
+        ensure!(output.status.success(), "git hash-object --literally failed");
+        let tree = String::from_utf8(output.stdout)?.trim().to_owned();
+        let commit = git_at(&origin_repo, &["commit-tree", &tree, "-m", "dup"])?;
+        git_at(&origin_repo, &["update-ref", "refs/heads/main", &commit])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+
+        let result = driver.freeze_exact(&source, &commit, "txn-dup", &frozen_source_root);
+        assert!(
+            result.is_err(),
+            "a tree with a leaf entry aliasing another entry's ancestor must be refused"
+        );
+        assert!(
+            !outside.join("pwn").exists(),
+            "the writer must never place content outside the frozen root, even on refusal"
+        );
+        Ok(())
+    }
+
+    /// F4 (Self's ruling, second Cut 1 fix batch): `freeze_exact` refuses a
+    /// symlink that escapes the frozen root, whether the target is absolute
+    /// or a relative `..` walk, before the tree is ever published. This
+    /// exercises the guard through the public `freeze_exact` entry point
+    /// (not the `harden_frozen_source` unit alone), so removing the call
+    /// inside `freeze_exact` -- not just the function -- is what this pins.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_refuses_an_absolute_or_escaping_symlink() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for (label, make_link) in [
+            (
+                "absolute",
+                Box::new(|repo: &Path| symlink("/etc/passwd", repo.join("l"))) as Box<dyn Fn(&Path) -> std::io::Result<()>>,
+            ),
+            (
+                "escaping",
+                Box::new(|repo: &Path| {
+                    fs::create_dir(repo.join("d"))?;
+                    symlink("../../../outside-the-root", repo.join("d/l"))
+                }),
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+            let origin_repo = temp.path().join("origin");
+            fs::create_dir(&origin_repo)?;
+            git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+            git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+            git_at(
+                &origin_repo,
+                &["config", "user.email", "idunn-test@example.invalid"],
+            )?;
+            fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+            make_link(&origin_repo)?;
+            git_at(&origin_repo, &["add", "--all"])?;
+            git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+            let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+            ensure!(
+                Command::new("/bin/chown")
+                    .args(["-R", "1000:1000"])
+                    .arg(&origin_repo)
+                    .status()?
+                    .success(),
+                "chowning the fixture origin repository"
+            );
+
+            let source_cache_root = temp.path().join("source-cache");
+            let frozen_source_root = temp.path().join("frozen-source");
+            fs::create_dir(&frozen_source_root)?;
+            fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+            let identity = ProcessIdentity {
+                uid: 1000,
+                gid: 1000,
+            };
+            let driver = GitSourceDriver::new(
+                source_cache_root.clone(),
+                frozen_source_root.clone(),
+                Some(identity),
+            );
+            let source = ExactSource {
+                origin: origin_repo.to_string_lossy().into_owned(),
+                checkout: source_cache_root.join("checkout"),
+                gitlinks: BTreeMap::new(),
+                recipe_path: PathBuf::from("deployment.toml"),
+            };
+            let result = driver.freeze_exact(&source, &revision, "txn-escape", &frozen_source_root);
+            assert!(result.is_err(), "{label} symlink must be refused");
+        }
+        Ok(())
+    }
+
+    /// F5 (Self's ruling, second Cut 1 fix batch): a lexical `..`-count is
+    /// not enough once the chain passes back through another symlink. `D`
+    /// points at `.` (itself), and `L` walks through a dozen `D` hops before
+    /// finally leaving with `..` -- lexically that undercounts how far the
+    /// chain really goes, because each `D` the OS resolves is a fresh copy
+    /// of the root, not one ordinary path component. `L` actually resolves
+    /// to `/etc/passwd`.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_refuses_a_symlink_chain_that_escapes_through_a_self_referential_directory() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        symlink(".", origin_repo.join("D"))?;
+        let chain = "D/D/D/D/D/D/D/D/D/D/D/D/../../../../../../../../../../../../etc/passwd";
+        symlink(chain, origin_repo.join("L"))?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+        let result = driver.freeze_exact(&source, &revision, "txn-chain", &frozen_source_root);
+        assert!(
+            result.is_err(),
+            "a symlink chain that resolves outside the root through a self-referential directory must be refused"
+        );
         Ok(())
     }
 
