@@ -11409,12 +11409,27 @@ mod tests {
                 .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
                 .collect();
             let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
-            let hostile_commit = git_at(
-                &origin_repo,
-                &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
-            )?;
-            git_at(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
-            chown_to_source_identity(&origin_repo)?;
+            // Not `git_at`: the repository is already chowned to the
+            // unprivileged identity above, and this process is root, so
+            // plain `git` here refuses it as "dubious ownership" without
+            // `safe.directory` (the same reason `freeze_exact_refuses_a_
+            // duplicate_named_tree...` above uses its own `git_owned`).
+            let git_owned = |args: &[&str]| -> Result<String> {
+                let output = Command::new("git")
+                    .args([
+                        "-c", "safe.directory=*",
+                        "-c", "user.name=Idunn Test",
+                        "-c", "user.email=idunn-test@example.invalid",
+                        "-C",
+                    ])
+                    .arg(&origin_repo)
+                    .args(args)
+                    .output()?;
+                ensure!(output.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
+                Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+            };
+            let hostile_commit = git_owned(&["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"])?;
+            git_owned(&["update-ref", "refs/heads/main", &hostile_commit])?;
 
             // The exact fetch `resolve()` runs (`drivers.rs`, `fn resolve`),
             // S1's fix included: `-c transfer.fsckObjects=true`, `--force`,
