@@ -30,6 +30,8 @@ use crate::deployment_plan::{
     ArtifactReceipt, CompiledDeploymentPlan, ExternalInputMaterializationReceipt, GitlinkTreeFact,
     SOURCE_SELECTION_FACTS_SCHEMA, SealedRelease, SourceSelection, SourceSelectionFacts,
 };
+#[cfg(test)]
+use crate::deployment_plan::compile_deployment_plan;
 use cultnet_rs::{
     CultNetMessage, CultNetRawPayloadEncoding, CultNetWireContract,
     GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA, GAMECULT_RUNTIME_PRESENCE_HEALTH_SIGNING_PURPOSE,
@@ -7587,6 +7589,17 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
             hasher.update(b"file\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
+            // R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): this is the
+            // artifact digest, and it had exactly the blindness R-I3 fixed
+            // for the frozen-source digest (S5-4) -- no executable-bit term
+            // at all, so an artifact losing or gaining its executable bit
+            // hashed identically. Pinned below.
+            hasher.update(
+                digest_tree_is_executable(&metadata)
+                    .to_string()
+                    .as_bytes(),
+            );
+            hasher.update(b"\0");
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(&bytes);
             *size = size.saturating_add(bytes.len().try_into()?);
@@ -7596,12 +7609,32 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
             hasher.update(target.as_os_str().as_encoded_bytes());
+            // R-I13: the second half of R-I3's treatment (S5-3) -- a
+            // terminator after the target, matching the frozen-source
+            // digest's own symlink arm and the self-delimiting shape the
+            // file arm above already has via its length prefix. Not
+            // independently pinned by a test: see the note above the tests
+            // below for why no legitimate fixture can construct a colliding
+            // pair (real symlink targets cannot contain the NUL byte a
+            // collision here would require).
+            hasher.update(b"\0");
             *size = size.saturating_add(target.as_os_str().len().try_into()?);
         } else {
             bail!("artifact tree contains a special filesystem entry")
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn digest_tree_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn digest_tree_is_executable(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 pub(crate) fn raw_sha256(bytes: &[u8]) -> String {
@@ -12215,6 +12248,288 @@ mod tests {
     fn nix_group_or_skip() -> Result<u32> {
         Ok(1)
     }
+    /// R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): `digest_tree` is
+    /// the artifact digest, separate from `frozen_source_sha256`, and had
+    /// exactly the blindness R-I3 fixed there (S5-4): no executable-bit
+    /// term. No ruling in the fifth batch covered it, so Soul flagged it
+    /// explicitly as not fixed by association.
+    #[cfg(unix)]
+    #[test]
+    fn digest_artifact_differs_when_only_the_executable_bit_differs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn build(temp: &Path, name: &str, mode: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let file = root.join("f");
+            fs::write(&file, b"same content\n")?;
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", 0o644)?;
+        let root_b = build(temp.path(), "root-b", 0o755)?;
+        let (digest_a, _) = digest_artifact(&root_a)?;
+        let (digest_b, _) = digest_artifact(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two artifact trees differing only in the executable bit must hash differently"
+        );
+        Ok(())
+    }
+
+    /// R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): the second half of
+    /// `digest_tree`'s blindness -- no terminator after a symlink target, so
+    /// the relative-name/target boundary and the target/next-entry boundary
+    /// could be shifted against each other without changing the hash. Two
+    /// trees are built so a bare concatenation of (`link\0` + name + `\0` +
+    /// target) collides across that boundary if the trailing `\0` is
+    /// missing: root A has one link named `a` targeting `bc`; root B has one
+    /// link named `ab` targeting `c`.
+    #[cfg(unix)]
+    #[test]
+    fn digest_artifact_differs_across_a_symlink_target_boundary_shift() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        fn build(temp: &Path, name: &str, link_name: &str, target: &str) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            symlink(target, root.join(link_name))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", "a", "bc")?;
+        let root_b = build(temp.path(), "root-b", "ab", "c")?;
+        let (digest_a, _) = digest_artifact(&root_a)?;
+        let (digest_b, _) = digest_artifact(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "a link named 'a' targeting 'bc' must not hash the same as a link named 'ab' \
+             targeting 'c': without a terminator after the target, both concatenate to the \
+             same bytes"
+        );
+        Ok(())
+    }
+
+    /// R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): `observe_frozen` is
+    /// the tamper check -- `validate_frozen_source` plus
+    /// `frozen_source_sha256` compared against the receipt -- and before this
+    /// test it had no test of its own at all, exercised only through those
+    /// two constituents separately (S6 pass 6/F6). This builds a real
+    /// `CompiledDeploymentPlan` (via `compile_deployment_plan`, the same
+    /// constructor production code uses, over a minimal but real
+    /// `TargetDeclaration`/`OperatorBinding` TOML pair that carries no
+    /// runtime state or dependency graph -- kept minimal deliberately, since
+    /// `observe_frozen` never reads past `plan.source` and `plan.recipe_blob`
+    /// once `receipt.validate_against` accepts the plan) and a real
+    /// `FrozenSourceReceipt` end to end through `GitSourceDriver::freeze_exact`,
+    /// then calls `observe_frozen` directly and confirms it both accepts the
+    /// untouched tree and refuses once the tree is tampered with after
+    /// freezing (a file's content changed post-freeze, caught only because
+    /// `observe_frozen` re-derives the digest rather than trusting the
+    /// receipt it was handed).
+    #[cfg(unix)]
+    #[test]
+    fn observe_frozen_accepts_an_intact_receipt_and_refuses_a_tampered_one() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        const RECIPE: &str = r#"
+schema = "gamecult.idunn.target_declaration.v1"
+target = "observe-frozen-test"
+source_stamp_environment = "OBSERVE_FROZEN_TEST_BUILD_COMMIT"
+
+[[steps]]
+id = "build"
+phase = "build"
+runner = "rust"
+argv = ["cargo", "--version"]
+
+[[artifacts]]
+id = "daemon"
+source_kind = "worktree-tree"
+source = "deployment.toml"
+destination = "daemon"
+
+[service]
+executable_artifact = "daemon"
+transport = "http"
+required_environment = ["GAMECULT_IDUNN_RUNTIME_BUNDLE"]
+
+[service.health]
+contract = "observe-frozen-test.health"
+"#;
+
+        const BINDING: &str = r#"
+schema = "gamecult.idunn.operator_binding.v2"
+target = "observe-frozen-test"
+
+[repository]
+origin = "https://example.invalid/observe-frozen-test.git"
+admitted_ref = "refs/heads/main"
+minimum_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+selection = "ref-head"
+checkout = "/srv/build/observe-frozen-test"
+recipe_path = "deployment.toml"
+
+[runners.rust]
+driver = "docker"
+image = "rust@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb"
+user = "1000:1000"
+affordances = ["source-read"]
+allowed_programs = ["cargo"]
+memory_mebibytes = 8192
+cpu_quota_percent = 400
+pids_limit = 512
+tmpfs_mebibytes = 1024
+
+[workload]
+driver = "systemd-transient"
+unit_prefix = "idunn-observe-frozen-test"
+release_root = "/srv/observe-frozen-test/releases"
+runtime_root = "/etc/gamecult/observe-frozen-test/runtime"
+network = "host-private"
+hardening = "strict"
+memory_mebibytes = 2048
+cpu_quota_percent = 200
+
+[workload.secret_files]
+GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/observe-frozen-test/runtime-presence-identity.cc"
+
+[runtime_identity]
+runtime_id = "observe-frozen-test-yggdrasil"
+expected_signer_identity_id = "observe-frozen-test-runtime-signer"
+trust_anchor_store = "/etc/gamecult/trust/observe-frozen-test.cc"
+
+[brakes]
+deployment_store = "/var/lib/gamecult/idunn-authority/observe-frozen-test-deployment-brake.cc"
+lifecycle_store = "/var/lib/gamecult/idunn-authority/observe-frozen-test-lifecycle-brake.cc"
+
+[rollout]
+strategy = "candidate-then-promote"
+drain_seconds = 30
+retain_releases = 2
+
+[placement]
+desired_replicas = 1
+nodes = ["yggdrasil"]
+"#;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), RECIPE)?;
+        // A second file, otherwise unreferenced by the plan: tampering with
+        // `deployment.toml` itself would also be caught by the separate
+        // recipe-bytes-equality check further down in `observe_frozen`
+        // ("observed deployment recipe differs from the persisted plan"),
+        // which would pass this test even with the digest re-check deleted
+        // -- confirmed by hand-mutation. Tampering with this file instead is
+        // caught only by `frozen_source_sha256`'s re-derivation.
+        fs::write(origin_repo.join("extra.txt"), b"original\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        // See `freeze_exact_is_byte_exact_and_recipe_checked`: the
+        // unprivileged identity below clones this fixture as a local path,
+        // which puts Git's ownership check in play, so hand the fixture to
+        // that identity the way a real network remote never has to.
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: origin_repo.to_string_lossy().into_owned(),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+
+        let transaction_id = "txn-observe-frozen";
+        let (tree_root, snapshot_sha256, recipe_bytes, _contains_lfs_pointers) =
+            driver.freeze_exact(&source, &revision, transaction_id, &frozen_source_root)?;
+        assert_eq!(recipe_bytes, RECIPE.as_bytes());
+
+        let facts = SourceSelectionFacts {
+            schema: SOURCE_SELECTION_FACTS_SCHEMA.into(),
+            origin: "https://example.invalid/observe-frozen-test.git".into(),
+            admitted_ref: "refs/heads/main".into(),
+            admitted_ref_revision: revision.clone(),
+            revision: revision.clone(),
+            source_tree: revision.clone(),
+            recipe_path: PathBuf::from("deployment.toml"),
+            recipe_blob_sha256: sha256_id(&recipe_bytes),
+            gitlinks: BTreeMap::new(),
+            selection: SourceSelection::RefHead,
+            selected_at_unix_millis: 1,
+        };
+        let plan = compile_deployment_plan(
+            &recipe_bytes,
+            BINDING.as_bytes(),
+            facts,
+            "observe-frozen-test-incarnation",
+            None,
+            1,
+            &[],
+        )
+        .context("compiling the minimal observe_frozen fixture plan")?;
+
+        let receipt = FrozenSourceReceipt {
+            transaction_id: transaction_id.to_owned(),
+            plan_id: plan.plan_id.clone(),
+            snapshot_sha256: snapshot_sha256.clone(),
+        };
+
+        let observed = driver.observe_frozen(&plan, &receipt)?;
+        assert_eq!(observed.receipt.snapshot_sha256, snapshot_sha256);
+
+        // Tamper with a file the plan never re-reads on its own, bypassing
+        // the writer entirely -- exactly the shape `observe_frozen`'s digest
+        // re-check exists to catch, and nothing else in `observe_frozen`
+        // happens to catch incidentally. Root (this test's own euid,
+        // required by `freeze_exact` itself) can write a 0444 root-owned
+        // file directly via DAC override, without needing to relax its mode
+        // first.
+        let tampered_file = tree_root.join("extra.txt");
+        fs::write(&tampered_file, b"tampered\n")?;
+
+        let result = driver.observe_frozen(&plan, &receipt);
+        assert!(
+            result.is_err(),
+            "observe_frozen must refuse a frozen tree that was tampered with after freezing: \
+             {result:?}"
+        );
+        Ok(())
+    }
+
 
     /// R-I4 (Self's ruling, fifth Cut 1 fix batch): pins S4-6's guard and
     /// fixes its off-by-one. `materialize_tree_raw`'s symlink-target length
