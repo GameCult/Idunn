@@ -449,7 +449,9 @@ cap in the operator's brief, and P1 shows Idunn's own suite compiles in about
 Depends: the Cut 6 host policy values only. The mechanism is in Cut 2 and Cut 4
 whatever the answer.
 
-**Q-V7. How does a pipeline agent on Starfire reach Idunn?**
+**Q-V7: RULED B by the operator, 2026-09-22 ("B sounds good to me too").** A dedicated `eureka` account on Yggdrasil holds an SSH key and is a member of group `idunn-verify`. It has no sudo. It can submit and cancel requests and can read verdicts and logs, and nothing else. The ban on ad hoc containers becomes structural rather than prose.
+
+*History, the question as asked:* **Q-V7. How does a pipeline agent on Starfire reach Idunn?**
 - A: `ssh ygg sudo -n idunn verify …` as `gamecultadmin`, which has full
   passwordless sudo (probe).
 - B: a dedicated `eureka` account on Yggdrasil with an SSH key, member of group
