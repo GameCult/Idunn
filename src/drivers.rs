@@ -5962,7 +5962,6 @@ struct FrozenSymlinkFrame {
 /// function.
 #[cfg(unix)]
 fn open_frozen_symlink_frame(
-    canonical_root: &Path,
     symlink_path: &Path,
     ceiling: u32,
     budget: &mut u32,
@@ -6024,12 +6023,8 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
     const MAX_LINK_TRAVERSALS: u32 = 40;
     let mut budget = MAX_LINK_TRAVERSALS;
     let mut memo: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
-    let mut stack: Vec<FrozenSymlinkFrame> = vec![open_frozen_symlink_frame(
-        canonical_root,
-        path,
-        MAX_LINK_TRAVERSALS,
-        &mut budget,
-    )?];
+    let mut stack: Vec<FrozenSymlinkFrame> =
+        vec![open_frozen_symlink_frame(path, MAX_LINK_TRAVERSALS, &mut budget)?];
 
     loop {
         let top = stack.len() - 1;
@@ -6066,7 +6061,6 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
                             stack[top].resolved = cached.clone();
                         } else {
                             stack.push(open_frozen_symlink_frame(
-                                canonical_root,
                                 &candidate,
                                 MAX_LINK_TRAVERSALS,
                                 &mut budget,
@@ -12417,6 +12411,461 @@ mod tests {
             rendered.contains("fetching the durable exact source revision"),
             "expected the refusal to come from freeze_exact's own guarded fetch, got: {rendered}"
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // R-I6 (Self's ruling, fifth Cut 1 fix batch): S5-7 -- `SourcePort::
+    // resolve` has one production caller and, before this, zero tests.
+    // Every other fixture in this suite approximates `resolve()` with a
+    // `file://` origin or a hand-copied fetch invocation; this one stands
+    // up a real HTTPS Git origin instead. Soul's own pass-5 rig (self-
+    // signed CA, `git-http-backend` behind TLS, a validated
+    // `OperatorBinding`, a clean fetch, then `main` moved onto a hostile
+    // commit) lived in Soul's session scratchpad, which -- as SKILL.md's
+    // own QUIC scar already documents -- does not survive past the
+    // session. It was gone by the time this batch landed (checked: no
+    // matching session, no leftover Yggdrasil work directory, no local
+    // scratch trace), so this rebuilds the rig from the map's description
+    // rather than reusing Soul's files, which is the discrepancy this
+    // comment records.
+    // -----------------------------------------------------------------
+
+    /// A minimal CGI-over-HTTPS bridge for `git-http-backend`: no web
+    /// server in `eureka-verify-rust` speaks smart HTTP out of the box, but
+    /// `python3` and `openssl` do exist there, and bridging CGI to a
+    /// `BaseHTTPRequestHandler` wrapped in an `ssl.SSLContext` is the
+    /// smallest thing that gets a real `https://` clone working. Written to
+    /// a temp file and spawned fresh per test run; never installed anywhere
+    /// permanent.
+    #[cfg(unix)]
+    const GIT_HTTPS_BRIDGE_PY: &str = r#"
+import http.server
+import os
+import socketserver
+import ssl
+import subprocess
+import sys
+
+port_file, repo_root, cert, key, git_http_backend = sys.argv[1:6]
+
+
+class CgiTlsHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _run_backend(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else b""
+        path, _, query = self.path.partition("?")
+        env = {
+            "GATEWAY_INTERFACE": "CGI/1.1",
+            "SERVER_PROTOCOL": "HTTP/1.1",
+            "SERVER_SOFTWARE": "idunn-test-git-https-bridge",
+            "REQUEST_METHOD": self.command,
+            "SCRIPT_NAME": "",
+            "PATH_INFO": path,
+            "QUERY_STRING": query,
+            "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+            "CONTENT_LENGTH": str(length),
+            "GIT_PROJECT_ROOT": repo_root,
+            "GIT_HTTP_EXPORT_ALL": "1",
+            "REMOTE_ADDR": self.client_address[0],
+            "SERVER_NAME": "127.0.0.1",
+            "SERVER_PORT": str(self.server.server_port),
+            "REQUEST_URI": self.path,
+            "PATH": "/usr/bin:/bin",
+        }
+        proc = subprocess.run(
+            [git_http_backend], input=body, capture_output=True, env=env
+        )
+        out = proc.stdout
+        for sep in (b"\r\n\r\n", b"\n\n"):
+            if sep in out:
+                header_blob, _, response_body = out.partition(sep)
+                break
+        else:
+            header_blob, response_body = b"", out
+        status = 200
+        header_lines = []
+        for line in header_blob.decode("latin1").splitlines():
+            if not line.strip():
+                continue
+            if line.lower().startswith("status:"):
+                status = int(line.split(":", 1)[1].strip().split(" ")[0])
+            else:
+                header_lines.append(line)
+        self.send_response(status)
+        for line in header_lines:
+            name, _, value = line.partition(":")
+            self.send_header(name.strip(), value.strip())
+        self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        self.wfile.write(response_body)
+
+    def do_GET(self):
+        self._run_backend()
+
+    def do_POST(self):
+        self._run_backend()
+
+    def log_message(self, *args):
+        pass
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    httpd = Server(("127.0.0.1", 0), CgiTlsHandler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    with open(port_file, "w") as f:
+        f.write(str(httpd.server_address[1]))
+        f.flush()
+        os.fsync(f.fileno())
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
+    /// The full `gamecult.idunn.operator_binding.v2` fixture `deployment.rs`
+    /// uses, minus the fields `resolve()` never reads, with `{origin}`,
+    /// `{minimum_revision}` and `{checkout}` left for this test to fill in.
+    /// `OperatorBinding::parse` runs the real, strict `validate()` over
+    /// whatever this renders, so this is exactly as demanding as a real
+    /// operator binding.
+    #[cfg(unix)]
+    const HTTPS_RIG_BINDING: &str = r#"
+schema = "gamecult.idunn.operator_binding.v2"
+target = "https-rig"
+
+[repository]
+origin = "{origin}"
+admitted_ref = "refs/heads/main"
+minimum_revision = "{minimum_revision}"
+selection = "ref-head"
+checkout = "{checkout}"
+recipe_path = "deployment.toml"
+
+[runners.rust]
+driver = "docker"
+image = "rust@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb"
+user = "1000:1000"
+affordances = ["source-read", "artifact-write", "build-cache"]
+cache_root = "/srv/ghostlight/build-cache"
+allowed_programs = ["cargo"]
+network_profile = "build-dependency-egress"
+memory_mebibytes = 8192
+cpu_quota_percent = 400
+pids_limit = 512
+tmpfs_mebibytes = 1024
+
+[workload]
+driver = "systemd-transient"
+state_group = "https-rig"
+unit_prefix = "idunn-https-rig"
+release_root = "/srv/https-rig/releases"
+state_root = "/var/lib/gamecult/https-rig"
+runtime_root = "/etc/gamecult/https-rig/runtime"
+network = "host-private"
+hardening = "strict"
+memory_mebibytes = 2048
+cpu_quota_percent = 200
+
+[workload.argument_bindings]
+state_root = "/var/lib/gamecult/https-rig"
+
+[workload.secret_files]
+GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/https-rig/runtime-presence-identity.cc"
+
+[runtime_identity]
+runtime_id = "https-rig-yggdrasil"
+expected_signer_identity_id = "https-rig-runtime-signer"
+trust_anchor_store = "/etc/gamecult/trust/https-rig.cc"
+
+[route]
+driver = "nginx-stream-tcp"
+route_id = "https-rig-public"
+stable_endpoint = "http://127.0.0.1:18830"
+private_host = "127.0.0.1"
+private_port_start = 18831
+private_port_end = 18839
+config_path = "/etc/nginx/idunn-stream-routes/https-rig.conf"
+reload_unit = "nginx.service"
+
+[process_write_lease]
+record_path = "/etc/gamecult/https-rig/runtime/process-write-lease.cc"
+
+[brakes]
+deployment_store = "/var/lib/gamecult/idunn-authority/https-rig-deployment-brake.cc"
+lifecycle_store = "/var/lib/gamecult/idunn-authority/https-rig-lifecycle-brake.cc"
+
+[rollout]
+strategy = "candidate-then-promote"
+drain_seconds = 30
+retain_releases = 2
+
+[placement]
+desired_replicas = 1
+nodes = ["yggdrasil"]
+"#;
+
+    /// R-I6 (Self's ruling, fifth Cut 1 fix batch): pins S5-7. Stands up a
+    /// real TLS `git-http-backend` origin -- a self-signed CA the client
+    /// trusts through `$HOME/.gitconfig`'s `http.sslCAInfo` (`HOME` is the
+    /// same directory `prepare_source_root` assigns to the unprivileged Git
+    /// identity via `ensure_source_directory`), and a validated
+    /// `OperatorBinding` whose origin is `https://127.0.0.1:<port>/
+    /// origin.git`. A clean revision must resolve; moving `refs/heads/main`
+    /// onto either hostile tree this suite already builds for
+    /// `freeze_exact` (duplicate-named trees, a `.GIT` look-alike) must be
+    /// refused by `resolve()`'s own `transfer.fsckObjects=true` fetch --
+    /// the exact guard S1 added, and the only thing standing between an
+    /// admitted ref and every downstream consumer of `ResolvedSource` for
+    /// every caller `resolve()` has, HTTPS or not.
+    ///
+    /// Skips (does not fail) when `openssl` or `git-http-backend` is
+    /// unavailable -- both exist in `eureka-verify-rust`, but neither is
+    /// guaranteed on a workstation.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_admits_a_clean_https_origin_and_refuses_hostile_trees_moved_onto_it() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let git_http_backend = Command::new("git")
+            .arg("--exec-path")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                    .join("git-http-backend")
+            })
+            .filter(|path| path.is_file());
+        let openssl_present = Command::new("openssl")
+            .arg("version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        let Some(git_http_backend) = git_http_backend else {
+            eprintln!(
+                "SKIP resolve_admits_a_clean_https_origin_and_refuses_hostile_trees_moved_onto_it: \
+                 git-http-backend not found"
+            );
+            return Ok(());
+        };
+        if !openssl_present {
+            eprintln!(
+                "SKIP resolve_admits_a_clean_https_origin_and_refuses_hostile_trees_moved_onto_it: \
+                 openssl not found"
+            );
+            return Ok(());
+        }
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+
+        // A self-signed certificate for 127.0.0.1, since the origin is
+        // reached at a loopback address, not a real hostname.
+        let cert = temp.path().join("cert.pem");
+        let key = temp.path().join("key.pem");
+        let openssl_status = Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
+                "-keyout",
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .args(["-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        ensure!(openssl_status.success(), "generating the self-signed test certificate");
+        fs::set_permissions(&cert, fs::Permissions::from_mode(0o644))?;
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644))?;
+
+        // The origin: a bare repository built directly with Git plumbing
+        // (no working tree, so an oversized or hostile blob never has to
+        // round-trip through a real file on disk to become a commit).
+        // Reached purely over HTTPS by every caller below, so unlike the
+        // `file://` hostile-tree fixtures elsewhere in this suite, nothing
+        // here needs `chown_to_source_identity` or `git_owned`'s dubious-
+        // ownership workaround: the bridge script below runs
+        // `git-http-backend` as this same process, against a repository
+        // this same process owns.
+        let repos = temp.path().join("repos");
+        fs::create_dir(&repos)?;
+        let origin_repo = repos.join("origin.git");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--bare", "--initial-branch=main"])?;
+        let recipe_blob = hash_object(&origin_repo, b"target = 'test'\n")?;
+        let root_tree = literal_tree(&origin_repo, &[("100644", "deployment.toml", &recipe_blob)])?;
+        let root_commit = git_owned(&origin_repo, &["commit-tree", &root_tree, "-m", "root"])?;
+        git_owned(&origin_repo, &["update-ref", "refs/heads/main", &root_commit])?;
+
+        // The bridge: `git-http-backend` has no HTTPS front end of its own,
+        // so a small CGI-over-TLS shim (see `GIT_HTTPS_BRIDGE_PY`) stands in
+        // for a real web server.
+        let bridge_script = temp.path().join("git_https_bridge.py");
+        fs::write(&bridge_script, GIT_HTTPS_BRIDGE_PY)?;
+        let port_file = temp.path().join("port");
+        let mut bridge = Command::new("python3")
+            .arg(&bridge_script)
+            .arg(&port_file)
+            .arg(&repos)
+            .arg(&cert)
+            .arg(&key)
+            .arg(&git_http_backend)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("starting the test HTTPS bridge")?;
+        let port: u16 = {
+            let mut attempts = 0;
+            loop {
+                if let Ok(text) = fs::read_to_string(&port_file) {
+                    if let Ok(port) = text.trim().parse() {
+                        break port;
+                    }
+                }
+                if let Some(status) = bridge.try_wait()? {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = bridge.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    bail!("the test HTTPS bridge exited early with {status}: {stderr}");
+                }
+                attempts += 1;
+                ensure!(attempts < 200, "the test HTTPS bridge never reported its port");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _bridge = KillOnDrop(bridge);
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity { uid: 1000, gid: 1000 };
+
+        // Trust for the self-signed CA is scoped to this driver's own Git
+        // identity, not the container's real trust store: `prepare_source_
+        // root` assigns `HOME` (`source_cache_root/.home`) to `identity`
+        // and `git_command` clears every other environment variable, so
+        // `$HOME/.gitconfig`'s `http.sslCAInfo` is the only channel left
+        // for this test to hand the driver's own `git` a CA it will trust.
+        // Pre-created here, with the same ownership and mode `ensure_
+        // source_directory` would assign, so it passes that function's
+        // ownership check instead of being reassigned or rejected.
+        use std::os::unix::ffi::OsStrExt;
+        fs::create_dir(&source_cache_root)?;
+        unsafe {
+            ensure!(
+                libc::chown(
+                    std::ffi::CString::new(source_cache_root.as_os_str().as_bytes())?.as_ptr(),
+                    identity.uid,
+                    identity.gid,
+                ) == 0,
+                "chowning the test source cache root"
+            );
+        }
+        fs::set_permissions(&source_cache_root, fs::Permissions::from_mode(0o750))?;
+        let home = source_cache_root.join(".home");
+        fs::create_dir(&home)?;
+        fs::write(home.join(".gitconfig"), format!("[http]\n\tsslCAInfo = {}\n", cert.display()))?;
+        unsafe {
+            ensure!(
+                libc::chown(
+                    std::ffi::CString::new(home.as_os_str().as_bytes())?.as_ptr(),
+                    identity.uid,
+                    identity.gid,
+                ) == 0,
+                "chowning the test HOME directory"
+            );
+            ensure!(
+                libc::chown(
+                    std::ffi::CString::new(home.join(".gitconfig").as_os_str().as_bytes())?.as_ptr(),
+                    identity.uid,
+                    identity.gid,
+                ) == 0,
+                "chowning the test .gitconfig"
+            );
+        }
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o750))?;
+        fs::set_permissions(home.join(".gitconfig"), fs::Permissions::from_mode(0o640))?;
+
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let origin_url = format!("https://127.0.0.1:{port}/origin.git");
+        let checkout = source_cache_root.join("checkout");
+
+        let render_binding = |resolution_target: &str| -> String {
+            HTTPS_RIG_BINDING
+                .replace("{origin}", &origin_url)
+                .replace("{minimum_revision}", &root_commit)
+                .replace("{checkout}", &checkout.to_string_lossy())
+                .replace("target = \"https-rig\"", &format!("target = \"{resolution_target}\""))
+        };
+
+        // Clean: `main` still points at the root commit.
+        let binding = OperatorBinding::parse(&render_binding("https-rig-clean"))
+            .context("parsing the clean HTTPS rig binding")?;
+        driver
+            .resolve(&binding, "r1", 1)
+            .context("a clean HTTPS origin must resolve")?;
+
+        // Hostile: reuse this suite's own dup-trees and `.GIT` fixtures
+        // (`s4_4_hostile_fixtures`), moving `main` onto each in turn.
+        for (label, build) in s4_4_hostile_fixtures()
+            .into_iter()
+            .filter(|(label, _)| *label == "dup-trees" || *label == ".GIT")
+        {
+            let entries = build(&origin_repo, &recipe_blob)
+                .with_context(|| format!("building the {label} fixture"))?;
+            let entry_refs: Vec<(&str, &str, &str)> = entries
+                .iter()
+                .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
+                .collect();
+            let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
+            let hostile_commit = git_owned(
+                &origin_repo,
+                &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
+            )?;
+            git_owned(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
+
+            let binding = OperatorBinding::parse(&render_binding(&format!("https-rig-{label}")))
+                .with_context(|| format!("parsing the {label} HTTPS rig binding"))?;
+            let result = driver.resolve(&binding, &format!("r-{label}"), 1);
+            assert!(
+                result.is_err(),
+                "{label}: a hostile tree moved onto main over a real HTTPS origin must be \
+                 refused by resolve()'s own guarded fetch: {result:?}"
+            );
+
+            // Restore `main` to the clean commit before the next fixture,
+            // so each one is judged against its own fresh fetch.
+            git_owned(&origin_repo, &["update-ref", "refs/heads/main", &root_commit])?;
+        }
+
         Ok(())
     }
 }
