@@ -494,7 +494,9 @@ firewall rules. B adds one unit file and one subcommand, and no new binary.
 
 Depends: Cuts 4 and 6.
 
-**Q-V9. May a verify runner be bound with `seccomp = "unconfined"`?** CultLib's
+**Q-V9: RULED A by Self, 2026-09-22. The operator deferred ("I have no meaningful opinion on Q-V9").** `seccomp` is an explicit per-runner field in the operator binding. It defaults to `default`, and `unconfined` is permitted only where the binding names it. The verdict echoes it. The first user is CultLib's Linux TSan mutation.
+
+*History, the question as asked:* **Q-V9. May a verify runner be bound with `seccomp = "unconfined"`?** CultLib's
 linux native TSan mutation requires it (F28).
 - A: yes, as an explicit per-runner binding field (default `default`), echoed
   into the verdict.
@@ -506,7 +508,9 @@ the binding is root-installed.
 
 Depends: the Cut 2 schema, Cut 6 CultLib binding, and Cut 7 completeness.
 
-**Q-V10. Who builds runner images?**
+**Q-V10: RULED A by Self, 2026-09-22.** This is a default, not a product fork, and the operator deferred the adjacent Q-V9. Runner images are built from Dockerfiles committed to gamecult-ops, on digest-pinned bases, and the binding pins each image by digest.
+
+*History, the question as asked:* **Q-V10. Who builds runner images?**
 - A: the operator, or a Hands pass the operator approves, builds each image once
   on Yggdrasil from a committed Dockerfile with a digest-pinned `FROM`, and pins
   `name@sha256:<id>` in the gamecult-ops verify binding (P3). The images are
