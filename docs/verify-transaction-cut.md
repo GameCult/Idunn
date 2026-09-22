@@ -1150,3 +1150,26 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
   - **F7:** delete the previous generation's provisioning steps from both bootstrap scripts. Keep only what is true under the v2 bindings, and add the brake-release step. If a script has nothing true left, delete it and point to the binding-install runbook.
   - **F8:** mark the Heimdall runbook step as gated on installing its binding.
   - **F9:** drain stderr and wait on the child on every path.
+- **2026-09-22: the second Cut 1 fix batch landed** (Sonnet, on Yggdrasil), Idunn `82e0edf` and gamecult-ops `9fc3af0`.
+  - **F1:** one bulk `git fetch --stdin` of every blob, plus a streaming writer.
+
+    | Target | Freeze time | Previous | Ratio |
+    |---|---|---|---|
+    | Ghostlight | 5.17 s | 5.3 s | 0.98x |
+    | Heimdall | 10.08 s | 8.5 s | 1.19x |
+    | Odin | 2.20 s | 2.2 s | 1.0x |
+    | Muninn | 1.93 s | 1.9 s | 1.0x |
+    | CodexConnector | 1.76 s | 1.8 s | 0.98x |
+
+    Measured with git 2.39 in the container, not the host's 2.47.
+  - **Digests are identical on all five live targets.**
+  - **F2 and F3:** `refuse_conflicting_tree_entries` runs before any write, and `ensure_frozen_directory` never follows a link. `transfer.fsckObjects` is kept as defense in depth. Its entry is *not yet reached*, because the refusal always fires first.
+  - **F4:** one hardening pass, pinned.
+  - **F5:** chain-aware symlink resolution.
+  - **F6:** N1, N2, N3 and N5 pinned.
+  - **F9:** stderr is drained and the child is waited on.
+  - **F7:** the four v1 artifacts are removed from both bootstraps, with a v2 anchor export and a brake release.
+  - **F8:** the Heimdall step is gated.
+  - Tests go from 142 to 152. cut1 is 28/28 killed.
+  - **Operator step, outside this campaign:** the Ghostlight and CodexConnector bindings still carry a placeholder `expected_signer_identity_id`. The scripts print the derived key.
+  - **Soul's third pass dispatched.**
