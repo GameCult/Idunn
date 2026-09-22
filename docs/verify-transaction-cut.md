@@ -1104,3 +1104,13 @@ deleted with the workspace. Nothing is compiled on Starfire in any cut.
   - **F8:** make the negative check `rg` over `src/` excluding `#[cfg(test)]`, or state its hit count.
   - **F9:** fix `guide.md:11`, and repoint every listed gamecult-ops runbook and bootstrap script at the current procedure (`idunn up` plus a brake release, as in `runbooks/idunn-host-raven.md`), or delete the steps. Delete the dead script.
   - **Stamp override:** refuse a binding environment variable whose name collides with the source stamp.
+- **2026-09-22: the Cut 1 fix batch landed** (Sonnet, verified on Yggdrasil).
+  - **Commits:** Idunn `7a5d32f` (F1, F3, F5, F7, F9, stamp override) and `95016e8` (F2); gamecult-ops `62b41b1` (runbooks and bootstraps moved off the dead `idunn redeploy`, script deleted).
+  - **Tests:** 130 to 142. `cut1.psd1` 17/17 killed. The revert to `git archive` dies on `freeze_exact_is_byte_exact_across_every_attribute_transform`.
+  - **The F2 survey found one attribute:** Eve's `packages/*/dist/** text eol=lf`, reached through Ghostlight's gitlink. **Self ruled it not a fork.** `eol=lf` transforms nothing on stored-LF blobs. At Eve rev `672c0c1e`, all 26 `dist` files hash the same through `git archive` and through `hash-object --no-filters`, and none contains a CR. Every other deploy target (Ghostlight, Odin, CodexConnector, Muninn, Heimdall and its CultLib gitlink) is clean. So the byte-exact freeze produces exactly what deploy got before.
+  - **Deleted:** `git_archive_into`, `materialize_gitlink_archive`, and the dead `tar_program`.
+  - **Not yet reached:** `cut1-freeze-exact-recipe-check`. Both sides are now the same raw blob, so it is kept as defense in depth.
+  - **Soul's S8 is not yet reached.** `harden_frozen_source` enforces the same invariants first.
+  - **Follow-up:** `freeze_exact` returns an LFS-pointer flag that `FrozenSourceReceipt` does not carry yet. It must reach the verify verdict (Cut 2/4).
+  - **Recorded, not this cut's:** `test-voidbot-swarm-yggdrasil.sh` fails on `add-daemon-health-trust-binding`. That failure is pre-existing.
+  - **Soul's pass dispatched.**
