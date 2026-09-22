@@ -12852,8 +12852,11 @@ nodes = ["yggdrasil"]
             )?;
             git_owned(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
 
-            let binding = OperatorBinding::parse(&render_binding(&format!("https-rig-{label}")))
-                .with_context(|| format!("parsing the {label} HTTPS rig binding"))?;
+            let binding = OperatorBinding::parse(&render_binding(&format!(
+                "https-rig-{}",
+                label.to_lowercase()
+            )))
+            .with_context(|| format!("parsing the {label} HTTPS rig binding"))?;
             let result = driver.resolve(&binding, &format!("r-{label}"), 1);
             assert!(
                 result.is_err(),
