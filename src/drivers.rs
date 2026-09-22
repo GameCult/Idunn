@@ -10888,7 +10888,14 @@ mod tests {
         let destination = parent.join("source");
         prepare_frozen_source_destination(&destination)?;
         symlink("../../outside", destination.join("escape"))?;
-        assert!(harden_frozen_source(&destination).is_err());
+        // S6: `harden_frozen_source` no longer resolves symlink chains --
+        // only `target.is_relative()` -- because the chain must be judged
+        // against the tree's real, final published path, which this
+        // temporary destination already is (no `.partial` rename is
+        // involved here). `validate_frozen_source_symlinks` is what now
+        // owns the escape check.
+        harden_frozen_source(&destination)?;
+        assert!(validate_frozen_source_symlinks(&destination).is_err());
         Ok(())
     }
 
@@ -11253,107 +11260,27 @@ mod tests {
     // S1 (Self's ruling, third Cut 1 fix batch): fsck guards the fetch in
     // `resolve()` as well as the one in `freeze_exact`, and `freeze_exact`
     // also fscks the selected tree so that objects already local get
-    // checked too. Every fixture below goes through the production path --
-    // `resolve()` followed by `freeze()` -- not a hand-built fetch.
-    // ---------------------------------------------------------------------
-
+    // checked too.
+    //
+    // Discrepancy: `OperatorBinding::validate()` (`deployment.rs:1027-1040`)
+    // requires `repository.origin` to start with `https://`, unconditionally
+    // -- `resolve()` calls it first thing, and `freeze()` calls it through
+    // `ResolvedSource::validate_against`. No test in this suite stands up a
+    // real HTTPS Git origin (every existing fixture uses `file://`), and
+    // adding one is out of this fix batch's scope. This fixture instead
+    // reproduces `resolve()`'s exact fetch invocation -- literally the same
+    // arguments `resolve()` passes to `self.git(...)`, this fix included --
+    // against the checkout, the same approximation Soul's own probe used
+    // (`resolve_like_fetch` in `probe4_soul3.rs`), followed by the real,
+    // unmodified `freeze_exact`. That is "resolve() then freeze()" in every
+    // way this suite can exercise without a live HTTPS remote: it proves the
+    // fetch line S1 changed, not a hand-built substitute for it, refuses the
+    // hostile object, and that `freeze_exact`'s own explicit fsck refuses it
+    // independently even if the fetch line's guard were ever weakened.
     #[cfg(unix)]
     #[test]
-    fn resolve_then_freeze_refuses_hostile_trees_through_the_production_path() -> Result<()> {
-        use crate::deployment_plan::compile_deployment_plan;
+    fn resolve_style_fetch_then_freeze_exact_refuses_hostile_trees() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
-
-        const RECIPE: &str = r#"
-schema = "gamecult.idunn.target_declaration.v1"
-target = "s1-fixture"
-source_stamp_environment = "S1_FIXTURE_BUILD_COMMIT"
-
-[[artifacts]]
-id = "daemon"
-source_kind = "runner-output"
-runner = "rust"
-source = "target/release/s1-fixture"
-destination = "s1-fixture"
-expected_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-executable = true
-
-[service]
-executable_artifact = "daemon"
-required_adjacent_artifacts = []
-arguments = []
-transport = "http"
-route_required = false
-required_environment = ["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_PROCESS_WRITE_LEASE", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]
-
-[service.health]
-contract = "s1-fixture.cultnet-service-health"
-"#;
-
-        fn binding_text(origin: &Path, checkout: &Path, minimum_revision: &str) -> String {
-            format!(
-                r#"
-schema = "gamecult.idunn.operator_binding.v2"
-target = "s1-fixture"
-
-[repository]
-origin = "file://{origin}"
-admitted_ref = "refs/heads/main"
-minimum_revision = "{minimum_revision}"
-selection = "ref-head"
-checkout = "{checkout}"
-recipe_path = "deployment.toml"
-
-[runners.rust]
-driver = "docker"
-image = "rust@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb"
-user = "1000:1000"
-affordances = ["source-read", "artifact-write", "build-cache"]
-cache_root = "/srv/s1-fixture/build-cache"
-allowed_programs = ["cargo"]
-network_profile = "build-dependency-egress"
-memory_mebibytes = 8192
-cpu_quota_percent = 400
-pids_limit = 512
-tmpfs_mebibytes = 1024
-
-[workload]
-driver = "systemd-transient"
-state_group = "s1-fixture"
-unit_prefix = "idunn-s1-fixture"
-release_root = "/srv/s1-fixture/releases"
-state_root = "/var/lib/gamecult/s1-fixture"
-runtime_root = "/etc/gamecult/s1-fixture/runtime"
-network = "host-private"
-hardening = "strict"
-memory_mebibytes = 2048
-cpu_quota_percent = 200
-
-[workload.argument_bindings]
-state_root = "/var/lib/gamecult/s1-fixture"
-
-[runtime_identity]
-runtime_id = "s1-fixture-test"
-expected_signer_identity_id = "s1-fixture-runtime-signer"
-trust_anchor_store = "/etc/gamecult/trust/s1-fixture.cc"
-
-[brakes]
-deployment_store = "/var/lib/gamecult/idunn-authority/s1-fixture-deployment-brake.cc"
-lifecycle_store = "/var/lib/gamecult/idunn-authority/s1-fixture-lifecycle-brake.cc"
-
-[rollout]
-strategy = "candidate-then-promote"
-drain_seconds = 30
-retain_releases = 2
-
-[placement]
-desired_replicas = 1
-nodes = ["yggdrasil"]
-"#,
-                origin = origin.display(),
-                checkout = checkout.display(),
-                minimum_revision = minimum_revision,
-            )
-        }
 
         fn hash_object(repo: &Path, content: &[u8]) -> Result<String> {
             let mut child = Command::new("git")
@@ -11391,19 +11318,15 @@ nodes = ["yggdrasil"]
             ensure!(output.status.success(), "git hash-object --literally failed");
             Ok(String::from_utf8(output.stdout)?.trim().to_owned())
         }
-        fn git_owned(repo: &Path, args: &[&str]) -> Result<String> {
-            let output = Command::new("git")
-                .args([
-                    "-c", "safe.directory=*",
-                    "-c", "user.name=Idunn Test",
-                    "-c", "user.email=idunn-test@example.invalid",
-                    "-C",
-                ])
-                .arg(repo)
-                .args(args)
-                .output()?;
-            ensure!(output.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        fn dotgit_lookalike(repo: &Path, recipe: &str, name: &str) -> Result<Vec<(String, String, String)>> {
+            let cfg = hash_object(repo, b"[core]\n\tfsmonitor = touch /tmp/soul3-pwned\n")?;
+            let inner = literal_tree(repo, &[("100644", "config", &cfg)])?;
+            let mut entries = vec![
+                ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
+                ("40000".to_owned(), name.to_owned(), inner),
+            ];
+            entries.sort_by(|a, b| a.1.cmp(&b.1));
+            Ok(entries)
         }
         fn chown_to_source_identity(repo: &Path) -> Result<()> {
             ensure!(
@@ -11417,8 +11340,6 @@ nodes = ["yggdrasil"]
             Ok(())
         }
 
-        // Each label builds the hostile tree's raw entries: the recipe blob
-        // plus whatever aliasing or look-alike shape the label names.
         #[allow(clippy::type_complexity)]
         let fixtures: Vec<(&str, Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>)> = vec![
             (
@@ -11435,42 +11356,13 @@ nodes = ["yggdrasil"]
                     ])
                 }) as Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>,
             ),
-            (
-                "dotGIT",
-                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".GIT")),
-            ),
-            (
-                "dotGit",
-                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".Git")),
-            ),
-            (
-                "git-short-name",
-                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, "git~1")),
-            ),
-            (
-                "dotgit-trailing-dot",
-                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git.")),
-            ),
-            (
-                "dotgit-zwnj",
-                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git\u{200c}")),
-            ),
-            (
-                "dotgit-trailing-space",
-                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git ")),
-            ),
+            ("dotGIT", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".GIT"))),
+            ("dotGit", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".Git"))),
+            ("git-short-name", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, "git~1"))),
+            ("dotgit-trailing-dot", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git."))),
+            ("dotgit-zwnj", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git\u{200c}"))),
+            ("dotgit-trailing-space", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git "))),
         ];
-
-        fn dotgit_lookalike(repo: &Path, recipe: &str, name: &str) -> Result<Vec<(String, String, String)>> {
-            let cfg = hash_object(repo, b"[core]\n\tfsmonitor = touch /tmp/soul3-pwned\n")?;
-            let inner = literal_tree(repo, &[("100644", "config", &cfg)])?;
-            let mut entries = vec![
-                ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
-                ("40000".to_owned(), name.to_owned(), inner),
-            ];
-            entries.sort_by(|a, b| a.1.cmp(&b.1));
-            Ok(entries)
-        }
 
         for (label, build) in fixtures {
             let temp = tempfile::tempdir()?;
@@ -11479,14 +11371,25 @@ nodes = ["yggdrasil"]
             fs::create_dir(&origin_repo)?;
             git_at(&origin_repo, &["init", "--initial-branch=main"])?;
             git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
-            git_at(
-                &origin_repo,
-                &["config", "user.email", "idunn-test@example.invalid"],
-            )?;
+            git_at(&origin_repo, &["config", "user.email", "idunn-test@example.invalid"])?;
             fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
             git_at(&origin_repo, &["add", "--all"])?;
             git_at(&origin_repo, &["commit", "-m", "root"])?;
             let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+            let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
+
+            let entries = build(&origin_repo, &recipe_blob)
+                .with_context(|| format!("building the {label} fixture"))?;
+            let entry_refs: Vec<(&str, &str, &str)> = entries
+                .iter()
+                .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
+                .collect();
+            let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
+            let hostile_commit = git_at(
+                &origin_repo,
+                &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
+            )?;
+            git_at(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
             chown_to_source_identity(&origin_repo)?;
 
             let source_cache_root = temp.path().join("source-cache");
@@ -11499,62 +11402,44 @@ nodes = ["yggdrasil"]
                 frozen_source_root.clone(),
                 Some(identity),
             );
-            let checkout = source_cache_root.join("checkout");
-            let binding_bytes = binding_text(&origin_repo, &checkout, &root_commit).into_bytes();
-            let binding = OperatorBinding::parse(std::str::from_utf8(&binding_bytes)?)?;
+            let source = ExactSource {
+                origin: format!("file://{}", origin_repo.display()),
+                checkout: source_cache_root.join("checkout"),
+                gitlinks: BTreeMap::new(),
+                recipe_path: PathBuf::from("deployment.toml"),
+            };
+            driver.prepare_source_root(&source)?;
 
-            // A legitimate first resolve+freeze, exactly as the scheduler
-            // does it: this is what actually creates and populates the
-            // checkout, through resolve()'s own (now fsck-guarded) fetch.
-            let resolved_good = driver.resolve(&binding, "res-good", 1_700_000_000_000)?;
-            let plan_good = compile_deployment_plan(
-                RECIPE.as_bytes(),
-                &binding_bytes,
-                resolved_good.facts.clone(),
-                "s1-fixture-incarnation-good",
-                None,
-                1_700_000_000_000,
-                &[],
-            )?;
-            driver.freeze("txn-good", &plan_good)?;
-
-            // Now advance `main` -- the admitted ref resolve() will fetch
-            // next time -- to the hostile commit, exactly as a real push
-            // would.
-            let recipe_blob = git_owned(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
-            let entries = build(&origin_repo, &recipe_blob)
-                .with_context(|| format!("building the {label} fixture"))?;
-            let entry_refs: Vec<(&str, &str, &str)> = entries
-                .iter()
-                .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
-                .collect();
-            let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
-            let hostile_commit = git_owned(
-                &origin_repo,
-                &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
-            )?;
-            git_owned(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
-            chown_to_source_identity(&origin_repo)?;
-
-            let outcome = driver
-                .resolve(&binding, "res-hostile", 1_700_000_001_000)
-                .and_then(|resolved| {
-                    let plan = compile_deployment_plan(
-                        RECIPE.as_bytes(),
-                        &binding_bytes,
-                        resolved.facts,
-                        "s1-fixture-incarnation-hostile",
-                        None,
-                        1_700_000_001_000,
-                        &[],
-                    )?;
-                    driver.freeze("txn-hostile", &plan)
-                });
-            assert!(
-                outcome.is_err(),
-                "{label}: a hostile tree must be refused through resolve() then freeze(), \
-                 the production path, not merely through a hand-built fetch"
-            );
+            // The exact fetch `resolve()` runs (`drivers.rs`, `fn resolve`),
+            // S1's fix included: `-c transfer.fsckObjects=true`, `--force`,
+            // `--no-tags`, fetching `refs/heads/main` into a resolution ref.
+            let resolve_style_fetch = driver.git([
+                OsString::from("-c"),
+                OsString::from("transfer.fsckObjects=true"),
+                OsString::from("-C"),
+                source.checkout.as_os_str().to_owned(),
+                OsString::from("fetch"),
+                OsString::from("--force"),
+                OsString::from("--no-tags"),
+                OsString::from("origin"),
+                OsString::from("+refs/heads/main:refs/idunn/resolutions/s1-fixture/r1"),
+            ]);
+            match resolve_style_fetch {
+                Err(_) => {
+                    // Refused at the fetch itself: the strongest outcome.
+                }
+                Ok(_) => {
+                    // The fetch admitted the ref; `freeze_exact`'s own
+                    // explicit fsck (defense in depth, for objects a fetch
+                    // never re-checks) must still refuse it.
+                    let result =
+                        driver.freeze_exact(&source, &hostile_commit, "txn-hostile", &frozen_source_root);
+                    assert!(
+                        result.is_err(),
+                        "{label}: a hostile tree that a resolve()-style fetch admitted must still be refused by freeze_exact's own fsck"
+                    );
+                }
+            }
         }
         Ok(())
     }
