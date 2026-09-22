@@ -1451,9 +1451,16 @@ impl GitSourceDriver {
                                 let target_len = fs::symlink_metadata(&target)
                                     .with_context(|| format!("inspecting {}", target.display()))?
                                     .len() as usize;
+                                // R-I4 (Self's ruling, fifth Cut 1 fix batch): strictly
+                                // less than, not `<=`. The kernel accepts a symlink
+                                // target of exactly PATH_MAX-1 (4095) bytes and refuses
+                                // PATH_MAX (4096) with ENAMETOOLONG, so this guard must
+                                // refuse at 4096 too -- refusing exactly what the kernel
+                                // refuses, with a message that names the reason instead
+                                // of surfacing the OS's own error from the write below.
                                 ensure!(
-                                    target_len <= FROZEN_SOURCE_SYMLINK_TARGET_LIMIT,
-                                    "frozen source symlink target for {} exceeds the platform's path length limit ({target_len} > {FROZEN_SOURCE_SYMLINK_TARGET_LIMIT} bytes)",
+                                    target_len < FROZEN_SOURCE_SYMLINK_TARGET_LIMIT,
+                                    "frozen source symlink target for {} exceeds the platform's path length limit ({target_len} >= {FROZEN_SOURCE_SYMLINK_TARGET_LIMIT} bytes)",
                                     extra.path.display()
                                 );
                                 symlink_targets.insert(extra.path.clone(), fs::read(&target)?);
@@ -1466,9 +1473,12 @@ impl GitSourceDriver {
                     }
                 }
                 "120000" => {
+                    // R-I4 (Self's ruling, fifth Cut 1 fix batch): see the sibling
+                    // guard above -- strictly less than, matching the kernel's real
+                    // PATH_MAX-1 (4095) byte ceiling on a symlink target.
                     ensure!(
-                        size <= FROZEN_SOURCE_SYMLINK_TARGET_LIMIT,
-                        "frozen source symlink target for {} exceeds the platform's path length limit ({size} > {FROZEN_SOURCE_SYMLINK_TARGET_LIMIT} bytes)",
+                        size < FROZEN_SOURCE_SYMLINK_TARGET_LIMIT,
+                        "frozen source symlink target for {} exceeds the platform's path length limit ({size} >= {FROZEN_SOURCE_SYMLINK_TARGET_LIMIT} bytes)",
                         first.path.display()
                     );
                     let mut content = vec![0u8; size];
@@ -5933,14 +5943,14 @@ fn frozen_symlink_steps(target: &Path) -> Result<std::collections::VecDeque<Froz
     Ok(steps)
 }
 
-/// One in-progress symlink expansion on the explicit work stack.
-/// `symlink_path` is `None` only for the outermost frame, the one resolving
-/// the caller's own starting path rather than a nested symlink this walk
-/// met along the way; every other frame's `symlink_path` is memoised under
-/// its own key once the frame finishes.
+/// One in-progress symlink expansion on the explicit work stack. Every
+/// frame, including the outermost one (which resolves the caller's own
+/// starting path, not a nested symlink this walk met along the way), is
+/// opened by `open_frozen_symlink_frame` from a real symlink path, so
+/// `symlink_path` is memoised under its own key once the frame finishes.
 #[cfg(unix)]
 struct FrozenSymlinkFrame {
-    symlink_path: Option<PathBuf>,
+    symlink_path: PathBuf,
     resolved: PathBuf,
     remaining: std::collections::VecDeque<FrozenSymlinkStep>,
 }
@@ -5954,11 +5964,21 @@ struct FrozenSymlinkFrame {
 fn open_frozen_symlink_frame(
     canonical_root: &Path,
     symlink_path: &Path,
+    ceiling: u32,
     budget: &mut u32,
 ) -> Result<FrozenSymlinkFrame> {
+    // R-I5 (Self's ruling, fifth Cut 1 fix batch): named, not just counted.
+    // `ceiling - *budget + 1` is the traversal this open would have been --
+    // always `ceiling + 1` at the point this fires, since the ensure! below
+    // only trips on an exhausted budget, but spelling it this way keeps the
+    // number tied to the budget's own arithmetic rather than a second
+    // hand-copied constant.
     ensure!(
         *budget > 0,
-        "frozen source symlink chain exceeds the traversal budget"
+        "frozen source symlink chain reached {} at {}, past the {ceiling}-traversal ceiling \
+         (matching the kernel's own ELOOP limit; see MAX_LINK_TRAVERSALS)",
+        ceiling - *budget + 1,
+        symlink_path.display()
     );
     *budget -= 1;
     let target = fs::read_link(symlink_path)?;
@@ -5972,12 +5992,13 @@ fn open_frozen_symlink_frame(
             symlink_path.display()
         )
     })?;
-    ensure!(
-        resolved.starts_with(canonical_root),
-        "frozen source symlink escapes its root"
-    );
+    // R-I7 (Self's ruling, fifth Cut 1 fix batch): no containment check
+    // here -- Soul proved it redundant by deletion (S5-8). The frame this
+    // returns is always pushed onto the stack and walked through the
+    // `Normal` arm's own containment check below before `resolved` is read
+    // by anything outside this function.
     Ok(FrozenSymlinkFrame {
-        symlink_path: Some(symlink_path.to_path_buf()),
+        symlink_path: symlink_path.to_path_buf(),
         resolved,
         remaining: frozen_symlink_steps(&target)?,
     })
@@ -5988,20 +6009,34 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
     // Total distinct symlinks this one resolution may read, matching the old
     // `MAX_HOPS` chain-depth bound in spirit: a memoised re-visit is free, so
     // this is now a bound on real work rather than on nesting depth.
+    //
+    // R-I5 (Self's ruling, fifth Cut 1 fix batch), declared: 40 matches the
+    // kernel's own `ELOOP` symlink-resolution limit (Linux's
+    // `MAXSYMLINKS`/`ELOOP` ceiling), so a chain the kernel itself would
+    // refuse to resolve is refused here too. This is a deliberate, narrow
+    // departure from the third fix batch's "keep S6's behaviour exactly":
+    // the old recursion charged each *sibling* symlink at the same nesting
+    // depth as one hop, so a legitimate target reached through more than 39
+    // symlinked path components -- accepted before this rewrite, because
+    // depth, not traversal count, was the old bound -- is now refused.
+    // Fail-closed at a kernel-matched boundary is judged the right
+    // behaviour, not a regression to patch around.
     const MAX_LINK_TRAVERSALS: u32 = 40;
     let mut budget = MAX_LINK_TRAVERSALS;
     let mut memo: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
-    let mut stack: Vec<FrozenSymlinkFrame> =
-        vec![open_frozen_symlink_frame(canonical_root, path, &mut budget)?];
+    let mut stack: Vec<FrozenSymlinkFrame> = vec![open_frozen_symlink_frame(
+        canonical_root,
+        path,
+        MAX_LINK_TRAVERSALS,
+        &mut budget,
+    )?];
 
     loop {
         let top = stack.len() - 1;
         match stack[top].remaining.pop_front() {
             None => {
                 let frame = stack.pop().expect("resolver stack is never empty");
-                if let Some(symlink_path) = frame.symlink_path {
-                    memo.insert(symlink_path, frame.resolved.clone());
-                }
+                memo.insert(frame.symlink_path, frame.resolved.clone());
                 match stack.last_mut() {
                     None => return Ok(frame.resolved),
                     Some(parent) => parent.resolved = frame.resolved,
@@ -6009,11 +6044,13 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
             }
             Some(FrozenSymlinkStep::CurDir) => {}
             Some(FrozenSymlinkStep::ParentDir) => {
-                let frame = &mut stack[top];
-                ensure!(
-                    frame.resolved.pop() && frame.resolved.starts_with(canonical_root),
-                    "frozen source symlink escapes its root"
-                );
+                // R-I7 (Self's ruling, fifth Cut 1 fix batch): the `pop()`
+                // is load-bearing (it walks `resolved` up one component);
+                // the containment check that used to gate on its result is
+                // not (S5-8) -- the `Normal` arm's own check, two steps
+                // below, is what actually stands between this walk and an
+                // out-of-root path reaching `symlink_metadata`.
+                stack[top].resolved.pop();
             }
             Some(FrozenSymlinkStep::Normal(part)) => {
                 let frame = &mut stack[top];
@@ -6031,15 +6068,20 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
                             stack.push(open_frozen_symlink_frame(
                                 canonical_root,
                                 &candidate,
+                                MAX_LINK_TRAVERSALS,
                                 &mut budget,
                             )?);
                         }
                     }
                     Ok(_) => {
-                        let real = candidate.canonicalize().with_context(|| {
-                            format!("resolving frozen source symlink chain at {}", candidate.display())
-                        })?;
-                        stack[top].resolved = real;
+                        // `frame.resolved` is already canonical here: the
+                        // parent was canonicalized when this frame opened,
+                        // and every earlier component in this walk passed
+                        // through this same match. Re-canonicalizing a path
+                        // that is already canonical cannot change the
+                        // answer, and re-running it per component is what
+                        // made a long symlink chain cost roughly O(k^3).
+                        stack[top].resolved = candidate;
                     }
                     Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
                         // Nothing exists here yet: the remaining components,
@@ -6055,6 +6097,17 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
                 }
             }
         }
+        // R-I7 (Self's ruling, fifth Cut 1 fix batch): NOT one of the
+        // deleted redundant checks, despite matching Soul's pass-5 line
+        // range for one of the three -- it is the only check left standing
+        // after `open_frozen_symlink_frame`'s own (S5-8's first) and the
+        // `ParentDir` arm's own (S5-8's second) are gone. A symlink whose
+        // entire target is `..` has no `Normal` step after it to trip that
+        // arm's containment check, so nothing else in this walk ever
+        // revisits `frame.resolved` before it can be returned or handed to
+        // a parent frame. Traced by hand and pinned by
+        // `validate_frozen_source_symlink_refuses_a_bare_parent_reference_
+        // at_the_root`; see that test for the shape that forced this.
         if let Some(frame) = stack.last() {
             ensure!(
                 frame.resolved.starts_with(canonical_root),
@@ -8282,6 +8335,126 @@ mod tests {
             String::from_utf8_lossy(&output.stderr).trim()
         );
         Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    /// R-I7 (Self's ruling, fifth Cut 1 fix batch): the hostile-tree
+    /// fixture builders each rebuilt this identically -- hashes `content`
+    /// into a loose object with real Git, the way a hand-built tree entry
+    /// needs a real blob to point at.
+    #[cfg(unix)]
+    fn hash_object(repo: &Path, content: &[u8]) -> Result<String> {
+        let mut child = Command::new("git")
+            .args(["-c", "safe.directory=*", "-C"])
+            .arg(repo)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(content)?;
+        let output = child.wait_with_output()?;
+        ensure!(output.status.success(), "git hash-object failed");
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    /// R-I7 (Self's ruling, fifth Cut 1 fix batch): writes a literal tree
+    /// object (`git hash-object -t tree --literally`) from `(mode, name,
+    /// sha1-hex)` entries, without Git re-sorting or re-validating them --
+    /// the only way this suite's hostile fixtures (duplicate names, `.GIT`
+    /// look-alikes, unsorted entries) get onto disk at all.
+    #[cfg(unix)]
+    fn literal_tree(repo: &Path, entries: &[(&str, &str, &str)]) -> Result<String> {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..20)
+                .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let mut raw = Vec::new();
+        for (mode, name, sha) in entries {
+            raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+            raw.extend(hex(sha));
+        }
+        let mut child = Command::new("git")
+            .args(["-c", "safe.directory=*", "-C"])
+            .arg(repo)
+            .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(&raw)?;
+        let output = child.wait_with_output()?;
+        ensure!(output.status.success(), "git hash-object --literally failed");
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    /// R-I7 (Self's ruling, fifth Cut 1 fix batch): a `.GIT`-look-alike
+    /// tree (a `deployment.toml` sibling to a `40000`-mode entry named some
+    /// case/normalization variant of `.git`, holding a hostile
+    /// `[core] fsmonitor = ...` config blob) -- the shape six of the
+    /// eleven `freeze_exact_refuses_already_local_hostile_objects_via_its_
+    /// own_fsck` fixtures share, differing only in that one entry's name.
+    #[cfg(unix)]
+    fn dotgit_lookalike(
+        repo: &Path,
+        recipe: &str,
+        name: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let cfg = hash_object(repo, b"[core]\n\tfsmonitor = touch /tmp/idunn-test-pwned\n")?;
+        let inner = literal_tree(repo, &[("100644", "config", &cfg)])?;
+        let mut entries = vec![
+            ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
+            ("40000".to_owned(), name.to_owned(), inner),
+        ];
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(entries)
+    }
+
+    /// R-I7 (Self's ruling, fifth Cut 1 fix batch): runs a Git command
+    /// against `repo` as the identity `repo` was already `chown`ed to,
+    /// exactly the arguments a real unprivileged Git identity would use --
+    /// needed once this process (running as root, to exercise Idunn's own
+    /// root-owned actuator) would otherwise be refused by Git's "dubious
+    /// ownership" check for touching a directory it does not own.
+    #[cfg(unix)]
+    fn git_owned(repo: &Path, args: &[&str]) -> Result<String> {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "safe.directory=*",
+                "-c",
+                "user.name=Idunn Test",
+                "-c",
+                "user.email=idunn-test@example.invalid",
+                "-C",
+            ])
+            .arg(repo)
+            .args(args)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    /// R-I7 (Self's ruling, fifth Cut 1 fix batch): `chown -R` a fixture
+    /// origin repository to the unprivileged Git identity (uid/gid 1000)
+    /// these hostile-tree fixtures build and commit as, so a later `git`
+    /// invocation running as this process's real identity (root, in every
+    /// environment that actually exercises `freeze_exact`'s root-only
+    /// guard) needs `git_owned` rather than being refused outright.
+    #[cfg(unix)]
+    fn chown_to_source_identity(repo: &Path) -> Result<()> {
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+        Ok(())
     }
 
     fn fixture_docker_runner_binding() -> DockerRunnerBinding {
@@ -11376,215 +11549,6 @@ mod tests {
         Ok(())
     }
 
-    // ---------------------------------------------------------------------
-    // S1 (Self's ruling, third Cut 1 fix batch): fsck guards the fetch in
-    // `resolve()` as well as the one in `freeze_exact`, and `freeze_exact`
-    // also fscks the selected tree so that objects already local get
-    // checked too.
-    //
-    // Discrepancy: `OperatorBinding::validate()` (`deployment.rs:1027-1040`)
-    // requires `repository.origin` to start with `https://`, unconditionally
-    // -- `resolve()` calls it first thing, and `freeze()` calls it through
-    // `ResolvedSource::validate_against`. No test in this suite stands up a
-    // real HTTPS Git origin (every existing fixture uses `file://`), and
-    // adding one is out of this fix batch's scope. This fixture instead
-    // reproduces `resolve()`'s exact fetch invocation -- literally the same
-    // arguments `resolve()` passes to `self.git(...)`, this fix included --
-    // against the checkout, the same approximation Soul's own probe used
-    // (`resolve_like_fetch` in `probe4_soul3.rs`), followed by the real,
-    // unmodified `freeze_exact`. That is "resolve() then freeze()" in every
-    // way this suite can exercise without a live HTTPS remote: it proves the
-    // fetch line S1 changed, not a hand-built substitute for it, refuses the
-    // hostile object, and that `freeze_exact`'s own explicit fsck refuses it
-    // independently even if the fetch line's guard were ever weakened.
-    #[cfg(unix)]
-    #[test]
-    fn resolve_style_fetch_then_freeze_exact_refuses_hostile_trees() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        fn hash_object(repo: &Path, content: &[u8]) -> Result<String> {
-            let mut child = Command::new("git")
-                .args(["-c", "safe.directory=*", "-C"])
-                .arg(repo)
-                .args(["hash-object", "-w", "--stdin"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            child.stdin.take().unwrap().write_all(content)?;
-            let output = child.wait_with_output()?;
-            ensure!(output.status.success(), "git hash-object failed");
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        }
-        fn literal_tree(repo: &Path, entries: &[(&str, &str, &str)]) -> Result<String> {
-            let hex = |s: &str| -> Vec<u8> {
-                (0..20)
-                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
-                    .collect()
-            };
-            let mut raw = Vec::new();
-            for (mode, name, sha) in entries {
-                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
-                raw.extend(hex(sha));
-            }
-            let mut child = Command::new("git")
-                .args(["-c", "safe.directory=*", "-C"])
-                .arg(repo)
-                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            child.stdin.take().unwrap().write_all(&raw)?;
-            let output = child.wait_with_output()?;
-            ensure!(output.status.success(), "git hash-object --literally failed");
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        }
-        fn dotgit_lookalike(repo: &Path, recipe: &str, name: &str) -> Result<Vec<(String, String, String)>> {
-            let cfg = hash_object(repo, b"[core]\n\tfsmonitor = touch /tmp/soul3-pwned\n")?;
-            let inner = literal_tree(repo, &[("100644", "config", &cfg)])?;
-            let mut entries = vec![
-                ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
-                ("40000".to_owned(), name.to_owned(), inner),
-            ];
-            entries.sort_by(|a, b| a.1.cmp(&b.1));
-            Ok(entries)
-        }
-        fn chown_to_source_identity(repo: &Path) -> Result<()> {
-            ensure!(
-                Command::new("/bin/chown")
-                    .args(["-R", "1000:1000"])
-                    .arg(repo)
-                    .status()?
-                    .success(),
-                "chowning the fixture origin repository"
-            );
-            Ok(())
-        }
-
-        #[allow(clippy::type_complexity)]
-        let fixtures: Vec<(&str, Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>)> = vec![
-            (
-                "dup-trees",
-                Box::new(|repo: &Path, recipe: &str| {
-                    let x = hash_object(repo, b"x\n")?;
-                    let y = hash_object(repo, b"y\n")?;
-                    let tx = literal_tree(repo, &[("100644", "x", &x)])?;
-                    let ty = literal_tree(repo, &[("100644", "y", &y)])?;
-                    Ok(vec![
-                        ("40000".into(), "d".into(), tx),
-                        ("40000".into(), "d".into(), ty),
-                        ("100644".into(), "deployment.toml".into(), recipe.into()),
-                    ])
-                }) as Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>,
-            ),
-            ("dotGIT", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".GIT"))),
-            ("dotGit", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".Git"))),
-            ("git-short-name", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, "git~1"))),
-            ("dotgit-trailing-dot", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git."))),
-            ("dotgit-zwnj", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git\u{200c}"))),
-            ("dotgit-trailing-space", Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git "))),
-        ];
-
-        for (label, build) in fixtures {
-            let temp = tempfile::tempdir()?;
-            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
-            let origin_repo = temp.path().join("origin");
-            fs::create_dir(&origin_repo)?;
-            git_at(&origin_repo, &["init", "--initial-branch=main"])?;
-            git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
-            git_at(&origin_repo, &["config", "user.email", "idunn-test@example.invalid"])?;
-            fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
-            git_at(&origin_repo, &["add", "--all"])?;
-            git_at(&origin_repo, &["commit", "-m", "root"])?;
-            let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
-            let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
-            chown_to_source_identity(&origin_repo)?;
-
-            let source_cache_root = temp.path().join("source-cache");
-            let frozen_source_root = temp.path().join("frozen-source");
-            fs::create_dir(&frozen_source_root)?;
-            fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
-            let identity = ProcessIdentity { uid: 1000, gid: 1000 };
-            let driver = GitSourceDriver::new(
-                source_cache_root.clone(),
-                frozen_source_root.clone(),
-                Some(identity),
-            );
-            let source = ExactSource {
-                origin: format!("file://{}", origin_repo.display()),
-                checkout: source_cache_root.join("checkout"),
-                gitlinks: BTreeMap::new(),
-                recipe_path: PathBuf::from("deployment.toml"),
-            };
-            // The checkout is established on the good root commit first,
-            // exactly as a real deploy target's checkout already exists by
-            // the time a later push lands: this is what makes the objects
-            // this fixture cares about arrive only through the *next*
-            // fetch, not the initial clone.
-            driver.prepare_source_root(&source)?;
-
-            let entries = build(&origin_repo, &recipe_blob)
-                .with_context(|| format!("building the {label} fixture"))?;
-            let entry_refs: Vec<(&str, &str, &str)> = entries
-                .iter()
-                .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
-                .collect();
-            let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
-            // Not `git_at`: the repository is already chowned to the
-            // unprivileged identity above, and this process is root, so
-            // plain `git` here refuses it as "dubious ownership" without
-            // `safe.directory` (the same reason `freeze_exact_refuses_a_
-            // duplicate_named_tree...` above uses its own `git_owned`).
-            let git_owned = |args: &[&str]| -> Result<String> {
-                let output = Command::new("git")
-                    .args([
-                        "-c", "safe.directory=*",
-                        "-c", "user.name=Idunn Test",
-                        "-c", "user.email=idunn-test@example.invalid",
-                        "-C",
-                    ])
-                    .arg(&origin_repo)
-                    .args(args)
-                    .output()?;
-                ensure!(output.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
-                Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-            };
-            let hostile_commit = git_owned(&["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"])?;
-            git_owned(&["update-ref", "refs/heads/main", &hostile_commit])?;
-
-            // The exact fetch `resolve()` runs (`drivers.rs`, `fn resolve`),
-            // S1's fix included: `-c transfer.fsckObjects=true`, `--force`,
-            // `--no-tags`, fetching `refs/heads/main` into a resolution ref.
-            let resolve_style_fetch = driver.git([
-                OsString::from("-c"),
-                OsString::from("transfer.fsckObjects=true"),
-                OsString::from("-C"),
-                source.checkout.as_os_str().to_owned(),
-                OsString::from("fetch"),
-                OsString::from("--force"),
-                OsString::from("--no-tags"),
-                OsString::from("origin"),
-                OsString::from("+refs/heads/main:refs/idunn/resolutions/s1-fixture/r1"),
-            ]);
-            match resolve_style_fetch {
-                Err(_) => {
-                    // Refused at the fetch itself: the strongest outcome.
-                }
-                Ok(_) => {
-                    // The fetch admitted the ref; `freeze_exact`'s own
-                    // explicit fsck (defense in depth, for objects a fetch
-                    // never re-checks) must still refuse it.
-                    let result =
-                        driver.freeze_exact(&source, &hostile_commit, "txn-hostile", &frozen_source_root);
-                    assert!(
-                        result.is_err(),
-                        "{label}: a hostile tree that a resolve()-style fetch admitted must still be refused by freeze_exact's own fsck"
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
     // -----------------------------------------------------------------
     // S4-1 (Self's ruling, fourth Cut 1 fix batch): the symlink resolver
     // used to recurse per path component and cost 2^n real filesystem
@@ -11631,6 +11595,124 @@ mod tests {
         Ok(())
     }
 
+    /// R-I1 (Self's ruling, fifth Cut 1 fix batch): pins the fix for S5-1.
+    /// `open_frozen_symlink_frame`'s `Normal` step used to call
+    /// `canonicalize()` on every real (non-symlink) path component it
+    /// walked, even though `frame.resolved` is already canonical there. The
+    /// budget only charges distinct symlinks read, never components walked,
+    /// so one link with k real components cost roughly O(k^3): 14.92 s at
+    /// k=800 under the unfixed code. This freezes a single link whose
+    /// target has many real directory components (no further symlinks) at
+    /// two component counts 4x apart and requires the larger one to cost
+    /// far less than the ~64x a cubic term would produce, so the
+    /// per-component `canonicalize()` cannot come back unnoticed.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_symlinks_resolves_a_long_component_chain_roughly_linearly(
+    ) -> Result<()> {
+        use std::os::unix::fs::symlink;
+        use std::time::Instant;
+
+        fn build_chain(root: &Path, components: usize) -> Result<()> {
+            fs::create_dir(root)?;
+            let mut dir = root.to_path_buf();
+            for i in 0..components {
+                dir.push(format!("d{i}"));
+                fs::create_dir(&dir)?;
+            }
+            fs::write(dir.join("target.txt"), b"leaf\n")?;
+            let target: PathBuf = (0..components)
+                .map(|i| format!("d{i}"))
+                .chain(std::iter::once("target.txt".to_string()))
+                .collect();
+            symlink(target, root.join("link"))?;
+            Ok(())
+        }
+
+        fn time_resolution(components: usize) -> Result<std::time::Duration> {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("root");
+            build_chain(&root, components)?;
+            let start = Instant::now();
+            validate_frozen_source_symlinks(&root)?;
+            Ok(start.elapsed())
+        }
+
+        let small = time_resolution(50)?;
+        let large = time_resolution(200)?;
+
+        assert!(
+            large.as_secs_f64() < small.as_secs_f64().max(0.01) * 20.0,
+            "resolving a 4x longer component chain must cost far less than the ~64x a \
+             cubic per-component canonicalize() would produce: {small:?} at 50 components, \
+             {large:?} at 200 components"
+        );
+        assert!(
+            large.as_secs() < 5,
+            "a 200-component chain must resolve in a few seconds with the dead \
+             per-component canonicalize() removed, took {large:?}"
+        );
+        Ok(())
+    }
+
+    /// R-I2 (Self's ruling, fifth Cut 1 fix batch): pins S5-2. The
+    /// traversal budget is the resolver's only termination guarantee --
+    /// memoisation cannot help a cycle, because an in-progress frame is
+    /// never inserted into the memo until it finishes, and it never
+    /// finishes. `cargo-mutants --in-diff` found two mutants that
+    /// `open_frozen_symlink_frame`'s budget check missed, both making the
+    /// budget never decrease (`*budget -= 1` mutated away). This fixture, a
+    /// bound two-link cycle, must refuse under real code and must go red
+    /// under that mutation (checked by hand below).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_frozen_source_symlink_refuses_a_two_link_cycle() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        symlink("b", root.join("a"))?;
+        symlink("a", root.join("b"))?;
+
+        let result = validate_frozen_source_symlink(&root, &root.join("a"));
+        assert!(
+            result.is_err(),
+            "a two-link cycle can never terminate on its own; only the traversal \
+             budget stops it, and it must refuse: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// R-I2 (Self's ruling, fifth Cut 1 fix batch): the second budget
+    /// fixture -- 41 *distinct* links (not a cycle, so memoisation cannot
+    /// hide the count) chained end to end, one more than
+    /// `MAX_LINK_TRAVERSALS`. Each is read exactly once, so this exercises
+    /// the budget itself rather than the cycle-detection consequence of it.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_frozen_source_symlink_refuses_41_distinct_links() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("leaf.txt"), b"leaf\n")?;
+        // link40 -> leaf.txt, link39 -> link40, ..., link0 -> link1: 41
+        // distinct symlinks (link0..link40) must be read to reach the leaf.
+        symlink("leaf.txt", root.join("link40"))?;
+        for i in (0..40usize).rev() {
+            symlink(format!("link{}", i + 1), root.join(format!("link{i}")))?;
+        }
+
+        let result = validate_frozen_source_symlink(&root, &root.join("link0"));
+        assert!(
+            result.is_err(),
+            "41 distinct links exceeds the 40-traversal budget and must refuse: {result:?}"
+        );
+        Ok(())
+    }
+
     /// S4-5 (Self's ruling, fourth Cut 1 fix batch): every existing S6 test
     /// naming `..` is a refusal (an escape). `cargo-mutants` found that
     /// deleting the `Component::ParentDir` match arm entirely -- so it falls
@@ -11657,6 +11739,39 @@ mod tests {
             resolved,
             canonical_root.join("deployment.toml"),
             "a `..` chain that stays inside the root must resolve to the real in-root target"
+        );
+        Ok(())
+    }
+
+    /// R-I7 (Self's ruling, fifth Cut 1 fix batch): a symlink whose entire
+    /// target is `..`, sitting directly at the root, leaves nothing behind
+    /// to re-enter the root -- no later `Normal` step ever runs to trip
+    /// that arm's own containment check. This pins that the resolver still
+    /// refuses it: while auditing R-I7's three "redundant" containment
+    /// checks for deletion, tracing this exact shape by hand showed the
+    /// third one (the unconditional check at the bottom of the resolver's
+    /// loop, after `:6058-6063` in Soul's pass-5 numbering) is the only
+    /// thing that catches a chain that leaves the root and never returns
+    /// through another path component -- so unlike the other two, it survives
+    /// this batch. Recorded here as the discrepancy from the map's "delete
+    /// all three" reading.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_symlink_refuses_a_bare_parent_reference_at_the_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("deployment.toml"), b"target = 'test'\n")?;
+        let link = root.join("escape");
+        symlink("..", &link)?;
+
+        let result = validate_frozen_source_symlink(&root, &link);
+        assert!(
+            result.is_err(),
+            "a symlink whose entire target is `..`, with no component after it to trip the \
+             `Normal` arm's own check, must still be refused: {result:?}"
         );
         Ok(())
     }
@@ -11699,6 +11814,157 @@ mod tests {
         Ok(())
     }
 
+    /// R-I3 (Self's ruling, fifth Cut 1 fix batch): pins S5-3. The digest
+    /// is the tamper check `observe_frozen` relies on, so it must not be
+    /// blind to a repointed symlink target: two trees whose only
+    /// difference is where the same-named symlink points must hash
+    /// differently. Before this test existed, deleting the
+    /// `hasher.update(target...)` call at `hash_frozen_source_tree`'s
+    /// symlink arm left the suite green.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_sha256_differs_when_only_a_symlink_target_differs() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        fn build(temp: &Path, name: &str, target: &str) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            fs::write(root.join("a"), b"a\n")?;
+            fs::write(root.join("b"), b"b\n")?;
+            symlink(target, root.join("link"))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", "a")?;
+        let root_b = build(temp.path(), "root-b", "b")?;
+        let digest_a = frozen_source_sha256(&root_a)?;
+        let digest_b = frozen_source_sha256(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two trees differing only in a symlink's target must hash differently, \
+             since the digest is the only tamper check a repointed in-root symlink faces"
+        );
+        Ok(())
+    }
+
+    /// R-I3 (Self's ruling, fifth Cut 1 fix batch): pins S5-4. Deleting the
+    /// `metadata.permissions().mode() & 0o111 != 0` term left the suite
+    /// green, and `validate_frozen_source` legally accepts both `0444` and
+    /// `0555`, so the digest must be the thing that notices a file gaining
+    /// or losing its executable bit.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_sha256_differs_when_only_the_executable_bit_differs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn build(temp: &Path, name: &str, mode: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let file = root.join("f");
+            fs::write(&file, b"same content\n")?;
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", 0o444)?;
+        let root_b = build(temp.path(), "root-b", 0o555)?;
+        let digest_a = frozen_source_sha256(&root_a)?;
+        let digest_b = frozen_source_sha256(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two trees differing only in the executable bit must hash differently: \
+             validate_frozen_source legally accepts both 0444 and 0555, so the digest \
+             is the only thing that can still notice the change"
+        );
+        Ok(())
+    }
+
+    /// R-I4 (Self's ruling, fifth Cut 1 fix batch): pins S4-6's guard and
+    /// fixes its off-by-one. `materialize_tree_raw`'s symlink-target length
+    /// `ensure!`s used `<=` against `FROZEN_SOURCE_SYMLINK_TARGET_LIMIT`
+    /// (`PATH_MAX`, 4096), admitting a 4096-byte target that the kernel's
+    /// own `symlink()` then refuses with `ENAMETOOLONG` -- confirmed by
+    /// hand against this container's kernel: a 4095-byte target writes
+    /// cleanly, a 4096-byte one does not (`errno 36`, "File name too
+    /// long"). The guard now refuses at 4096, matching the kernel exactly,
+    /// so the failure surfaces as this guard's own message instead of an
+    /// opaque OS error after `fs::read`ing a target this large into memory
+    /// -- the exact shape S4-6 exists to avoid.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_tree_raw_admits_the_kernels_symlink_target_limit_and_refuses_one_byte_more()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn build_and_materialize(byte_len: usize) -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let repository = temp.path().join("repository");
+            fs::create_dir(&repository)?;
+            git_at(&repository, &["init", "--initial-branch=main"])?;
+            git_at(&repository, &["config", "user.name", "Idunn Test"])?;
+            git_at(
+                &repository,
+                &["config", "user.email", "idunn-test@example.invalid"],
+            )?;
+            fs::write(repository.join("deployment.toml"), b"target = 'test'\n")?;
+            git_at(&repository, &["add", "--all"])?;
+            git_at(&repository, &["commit", "-m", "root"])?;
+            let recipe_blob = git_at(&repository, &["rev-parse", "HEAD:deployment.toml"])?;
+
+            // A blob this large can never come from a real `symlink()` call
+            // (the kernel refuses to create one past its own limit), so the
+            // fixture writes the oversized target straight into a Git blob
+            // -- exactly how a hostile or merely careless commit could still
+            // get one past a Git-level check into the tree this guard reads.
+            let target = vec![b'a'; byte_len];
+            let target_blob = hash_object(&repository, &target)?;
+            let tree = literal_tree(
+                &repository,
+                &[
+                    ("100644", "deployment.toml", &recipe_blob),
+                    ("120000", "link", &target_blob),
+                ],
+            )?;
+            let commit = git_owned(&repository, &["commit-tree", &tree, "-m", "symlink"])?;
+
+            let parent = temp.path().join("transaction");
+            fs::create_dir(&parent)?;
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+            let destination = parent.join("source");
+            prepare_frozen_source_destination(&destination)?;
+            let driver = GitSourceDriver::new(
+                temp.path().join("source-cache"),
+                temp.path().join("frozen-source"),
+                None,
+            );
+            let mut created_dirs = std::collections::HashSet::new();
+            created_dirs.insert(destination.clone());
+            driver.materialize_tree_raw(
+                &repository,
+                &commit,
+                &destination,
+                &destination,
+                &mut created_dirs,
+            )?;
+            Ok(())
+        }
+
+        build_and_materialize(4095).with_context(|| {
+            "4095 bytes is the kernel's own symlink-target ceiling and must be admitted"
+        })?;
+        let error = build_and_materialize(4096)
+            .expect_err("4096 bytes exceeds the kernel's own symlink-target ceiling and must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("exceeds the platform's path length limit"),
+            "expected the guard's own message, not a bare OS failure after a wasted write \
+             attempt, got: {rendered}"
+        );
+        Ok(())
+    }
+
     // -----------------------------------------------------------------
     // S4-3 (Self's ruling, fourth Cut 1 fix batch): three of the five S5
     // tests did not kill their own guard, because another refusal fired
@@ -11719,43 +11985,6 @@ mod tests {
     fn git_tree_entries_refuses_a_tree_that_emits_a_path_twice() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        fn hash_object(repo: &Path, content: &[u8]) -> Result<String> {
-            let mut child = Command::new("git")
-                .args(["-c", "safe.directory=*", "-C"])
-                .arg(repo)
-                .args(["hash-object", "-w", "--stdin"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            child.stdin.take().unwrap().write_all(content)?;
-            let output = child.wait_with_output()?;
-            ensure!(output.status.success(), "git hash-object failed");
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        }
-        fn literal_tree(repo: &Path, entries: &[(&str, &str, &str)]) -> Result<String> {
-            let hex = |s: &str| -> Vec<u8> {
-                (0..20)
-                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
-                    .collect()
-            };
-            let mut raw = Vec::new();
-            for (mode, name, sha) in entries {
-                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
-                raw.extend(hex(sha));
-            }
-            let mut child = Command::new("git")
-                .args(["-c", "safe.directory=*", "-C"])
-                .arg(repo)
-                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            child.stdin.take().unwrap().write_all(&raw)?;
-            let output = child.wait_with_output()?;
-            ensure!(output.status.success(), "git hash-object --literally failed");
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        }
-
         let temp = tempfile::tempdir()?;
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
         let origin_repo = temp.path().join("origin");
@@ -11768,14 +11997,7 @@ mod tests {
         git_at(&origin_repo, &["commit", "-m", "root"])?;
         let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
         let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
-        ensure!(
-            Command::new("/bin/chown")
-                .args(["-R", "1000:1000"])
-                .arg(&origin_repo)
-                .status()?
-                .success(),
-            "chowning the fixture origin repository"
-        );
+        chown_to_source_identity(&origin_repo)?;
 
         let source_cache_root = temp.path().join("source-cache");
         let frozen_source_root = temp.path().join("frozen-source");
@@ -11816,28 +12038,11 @@ mod tests {
                 ("100644", "same.txt", &b),
             ],
         )?;
-        let git_owned = |args: &[&str]| -> Result<String> {
-            let output = Command::new("git")
-                .args([
-                    "-c", "safe.directory=*",
-                    "-c", "user.name=Idunn Test",
-                    "-c", "user.email=idunn-test@example.invalid",
-                    "-C",
-                ])
-                .arg(&origin_repo)
-                .args(args)
-                .output()?;
-            ensure!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        };
-        let hostile_commit =
-            git_owned(&["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"])?;
-        git_owned(&["update-ref", "refs/heads/main", &hostile_commit])?;
+        let hostile_commit = git_owned(
+            &origin_repo,
+            &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
+        )?;
+        git_owned(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
 
         // The hostile objects land already-local through an UNGUARDED fetch
         // (no `transfer.fsckObjects=true`), exactly like Soul's probe A: no
@@ -11951,53 +12156,6 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn s4_4_hostile_fixtures()
     -> Vec<(&'static str, Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>)> {
-        fn hash_object(repo: &Path, content: &[u8]) -> Result<String> {
-            let mut child = Command::new("git")
-                .args(["-c", "safe.directory=*", "-C"])
-                .arg(repo)
-                .args(["hash-object", "-w", "--stdin"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            child.stdin.take().unwrap().write_all(content)?;
-            let output = child.wait_with_output()?;
-            ensure!(output.status.success(), "git hash-object failed");
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        }
-        fn literal_tree(repo: &Path, entries: &[(&str, &str, &str)]) -> Result<String> {
-            let hex = |s: &str| -> Vec<u8> {
-                (0..20)
-                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
-                    .collect()
-            };
-            let mut raw = Vec::new();
-            for (mode, name, sha) in entries {
-                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
-                raw.extend(hex(sha));
-            }
-            let mut child = Command::new("git")
-                .args(["-c", "safe.directory=*", "-C"])
-                .arg(repo)
-                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            child.stdin.take().unwrap().write_all(&raw)?;
-            let output = child.wait_with_output()?;
-            ensure!(output.status.success(), "git hash-object --literally failed");
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        }
-        fn dotgit_lookalike(repo: &Path, recipe: &str, name: &str) -> Result<Vec<(String, String, String)>> {
-            let cfg = hash_object(repo, b"[core]\n\tfsmonitor = touch /tmp/s4-4-pwned\n")?;
-            let inner = literal_tree(repo, &[("100644", "config", &cfg)])?;
-            let mut entries = vec![
-                ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
-                ("40000".to_owned(), name.to_owned(), inner),
-            ];
-            entries.sort_by(|a, b| a.1.cmp(&b.1));
-            Ok(entries)
-        }
-
         vec![
             (
                 "dup-trees",
@@ -12097,14 +12255,7 @@ mod tests {
             git_at(&origin_repo, &["commit", "-m", "root"])?;
             let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
             let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
-            ensure!(
-                Command::new("/bin/chown")
-                    .args(["-R", "1000:1000"])
-                    .arg(&origin_repo)
-                    .status()?
-                    .success(),
-                "chowning the fixture origin repository"
-            );
+            chown_to_source_identity(&origin_repo)?;
 
             let source_cache_root = temp.path().join("source-cache");
             let frozen_source_root = temp.path().join("frozen-source");
@@ -12136,50 +12287,13 @@ mod tests {
                 .iter()
                 .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
                 .collect();
-            let hex = |s: &str| -> Vec<u8> {
-                (0..20)
-                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
-                    .collect()
-            };
-            let mut raw = Vec::new();
-            for (mode, name, sha) in &entry_refs {
-                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
-                raw.extend(hex(sha));
-            }
-            let mut child = Command::new("git")
-                .args(["-c", "safe.directory=*", "-C"])
-                .arg(&origin_repo)
-                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            child.stdin.take().unwrap().write_all(&raw)?;
-            let tree_output = child.wait_with_output()?;
-            ensure!(tree_output.status.success(), "git hash-object --literally failed");
-            let hostile_tree = String::from_utf8(tree_output.stdout)?.trim().to_owned();
+            let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
 
-            let git_owned = |args: &[&str]| -> Result<String> {
-                let output = Command::new("git")
-                    .args([
-                        "-c", "safe.directory=*",
-                        "-c", "user.name=Idunn Test",
-                        "-c", "user.email=idunn-test@example.invalid",
-                        "-C",
-                    ])
-                    .arg(&origin_repo)
-                    .args(args)
-                    .output()?;
-                ensure!(
-                    output.status.success(),
-                    "git {:?} failed: {}",
-                    args,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-            };
-            let hostile_commit =
-                git_owned(&["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"])?;
-            git_owned(&["update-ref", "refs/heads/main", &hostile_commit])?;
+            let hostile_commit = git_owned(
+                &origin_repo,
+                &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
+            )?;
+            git_owned(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
 
             // Unguarded fetch: no `transfer.fsckObjects=true`. Most of
             // Soul's fixtures land already local this way, exactly like her
@@ -12248,48 +12362,8 @@ mod tests {
         let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
         let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
 
-        let cfg = Command::new("git")
-            .args(["-c", "safe.directory=*", "-C"])
-            .arg(&origin_repo)
-            .args(["hash-object", "-w", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(b"[core]\n\tfsmonitor = touch /tmp/s4-4c-pwned\n")?;
-                child.wait_with_output()
-            })?;
-        ensure!(cfg.status.success(), "git hash-object failed");
-        let cfg_blob = String::from_utf8(cfg.stdout)?.trim().to_owned();
-
-        let hex = |s: &str| -> Vec<u8> {
-            (0..20)
-                .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
-                .collect()
-        };
-        let write_tree = |entries: &[(&str, &str, &str)]| -> Result<String> {
-            let mut raw = Vec::new();
-            for (mode, name, sha) in entries {
-                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
-                raw.extend(hex(sha));
-            }
-            let mut child = Command::new("git")
-                .args(["-c", "safe.directory=*", "-C"])
-                .arg(&origin_repo)
-                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            child.stdin.take().unwrap().write_all(&raw)?;
-            let output = child.wait_with_output()?;
-            ensure!(output.status.success(), "git hash-object --literally failed");
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        };
-        let inner = write_tree(&[("100644", "config", &cfg_blob)])?;
+        let cfg_blob = hash_object(&origin_repo, b"[core]\n\tfsmonitor = touch /tmp/idunn-test-pwned\n")?;
+        let inner = literal_tree(&origin_repo, &[("100644", "config", &cfg_blob)])?;
         let mut top_entries = vec![
             ("100644".to_owned(), "deployment.toml".to_owned(), recipe_blob.clone()),
             ("40000".to_owned(), ".git".to_owned(), inner),
@@ -12299,37 +12373,13 @@ mod tests {
             .iter()
             .map(|(m, n, s)| (m.as_str(), n.as_str(), s.as_str()))
             .collect();
-        let hostile_tree = write_tree(&top_refs)?;
+        let hostile_tree = literal_tree(&origin_repo, &top_refs)?;
 
-        ensure!(
-            Command::new("/bin/chown")
-                .args(["-R", "1000:1000"])
-                .arg(&origin_repo)
-                .status()?
-                .success(),
-            "chowning the fixture origin repository"
-        );
-        let git_owned = |args: &[&str]| -> Result<String> {
-            let output = Command::new("git")
-                .args([
-                    "-c", "safe.directory=*",
-                    "-c", "user.name=Idunn Test",
-                    "-c", "user.email=idunn-test@example.invalid",
-                    "-C",
-                ])
-                .arg(&origin_repo)
-                .args(args)
-                .output()?;
-            ensure!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-        };
-        let hostile_commit =
-            git_owned(&["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"])?;
+        chown_to_source_identity(&origin_repo)?;
+        let hostile_commit = git_owned(
+            &origin_repo,
+            &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
+        )?;
 
         let source_cache_root = temp.path().join("source-cache");
         let frozen_source_root = temp.path().join("frozen-source");
@@ -12357,7 +12407,7 @@ mod tests {
         // been fetched by anything, guarded or not, and `freeze_exact`'s own
         // fetch is the first thing to ever see it.
         driver.prepare_source_root(&source)?;
-        git_owned(&["update-ref", "refs/heads/main", &hostile_commit])?;
+        git_owned(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
 
         let result =
             driver.freeze_exact(&source, &hostile_commit, "txn-s4-4c", &frozen_source_root);
