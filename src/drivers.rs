@@ -58,48 +58,6 @@ struct GitTreeEntry {
     path: PathBuf,
 }
 
-/// F2/F3 layer (a): refuses a tree before anything is written from it. Two
-/// distinct leaf entries may not case-fold to the same path (a
-/// case-insensitive filesystem would collapse them), and no leaf entry's
-/// path may be a case-folded ancestor of another leaf's path: a symlink or
-/// file entry named `a` sharing a root with a tree entry that recurses to
-/// `a/pwn` is exactly the shape `git hash-object --literally` can construct
-/// (two entries literally named `a` in one raw tree object) and that
-/// `ls-tree -r` then lists as both a leaf `a` and a leaf `a/pwn`. Refusing it
-/// here, before `materialize_tree_raw` ever runs, is layer (a); the writer
-/// itself (`ensure_frozen_directory`) is layer (b) and never trusts this
-/// check alone.
-fn refuse_conflicting_tree_entries(entries: &[GitTreeEntry]) -> Result<()> {
-    let mut by_lowercase: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for entry in entries {
-        let lowered = entry.path.to_string_lossy().to_lowercase();
-        if let Some(existing) = by_lowercase.insert(lowered, entry.path.clone()) {
-            ensure!(
-                existing == entry.path,
-                "Git tree paths {} and {} collide case-insensitively",
-                existing.display(),
-                entry.path.display()
-            );
-        }
-    }
-    for entry in entries {
-        for ancestor in entry.path.ancestors().skip(1) {
-            if ancestor.as_os_str().is_empty() {
-                continue;
-            }
-            let lowered = ancestor.to_string_lossy().to_lowercase();
-            if let Some(colliding) = by_lowercase.get(&lowered) {
-                bail!(
-                    "Git tree entry {} aliases path {} used by another entry",
-                    entry.path.display(),
-                    colliding.display()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 /// F2/F3 layer (b): the only way `materialize_tree_raw` is allowed to obtain
 /// a directory to write into. `path` must already be a directory this
 /// function created earlier in the same freeze (tracked in `created_dirs`,
@@ -1019,7 +977,17 @@ impl GitSourceDriver {
             entries.windows(2).all(|pair| pair[0].path != pair[1].path),
             "Git tree emits a path twice"
         );
-        refuse_conflicting_tree_entries(&entries)?;
+        // S7 (Self's ruling, third Cut 1 fix batch): the case-insensitive
+        // collision/alias refusal that used to run here is deleted. The host
+        // is case-sensitive ext4, so a case-fold collision was never a real
+        // write hazard, and the check was inconsistent (leaf paths only, a
+        // plain `to_lowercase` rather than Unicode case folding or
+        // normalization). `.git` look-alikes are now refused by `git fsck`
+        // itself (S1, `resolve()` and `freeze_exact`), independent of case.
+        // An exact-name alias (a leaf `a` sharing a root with a tree that
+        // recurses to `a/pwn`) is still refused, at write time, by
+        // `ensure_frozen_directory` below: it never writes through an
+        // existing entry, symlink or otherwise.
         Ok(entries)
     }
 
@@ -1141,9 +1109,10 @@ impl GitSourceDriver {
     /// thousands of objects without an argv-length limit. Objects the
     /// checkout already has are asked for again; Git answers from the local
     /// pack without a network round trip for those, which is cheap next to
-    /// the round trips this replaces. `transfer.fsckObjects=true` is layer
-    /// (a) of F2/F3: Git itself refuses a fetched tree with duplicate names
-    /// before any of it reaches disk, independent of `refuse_conflicting_tree_entries`.
+    /// the round trips this replaces. `transfer.fsckObjects=true` is defense
+    /// in depth: Git itself refuses a fetched tree with duplicate names
+    /// before any of it reaches disk, independent of the explicit `fsck`
+    /// call S1 added around the revision this bulk fetch serves.
     fn bulk_fetch_objects(&self, repository: &Path, objects: &[String]) -> Result<()> {
         if objects.is_empty() {
             return Ok(());
@@ -1647,6 +1616,22 @@ impl GitSourceDriver {
             OsString::from(revision),
         ])
         .context("fetching the durable exact source revision")?;
+        // S1: `transfer.fsckObjects=true` above only inspects objects this
+        // fetch actually transfers. An object the checkout already holds --
+        // brought in by an earlier `resolve()` on this same checkout, or by
+        // any other path into the local store -- is never re-transferred and
+        // so is never re-checked by that flag. Fsck the selected revision
+        // explicitly and independently here, so objects that were already
+        // local get checked too, not only freshly fetched ones.
+        self.git([
+            OsString::from("-C"),
+            source.checkout.as_os_str().to_owned(),
+            OsString::from("fsck"),
+            OsString::from("--strict"),
+            OsString::from("--no-dangling"),
+            OsString::from(revision),
+        ])
+        .with_context(|| format!("fsck refused the selected revision {revision}"))?;
         let (recipe_bytes, gitlinks) = self.exact_recipe_and_gitlinks(source, revision)?;
         let transaction_root = prepare_frozen_transaction_root(root, transaction_id)?;
         let partial = transaction_root.join(".partial");
@@ -1700,6 +1685,13 @@ impl GitSourceDriver {
             .expect("generated frozen source digest");
         let final_root = transaction_root.join(snapshot_component);
         fs::rename(&partial, &final_root).context("publishing immutable frozen source")?;
+        // S6: symlinks are judged against the tree's real, final published
+        // path, not `.partial`. This must run after the rename and before
+        // anything trusts the tree.
+        if let Err(error) = validate_frozen_source_symlinks(&final_root) {
+            let _ = remove_frozen_transaction_root(root, transaction_id);
+            return Err(error);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1732,7 +1724,16 @@ impl SourcePort for GitSourceDriver {
         let source = exact_source_from(binding);
         self.prepare_source_root(&source)?;
         let fetched_ref = Self::admitted_ref_name(binding, resolution_id)?;
+        // S1: this fetch brings the superproject's commit and tree objects
+        // into the local store first, before any other guard ever sees them.
+        // `freeze_exact`'s own fetch is fsck-guarded, but a fetch by exact
+        // revision never re-transfers (and so never re-checks) an object
+        // that is already local -- and this call is what makes it local.
+        // Without `transfer.fsckObjects=true` here, a hostile `.git`
+        // look-alike or a tree with duplicate entries lands unchecked.
         self.git([
+            OsString::from("-c"),
+            OsString::from("transfer.fsckObjects=true"),
             OsString::from("-C"),
             binding.repository.checkout.as_os_str().to_owned(),
             OsString::from("fetch"),
@@ -1743,7 +1744,8 @@ impl SourcePort for GitSourceDriver {
                 "+{}:{fetched_ref}",
                 binding.repository.admitted_ref
             )),
-        ])?;
+        ])
+        .context("fetching the admitted ref")?;
         let admitted_ref_revision = self.git_text([
             OsString::from("-C"),
             binding.repository.checkout.as_os_str().to_owned(),
@@ -5843,33 +5845,134 @@ fn harden_frozen_source_tree(root: &Path, current: &Path) -> Result<()> {
         };
         fs::set_permissions(current, fs::Permissions::from_mode(mode))?;
     } else if metadata.file_type().is_symlink() {
-        validate_frozen_source_symlink(root, current)?;
+        // S6: only the target's shape is checked here, against `.partial`,
+        // the temporary name the tree is built under. Whether the chain
+        // actually resolves inside the root -- and whether a dangling
+        // target still counts as inside it -- is decided later, by
+        // `validate_frozen_source_symlinks`, against the tree's real, final
+        // published path. A link built to look correct under `.partial` and
+        // dangling or escaping once renamed (or the reverse) must be judged
+        // by what it resolves to at the name every later reader actually
+        // opens, not by this transient one.
+        let target = fs::read_link(current)?;
+        ensure!(target.is_relative(), "frozen source symlink is absolute");
     } else {
         bail!("frozen source contains a special filesystem entry")
     }
     Ok(())
 }
 
-/// F5: a lexical, component-counting check is not enough once the chain
-/// passes back through another symlink. The fixture `D -> .`, `L ->
-/// D/D/../../../../../../etc/passwd` resolves inside the root by naive
-/// `..`-counting (each `D` looks like one ordinary path component to a
-/// counter), but the filesystem resolves `D` to a fresh copy of the root on
-/// every hop, so the real target is `/etc/passwd`. Asking the filesystem to
-/// resolve the whole chain, the same way anything that later opens the link
-/// will, is exact where counting is not.
+/// S6 (Self's ruling, third Cut 1 fix batch): resolves a frozen source
+/// symlink's full chain against the tree's real, final published root. Every
+/// component the chain crosses that exists on disk is resolved for real
+/// (`fs::canonicalize`, recursing through any symlink it meets), so a
+/// self-referential directory cannot lexically undercount how far the chain
+/// travels -- the same defense F5 relied on. Only the walk's trailing,
+/// still-nonexistent components may be missing: once resolution reaches a
+/// component that does not exist, nothing on disk remains to be tricked by,
+/// so the rest of the target is appended lexically and containment keeps
+/// being checked at every step. A dangling link is accepted exactly when
+/// every component that exists stays inside the root; one whose real or
+/// lexical remainder ever leaves the root is refused, dangling or not.
 #[cfg(unix)]
-fn validate_frozen_source_symlink(root: &Path, path: &Path) -> Result<()> {
+fn resolve_frozen_source_symlink(
+    canonical_root: &Path,
+    path: &Path,
+    hops: u32,
+) -> Result<PathBuf> {
+    const MAX_HOPS: u32 = 40;
+    ensure!(
+        hops < MAX_HOPS,
+        "frozen source symlink chain exceeds the hop limit"
+    );
     let target = fs::read_link(path)?;
     ensure!(target.is_relative(), "frozen source symlink is absolute");
-    let canonical_root = root.canonicalize().context("resolving frozen source root")?;
-    let canonical_target = path.canonicalize().with_context(|| {
+    let parent = path
+        .parent()
+        .context("frozen source symlink has no parent")?;
+    let mut resolved = parent.canonicalize().with_context(|| {
         format!("resolving frozen source symlink chain at {}", path.display())
     })?;
     ensure!(
-        canonical_target.starts_with(&canonical_root),
+        resolved.starts_with(canonical_root),
         "frozen source symlink escapes its root"
     );
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                ensure!(
+                    resolved.pop() && resolved.starts_with(canonical_root),
+                    "frozen source symlink escapes its root"
+                );
+            }
+            std::path::Component::Normal(part) => {
+                resolved.push(part);
+                ensure!(
+                    resolved.starts_with(canonical_root),
+                    "frozen source symlink escapes its root"
+                );
+                match fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        resolved = resolve_frozen_source_symlink(canonical_root, &resolved, hops + 1)?;
+                    }
+                    Ok(_) => {
+                        resolved = resolved.canonicalize().with_context(|| {
+                            format!("resolving frozen source symlink chain at {}", resolved.display())
+                        })?;
+                    }
+                    Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Nothing exists here yet: the remaining components,
+                        // including this one, are appended lexically below
+                        // (no real symlink can hide along a path nothing on
+                        // disk has reached), and containment is still
+                        // enforced on every step that follows.
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("inspecting {}", resolved.display()));
+                    }
+                }
+            }
+            _ => bail!("frozen source symlink target has a non-normal path component"),
+        }
+        ensure!(
+            resolved.starts_with(canonical_root),
+            "frozen source symlink escapes its root"
+        );
+    }
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn validate_frozen_source_symlink(root: &Path, path: &Path) -> Result<()> {
+    let canonical_root = root.canonicalize().context("resolving frozen source root")?;
+    resolve_frozen_source_symlink(&canonical_root, path, 0).map(|_| ())
+}
+
+/// S6: run once, against the tree's real, final published path -- after the
+/// atomic rename off `.partial`, in `freeze_exact`, and again (read-only)
+/// whenever `observe_frozen` re-checks a tree it did not just write. Separate
+/// from `validate_frozen_source_tree`'s ownership and mode checks (already
+/// covered by `harden_frozen_source` at write time) so this stays one cheap
+/// extra walk, not a second full re-hardening pass.
+#[cfg(unix)]
+fn validate_frozen_source_symlinks(root: &Path) -> Result<()> {
+    validate_frozen_source_symlinks_tree(root, root)
+}
+
+#[cfg(unix)]
+fn validate_frozen_source_symlinks_tree(root: &Path, current: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(current)?;
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            validate_frozen_source_symlinks_tree(root, &entry.path())?;
+        }
+    } else if metadata.file_type().is_symlink() {
+        validate_frozen_source_symlink(root, current)?;
+    }
     Ok(())
 }
 
@@ -5921,6 +6024,11 @@ fn validate_frozen_source(_root: &Path) -> Result<()> {
     bail!("frozen source observation requires Unix permissions")
 }
 
+#[cfg(not(unix))]
+fn validate_frozen_source_symlinks(_root: &Path) -> Result<()> {
+    bail!("frozen source observation requires Unix permissions")
+}
+
 #[cfg(unix)]
 fn frozen_source_sha256(root: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
@@ -5944,7 +6052,6 @@ fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> 
             hasher.update(b"\0");
             hash_frozen_source_tree(root, &path, hasher)?;
         } else if metadata.is_file() {
-            let bytes = fs::read(&path)?;
             hasher.update(b"file\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
@@ -5954,8 +6061,22 @@ fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> 
                     .as_bytes(),
             );
             hasher.update(b"\0");
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(&bytes);
+            hasher.update(metadata.len().to_le_bytes());
+            // S9: streamed in fixed-size chunks rather than `fs::read`ing the
+            // whole file, so peak RSS is bounded by the buffer, not by the
+            // largest file in the tree.
+            let mut file = fs::File::open(&path)
+                .with_context(|| format!("opening {} to hash it", path.display()))?;
+            let mut buffer = [0u8; 1 << 16];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .with_context(|| format!("reading {} to hash it", path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path)?;
             hasher.update(b"link\0");
@@ -9142,17 +9263,15 @@ mod tests {
         Ok(())
     }
 
-    /// F2 (Self's ruling, second Cut 1 fix batch), isolated from the writer:
-    /// two regular files whose names differ only by case are two distinct,
-    /// individually valid Git blobs -- `git fsck` accepts them, and the
-    /// writer places both side by side without ever colliding on a
-    /// case-sensitive filesystem. Nothing but `refuse_conflicting_tree_entries`
-    /// stands between this tree and a successful freeze, so this fixture
-    /// pins that check on its own, decoupled from fsck and from the writer's
-    /// own defenses.
+    /// S7 (Self's ruling, third Cut 1 fix batch): two regular files whose
+    /// names differ only by case are two distinct, individually valid Git
+    /// blobs. `git fsck` accepts them, the host is case-sensitive ext4, and
+    /// the writer places both side by side without ever colliding. The
+    /// case-insensitive refusal this used to pin is deleted; this fixture now
+    /// pins the opposite -- that a mutant reintroducing it is caught.
     #[cfg(unix)]
     #[test]
-    fn freeze_exact_refuses_a_case_folding_collision_between_two_regular_files() -> Result<()> {
+    fn freeze_exact_accepts_two_paths_that_differ_only_by_case() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
@@ -9199,10 +9318,10 @@ mod tests {
             gitlinks: BTreeMap::new(),
             recipe_path: PathBuf::from("deployment.toml"),
         };
-        let result = driver.freeze_exact(&source, &revision, "txn-case", &frozen_source_root);
+        let (frozen_root, ..) = driver.freeze_exact(&source, &revision, "txn-case", &frozen_source_root)?;
         assert!(
-            result.is_err(),
-            "two paths that differ only by case must be refused, not silently coexist"
+            frozen_root.join("README.txt").is_file() && frozen_root.join("readme.txt").is_file(),
+            "two paths that differ only by case must both freeze, side by side, on a case-sensitive host"
         );
         Ok(())
     }
@@ -9213,7 +9332,7 @@ mod tests {
     /// plain pre-existing directory this call did not itself create --
     /// rather than reuse it. Calling it directly, with a pre-seeded root a
     /// real freeze would never produce, is what proves the writer itself
-    /// carries this invariant rather than relying on `refuse_conflicting_tree_entries`
+    /// carries this invariant on its own, rather than relying on `git fsck`
     /// upstream or a write-order accident downstream to prevent the same
     /// outcome.
     #[cfg(unix)]
@@ -10770,6 +10889,673 @@ mod tests {
         prepare_frozen_source_destination(&destination)?;
         symlink("../../outside", destination.join("escape"))?;
         assert!(harden_frozen_source(&destination).is_err());
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // S5 (Self's ruling, third Cut 1 fix batch): a behavioural test for each
+    // guard Soul's third pass found unpinned, through `freeze_exact` or its
+    // own primitives wherever the guard is reachable from there.
+    // ---------------------------------------------------------------------
+
+    /// S5, root ownership: `harden_frozen_source` refuses any entry not
+    /// owned by root, not only the top-level directory. A file left behind
+    /// by a step that ran as the unprivileged Git identity, and never
+    /// re-owned, must be refused rather than silently hardened.
+    #[cfg(unix)]
+    #[test]
+    fn harden_frozen_source_refuses_a_non_root_owned_entry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("f"), b"x")?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["1000:1000"])
+                .arg(root.join("f"))
+                .status()?
+                .success(),
+            "chowning the fixture file"
+        );
+        assert!(
+            harden_frozen_source(&root).is_err(),
+            "a non-root-owned entry must be refused"
+        );
+        Ok(())
+    }
+
+    /// S5, exact duplicate path: two raw tree entries that literally share
+    /// one leaf path (not merely alias each other through a directory) must
+    /// be refused before anything is written. `git ls-tree -r` emits the
+    /// path twice; only `git_tree_entries`'s own "emits a path twice" check
+    /// -- not fsck, which is content-agnostic about which of the two blobs a
+    /// reader would see -- stands between this tree and a freeze that
+    /// silently picks one of the two blobs.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_refuses_an_exact_duplicate_leaf_path() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "seed"])?;
+
+        let hash_object = |content: &[u8]| -> Result<String> {
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(&origin_repo)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(content)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        let recipe = hash_object(b"target = 'test'\n")?;
+        let a = hash_object(b"a\n")?;
+        let b = hash_object(b"b\n")?;
+        let hex = |s: &str| -> Vec<u8> {
+            (0..20)
+                .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let mut raw = Vec::new();
+        for (mode, name, sha) in [
+            ("100644", "deployment.toml", &recipe),
+            ("100644", "same.txt", &a),
+            ("100644", "same.txt", &b),
+        ] {
+            raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+            raw.extend(hex(sha));
+        }
+        let mut child = Command::new("git")
+            .args(["-c", "safe.directory=*", "-C"])
+            .arg(&origin_repo)
+            .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(&raw)?;
+        let output = child.wait_with_output()?;
+        ensure!(output.status.success(), "git hash-object --literally failed");
+        let tree = String::from_utf8(output.stdout)?.trim().to_owned();
+        let git_owned = |args: &[&str]| -> Result<String> {
+            let output = Command::new("git")
+                .args([
+                    "-c", "safe.directory=*",
+                    "-c", "user.name=Idunn Test",
+                    "-c", "user.email=idunn-test@example.invalid",
+                    "-C",
+                ])
+                .arg(&origin_repo)
+                .args(args)
+                .output()?;
+            ensure!(output.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        let commit = git_owned(&["commit-tree", &tree, "-m", "dup-leaf"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: format!("file://{}", origin_repo.display()),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+        let result = driver.freeze_exact(&source, &commit, "txn-dup-leaf", &frozen_source_root);
+        assert!(
+            result.is_err(),
+            "a raw tree with the same leaf path recorded twice must be refused"
+        );
+        Ok(())
+    }
+
+    /// S5, `ensure_frozen_directory` containment: its own top-of-function
+    /// check that `path` starts with `root` must be pinned directly, not
+    /// only observed indirectly through a symlink escape. A path that is
+    /// simply outside the root -- no symlink involved at all -- must be
+    /// refused, and nothing may be created along the way.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_frozen_directory_refuses_a_path_outside_its_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let outside = temp.path().join("outside-dir");
+        let mut created_dirs = std::collections::HashSet::new();
+        created_dirs.insert(root.clone());
+        let result = ensure_frozen_directory(&root, &mut created_dirs, &outside);
+        assert!(result.is_err(), "a path outside the root must be refused");
+        assert!(!outside.exists(), "nothing outside the root may be created");
+        Ok(())
+    }
+
+    /// S5, the writer's own layer: pass 1's creation call is `fs::create_dir`,
+    /// which errors whenever something is already at the path, never
+    /// `fs::create_dir_all`, which treats an already-existing directory as
+    /// success. A second, independent `created_dirs` bookkeeping set --
+    /// exactly what a later pass or a second freeze would carry -- must
+    /// still refuse to reuse a directory an earlier call already made,
+    /// rather than silently accept it as already there.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_frozen_directory_does_not_silently_reuse_a_directory_it_did_not_track() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+
+        let target = root.join("fresh");
+        let mut created_dirs = std::collections::HashSet::new();
+        created_dirs.insert(root.clone());
+        ensure_frozen_directory(&root, &mut created_dirs, &target)?;
+        assert!(target.is_dir());
+
+        let mut other_created_dirs = std::collections::HashSet::new();
+        other_created_dirs.insert(root.clone());
+        assert!(
+            ensure_frozen_directory(&root, &mut other_created_dirs, &target).is_err(),
+            "a directory this call did not itself create in this pass must be refused, not silently reused"
+        );
+        Ok(())
+    }
+
+    /// S5, `copy_artifact` containment: a source reached only by resolving a
+    /// symlink that leaves the artifact root must be refused before anything
+    /// is read from it or copied.
+    #[cfg(unix)]
+    #[test]
+    fn copy_artifact_refuses_a_source_that_escapes_its_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let outside = temp.path().join("outside.txt");
+        fs::write(&outside, b"secret")?;
+        let link = root.join("escape");
+        symlink(&outside, &link)?;
+        let destination = temp.path().join("dest.txt");
+
+        let result = copy_artifact(&root, &link, &destination);
+        assert!(
+            result.is_err(),
+            "an artifact source reached only by escaping the root must be refused"
+        );
+        assert!(!destination.exists(), "nothing may be copied on refusal");
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // S6 (Self's ruling, third Cut 1 fix batch): symlinks are judged against
+    // the tree's real, final published path, not `.partial`.
+    // ---------------------------------------------------------------------
+
+    /// A symlink whose target does not exist anywhere, but whose target path
+    /// stays inside the root once every real component along the way is
+    /// resolved, must freeze -- not be refused merely for being dangling.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_accepts_a_dangling_symlink_whose_target_stays_inside_the_root() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        symlink("not-there.txt", origin_repo.join("dangling"))?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: format!("file://{}", origin_repo.display()),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+        let (frozen_root, ..) =
+            driver.freeze_exact(&source, &revision, "txn-dangling", &frozen_source_root)?;
+        assert!(
+            fs::symlink_metadata(frozen_root.join("dangling"))?
+                .file_type()
+                .is_symlink(),
+            "a dangling in-root symlink must freeze, not be refused"
+        );
+        // Consistency with observe-time, the other half of S6's fix.
+        validate_frozen_source(&frozen_root)?;
+        Ok(())
+    }
+
+    /// The published-location regression Soul found: a relative symlink
+    /// naming `.partial`, the temporary directory the tree is built under
+    /// before the atomic rename that publishes it. Judged against `.partial`
+    /// it resolves back inside (a coincidence of the temporary name), but
+    /// judged against the tree's real, final name -- what every later reader
+    /// actually opens -- it resolves outside the root and must be refused at
+    /// freeze time, not accepted then found broken later by `observe_frozen`.
+    #[cfg(unix)]
+    #[test]
+    fn freeze_exact_refuses_a_symlink_that_only_resolves_inside_the_partial_name() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+        symlink("../.partial/deployment.toml", origin_repo.join("pl"))?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let revision = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+        ensure!(
+            Command::new("/bin/chown")
+                .args(["-R", "1000:1000"])
+                .arg(&origin_repo)
+                .status()?
+                .success(),
+            "chowning the fixture origin repository"
+        );
+
+        let source_cache_root = temp.path().join("source-cache");
+        let frozen_source_root = temp.path().join("frozen-source");
+        fs::create_dir(&frozen_source_root)?;
+        fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+        let identity = ProcessIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            frozen_source_root.clone(),
+            Some(identity),
+        );
+        let source = ExactSource {
+            origin: format!("file://{}", origin_repo.display()),
+            checkout: source_cache_root.join("checkout"),
+            gitlinks: BTreeMap::new(),
+            recipe_path: PathBuf::from("deployment.toml"),
+        };
+        let result = driver.freeze_exact(&source, &revision, "txn-partial-name", &frozen_source_root);
+        assert!(
+            result.is_err(),
+            "a symlink that resolves inside the root only under the temporary `.partial` name, and outside it under the real published name, must be refused"
+        );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // S1 (Self's ruling, third Cut 1 fix batch): fsck guards the fetch in
+    // `resolve()` as well as the one in `freeze_exact`, and `freeze_exact`
+    // also fscks the selected tree so that objects already local get
+    // checked too. Every fixture below goes through the production path --
+    // `resolve()` followed by `freeze()` -- not a hand-built fetch.
+    // ---------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_then_freeze_refuses_hostile_trees_through_the_production_path() -> Result<()> {
+        use crate::deployment_plan::compile_deployment_plan;
+        use std::os::unix::fs::PermissionsExt;
+
+        const RECIPE: &str = r#"
+schema = "gamecult.idunn.target_declaration.v1"
+target = "s1-fixture"
+source_stamp_environment = "S1_FIXTURE_BUILD_COMMIT"
+
+[[artifacts]]
+id = "daemon"
+source_kind = "runner-output"
+runner = "rust"
+source = "target/release/s1-fixture"
+destination = "s1-fixture"
+expected_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+executable = true
+
+[service]
+executable_artifact = "daemon"
+required_adjacent_artifacts = []
+arguments = []
+transport = "http"
+route_required = false
+required_environment = ["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_PROCESS_WRITE_LEASE", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]
+
+[service.health]
+contract = "s1-fixture.cultnet-service-health"
+"#;
+
+        fn binding_text(origin: &Path, checkout: &Path, minimum_revision: &str) -> String {
+            format!(
+                r#"
+schema = "gamecult.idunn.operator_binding.v2"
+target = "s1-fixture"
+
+[repository]
+origin = "file://{origin}"
+admitted_ref = "refs/heads/main"
+minimum_revision = "{minimum_revision}"
+selection = "ref-head"
+checkout = "{checkout}"
+recipe_path = "deployment.toml"
+
+[runners.rust]
+driver = "docker"
+image = "rust@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb"
+user = "1000:1000"
+affordances = ["source-read", "artifact-write", "build-cache"]
+cache_root = "/srv/s1-fixture/build-cache"
+allowed_programs = ["cargo"]
+network_profile = "build-dependency-egress"
+memory_mebibytes = 8192
+cpu_quota_percent = 400
+pids_limit = 512
+tmpfs_mebibytes = 1024
+
+[workload]
+driver = "systemd-transient"
+state_group = "s1-fixture"
+unit_prefix = "idunn-s1-fixture"
+release_root = "/srv/s1-fixture/releases"
+state_root = "/var/lib/gamecult/s1-fixture"
+runtime_root = "/etc/gamecult/s1-fixture/runtime"
+network = "host-private"
+hardening = "strict"
+memory_mebibytes = 2048
+cpu_quota_percent = 200
+
+[workload.argument_bindings]
+state_root = "/var/lib/gamecult/s1-fixture"
+
+[runtime_identity]
+runtime_id = "s1-fixture-test"
+expected_signer_identity_id = "s1-fixture-runtime-signer"
+trust_anchor_store = "/etc/gamecult/trust/s1-fixture.cc"
+
+[brakes]
+deployment_store = "/var/lib/gamecult/idunn-authority/s1-fixture-deployment-brake.cc"
+lifecycle_store = "/var/lib/gamecult/idunn-authority/s1-fixture-lifecycle-brake.cc"
+
+[rollout]
+strategy = "candidate-then-promote"
+drain_seconds = 30
+retain_releases = 2
+
+[placement]
+desired_replicas = 1
+nodes = ["yggdrasil"]
+"#,
+                origin = origin.display(),
+                checkout = checkout.display(),
+                minimum_revision = minimum_revision,
+            )
+        }
+
+        fn hash_object(repo: &Path, content: &[u8]) -> Result<String> {
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(repo)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(content)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        }
+        fn literal_tree(repo: &Path, entries: &[(&str, &str, &str)]) -> Result<String> {
+            let hex = |s: &str| -> Vec<u8> {
+                (0..20)
+                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                    .collect()
+            };
+            let mut raw = Vec::new();
+            for (mode, name, sha) in entries {
+                raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+                raw.extend(hex(sha));
+            }
+            let mut child = Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(repo)
+                .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(&raw)?;
+            let output = child.wait_with_output()?;
+            ensure!(output.status.success(), "git hash-object --literally failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        }
+        fn git_owned(repo: &Path, args: &[&str]) -> Result<String> {
+            let output = Command::new("git")
+                .args([
+                    "-c", "safe.directory=*",
+                    "-c", "user.name=Idunn Test",
+                    "-c", "user.email=idunn-test@example.invalid",
+                    "-C",
+                ])
+                .arg(repo)
+                .args(args)
+                .output()?;
+            ensure!(output.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        }
+        fn chown_to_source_identity(repo: &Path) -> Result<()> {
+            ensure!(
+                Command::new("/bin/chown")
+                    .args(["-R", "1000:1000"])
+                    .arg(repo)
+                    .status()?
+                    .success(),
+                "chowning the fixture origin repository"
+            );
+            Ok(())
+        }
+
+        // Each label builds the hostile tree's raw entries: the recipe blob
+        // plus whatever aliasing or look-alike shape the label names.
+        #[allow(clippy::type_complexity)]
+        let fixtures: Vec<(&str, Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>)> = vec![
+            (
+                "dup-trees",
+                Box::new(|repo: &Path, recipe: &str| {
+                    let x = hash_object(repo, b"x\n")?;
+                    let y = hash_object(repo, b"y\n")?;
+                    let tx = literal_tree(repo, &[("100644", "x", &x)])?;
+                    let ty = literal_tree(repo, &[("100644", "y", &y)])?;
+                    Ok(vec![
+                        ("40000".into(), "d".into(), tx),
+                        ("40000".into(), "d".into(), ty),
+                        ("100644".into(), "deployment.toml".into(), recipe.into()),
+                    ])
+                }) as Box<dyn Fn(&Path, &str) -> Result<Vec<(String, String, String)>>>,
+            ),
+            (
+                "dotGIT",
+                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".GIT")),
+            ),
+            (
+                "dotGit",
+                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".Git")),
+            ),
+            (
+                "git-short-name",
+                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, "git~1")),
+            ),
+            (
+                "dotgit-trailing-dot",
+                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git.")),
+            ),
+            (
+                "dotgit-zwnj",
+                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git\u{200c}")),
+            ),
+            (
+                "dotgit-trailing-space",
+                Box::new(|repo: &Path, recipe: &str| dotgit_lookalike(repo, recipe, ".git ")),
+            ),
+        ];
+
+        fn dotgit_lookalike(repo: &Path, recipe: &str, name: &str) -> Result<Vec<(String, String, String)>> {
+            let cfg = hash_object(repo, b"[core]\n\tfsmonitor = touch /tmp/soul3-pwned\n")?;
+            let inner = literal_tree(repo, &[("100644", "config", &cfg)])?;
+            let mut entries = vec![
+                ("100644".to_owned(), "deployment.toml".to_owned(), recipe.to_owned()),
+                ("40000".to_owned(), name.to_owned(), inner),
+            ];
+            entries.sort_by(|a, b| a.1.cmp(&b.1));
+            Ok(entries)
+        }
+
+        for (label, build) in fixtures {
+            let temp = tempfile::tempdir()?;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))?;
+            let origin_repo = temp.path().join("origin");
+            fs::create_dir(&origin_repo)?;
+            git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+            git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+            git_at(
+                &origin_repo,
+                &["config", "user.email", "idunn-test@example.invalid"],
+            )?;
+            fs::write(origin_repo.join("deployment.toml"), b"target = 'test'\n")?;
+            git_at(&origin_repo, &["add", "--all"])?;
+            git_at(&origin_repo, &["commit", "-m", "root"])?;
+            let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
+            chown_to_source_identity(&origin_repo)?;
+
+            let source_cache_root = temp.path().join("source-cache");
+            let frozen_source_root = temp.path().join("frozen-source");
+            fs::create_dir(&frozen_source_root)?;
+            fs::set_permissions(&frozen_source_root, fs::Permissions::from_mode(0o700))?;
+            let identity = ProcessIdentity { uid: 1000, gid: 1000 };
+            let driver = GitSourceDriver::new(
+                source_cache_root.clone(),
+                frozen_source_root.clone(),
+                Some(identity),
+            );
+            let checkout = source_cache_root.join("checkout");
+            let binding_bytes = binding_text(&origin_repo, &checkout, &root_commit).into_bytes();
+            let binding = OperatorBinding::parse(std::str::from_utf8(&binding_bytes)?)?;
+
+            // A legitimate first resolve+freeze, exactly as the scheduler
+            // does it: this is what actually creates and populates the
+            // checkout, through resolve()'s own (now fsck-guarded) fetch.
+            let resolved_good = driver.resolve(&binding, "res-good", 1_700_000_000_000)?;
+            let plan_good = compile_deployment_plan(
+                RECIPE.as_bytes(),
+                &binding_bytes,
+                resolved_good.facts.clone(),
+                "s1-fixture-incarnation-good",
+                None,
+                1_700_000_000_000,
+                &[],
+            )?;
+            driver.freeze("txn-good", &plan_good)?;
+
+            // Now advance `main` -- the admitted ref resolve() will fetch
+            // next time -- to the hostile commit, exactly as a real push
+            // would.
+            let recipe_blob = git_owned(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
+            let entries = build(&origin_repo, &recipe_blob)
+                .with_context(|| format!("building the {label} fixture"))?;
+            let entry_refs: Vec<(&str, &str, &str)> = entries
+                .iter()
+                .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
+                .collect();
+            let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
+            let hostile_commit = git_owned(
+                &origin_repo,
+                &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
+            )?;
+            git_owned(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
+            chown_to_source_identity(&origin_repo)?;
+
+            let outcome = driver
+                .resolve(&binding, "res-hostile", 1_700_000_001_000)
+                .and_then(|resolved| {
+                    let plan = compile_deployment_plan(
+                        RECIPE.as_bytes(),
+                        &binding_bytes,
+                        resolved.facts,
+                        "s1-fixture-incarnation-hostile",
+                        None,
+                        1_700_000_001_000,
+                        &[],
+                    )?;
+                    driver.freeze("txn-hostile", &plan)
+                });
+            assert!(
+                outcome.is_err(),
+                "{label}: a hostile tree must be refused through resolve() then freeze(), \
+                 the production path, not merely through a hand-built fetch"
+            );
+        }
         Ok(())
     }
 }
