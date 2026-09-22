@@ -222,15 +222,9 @@
             Test = 'drivers::tests::freeze_exact_materializes_gitlinks'
             Old  = @'
             for (path, fact) in &gitlinks {
-                lfs_pointer_paths
-                    .extend(self.materialize_gitlink_raw(source, path, fact, &partial)?);
-            }
 '@
             New  = @'
             for (path, fact) in gitlinks.iter().take(0) {
-                lfs_pointer_paths
-                    .extend(self.materialize_gitlink_raw(source, path, fact, &partial)?);
-            }
 '@
         }
         @{
