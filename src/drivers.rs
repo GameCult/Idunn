@@ -11377,19 +11377,6 @@ mod tests {
             git_at(&origin_repo, &["commit", "-m", "root"])?;
             let root_commit = git_at(&origin_repo, &["rev-parse", "HEAD"])?;
             let recipe_blob = git_at(&origin_repo, &["rev-parse", "HEAD:deployment.toml"])?;
-
-            let entries = build(&origin_repo, &recipe_blob)
-                .with_context(|| format!("building the {label} fixture"))?;
-            let entry_refs: Vec<(&str, &str, &str)> = entries
-                .iter()
-                .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
-                .collect();
-            let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
-            let hostile_commit = git_at(
-                &origin_repo,
-                &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
-            )?;
-            git_at(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
             chown_to_source_identity(&origin_repo)?;
 
             let source_cache_root = temp.path().join("source-cache");
@@ -11408,7 +11395,26 @@ mod tests {
                 gitlinks: BTreeMap::new(),
                 recipe_path: PathBuf::from("deployment.toml"),
             };
+            // The checkout is established on the good root commit first,
+            // exactly as a real deploy target's checkout already exists by
+            // the time a later push lands: this is what makes the objects
+            // this fixture cares about arrive only through the *next*
+            // fetch, not the initial clone.
             driver.prepare_source_root(&source)?;
+
+            let entries = build(&origin_repo, &recipe_blob)
+                .with_context(|| format!("building the {label} fixture"))?;
+            let entry_refs: Vec<(&str, &str, &str)> = entries
+                .iter()
+                .map(|(mode, name, sha)| (mode.as_str(), name.as_str(), sha.as_str()))
+                .collect();
+            let hostile_tree = literal_tree(&origin_repo, &entry_refs)?;
+            let hostile_commit = git_at(
+                &origin_repo,
+                &["commit-tree", &hostile_tree, "-p", &root_commit, "-m", "hostile"],
+            )?;
+            git_at(&origin_repo, &["update-ref", "refs/heads/main", &hostile_commit])?;
+            chown_to_source_identity(&origin_repo)?;
 
             // The exact fetch `resolve()` runs (`drivers.rs`, `fn resolve`),
             // S1's fix included: `-c transfer.fsckObjects=true`, `--force`,
