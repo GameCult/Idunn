@@ -320,7 +320,9 @@ exact.
 Each question gives its options, a recommendation, and what depends on it. The
 answers gate Cut 2 onward.
 
-**Q-V1. Where do verify recipes live?**
+**Q-V1: RULED A by the operator, 2026-09-22 ("A sounds good").** Recipes live in the repo at a binding-named path, read from the exact revision. Privilege stays in the operator verify binding.
+
+*History, the question as asked:* **Q-V1. Where do verify recipes live?**
 - A: in the repository, at a binding-named path (suggested
   `deployment/idunn/verify.toml`, beside the deploy recipe), read from the exact
   revision being verified. Privilege lives in a separate operator verify binding
