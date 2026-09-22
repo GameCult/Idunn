@@ -384,7 +384,18 @@ duplicates the recipe.
 
 Depends: the Cut 2 admit rules.
 
-**Q-V4. What shape is the verdict, and how does mutation data reach it?**
+**Q-V4: RULED B, via `Add-Type`, by the operator, 2026-09-22 ("yep").**
+
+The harness writes its mutation report as CultCache itself. PowerShell 7 is .NET, so the harness loads `GameCult.Caching.dll`, CultLib's C# reference runtime at a pinned published version, with `Add-Type -Path`. It compiles the report document type inline with `Add-Type -TypeDefinition` and writes a `.cc` report to the step's declared path. Idunn decodes the report into its own Rust type, which is canonical, and cross-checks it against the exit status. A report that contradicts the exit status becomes `Error{ReportContradictsExit}`.
+
+Why B over A, C or D:
+- **A put load-bearing JSON between two GameCult components.** The operator's doctrine rules that out.
+- **A and B's original premise was wrong.** It assumed PowerShell had no CultCache runtime, and Self's option D (an `idunn verify-report` subcommand) rested on the same assumption. The operator pointed out that PowerShell compiles and loads C#.
+- **B gives one report path for every run on every host.** That includes the win32 QUIC runs that stay on Starfire outside Idunn (Q-V5). Under D those runs had no `idunn` binary and would have fallen back to text.
+
+The cost is two declarations of the report type, one in C# and one in Rust. CultCache schema identity makes drift a loud decode refusal rather than a silent misread. Cut 5 changes accordingly: the harness side lands in Eureka and CultLib, and Idunn's side is the decoder plus the cross-check. Idunn parses no JSON and no stdout.
+
+*History, the question as asked:* **Q-V4. What shape is the verdict, and how does mutation data reach it?**
 
 The verdict records, for each step: exit status, duration, admitted deadline,
 and a log reference (path, sha256, kept and total bytes, truncated flag), never
