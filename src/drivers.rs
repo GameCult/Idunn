@@ -6348,6 +6348,7 @@ fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> 
             hasher.update(b"\0");
             hasher.update(metadata.gid().to_le_bytes());
             hasher.update(b"\0");
+            hash_frozen_source_xattrs(&path, hasher)?;
             hash_frozen_source_tree(root, &path, hasher)?;
         } else if metadata.is_file() {
             hasher.update(b"file\0");
@@ -6363,6 +6364,7 @@ fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> 
             hasher.update(b"\0");
             hasher.update(metadata.gid().to_le_bytes());
             hasher.update(b"\0");
+            hash_frozen_source_xattrs(&path, hasher)?;
             hasher.update(metadata.len().to_le_bytes());
             // S9: streamed in fixed-size chunks rather than `fs::read`ing the
             // whole file, so peak RSS is bounded by the buffer, not by the
@@ -6386,11 +6388,131 @@ fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> 
             hasher.update(b"\0");
             hasher.update(target.as_os_str().as_encoded_bytes());
             hasher.update(b"\0");
+            hash_frozen_source_xattrs(&path, hasher)?;
         } else {
             bail!("frozen source contains a special filesystem entry")
         }
     }
     Ok(())
+}
+
+// R-I18 (Self's ruling, seventh Cut 1 fix batch, F3): a real root-owned
+// 0555 tree with `security.capability` set to `cap_setuid=ep` -- the
+// setuid-equivalent grant that carries no setuid *bit* -- validated
+// ACCEPT and re-hashed unchanged under both `validate_frozen_source` and
+// `frozen_source_sha256`. Soul pass 7 measured it directly, since none of
+// R-I9/R-I13/R-I16's mode-and-gid coverage can see a grant that lives
+// entirely outside `mode & 0o7777`. This walks and hashes every extended
+// attribute on the entry (name and value, sorted by name so the digest is
+// order-independent of `listxattr`'s own ordering, which is unspecified),
+// covering `security.capability` and any other xattr the same way. This is
+// **detection**, not prevention: it makes a tamper that sets, changes, or
+// removes an xattr show up in the digest of a tree already on disk. What
+// prevents a file capability from being *exercised* on Idunn's own
+// deployment path is `no-new-privileges` on the runner and the systemd
+// workload, the same mitigation already relied on for setuid -- this
+// digest term exists so `observe_frozen`'s "this is the tree we froze"
+// verdict is no longer false for xattrs, per Cut 4. Soul's probe ran as
+// root, which is exactly the precondition `setxattr` on `security.capability`
+// needs; like the setuid/gid probes before it, this does **not** establish
+// that an unprivileged attacker can set one on a tree they do not own.
+#[cfg(unix)]
+fn hash_frozen_source_xattrs(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    hasher.update(b"xattrs\0");
+    let xattrs = read_sorted_xattrs(path)?;
+    hasher.update((xattrs.len() as u64).to_le_bytes());
+    for (name, value) in xattrs {
+        hasher.update(&name);
+        hasher.update(b"\0");
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(&value);
+    }
+    Ok(())
+}
+
+/// Reads every extended attribute on `path` (without following a symlink),
+/// sorted by name, as `(name, value)` pairs. A filesystem or entry that
+/// does not support extended attributes at all reports an empty list
+/// rather than an error, since that is a property of the storage, not a
+/// tamper.
+#[cfg(unix)]
+fn read_sorted_xattrs(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{} contains a NUL byte", path.display()))?;
+
+    let mut names_buf = Vec::new();
+    loop {
+        let needed = unsafe { libc::llistxattr(cpath.as_ptr(), std::ptr::null_mut(), 0) };
+        if needed < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP) => Ok(Vec::new()),
+                _ => Err(error)
+                    .with_context(|| format!("listing extended attributes on {}", path.display())),
+            };
+        }
+        if needed == 0 {
+            return Ok(Vec::new());
+        }
+        names_buf = vec![0u8; needed as usize];
+        let written = unsafe {
+            libc::llistxattr(
+                cpath.as_ptr(),
+                names_buf.as_mut_ptr() as *mut libc::c_char,
+                names_buf.len(),
+            )
+        };
+        if written < 0 {
+            // The attribute set changed size between the sizing call and
+            // this one (another process added/removed an xattr); retry.
+            continue;
+        }
+        names_buf.truncate(written as usize);
+        break;
+    }
+
+    let mut names: Vec<Vec<u8>> = names_buf
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_vec())
+        .collect();
+    names.sort();
+
+    let mut result = Vec::with_capacity(names.len());
+    for name in names {
+        let cname = std::ffi::CString::new(name.clone())
+            .with_context(|| format!("extended attribute name on {} contains a NUL", path.display()))?;
+        let needed =
+            unsafe { libc::lgetxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
+        ensure!(
+            needed >= 0,
+            "reading extended attribute {} on {}: {}",
+            String::from_utf8_lossy(&name),
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        let mut value = vec![0u8; needed as usize];
+        let written = unsafe {
+            libc::lgetxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_mut_ptr() as *mut libc::c_void,
+                value.len(),
+            )
+        };
+        ensure!(
+            written >= 0,
+            "reading extended attribute {} on {}: {}",
+            String::from_utf8_lossy(&name),
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        value.truncate(written as usize);
+        result.push((name, value));
+    }
+    Ok(result)
 }
 
 #[cfg(not(unix))]
@@ -7624,22 +7746,36 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
             hasher.update(b"dir\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
+            // R-I16 (Self's ruling, seventh Cut 1 fix batch, F4): R-I13 gave
+            // this digest an executable-bit boolean for files and nothing
+            // at all for directories. Soul pass 7 measured it blind: setuid,
+            // setgid, uid, gid and the read bits were all invisible
+            // (`0o500` hashed the same as `0o555`), and a directory carried
+            // no mode term whatsoever. This is the *artifact* digest,
+            // re-derived against the sealed receipt immediately before
+            // launch, so that blindness meant a post-install tamper adding
+            // setuid to an installed binary re-verified clean. Widened to
+            // the full `mode & 0o7777` and the owning gid, for directories
+            // as well as files, matching `hash_frozen_source_tree`'s own
+            // R-I9 treatment term for term. Each term is pinned by its own
+            // test below so narrowing any one of them back down is caught.
+            hasher.update(digest_tree_mode(&metadata).to_le_bytes());
+            hasher.update(b"\0");
+            hasher.update(digest_tree_gid(&metadata).to_le_bytes());
+            hasher.update(b"\0");
             digest_tree(root, &path, hasher, size)?;
         } else if metadata.is_file() {
             let bytes = fs::read(&path)?;
             hasher.update(b"file\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            // R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): this is the
-            // artifact digest, and it had exactly the blindness R-I3 fixed
-            // for the frozen-source digest (S5-4) -- no executable-bit term
-            // at all, so an artifact losing or gaining its executable bit
-            // hashed identically. Pinned below.
-            hasher.update(
-                digest_tree_is_executable(&metadata)
-                    .to_string()
-                    .as_bytes(),
-            );
+            // R-I13 (Self's ruling, sixth Cut 1 fix batch, F6)/R-I16 (Self's
+            // ruling, seventh Cut 1 fix batch, F4): was an executable-bit
+            // boolean alone; now the full mode plus gid, the same widening
+            // given to the directory arm above. See the comment there.
+            hasher.update(digest_tree_mode(&metadata).to_le_bytes());
+            hasher.update(b"\0");
+            hasher.update(digest_tree_gid(&metadata).to_le_bytes());
             hasher.update(b"\0");
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(&bytes);
@@ -7654,10 +7790,14 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
             // terminator after the target, matching the frozen-source
             // digest's own symlink arm and the self-delimiting shape the
             // file arm above already has via its length prefix. Not
-            // independently pinned by a test: see the note above the tests
-            // below for why no legitimate fixture can construct a colliding
-            // pair (real symlink targets cannot contain the NUL byte a
-            // collision here would require).
+            // independently pinned by a test (R-I15, Self's ruling, seventh
+            // Cut 1 fix batch, F2): no legitimate fixture can construct a
+            // colliding pair, because the link name is already
+            // NUL-terminated ahead of the target above, so two differing
+            // (name, target) pairs always diverge there regardless of this
+            // terminator, and no real symlink target or filename can carry
+            // the NUL byte a boundary collision here would require. See the
+            // note in `mod tests` where the disproved fixture used to sit.
             hasher.update(b"\0");
             *size = size.saturating_add(target.as_os_str().len().try_into()?);
         } else {
@@ -7668,14 +7808,25 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
 }
 
 #[cfg(unix)]
-fn digest_tree_is_executable(metadata: &fs::Metadata) -> bool {
+fn digest_tree_mode(metadata: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o111 != 0
+    metadata.permissions().mode() & 0o7777
 }
 
 #[cfg(not(unix))]
-fn digest_tree_is_executable(_metadata: &fs::Metadata) -> bool {
-    false
+fn digest_tree_mode(_metadata: &fs::Metadata) -> u32 {
+    0
+}
+
+#[cfg(unix)]
+fn digest_tree_gid(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.gid()
+}
+
+#[cfg(not(unix))]
+fn digest_tree_gid(_metadata: &fs::Metadata) -> u32 {
+    0
 }
 
 pub(crate) fn raw_sha256(bytes: &[u8]) -> String {
@@ -12132,6 +12283,130 @@ mod tests {
         Ok(())
     }
 
+    /// R-I17 (Self's ruling, seventh Cut 1 fix batch, F5): the setgid case
+    /// of the same file-mask finding. Soul pass 7 measured that narrowing
+    /// the file mask to `0o5777` (blind to setgid) still leaves all 183
+    /// tests passing -- only setuid-on-a-file was pinned by R-I9.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_refuses_a_setgid_file() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("f"), b"same content\n")?;
+        fs::set_permissions(root.join("f"), fs::Permissions::from_mode(0o2555))?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555))?;
+        let result = validate_frozen_source(&root);
+        let error = result.as_ref().expect_err(
+            "a root-owned setgid file must be refused outright, not masked to 0o555",
+        );
+        assert!(
+            error.to_string().contains("noncanonical mode"),
+            "must be refused specifically for its mode, not some other reason: {error:?}"
+        );
+        Ok(())
+    }
+
+    /// R-I17 (Self's ruling, seventh Cut 1 fix batch, F5): the sticky case
+    /// of the same file-mask finding.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_refuses_a_sticky_file() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("f"), b"same content\n")?;
+        fs::set_permissions(root.join("f"), fs::Permissions::from_mode(0o1555))?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555))?;
+        let result = validate_frozen_source(&root);
+        let error = result.as_ref().expect_err(
+            "a root-owned sticky file must be refused outright, not masked to 0o555",
+        );
+        assert!(
+            error.to_string().contains("noncanonical mode"),
+            "must be refused specifically for its mode, not some other reason: {error:?}"
+        );
+        Ok(())
+    }
+
+    /// R-I17 (Self's ruling, seventh Cut 1 fix batch, F5): Soul pass 7
+    /// measured that narrowing the directory mask to `0o3777` (blind to
+    /// setuid on a directory) still leaves all 183 tests passing -- no
+    /// directory-mode test existed at all before this batch. Setuid on a
+    /// directory carries no kernel semantics of its own, but the widened
+    /// mask refuses it anyway: a frozen source directory has no legitimate
+    /// reason to carry it, same as the file case.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_refuses_a_setuid_directory() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o4555))?;
+        let result = validate_frozen_source(&root);
+        let error = result.as_ref().expect_err(
+            "a root-owned setuid directory must be refused outright, not masked to 0o555",
+        );
+        assert!(
+            error.to_string().contains("not 0555"),
+            "must be refused specifically for its mode, not some other reason: {error:?}"
+        );
+        Ok(())
+    }
+
+    /// R-I17 (Self's ruling, seventh Cut 1 fix batch, F5): the setgid case
+    /// on a directory -- this is, per Soul pass 7, "the one with real
+    /// semantics" (new entries inherit the directory's owning group), so a
+    /// mask that admitted it would be the most consequential blind spot in
+    /// this batch.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_refuses_a_setgid_directory() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o2555))?;
+        let result = validate_frozen_source(&root);
+        let error = result.as_ref().expect_err(
+            "a root-owned setgid directory must be refused outright, not masked to 0o555",
+        );
+        assert!(
+            error.to_string().contains("not 0555"),
+            "must be refused specifically for its mode, not some other reason: {error:?}"
+        );
+        Ok(())
+    }
+
+    /// R-I17 (Self's ruling, seventh Cut 1 fix batch, F5): the sticky case
+    /// on a directory.
+    #[cfg(unix)]
+    #[test]
+    fn validate_frozen_source_refuses_a_sticky_directory() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o1555))?;
+        let result = validate_frozen_source(&root);
+        let error = result.as_ref().expect_err(
+            "a root-owned sticky directory must be refused outright, not masked to 0o555",
+        );
+        assert!(
+            error.to_string().contains("not 0555"),
+            "must be refused specifically for its mode, not some other reason: {error:?}"
+        );
+        Ok(())
+    }
+
     /// R-I9 (Self's ruling, sixth Cut 1 fix batch, F2): pins the digest half
     /// of the setuid/setgid/sticky privilege finding. Soul measured a
     /// root-owned setuid file (`04555`) accepted by the (pre-fix) validator
@@ -12228,7 +12503,7 @@ mod tests {
 
         let temp = tempfile::tempdir()?;
         let root_a = build(temp.path(), "root-a", 0)?;
-        let root_b = build(temp.path(), "root-b", nix_group_or_skip()?)?;
+        let root_b = build(temp.path(), "root-b", second_gid_for_chown_fixture()?)?;
         let digest_a = frozen_source_sha256(&root_a)?;
         let digest_b = frozen_source_sha256(&root_b)?;
         assert_ne!(
@@ -12262,12 +12537,129 @@ mod tests {
 
         let temp = tempfile::tempdir()?;
         let root_a = build(temp.path(), "root-a", 0)?;
-        let root_b = build(temp.path(), "root-b", nix_group_or_skip()?)?;
+        let root_b = build(temp.path(), "root-b", second_gid_for_chown_fixture()?)?;
         let digest_a = frozen_source_sha256(&root_a)?;
         let digest_b = frozen_source_sha256(&root_b)?;
         assert_ne!(
             digest_a, digest_b,
             "two trees differing only in a directory's owning gid must hash differently"
+        );
+        Ok(())
+    }
+
+    /// Sets an extended attribute through the `setxattr(2)` syscall
+    /// directly, matching Soul's rig rather than a crate dependency this
+    /// project does not otherwise carry.
+    #[cfg(unix)]
+    fn setxattr_or_bail(path: &Path, name: &str, value: &[u8]) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let cname = std::ffi::CString::new(name)?;
+        let rc = unsafe {
+            libc::setxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        ensure!(
+            rc == 0,
+            "setxattr({name}) on {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        Ok(())
+    }
+
+    /// R-I18 (Self's ruling, seventh Cut 1 fix batch, F3): the general
+    /// xattr-coverage pin, independent of any one attribute's namespace or
+    /// semantics -- before this batch, `frozen_source_sha256` had no xattr
+    /// term at all, so any tampered extended attribute re-observed clean.
+    /// Uses the unprivileged `user.` namespace so the pin does not
+    /// coincidentally depend on the same root/capability precondition the
+    /// finding itself is about.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_sha256_differs_when_only_an_extended_attribute_differs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn build(temp: &Path, name: &str, xattr_value: Option<&[u8]>) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let file = root.join("f");
+            fs::write(&file, b"same content\n")?;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o444))?;
+            if let Some(value) = xattr_value {
+                setxattr_or_bail(&file, "user.idunn.soul_probe", value)?;
+            }
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", None)?;
+        let root_b = build(temp.path(), "root-b", Some(b"tampered"))?;
+        let digest_a = frozen_source_sha256(&root_a)?;
+        let digest_b = frozen_source_sha256(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two trees differing only in one file's extended attribute must hash differently"
+        );
+        Ok(())
+    }
+
+    /// R-I18 (Self's ruling, seventh Cut 1 fix batch, F3): the exact finding
+    /// Soul pass 7 measured -- `security.capability` set to `cap_setuid=ep`
+    /// on a real root-owned 0555 tree, the setuid-equivalent grant that
+    /// carries no setuid *bit*, so no mode-and-gid term from R-I9/R-I13/R-I16
+    /// can see it. Both `validate_frozen_source` and `frozen_source_sha256`
+    /// are checked directly against the same tamper Soul used. Requires
+    /// root (this test's own process), the same precondition the finding
+    /// itself was measured under; it does not show an unprivileged process
+    /// can reach this path.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_source_privilege_surface_sees_a_file_capability() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn build(temp: &Path, name: &str) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let file = root.join("f");
+            fs::write(&file, b"same content\n")?;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o555))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let clean = build(temp.path(), "clean")?;
+        fs::set_permissions(&clean, fs::Permissions::from_mode(0o555))?;
+        let clean_digest = frozen_source_sha256(&clean)?;
+
+        let capped = build(temp.path(), "capped")?;
+        // `cap_setuid=ep`: the same 20-byte VFS capability value Soul's rig
+        // used, version 2, permitted+effective, `CAP_SETUID` (bit 7) set.
+        let value: [u8; 20] = [
+            0x01, 0x00, 0x00, 0x02, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        setxattr_or_bail(&capped.join("f"), "security.capability", &value)?;
+        fs::set_permissions(&capped, fs::Permissions::from_mode(0o555))?;
+        let capped_digest = frozen_source_sha256(&capped)?;
+
+        assert_ne!(
+            clean_digest, capped_digest,
+            "a root-owned 0555 tree gaining a security.capability xattr must move the digest: \
+             this is the setuid-equivalent grant that carries no setuid bit for the mode term \
+             to see"
+        );
+
+        let validated = validate_frozen_source(&capped);
+        assert!(
+            validated.is_ok(),
+            "the validator does not (and is not asked to) refuse a file capability by itself -- \
+             only the digest is this batch's detection surface: {validated:?}"
         );
         Ok(())
     }
@@ -12285,8 +12677,18 @@ mod tests {
     /// environment cannot exercise this path at all and the fixture itself
     /// (not the code under test) is what would be wrong, so this bails
     /// loudly rather than silently skip.
+    ///
+    /// R-I19 (Self's ruling, seventh Cut 1 fix batch, F6): this used to be
+    /// named `nix_group_or_skip`, which promised a skip it never performed
+    /// -- it returned `Ok(1)` unconditionally, and the `/etc/group`
+    /// reasoning in this comment was already moot, since `chown(2)` never
+    /// consults `/etc/group` at all (it takes a raw gid, not a name). Soul
+    /// pass 7 flagged this as informational: not a new class of bug, but a
+    /// name that told the next reader something the function does not do.
+    /// Renamed instead of made to skip, since the "bail loudly, don't
+    /// silently skip" behaviour documented above is the intended one.
     #[cfg(unix)]
-    fn nix_group_or_skip() -> Result<u32> {
+    fn second_gid_for_chown_fixture() -> Result<u32> {
         Ok(1)
     }
     /// R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): `digest_tree` is
@@ -12320,39 +12722,150 @@ mod tests {
         Ok(())
     }
 
-    /// R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): the second half of
-    /// `digest_tree`'s blindness -- no terminator after a symlink target, so
-    /// the relative-name/target boundary and the target/next-entry boundary
-    /// could be shifted against each other without changing the hash. Two
-    /// trees are built so a bare concatenation of (`link\0` + name + `\0` +
-    /// target) collides across that boundary if the trailing `\0` is
-    /// missing: root A has one link named `a` targeting `bc`; root B has one
-    /// link named `ab` targeting `c`.
+    /// R-I16 (Self's ruling, seventh Cut 1 fix batch, F4): pins the widened
+    /// artifact-digest file term beyond the executable-bit boolean above.
+    /// `0o555` and `0o4555` both report the executable bit set, so this is
+    /// the term the boolean test just above cannot distinguish -- exactly
+    /// Soul pass 7's "post-install tamper adding setuid to an installed
+    /// binary re-verifies clean" scenario.
     #[cfg(unix)]
     #[test]
-    fn digest_artifact_differs_across_a_symlink_target_boundary_shift() -> Result<()> {
-        use std::os::unix::fs::symlink;
+    fn digest_artifact_differs_when_only_a_files_setuid_bit_differs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
 
-        fn build(temp: &Path, name: &str, link_name: &str, target: &str) -> Result<PathBuf> {
+        fn build(temp: &Path, name: &str, mode: u32) -> Result<PathBuf> {
             let root = temp.join(name);
             fs::create_dir(&root)?;
-            symlink(target, root.join(link_name))?;
+            let file = root.join("f");
+            fs::write(&file, b"same content\n")?;
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode))?;
             Ok(root)
         }
 
         let temp = tempfile::tempdir()?;
-        let root_a = build(temp.path(), "root-a", "a", "bc")?;
-        let root_b = build(temp.path(), "root-b", "ab", "c")?;
+        let root_a = build(temp.path(), "root-a", 0o555)?;
+        let root_b = build(temp.path(), "root-b", 0o4555)?;
         let (digest_a, _) = digest_artifact(&root_a)?;
         let (digest_b, _) = digest_artifact(&root_b)?;
         assert_ne!(
             digest_a, digest_b,
-            "a link named 'a' targeting 'bc' must not hash the same as a link named 'ab' \
-             targeting 'c': without a terminator after the target, both concatenate to the \
-             same bytes"
+            "two artifact trees differing only in a file's setuid bit must hash differently"
         );
         Ok(())
     }
+
+    /// R-I16 (Self's ruling, seventh Cut 1 fix batch, F4): the artifact
+    /// digest hashed no gid term at all before this batch, on files or
+    /// directories. This pins the file case.
+    #[cfg(unix)]
+    #[test]
+    fn digest_artifact_differs_when_only_a_files_gid_differs() -> Result<()> {
+        use std::os::unix::fs::chown;
+
+        fn build(temp: &Path, name: &str, gid: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let file = root.join("f");
+            fs::write(&file, b"same content\n")?;
+            chown(&file, None, Some(gid))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", 0)?;
+        let root_b = build(temp.path(), "root-b", second_gid_for_chown_fixture()?)?;
+        let (digest_a, _) = digest_artifact(&root_a)?;
+        let (digest_b, _) = digest_artifact(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two artifact trees differing only in a file's owning gid must hash differently"
+        );
+        Ok(())
+    }
+
+    /// R-I16 (Self's ruling, seventh Cut 1 fix batch, F4): before this batch
+    /// `digest_tree` had no mode term for directories at all, so a directory
+    /// gaining setgid or sticky -- privilege-relevant, unlike a plain
+    /// permission bit -- re-verified clean.
+    #[cfg(unix)]
+    #[test]
+    fn digest_artifact_differs_when_only_a_directorys_mode_differs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `digest_tree(root, root, ...)` only ever hashes an entry it reads
+        // out of some directory's `read_dir`, never the digest root itself,
+        // so the differing directory must be a child of the artifact root.
+        fn build(temp: &Path, name: &str, mode: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let child = root.join("d");
+            fs::create_dir(&child)?;
+            fs::write(child.join("f"), b"same content\n")?;
+            fs::set_permissions(&child, fs::Permissions::from_mode(mode))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", 0o755)?;
+        let root_b = build(temp.path(), "root-b", 0o2755)?;
+        let (digest_a, _) = digest_artifact(&root_a)?;
+        let (digest_b, _) = digest_artifact(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two artifact trees differing only in a directory's setgid bit must hash differently"
+        );
+        Ok(())
+    }
+
+    /// R-I16 (Self's ruling, seventh Cut 1 fix batch, F4): the directory
+    /// case of the artifact digest's gid-coverage gap.
+    #[cfg(unix)]
+    #[test]
+    fn digest_artifact_differs_when_only_a_directorys_gid_differs() -> Result<()> {
+        use std::os::unix::fs::chown;
+
+        fn build(temp: &Path, name: &str, gid: u32) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            let child = root.join("d");
+            fs::create_dir(&child)?;
+            fs::write(child.join("f"), b"same content\n")?;
+            chown(&child, None, Some(gid))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root_a = build(temp.path(), "root-a", 0)?;
+        let root_b = build(temp.path(), "root-b", second_gid_for_chown_fixture()?)?;
+        let (digest_a, _) = digest_artifact(&root_a)?;
+        let (digest_b, _) = digest_artifact(&root_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two artifact trees differing only in a directory's owning gid must hash differently"
+        );
+        Ok(())
+    }
+
+    // R-I15 (Self's ruling, seventh Cut 1 fix batch, F2): the boundary-shift
+    // fixture that used to live here
+    // (`digest_artifact_differs_across_a_symlink_target_boundary_shift`) is
+    // deleted, not repaired. Soul pass 7 confirmed it cannot fail: the link
+    // name is already NUL-terminated *before* the target
+    // (`hasher.update(relative.as_bytes()); hasher.update(b"\0");` in
+    // `digest_tree`, ahead of the target bytes), so two spellings whose
+    // (name, target) pairs differ always diverge at that terminator
+    // regardless of what the (missing) trailing terminator after the target
+    // does. The collision class the test's own doc comment described is
+    // real in principle but unreachable in practice: Soul verified by hand
+    // that `std::os::unix::fs::symlink("a\0b", ..)` and
+    // `fs::write(OsString::from("a\0b"), ..)` both fail at `InvalidInput`
+    // before the kernel ever sees the NUL, and the same closure covers path
+    // components, so no real symlink target or filename can carry the NUL
+    // byte a boundary collision here would require. The production comment
+    // above the missing terminator, which says the term is not
+    // independently pinned, was the true one; this fixture, which claimed
+    // otherwise and passed under deletion of what it named, was not. See
+    // Soul pass 7's F2 and R-I15 in `docs/verify-transaction-cut.md`.
 
     /// R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): `observe_frozen` is
     /// the tamper check -- `validate_frozen_source` plus
