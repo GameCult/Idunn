@@ -93,6 +93,10 @@ ReadWritePaths=/etc/gamecult/heimdall /var/lib/gamecult/heimdall /srv/heimdall/a
 # target it cannot deploy, and Odin has to be deployable: it is the bootstrap
 # target every other target's warming presence is observed through.
 ReadWritePaths=/etc/gamecult/odin /var/lib/gamecult/odin /srv/odin
+# Ghostlight Dungeon: its runtime root only, not /etc/gamecult/ghostlight,
+# which also holds the credential originals Idunn reads but never writes.
+# The release root sits beside the legacy v1 actuator's /srv/ghostlight.
+ReadWritePaths=/etc/gamecult/ghostlight/runtime /var/lib/gamecult/ghostlight-world-v2 /srv/ghostlight-idunn
 
 [Install]
 WantedBy=multi-user.target
