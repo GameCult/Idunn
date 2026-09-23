@@ -12094,7 +12094,7 @@ mod tests {
 
         validate_frozen_source_symlink(&root, &link)?;
         let canonical_root = root.canonicalize()?;
-        let resolved = resolve_frozen_source_symlink(&canonical_root, &link)?;
+        let resolved = resolve_frozen_source_symlink(&StdFrozenSymlinkFs, &canonical_root, &link)?;
         assert_eq!(
             resolved,
             canonical_root.join("deployment.toml"),
