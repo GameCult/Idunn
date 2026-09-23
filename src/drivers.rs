@@ -1915,8 +1915,13 @@ impl SourcePort for GitSourceDriver {
             "frozen source receipt resolves outside its authority root"
         );
         validate_frozen_source(&root)?;
+        // R-I25: recomputes under whichever shape (current, or either of
+        // the two `hash_frozen_source_tree` carried before this cut's sixth
+        // and seventh batches) actually matches the receipt, so a receipt
+        // frozen before an Idunn upgrade that changed this algorithm still
+        // verifies on resume.
         ensure!(
-            frozen_source_sha256(&root)? == receipt.snapshot_sha256,
+            verify_frozen_source_digest(&root, &receipt.snapshot_sha256)?,
             "frozen source snapshot differs from its receipt"
         );
         let recipe_path = root.join(&plan.source.recipe_path);
@@ -6578,6 +6583,146 @@ fn read_sorted_xattrs(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(result)
 }
 
+// R-I25 (Self's finding: check the frozen-source digest for the same
+// exposure). `frozen_source_sha256`'s algorithm changed twice before this
+// batch touched anything: R-I9 (sixth batch) added the mode and gid terms,
+// R-I18 (seventh batch) added the xattr term. Neither landed with a
+// versioning scheme, and `observe_frozen` compares a fresh recompute
+// against `receipt.snapshot_sha256` -- a `FrozenSourceReceipt` persisted in
+// `DeploymentTransaction.frozen_source` (`control_plane.rs`) between the
+// `freeze()` step and the step that calls `observe_frozen`, each a separate
+// `advance_sealing` call that can cross a restart. So yes, this has the same
+// structural exposure R-I20 had on the artifact side: an Idunn upgrade that
+// changed this algorithm, landing while a transaction's `freeze()` receipt
+// is persisted but not yet observed, would fail `observe_frozen` on resume.
+// The window is narrower -- one in-flight Sealing-phase transaction, not
+// every already-installed and already-running workload -- but it is real,
+// and this cut's own batches 6 through 8 already crossed it twice. Applying
+// R-I25's answer here too: recompute in whichever of the three shapes that
+// have ever shipped actually matches, current first.
+//
+// `snapshot_sha256` (`FrozenSourceReceipt`) has no `is_sha256`-style
+// external validator the way `expected.artifact_sha256` does -- it is
+// validated locally by `require_sha256_id` in this same crate -- but it is
+// still a bare `sha256-<64 lower hex>` id with the same "one value, no
+// metadata channel" shape, so the same recompute-and-try approach applies
+// rather than inventing a tag this one value has never carried.
+#[cfg(unix)]
+pub(crate) fn verify_frozen_source_digest(root: &Path, stored_sha256_id: &str) -> Result<bool> {
+    if frozen_source_sha256(root)? == stored_sha256_id {
+        return Ok(true);
+    }
+    if frozen_source_sha256_legacy(root, FrozenSourceDigestShape::ModeAndGidOnly)?
+        == stored_sha256_id
+    {
+        return Ok(true);
+    }
+    Ok(
+        frozen_source_sha256_legacy(root, FrozenSourceDigestShape::ExecutableBitOnly)?
+            == stored_sha256_id,
+    )
+}
+
+#[cfg(not(unix))]
+pub(crate) fn verify_frozen_source_digest(_root: &Path, _stored_sha256_id: &str) -> Result<bool> {
+    bail!("frozen source observation requires Unix permissions")
+}
+
+/// The two shapes `hash_frozen_source_tree` carried before this batch, kept
+/// only so a receipt sealed under either still verifies. Not used to seal
+/// anything -- `freeze_exact` always calls `frozen_source_sha256`, the
+/// current shape, directly.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum FrozenSourceDigestShape {
+    /// R-I9 (sixth batch) through the commit before R-I18 (seventh batch):
+    /// full mode and gid, no xattr term.
+    ModeAndGidOnly,
+    /// Before R-I9 (R-I3/S5-4): an executable-bit boolean alone, no gid, no
+    /// xattr term.
+    ExecutableBitOnly,
+}
+
+#[cfg(unix)]
+fn frozen_source_sha256_legacy(root: &Path, shape: FrozenSourceDigestShape) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hash_frozen_source_tree_legacy(root, root, &mut hasher, shape)?;
+    Ok(format!("sha256-{:x}", hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn hash_frozen_source_tree_legacy(
+    root: &Path,
+    current: &Path,
+    hasher: &mut Sha256,
+    shape: FrozenSourceDigestShape,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut entries = fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let relative = normalized_relative(path.strip_prefix(root)?)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            hasher.update(b"dir\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            if let FrozenSourceDigestShape::ModeAndGidOnly = shape {
+                hasher.update((metadata.permissions().mode() & 0o7777).to_le_bytes());
+                hasher.update(b"\0");
+                hasher.update(metadata.gid().to_le_bytes());
+                hasher.update(b"\0");
+            }
+            hash_frozen_source_tree_legacy(root, &path, hasher, shape)?;
+        } else if metadata.is_file() {
+            hasher.update(b"file\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            match shape {
+                FrozenSourceDigestShape::ModeAndGidOnly => {
+                    hasher.update((metadata.permissions().mode() & 0o7777).to_le_bytes());
+                    hasher.update(b"\0");
+                    hasher.update(metadata.gid().to_le_bytes());
+                    hasher.update(b"\0");
+                }
+                FrozenSourceDigestShape::ExecutableBitOnly => {
+                    hasher.update(
+                        (metadata.permissions().mode() & 0o111 != 0)
+                            .to_string()
+                            .as_bytes(),
+                    );
+                    hasher.update(b"\0");
+                }
+            }
+            hasher.update(metadata.len().to_le_bytes());
+            let mut file = fs::File::open(&path)
+                .with_context(|| format!("opening {} to hash it", path.display()))?;
+            let mut buffer = [0u8; 1 << 16];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .with_context(|| format!("reading {} to hash it", path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)?;
+            hasher.update(b"link\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(target.as_os_str().as_encoded_bytes());
+            hasher.update(b"\0");
+        } else {
+            bail!("frozen source contains a special filesystem entry")
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn frozen_source_sha256(_root: &Path) -> Result<String> {
     bail!("frozen source observation requires Unix permissions")
@@ -7809,6 +7954,47 @@ pub(crate) fn digest_artifact(path: &Path) -> Result<(String, u64)> {
     digest_tree(path, path, &mut hasher, &mut size)?;
     ensure!(size > 0, "artifact directory has no file content");
     Ok((format!("{:x}", hasher.finalize()), size))
+}
+
+// R-I25 (Self's ruling: the digest format change is a migration hazard):
+// R-I20 changed the bytes `digest_artifact`'s bare-file branch produces, but
+// three stored values are compared against a fresh recompute of it forever
+// after they are sealed -- `expected.artifact_sha256`
+// (`cultnet_rs::IdunnExpectedIncarnationRecord`), `ArtifactReceipt::sha256`
+// (`SealedRelease`, in `verify_artifacts` below), and
+// `HostWorkloadObservation::executable_sha256` -- so the first Idunn upgrade
+// past R-I20 would refuse every already-installed and already-running
+// workload sealed under the old shape.
+//
+// The ruling asked for an explicit version tag recorded with the stored
+// value. That is not available here: `expected.artifact_sha256` and
+// `ArtifactReceipt::sha256` are both validated to the bare `sha256-<64 lower
+// hex>` shape (`is_sha256` in the pinned `cultnet-rs` git dependency;
+// `require_sha256` in `deployment_plan.rs`), leaving no channel to carry a
+// tag alongside the digest without widening a schema this worktree has no
+// authority to change (`cultnet-rs` is a separate repo, pinned by git rev in
+// `Cargo.toml`). There has only ever been one prior shape, so verification
+// instead tries the current algorithm first and falls back to the exact
+// bare-content shape `digest_artifact` produced before R-I20 -- the same
+// effect as reading an implicit version, without a tag this worktree cannot
+// add. New seals always call `digest_artifact` directly and so always use
+// the current shape; nothing here ever rewrites a stored value to match.
+pub(crate) fn verify_artifact_digest(path: &Path, stored_sha256_id: &str) -> Result<bool> {
+    let (current_hex, _) = digest_artifact(path)?;
+    if format!("sha256-{current_hex}") == stored_sha256_id {
+        return Ok(true);
+    }
+    // The pre-R-I20 shape only ever applied to the bare-file branch; the
+    // directory branch (`digest_tree`) has not changed, so no fallback
+    // applies to a directory artifact.
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        let legacy_hex = raw_sha256(&fs::read(path)?);
+        if format!("sha256-{legacy_hex}") == stored_sha256_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64) -> Result<()> {
@@ -12279,6 +12465,56 @@ mod tests {
         Ok(())
     }
 
+    /// R-I25 (Self's finding, applied to the frozen-source side): a receipt
+    /// frozen under either shape `hash_frozen_source_tree` carried before
+    /// this cut's sixth and seventh batches must still verify against the
+    /// current code. Built by calling the legacy hashers directly rather
+    /// than a real historical commit, since the shapes are pinned here
+    /// (and, independently, by the `git show` transcript in this batch's
+    /// commit message).
+    #[cfg(unix)]
+    #[test]
+    fn verify_frozen_source_digest_accepts_both_shapes_that_predate_this_cuts_sixth_batch()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("f"), b"same content\n")?;
+
+        let current = frozen_source_sha256(&root)?;
+        let mode_and_gid_only = frozen_source_sha256_legacy(
+            &root,
+            FrozenSourceDigestShape::ModeAndGidOnly,
+        )?;
+        let executable_bit_only = frozen_source_sha256_legacy(
+            &root,
+            FrozenSourceDigestShape::ExecutableBitOnly,
+        )?;
+        // Fixture sanity: the three shapes actually disagree here (the gid
+        // term differs by machine, but the framing -- dir/file tags,
+        // presence of a gid term at all -- is enough to separate them from
+        // plain file content).
+        assert_ne!(current, mode_and_gid_only);
+        assert_ne!(current, executable_bit_only);
+        assert_ne!(mode_and_gid_only, executable_bit_only);
+
+        assert!(verify_frozen_source_digest(&root, &current)?);
+        assert!(verify_frozen_source_digest(&root, &mode_and_gid_only)?);
+        assert!(verify_frozen_source_digest(&root, &executable_bit_only)?);
+
+        // Without the fallback, only the current shape would be accepted --
+        // this is what R-I25 replaced.
+        assert_ne!(current, mode_and_gid_only);
+        assert_ne!(current, executable_bit_only);
+
+        fs::write(root.join("f"), b"tampered\n")?;
+        assert!(
+            !verify_frozen_source_digest(&root, &executable_bit_only)?,
+            "a content change must still be caught under every shape"
+        );
+        Ok(())
+    }
+
     // -----------------------------------------------------------------
     // S4-2 (Self's ruling, fourth Cut 1 fix batch): the S9 streamed hash had
     // no behavioural pin. Deleting the read buffer's size (hashing zero
@@ -12834,6 +13070,81 @@ mod tests {
     fn second_gid_for_chown_fixture() -> Result<u32> {
         Ok(1)
     }
+
+    /// R-I25 (Self's ruling: the digest format change is a migration
+    /// hazard). The whole finding is that nothing exercised the
+    /// stored-value path -- every prior test recomputes both sides with the
+    /// same code, which proves nothing about an already-sealed receipt.
+    /// This constructs a stored value the way the *old* `digest_artifact`
+    /// (pre-R-I20: `raw_sha256(&bytes)` alone) actually produced it, then
+    /// verifies it under the current code.
+    #[test]
+    fn verify_artifact_digest_accepts_a_receipt_sealed_under_the_pre_r_i20_shape() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let file = temp.path().join("executable");
+        fs::write(&file, b"same content\n")?;
+        let legacy_stored = format!("sha256-{}", raw_sha256(&fs::read(&file)?));
+
+        // The current algorithm alone does not accept it: the whole point
+        // is that `digest_artifact`'s bare-file shape changed under R-I20.
+        let (current_hex, _) = digest_artifact(&file)?;
+        assert_ne!(
+            format!("sha256-{current_hex}"),
+            legacy_stored,
+            "fixture is invalid: the legacy and current shapes must actually differ \
+             for this test to prove anything"
+        );
+
+        assert!(
+            verify_artifact_digest(&file, &legacy_stored)?,
+            "a receipt sealed under the pre-R-I20 shape must still verify"
+        );
+
+        // Removing the fallback -- i.e. asking only "does the current
+        // algorithm's output match?", which is what R-I25 replaced --
+        // fails against the same stored value and the same file:
+        assert_ne!(
+            format!("sha256-{current_hex}"),
+            legacy_stored,
+            "without the version fallback this stored value is refused"
+        );
+        Ok(())
+    }
+
+    /// A tamper is still caught when the receipt is in the legacy shape:
+    /// content-only was always what the old shape covered, and it still
+    /// does.
+    #[test]
+    fn verify_artifact_digest_still_refuses_a_content_tamper_under_the_legacy_shape() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let file = temp.path().join("executable");
+        fs::write(&file, b"same content\n")?;
+        let legacy_stored = format!("sha256-{}", raw_sha256(&fs::read(&file)?));
+        assert!(verify_artifact_digest(&file, &legacy_stored)?);
+
+        fs::write(&file, b"tampered content\n")?;
+        assert!(
+            !verify_artifact_digest(&file, &legacy_stored)?,
+            "a content change must still be caught under the legacy shape"
+        );
+        Ok(())
+    }
+
+    /// Never reseals: verifying a legacy-shaped receipt does not mutate it,
+    /// there is nothing to write back, and the same legacy string keeps
+    /// verifying on a second call.
+    #[test]
+    fn verify_artifact_digest_does_not_reseal_a_legacy_receipt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let file = temp.path().join("executable");
+        fs::write(&file, b"same content\n")?;
+        let legacy_stored = format!("sha256-{}", raw_sha256(&fs::read(&file)?));
+        assert!(verify_artifact_digest(&file, &legacy_stored)?);
+        assert!(verify_artifact_digest(&file, &legacy_stored)?);
+        Ok(())
+    }
+
     /// R-I13 (Self's ruling, sixth Cut 1 fix batch, F6): `digest_tree` is
     /// the artifact digest, separate from `frozen_source_sha256`, and had
     /// exactly the blindness R-I3 fixed there (S5-4): no executable-bit

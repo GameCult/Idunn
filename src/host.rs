@@ -46,7 +46,8 @@ use crate::deployment::{
 use crate::deployment_plan::{ArtifactReceipt, CompiledDeploymentPlan, SealedRelease};
 use crate::drivers::{
     HostWorkloadObservation, InstalledReleaseObservation, copy_artifact, copy_tree,
-    digest_artifact, release_artifact, remove_tree_inside, sha256_id, write_runtime_bundle_records,
+    digest_artifact, release_artifact, remove_tree_inside, sha256_id, verify_artifact_digest,
+    write_runtime_bundle_records,
 };
 use crate::host_actuator::{
     HOST_ACTUATOR_CHANNEL, HOST_ACTUATOR_CONNECTION_ID, HOST_ACTUATOR_PING_MS,
@@ -689,12 +690,17 @@ impl Actuator {
         );
         let (executable, arguments) =
             Self::launch_command(&declaration, workload, &installed.root)?;
-        let (executable_sha256, _) = digest_artifact(&executable)?;
-        let executable_sha256 = format!("sha256-{executable_sha256}");
+        // R-I25: recomputes under whichever shape (current or the one
+        // R-I20 replaced) actually matches `expected.artifact_sha256`, so a
+        // receipt sealed before that change still verifies. The value
+        // carried forward is `expected.artifact_sha256` itself, not a fresh
+        // recompute, so a legacy-shaped receipt is echoed rather than
+        // silently upgraded to a value it was never sealed against.
         ensure!(
-            executable_sha256 == expected.artifact_sha256,
+            verify_artifact_digest(&executable, &expected.artifact_sha256)?,
             "installed executable differs from Expected"
         );
+        let executable_sha256 = expected.artifact_sha256.clone();
         let environment = self.launch_environment(workload, &bundle)?;
         if let Some(mut previous) = self.spawned.remove(&activation.runtime_instance_id) {
             if previous.try_wait()?.is_none() {
@@ -810,9 +816,10 @@ impl Actuator {
                 facts.image_path,
                 prior.executable
             );
-            let (executable_sha256, _) = digest_artifact(Path::new(&prior.executable))?;
+            // R-I25: `prior.executable_sha256` carries whichever shape was
+            // recorded at `start()`, current or legacy; verify against that.
             ensure!(
-                format!("sha256-{executable_sha256}") == prior.executable_sha256,
+                verify_artifact_digest(Path::new(&prior.executable), &prior.executable_sha256)?,
                 "the installed executable changed under the running process"
             );
         }
@@ -907,9 +914,12 @@ fn verify_artifacts(root: &Path, release: &SealedRelease) -> Result<()> {
     for artifact in &release.artifacts {
         let path = root.join(&artifact.destination);
         ensure!(path.exists(), "artifact {} is absent", artifact.artifact_id);
-        let (sha256, size_bytes) = digest_artifact(&path)?;
+        // R-I25: the byte length an artifact seals is independent of which
+        // `digest_artifact` shape computed its digest, so it is checked
+        // directly rather than through the version fallback below.
+        let size_bytes = fs::metadata(&path)?.len();
         ensure!(
-            format!("sha256-{sha256}") == artifact.sha256 && size_bytes == artifact.size_bytes,
+            verify_artifact_digest(&path, &artifact.sha256)? && size_bytes == artifact.size_bytes,
             "artifact {} differs from its sealed digest",
             artifact.artifact_id
         );
@@ -1312,6 +1322,42 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deployment_plan::ExternalInputMaterializationReceipt;
+    use crate::drivers::raw_sha256;
+
+    /// R-I25 (Self's ruling: the digest format change is a migration
+    /// hazard). `verify_artifacts` is exactly `host.rs`'s own stored-value
+    /// path R-I20 exposed: a receipt sealed by the pre-R-I20
+    /// `digest_artifact` (bare content, no mode/gid/xattr term) must still
+    /// verify under the current code, with no re-seal.
+    #[test]
+    fn verify_artifacts_accepts_a_receipt_sealed_under_the_pre_r_i20_shape() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().to_path_buf();
+        let destination = PathBuf::from("bin/service");
+        let content = b"same content\n";
+        fs::create_dir_all(root.join("bin"))?;
+        fs::write(root.join(&destination), content)?;
+        let legacy_sha256 = format!("sha256-{}", raw_sha256(content));
+
+        let release = SealedRelease {
+            schema: "gamecult.idunn.sealed_release.v1".into(),
+            sealed_release_id: format!("sha256-{}", "0".repeat(64)),
+            plan_id: "plan-1".into(),
+            artifacts: vec![ArtifactReceipt {
+                artifact_id: "service".into(),
+                destination: destination.clone(),
+                sha256: legacy_sha256,
+                size_bytes: content.len() as u64,
+                executable: true,
+            }],
+            external_inputs: Vec::<ExternalInputMaterializationReceipt>::new(),
+            sealed_at_unix_millis: 1,
+        };
+
+        verify_artifacts(&root, &release)?;
+        Ok(())
+    }
 
     #[test]
     fn config_is_strict_and_absolute() {
