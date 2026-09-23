@@ -13,19 +13,17 @@ jobs:
     # `FrozenSymlinkFs` port (see `src/drivers.rs`, `frozen_symlink_port`)
     # if something actually runs clippy with the lint promoted to an error.
     #
-    # No `--all-targets`: measured on Yggdrasil against this batch and
-    # against a46b997 (its parent, before this batch touched anything) --
-    # `cargo clippy --all-targets` already fails on a pre-existing,
-    # unrelated `clippy::never_loop` in `host_actuator.rs`'s own test code,
-    # nothing this batch introduced or is chartered to fix. Without
-    # `--all-targets`, clippy still analyzes the library crate itself,
-    # which is where `frozen_symlink_port` and every other disallowed-method
-    # call site actually live, so the port's coverage is unaffected; only
-    # test-only code outside the lib is left unchecked by this job.
+    # R-I26 (Self's ruling, migration-hazard follow-up): the pre-existing
+    # `clippy::never_loop` this batch's parent scoped the workflow around is
+    # fixed (`host_actuator.rs`'s answerer thread used a `while let` whose
+    # every path returned; it is an `if let` now, since the outer `for` was
+    # already what retried across polls). Test code is exactly where a
+    # `disallowed_methods` bypass would hide, so `--all-targets` is back:
+    # this job now reaches it too, not just the library crate.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --all-features -- -D clippy::disallowed_methods
+      - run: cargo clippy --all-targets --all-features -- -D clippy::disallowed_methods

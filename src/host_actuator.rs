@@ -1108,7 +1108,11 @@ mod tests {
         let answerer = thread::spawn(move || -> Result<()> {
             for _ in 0..500 {
                 client.poll_resends()?;
-                while let Some(frame) = client.receive_once()? {
+                // A plain `if let`, not `while`: every path through this body
+                // returns, so a loop here would never run a second iteration
+                // (`clippy::never_loop`) -- the outer `for` is what retries
+                // across polls.
+                if let Some(frame) = client.receive_once()? {
                     let envelope = HostActuatorEnvelope::decode(&frame.payload)?;
                     let request = envelope.open_request("raven", &idunn_anchor)?;
                     assert_eq!(envelope.session_nonce, nonce);
