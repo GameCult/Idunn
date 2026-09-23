@@ -1908,3 +1908,99 @@ point fixes would produce a ninth.**
 - **Standing, and this one outlives the batch: a test's fixture must be the
   shape production uses.** Where it cannot be, the test says so in one line.
   Three of this pass's five findings are that rule being broken.
+
+### The eighth fix batch landed, 2026-09-23
+
+Sonnet, `idunn/cut1-fix5` at `75153b0`. **201 passed / 0 failed / 2 ignored**
+(193 + 8). Ten `ygg-verify.sh` invocations, one slot each, sequential, about
+eleven minutes of slot time in total.
+
+**R-I23: the bypass is now a compile error, and it was verified by failing
+builds rather than by reading.** Everything the resolver can reach moved into
+a `frozen_symlink_port` submodule carrying `#![deny(clippy::disallowed_methods)]`,
+with `read_link` added to the port and `open_frozen_symlink_frame`'s direct
+`fs::read_link` — the exact leak Soul named — converted. `clippy.toml` lists
+`Path::canonicalize`, `fs::canonicalize`, `fs::symlink_metadata` and
+`fs::read_link`. Since `disallowed-methods` has no per-module scope,
+`drivers.rs` blanket-allows at file scope and the submodule's inner `deny`
+overrides it back — documented lexical scoping, not a hopeful guess.
+
+On Yggdrasil, against real source: Soul's `candidate.canonicalize()?` and
+`fs::canonicalize(&candidate)?` **each fail the build** with
+`use of a disallowed method`, as does reintroducing the `fs::read_link` leak.
+Clean baseline builds before and after each, file restored and reconfirmed.
+
+**The repository had no CI surface at all** before this batch — "denied in CI"
+had nothing to attach to — so `.github/workflows/lint.yml` is new.
+
+**R-I20 and R-I21.** `digest_artifact`'s bare-file branch now delegates to
+`digest_file_entry`, the same primitive `digest_tree`'s file arm uses, instead
+of a content-only `raw_sha256`. An xattr term covers all three `digest_tree`
+arms through shared framing with the frozen-source side, so the two cannot
+drift. The three tests that wrapped a file in a directory — **which is exactly
+why the bare-file blindness survived three batches** — now call
+`digest_artifact` on the file directly.
+
+Reverting the file branch to its old body fails all three of the gid, setuid
+and xattr tests, so they pin something.
+
+**Two real bugs found by running the suite rather than trusting it.**
+`digest_tree(root, root, …)` never hashes the root's own metadata, so a
+directory-arm test setting the xattr on the artifact root tested nothing;
+moved to a child. And `lsetxattr` with a `user.*` name on a symlink returns
+`EPERM` **even as root** — a kernel restriction to regular files and
+directories, not a privilege problem — so that arm uses `security.capability`.
+
+**R-I22.** Five tests call `hash_xattr_list` directly with lists chosen so
+each framing piece is what causes a real collision when removed, rather than
+merely changing the digest: value length prefix, count prefix, name
+terminator, name case, and value-versus-names-only. Each was verified against
+a real line-targeted mutation of production code, each failing exactly its own
+test. (A python heredoc attempt hit the `\0`-escaping trap the rig's README
+warns about; Hands switched to `sed` rather than fighting it.)
+
+**R-I24.** The doc is rewritten and **the formula corrected to `components + 4`**,
+not `+ 2` — `read_link` and the now-ported root canonicalize each add one. The
+false "cannot catch its own regression" line is gone: it was true before
+R-I23, and the compile-time deny now catches Soul's mutation independently of
+what the count asserts.
+
+### Self's finding: the digest format change is a migration hazard
+
+Hands flagged that `digest_artifact`'s single-file format changed, and
+reasoned that nothing compares against literals. **That is true of fixtures
+and false of receipts.** `host.rs:682` compares a freshly computed digest
+against `expected.artifact_sha256`, and `host.rs:803` against
+`prior.executable_sha256`. Both are **stored** values.
+
+So on the first Idunn upgrade past this commit:
+
+- every already-installed workload whose `Expected` was sealed under the old
+  format fails `"installed executable differs from Expected"` and refuses to
+  launch;
+- every workload already running fails `"the installed executable changed
+  under the running process"`.
+
+**Idunn is the deployment and daemon-survival authority.** A change that makes
+its own upgrade refuse every previously admitted artifact is precisely the
+class of failure its continuity rules exist to prevent, and it would land
+silently, at restart, on the whole fleet.
+
+- **R-I25. The artifact digest carries an explicit format version**, recorded
+  with the stored value. Verification recomputes **in the version the receipt
+  names** and compares against that, so an existing receipt still verifies;
+  new seals use the current version. A bare unversioned value is read as
+  version 1.
+- **No re-seal-everything migration.** Re-sealing on upgrade would mean
+  Idunn rewriting admitted state to make its own new code agree with itself,
+  which is the opposite of what a receipt is for.
+- **A test must cover the upgrade path directly**: seal under the old format,
+  verify under the new code, and pass. Until that test exists, this is not
+  closed — the whole finding is that nothing exercised the stored-value path.
+
+**Also owed:** `cargo clippy --all-targets` already fails on a pre-existing
+`clippy::never_loop` in `host_actuator.rs`'s test code, present on the parent
+commit too. Hands scoped the workflow to avoid it and said so rather than
+absorbing it silently. **Fix `never_loop` and restore `--all-targets`** — test
+code is exactly where a bypass would hide, and it is currently the one place
+the new lint does not reach.
