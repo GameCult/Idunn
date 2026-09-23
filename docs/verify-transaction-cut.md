@@ -2004,3 +2004,72 @@ commit too. Hands scoped the workflow to avoid it and said so rather than
 absorbing it silently. **Fix `never_loop` and restore `--all-targets`** — test
 code is exactly where a bypass would hide, and it is currently the one place
 the new lint does not reach.
+
+### The ninth fix batch landed, 2026-09-23
+
+Sonnet, `idunn/cut1-fix5`. **206 passed / 0 failed / 2 ignored** (201 + 5).
+Five sequential Yggdrasil runs.
+
+**R-I25 could not be implemented as written, and Hands said so.** An explicit
+version tag cannot be recorded beside the stored value: both
+`expected.artifact_sha256` and `ArtifactReceipt::sha256` are validated to a
+bare `sha256-<64 lowercase hex>` with no room for metadata, and that validator
+lives in the **pinned `cultnet-rs` dependency** — a separate repository this
+worktree has no authority to widen.
+
+What landed instead is an **implicit version read**: `verify_artifact_digest`
+recomputes under the current algorithm, then falls back to the exact shape
+`digest_artifact` produced before R-I20. There has only ever been one prior
+shape, so the fallback is total. New seals always call `digest_artifact`
+directly and therefore always use the current shape; **nothing rewrites a
+stored value**, and `start()` carries `expected.artifact_sha256` forward into
+its observation rather than recomputing, so a legacy receipt is echoed and not
+silently upgraded.
+
+**The proof is a test that fails without the fix**, which is what this finding
+was about. Five new tests — the upgrade path, a tamper still caught under the
+legacy shape, a no-reseal check, the frozen-source equivalent, and one at the
+real `host.rs` call site. Stripping the fallback and rerunning: **all five
+fail.** Restored, 206/0/2.
+
+**The frozen-source digest was exposed too, and this cut's own batches crossed
+the window twice.** `hash_frozen_source_tree` changed in batch 6 (mode and
+gid) and again in batch 7 (xattrs), while `observe_frozen` compares a fresh
+recompute against `receipt.snapshot_sha256` — a `FrozenSourceReceipt`
+persisted in `DeploymentTransaction.frozen_source` **between two separate
+`advance_sealing` calls that can cross a restart**. The window is narrower
+than the artifact side — one in-flight Sealing-phase transaction rather than
+every installed workload — but it is real. `verify_frozen_source_digest`
+applies the same answer against both prior shapes, reproduced verbatim from
+git history rather than reconstructed from memory.
+
+**R-I26.** The `never_loop` was a test-only `while let` whose only body path
+returned, so it could never reach a second iteration; the surrounding `for`
+loop was already doing the retrying. Changed to `if let`. The workflow now
+runs `cargo clippy --all-targets --all-features -D clippy::disallowed_methods`,
+verified **exit 0** on Yggdrasil after adding the clippy component, which the
+base image lacks. Only unrelated, undenied warnings remain.
+
+### Self's rulings
+
+- **R-I27. Hands made the right call proceeding.** The instruction named a
+  mechanism; the hazard was live and the alternative was to halt and leave the
+  fleet exposed. An equivalent fix, implemented and flagged with its
+  divergence, beats a literal one that cannot be built. **Standing: where a
+  ruling names a mechanism and the mechanism is unavailable, satisfy the
+  ruling's purpose and report the substitution** — do not halt, and do not
+  quietly redefine the ruling as satisfied.
+- **R-I28. The fallback chain is a liability that grows with every format
+  change**, and it is only tolerable because there is exactly one prior shape
+  per digest. **Follow-up outside this cut: widen the stored value's shape in
+  `cultnet-rs` to carry an explicit version**, then collapse the fallbacks.
+  Recorded, not scheduled — it is a cross-repo change on a pinned dependency
+  and does not belong inside Cut 1.
+- **R-I29. Investigate the third instance Hands spotted and did not chase.**
+  `SystemdWorkloadActuator`'s native-process path compares `sha256_reader` —
+  raw, content-only, read through procfs — against `expected.artifact_sha256`,
+  which for a file-based artifact is sealed via `digest_artifact` and now
+  carries mode, gid and xattr terms. **Two structurally different algorithms
+  compared to each other** is the same class of defect as the two above. Hands
+  flagged it rather than guessing, correctly. Settle whether it is a live
+  mismatch or a misreading, and report before fixing.
