@@ -6472,16 +6472,25 @@ fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> 
 // that an unprivileged attacker can set one on a tree they do not own.
 #[cfg(unix)]
 fn hash_frozen_source_xattrs(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    hash_xattr_list(&read_sorted_xattrs(path)?, hasher);
+    Ok(())
+}
+
+// R-I21 (Self's ruling, eighth Cut 1 fix batch, F3): shared with
+// `digest_tree_xattrs` below, so the artifact digest's xattr term is framed
+// identically to the frozen-source digest's -- same tag, same count prefix,
+// same per-attribute name/NUL/length-prefixed-value shape. Soul pass 8's F4
+// pinned this framing on the frozen-source side; sharing the writer means
+// the artifact side cannot quietly drift from it.
+fn hash_xattr_list(xattrs: &[(Vec<u8>, Vec<u8>)], hasher: &mut Sha256) {
     hasher.update(b"xattrs\0");
-    let xattrs = read_sorted_xattrs(path)?;
     hasher.update((xattrs.len() as u64).to_le_bytes());
     for (name, value) in xattrs {
-        hasher.update(&name);
+        hasher.update(name);
         hasher.update(b"\0");
         hasher.update((value.len() as u64).to_le_bytes());
-        hasher.update(&value);
+        hasher.update(value);
     }
-    Ok(())
 }
 
 /// Reads every extended attribute on `path` (without following a symlink),
@@ -7774,11 +7783,25 @@ pub(crate) fn copy_artifact(root: &Path, source: &Path, destination: &Path) -> R
     }
 }
 
+// R-I20 (Self's ruling, eighth Cut 1 fix batch, F2): the single-file branch
+// used to grow its own copy of the digest -- `raw_sha256(&bytes)` alone, no
+// mode, gid or (per R-I21) xattr term -- and it is the branch `host.rs`
+// actually takes for an installed executable, immediately before launch and
+// while the process is running. It now delegates to `digest_file_entry`, the
+// same primitive `digest_tree`'s own file arm uses below, so a bare artifact
+// file and a file inside an artifact tree are hashed by one body instead of
+// two that can drift apart.
 pub(crate) fn digest_artifact(path: &Path) -> Result<(String, u64)> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_file() {
-        let bytes = fs::read(path)?;
-        return Ok((raw_sha256(&bytes), bytes.len().try_into()?));
+        let relative = normalized_relative(Path::new(
+            path.file_name()
+                .context("artifact file path has no file name")?,
+        ))?;
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        digest_file_entry(path, &relative, &metadata, &mut hasher, &mut size)?;
+        return Ok((format!("{:x}", hasher.finalize()), size));
     }
     ensure!(metadata.is_dir(), "artifact is not a file or directory");
     let mut hasher = Sha256::new();
@@ -7817,23 +7840,17 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
             hasher.update(b"\0");
             hasher.update(digest_tree_gid(&metadata).to_le_bytes());
             hasher.update(b"\0");
+            // R-I21 (Self's ruling, eighth Cut 1 fix batch, F3): the
+            // artifact digest had no xattr term at all -- the asymmetry ran
+            // the wrong way, since this is the binary that gets exec'd and
+            // re-verified before every launch, unlike the frozen source's
+            // 0555 root-owned tree nothing executes. Covers all three arms
+            // (dir/file/link), matching `hash_frozen_source_tree`'s R-I18
+            // coverage term for term.
+            digest_tree_xattrs(&path, hasher)?;
             digest_tree(root, &path, hasher, size)?;
         } else if metadata.is_file() {
-            let bytes = fs::read(&path)?;
-            hasher.update(b"file\0");
-            hasher.update(relative.as_bytes());
-            hasher.update(b"\0");
-            // R-I13 (Self's ruling, sixth Cut 1 fix batch, F6)/R-I16 (Self's
-            // ruling, seventh Cut 1 fix batch, F4): was an executable-bit
-            // boolean alone; now the full mode plus gid, the same widening
-            // given to the directory arm above. See the comment there.
-            hasher.update(digest_tree_mode(&metadata).to_le_bytes());
-            hasher.update(b"\0");
-            hasher.update(digest_tree_gid(&metadata).to_le_bytes());
-            hasher.update(b"\0");
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(&bytes);
-            *size = size.saturating_add(bytes.len().try_into()?);
+            digest_file_entry(&path, &relative, &metadata, hasher, size)?;
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path)?;
             hasher.update(b"link\0");
@@ -7853,12 +7870,64 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
             // the NUL byte a boundary collision here would require. See the
             // note in `mod tests` where the disproved fixture used to sit.
             hasher.update(b"\0");
+            // R-I21: the symlink arm's xattr term.
+            digest_tree_xattrs(&path, hasher)?;
             *size = size.saturating_add(target.as_os_str().len().try_into()?);
         } else {
             bail!("artifact tree contains a special filesystem entry")
         }
     }
     Ok(())
+}
+
+// R-I20: the one place a file entry is hashed for the artifact digest,
+// shared by `digest_tree`'s own file arm and `digest_artifact`'s bare-file
+// branch above, so the two can no longer carry different terms.
+fn digest_file_entry(
+    path: &Path,
+    relative: &str,
+    metadata: &fs::Metadata,
+    hasher: &mut Sha256,
+    size: &mut u64,
+) -> Result<()> {
+    let bytes = fs::read(path)?;
+    hasher.update(b"file\0");
+    hasher.update(relative.as_bytes());
+    hasher.update(b"\0");
+    // R-I13 (Self's ruling, sixth Cut 1 fix batch, F6)/R-I16 (Self's ruling,
+    // seventh Cut 1 fix batch, F4): was an executable-bit boolean alone; now
+    // the full mode plus gid, matching the directory arm's own widening.
+    hasher.update(digest_tree_mode(metadata).to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(digest_tree_gid(metadata).to_le_bytes());
+    hasher.update(b"\0");
+    // R-I21: the file arm's xattr term.
+    digest_tree_xattrs(path, hasher)?;
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    *size = size.saturating_add(bytes.len().try_into()?);
+    Ok(())
+}
+
+// R-I21: the artifact digest's xattr term, framed identically to the
+// frozen-source digest's own (`hash_xattr_list`, shared by both). Unlike the
+// frozen source, artifact digesting runs on every target platform this
+// daemon ships for, not just Unix, so the reader is platform-conditional
+// while the framing stays the same shape everywhere: an empty attribute list
+// on a platform without extended-attribute support, not a missing term.
+fn digest_tree_xattrs(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    hash_xattr_list(&digest_tree_read_sorted_xattrs(path)?, hasher);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn digest_tree_read_sorted_xattrs(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    read_sorted_xattrs(path)
+}
+
+#[cfg(not(unix))]
+fn digest_tree_read_sorted_xattrs(_path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    Ok(Vec::new())
 }
 
 #[cfg(unix)]
@@ -12770,28 +12839,33 @@ mod tests {
     /// exactly the blindness R-I3 fixed there (S5-4): no executable-bit
     /// term. No ruling in the fifth batch covered it, so Soul flagged it
     /// explicitly as not fixed by association.
+    ///
+    /// R-I20 (Self's ruling, eighth Cut 1 fix batch, F2): this used to wrap
+    /// the file in a directory so `digest_tree` ran, which is exactly why
+    /// the single-file branch's own blindness (no mode/gid/xattr term at
+    /// all) survived three fix batches untested -- `host.rs` hands
+    /// `digest_artifact` a bare executable file, never a directory
+    /// containing one. Calls `digest_artifact` on the file itself.
     #[cfg(unix)]
     #[test]
     fn digest_artifact_differs_when_only_the_executable_bit_differs() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         fn build(temp: &Path, name: &str, mode: u32) -> Result<PathBuf> {
-            let root = temp.join(name);
-            fs::create_dir(&root)?;
-            let file = root.join("f");
+            let file = temp.join(name);
             fs::write(&file, b"same content\n")?;
             fs::set_permissions(&file, fs::Permissions::from_mode(mode))?;
-            Ok(root)
+            Ok(file)
         }
 
         let temp = tempfile::tempdir()?;
-        let root_a = build(temp.path(), "root-a", 0o644)?;
-        let root_b = build(temp.path(), "root-b", 0o755)?;
-        let (digest_a, _) = digest_artifact(&root_a)?;
-        let (digest_b, _) = digest_artifact(&root_b)?;
+        let file_a = build(temp.path(), "a", 0o644)?;
+        let file_b = build(temp.path(), "b", 0o755)?;
+        let (digest_a, _) = digest_artifact(&file_a)?;
+        let (digest_b, _) = digest_artifact(&file_b)?;
         assert_ne!(
             digest_a, digest_b,
-            "two artifact trees differing only in the executable bit must hash differently"
+            "two bare artifact files differing only in the executable bit must hash differently"
         );
         Ok(())
     }
@@ -12802,28 +12876,29 @@ mod tests {
     /// the term the boolean test just above cannot distinguish -- exactly
     /// Soul pass 7's "post-install tamper adding setuid to an installed
     /// binary re-verifies clean" scenario.
+    ///
+    /// R-I20: bare file, not wrapped in a directory -- see the comment on
+    /// the executable-bit test above.
     #[cfg(unix)]
     #[test]
     fn digest_artifact_differs_when_only_a_files_setuid_bit_differs() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         fn build(temp: &Path, name: &str, mode: u32) -> Result<PathBuf> {
-            let root = temp.join(name);
-            fs::create_dir(&root)?;
-            let file = root.join("f");
+            let file = temp.join(name);
             fs::write(&file, b"same content\n")?;
             fs::set_permissions(&file, fs::Permissions::from_mode(mode))?;
-            Ok(root)
+            Ok(file)
         }
 
         let temp = tempfile::tempdir()?;
-        let root_a = build(temp.path(), "root-a", 0o555)?;
-        let root_b = build(temp.path(), "root-b", 0o4555)?;
-        let (digest_a, _) = digest_artifact(&root_a)?;
-        let (digest_b, _) = digest_artifact(&root_b)?;
+        let file_a = build(temp.path(), "a", 0o555)?;
+        let file_b = build(temp.path(), "b", 0o4555)?;
+        let (digest_a, _) = digest_artifact(&file_a)?;
+        let (digest_b, _) = digest_artifact(&file_b)?;
         assert_ne!(
             digest_a, digest_b,
-            "two artifact trees differing only in a file's setuid bit must hash differently"
+            "two bare artifact files differing only in the setuid bit must hash differently"
         );
         Ok(())
     }
@@ -12831,30 +12906,269 @@ mod tests {
     /// R-I16 (Self's ruling, seventh Cut 1 fix batch, F4): the artifact
     /// digest hashed no gid term at all before this batch, on files or
     /// directories. This pins the file case.
+    ///
+    /// R-I20: bare file, not wrapped in a directory -- see the comment on
+    /// the executable-bit test above.
     #[cfg(unix)]
     #[test]
     fn digest_artifact_differs_when_only_a_files_gid_differs() -> Result<()> {
         use std::os::unix::fs::chown;
 
         fn build(temp: &Path, name: &str, gid: u32) -> Result<PathBuf> {
-            let root = temp.join(name);
-            fs::create_dir(&root)?;
-            let file = root.join("f");
+            let file = temp.join(name);
             fs::write(&file, b"same content\n")?;
             chown(&file, None, Some(gid))?;
+            Ok(file)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let file_a = build(temp.path(), "a", 0)?;
+        let file_b = build(temp.path(), "b", second_gid_for_chown_fixture()?)?;
+        let (digest_a, _) = digest_artifact(&file_a)?;
+        let (digest_b, _) = digest_artifact(&file_b)?;
+        assert_ne!(
+            digest_a, digest_b,
+            "two bare artifact files differing only in owning gid must hash differently"
+        );
+        Ok(())
+    }
+
+    /// R-I21 (Self's ruling, eighth Cut 1 fix batch, F3): the artifact
+    /// digest's file-arm xattr term, on the bare-file path `host.rs` takes.
+    /// Companion to `frozen_source_sha256_differs_when_only_an_extended_attribute_differs`.
+    #[cfg(unix)]
+    #[test]
+    fn digest_artifact_differs_when_only_a_files_extended_attribute_differs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let clean = temp.path().join("clean");
+        fs::write(&clean, b"same content\n")?;
+        let clean_digest = digest_artifact(&clean)?.0;
+
+        let capped = temp.path().join("capped");
+        fs::write(&capped, b"same content\n")?;
+        let value: [u8; 20] = [
+            0x01, 0x00, 0x00, 0x02, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        setxattr_or_bail(&capped, "security.capability", &value)?;
+        let capped_digest = digest_artifact(&capped)?.0;
+
+        assert_ne!(
+            clean_digest, capped_digest,
+            "a bare artifact file gaining a security.capability xattr must move the digest"
+        );
+        Ok(())
+    }
+
+    /// R-I21: the artifact digest's directory-arm xattr term.
+    #[cfg(unix)]
+    #[test]
+    fn digest_artifact_differs_when_only_a_directorys_extended_attribute_differs() -> Result<()> {
+        fn build(temp: &Path, name: &str) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            fs::write(root.join("f"), b"same content\n")?;
             Ok(root)
         }
 
         let temp = tempfile::tempdir()?;
-        let root_a = build(temp.path(), "root-a", 0)?;
-        let root_b = build(temp.path(), "root-b", second_gid_for_chown_fixture()?)?;
-        let (digest_a, _) = digest_artifact(&root_a)?;
-        let (digest_b, _) = digest_artifact(&root_b)?;
+        let clean = build(temp.path(), "clean")?;
+        let clean_digest = digest_artifact(&clean)?.0;
+
+        let capped = build(temp.path(), "capped")?;
+        setxattr_or_bail(&capped, "user.idunn.soul_probe", b"present")?;
+        let capped_digest = digest_artifact(&capped)?.0;
+
         assert_ne!(
-            digest_a, digest_b,
-            "two artifact trees differing only in a file's owning gid must hash differently"
+            clean_digest, capped_digest,
+            "an artifact directory gaining an extended attribute must move the digest"
         );
         Ok(())
+    }
+
+    /// R-I21: the artifact digest's symlink-arm xattr term. `lsetxattr` is
+    /// the underlying syscall `read_sorted_xattrs` uses (via `llistxattr`/
+    /// `lgetxattr`, which do not follow a final symlink), matching how a
+    /// symlink's own xattrs, not its target's, are read.
+    #[cfg(unix)]
+    #[test]
+    fn digest_artifact_differs_when_only_a_symlinks_extended_attribute_differs() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        fn build(temp: &Path, name: &str) -> Result<PathBuf> {
+            let root = temp.join(name);
+            fs::create_dir(&root)?;
+            fs::write(root.join("target"), b"same content\n")?;
+            std::os::unix::fs::symlink("target", root.join("link"))?;
+            Ok(root)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let clean = build(temp.path(), "clean")?;
+        let clean_digest = digest_artifact(&clean)?.0;
+
+        let capped = build(temp.path(), "capped")?;
+        let cpath = std::ffi::CString::new(capped.join("link").as_os_str().as_bytes())?;
+        let value = b"present";
+        let written = unsafe {
+            libc::lsetxattr(
+                cpath.as_ptr(),
+                c"user.idunn.soul_probe".as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        ensure!(
+            written == 0,
+            "lsetxattr on the symlink fixture: {}",
+            std::io::Error::last_os_error()
+        );
+        let capped_digest = digest_artifact(&capped)?.0;
+
+        assert_ne!(
+            clean_digest, capped_digest,
+            "an artifact symlink gaining an extended attribute of its own must move the digest"
+        );
+        Ok(())
+    }
+
+    /// R-I22 (Self's ruling, eighth Cut 1 fix batch, F4): Soul pass 8 found
+    /// `hash_xattr_list`'s framing pinned by nothing -- all 193 tests stayed
+    /// green while dropping the value length prefix, dropping the count
+    /// prefix, dropping the name NUL terminator, folding names to
+    /// lowercase, or hashing names only and dropping values entirely. These
+    /// five tests call `hash_xattr_list` directly (it is private, reached
+    /// through `super::*` inside this crate's own test module) with hand
+    /// constructed attribute lists chosen so a specific piece of framing
+    /// removed is exactly what makes two different lists hash the same --
+    /// each one is a real collision if that framing goes, not just an
+    /// assertion the digest changed for some reason.
+    ///
+    /// Chosen so the byte streams collide once the value's own 8-byte
+    /// length prefix is dropped: `"a"+NUL+"bc"+"d"+NUL+""` and
+    /// `"a"+NUL+"b"+"cd"+NUL+""` are the same six bytes
+    /// (`61 00 62 63 64 00`) without it, because the boundary between the
+    /// first entry's value and the second entry's name is what the length
+    /// prefix pins.
+    #[test]
+    fn hash_xattr_list_pins_each_values_length_prefix() {
+        let list_a = vec![
+            (b"a".to_vec(), b"bc".to_vec()),
+            (b"d".to_vec(), b"".to_vec()),
+        ];
+        let list_b = vec![
+            (b"a".to_vec(), b"b".to_vec()),
+            (b"cd".to_vec(), b"".to_vec()),
+        ];
+
+        let mut hasher_a = Sha256::new();
+        hash_xattr_list(&list_a, &mut hasher_a);
+        let mut hasher_b = Sha256::new();
+        hash_xattr_list(&list_b, &mut hasher_b);
+
+        assert_ne!(
+            format!("{:x}", hasher_a.finalize()),
+            format!("{:x}", hasher_b.finalize()),
+            "[(a,bc),(d,)] and [(a,b),(cd,)] write identical bytes without each value's own \
+             length prefix"
+        );
+    }
+
+    /// R-I22: chosen so the byte streams collide once the name/value
+    /// separator is dropped: name `"a"` with a one-byte value `[0x00]`, and
+    /// name `"a\x01"` (two bytes) with an empty value, both encode to
+    /// `61 01 00 00 00 00 00 00 00 00` if nothing marks where the name ends
+    /// and the value's length prefix begins.
+    #[test]
+    fn hash_xattr_list_pins_the_name_terminator() {
+        let list_a = vec![(b"a".to_vec(), vec![0u8])];
+        let list_b = vec![(vec![b'a', 0x01], Vec::new())];
+
+        let mut hasher_a = Sha256::new();
+        hash_xattr_list(&list_a, &mut hasher_a);
+        let mut hasher_b = Sha256::new();
+        hash_xattr_list(&list_b, &mut hasher_b);
+
+        assert_ne!(
+            format!("{:x}", hasher_a.finalize()),
+            format!("{:x}", hasher_b.finalize()),
+            "[(a,[0x00])] and [(a\\x01,[])] write identical bytes without a terminator between \
+             each name and its value's length prefix"
+        );
+    }
+
+    /// R-I22: names are hashed as raw bytes, not folded -- `user.A` and
+    /// `user.a` are a real xattr collision class (distinct attributes on
+    /// case-sensitive filesystems) that a case-insensitive comparison would
+    /// merge.
+    #[test]
+    fn hash_xattr_list_pins_name_case() {
+        let list_a = vec![(b"user.A".to_vec(), b"same value".to_vec())];
+        let list_b = vec![(b"user.a".to_vec(), b"same value".to_vec())];
+
+        let mut hasher_a = Sha256::new();
+        hash_xattr_list(&list_a, &mut hasher_a);
+        let mut hasher_b = Sha256::new();
+        hash_xattr_list(&list_b, &mut hasher_b);
+
+        assert_ne!(
+            format!("{:x}", hasher_a.finalize()),
+            format!("{:x}", hasher_b.finalize()),
+            "user.A and user.a must not hash the same"
+        );
+    }
+
+    /// R-I22: the material finding -- nothing proved an xattr's *value* was
+    /// hashed at all, so a capability edited from `cap_setuid` to
+    /// `cap_sys_admin` (same name, different value) would have been covered
+    /// by nothing before this batch.
+    #[test]
+    fn hash_xattr_list_pins_the_value_not_just_the_name() {
+        let list_a = vec![(b"security.capability".to_vec(), vec![1, 2, 3])];
+        let list_b = vec![(b"security.capability".to_vec(), vec![4, 5, 6])];
+
+        let mut hasher_a = Sha256::new();
+        hash_xattr_list(&list_a, &mut hasher_a);
+        let mut hasher_b = Sha256::new();
+        hash_xattr_list(&list_b, &mut hasher_b);
+
+        assert_ne!(
+            format!("{:x}", hasher_a.finalize()),
+            format!("{:x}", hasher_b.finalize()),
+            "the same attribute name with two different values must not hash the same"
+        );
+    }
+
+    /// R-I22: chosen so the byte streams collide once the leading count
+    /// prefix is dropped -- zero attributes followed by one attribute's own
+    /// bytes (as if they were the next field the caller hashes, e.g. a
+    /// file's size-prefixed content) looks identical to one attribute
+    /// followed by nothing, because every attribute is otherwise
+    /// self-delimiting (NUL-terminated name, length-prefixed value).
+    #[test]
+    fn hash_xattr_list_pins_the_count_prefix() {
+        let entry_name = b"n".to_vec();
+        let entry_value = b"v".to_vec();
+        let mut entry_bytes = Vec::new();
+        entry_bytes.extend_from_slice(&entry_name);
+        entry_bytes.push(0);
+        entry_bytes.extend_from_slice(&(entry_value.len() as u64).to_le_bytes());
+        entry_bytes.extend_from_slice(&entry_value);
+
+        let mut hasher_a = Sha256::new();
+        hash_xattr_list(&[], &mut hasher_a);
+        hasher_a.update(&entry_bytes);
+
+        let mut hasher_b = Sha256::new();
+        hash_xattr_list(&[(entry_name, entry_value)], &mut hasher_b);
+
+        assert_ne!(
+            format!("{:x}", hasher_a.finalize()),
+            format!("{:x}", hasher_b.finalize()),
+            "zero xattrs followed by one entry's own bytes must not hash the same as one xattr \
+             followed by nothing -- only the count prefix distinguishes them, since each entry \
+             is otherwise self-delimiting"
+        );
     }
 
     /// R-I16 (Self's ruling, seventh Cut 1 fix batch, F4): before this batch
