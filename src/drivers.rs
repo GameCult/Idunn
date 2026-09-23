@@ -12960,13 +12960,22 @@ mod tests {
     }
 
     /// R-I21: the artifact digest's directory-arm xattr term.
+    ///
+    /// `digest_tree(root, root, ...)` only ever hashes an entry it reads out
+    /// of some directory's `read_dir`, never the digest root itself (see the
+    /// comment on the directory-mode test above), so the differing
+    /// directory must be a child of the artifact root -- measured directly:
+    /// setting the xattr on `capped` itself here first left the two digests
+    /// equal.
     #[cfg(unix)]
     #[test]
     fn digest_artifact_differs_when_only_a_directorys_extended_attribute_differs() -> Result<()> {
         fn build(temp: &Path, name: &str) -> Result<PathBuf> {
             let root = temp.join(name);
             fs::create_dir(&root)?;
-            fs::write(root.join("f"), b"same content\n")?;
+            let child = root.join("d");
+            fs::create_dir(&child)?;
+            fs::write(child.join("f"), b"same content\n")?;
             Ok(root)
         }
 
@@ -12975,7 +12984,7 @@ mod tests {
         let clean_digest = digest_artifact(&clean)?.0;
 
         let capped = build(temp.path(), "capped")?;
-        setxattr_or_bail(&capped, "user.idunn.soul_probe", b"present")?;
+        setxattr_or_bail(&capped.join("d"), "user.idunn.soul_probe", b"present")?;
         let capped_digest = digest_artifact(&capped)?.0;
 
         assert_ne!(
@@ -12989,6 +12998,13 @@ mod tests {
     /// the underlying syscall `read_sorted_xattrs` uses (via `llistxattr`/
     /// `lgetxattr`, which do not follow a final symlink), matching how a
     /// symlink's own xattrs, not its target's, are read.
+    ///
+    /// Uses the `security` namespace, not `user`: measured directly,
+    /// `lsetxattr(..., "user.idunn.soul_probe", ...)` on a symlink fails
+    /// `EPERM` even as root -- the kernel restricts the `user` namespace to
+    /// regular files and directories, symlinks included in the refusal
+    /// regardless of privilege. `security.capability` is the same
+    /// setuid-equivalent value the frozen-source xattr tests already use.
     #[cfg(unix)]
     #[test]
     fn digest_artifact_differs_when_only_a_symlinks_extended_attribute_differs() -> Result<()> {
@@ -13008,11 +13024,13 @@ mod tests {
 
         let capped = build(temp.path(), "capped")?;
         let cpath = std::ffi::CString::new(capped.join("link").as_os_str().as_bytes())?;
-        let value = b"present";
+        let value: [u8; 20] = [
+            0x01, 0x00, 0x00, 0x02, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let written = unsafe {
             libc::lsetxattr(
                 cpath.as_ptr(),
-                c"user.idunn.soul_probe".as_ptr(),
+                c"security.capability".as_ptr(),
                 value.as_ptr() as *const libc::c_void,
                 value.len(),
                 0,
