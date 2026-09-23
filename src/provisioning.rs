@@ -1,3 +1,9 @@
+// R-I23 (Self's ruling, Cut 1's eighth fix batch, F1): see the matching
+// attribute in `drivers.rs` -- `clippy.toml`'s `disallowed-methods` list has
+// no per-module scope, so it reaches this file's unrelated `.canonicalize()`
+// call too unless blanket-allowed here.
+#![allow(clippy::disallowed_methods)]
+
 use anyhow::{Context, Result, anyhow, bail};
 use cultcache_rs::{
     CultCacheEnvelope, CultCacheExpectedEnvelope, DatabaseEntry, SingleFileMessagePackBackingStore,

@@ -1,0 +1,25 @@
+# R-I23 (Self's ruling, Cut 1's eighth fix batch, F1): these four methods are
+# how the frozen-symlink resolver's authority leaks. Soul pass 8 proved it by
+# existence -- `open_frozen_symlink_frame` called `fs::read_link` directly
+# while everything else in the resolver went through `FrozenSymlinkFs`, and
+# restoring the pass-7 cubic bug as `candidate.canonicalize()?` (or
+# `fs::canonicalize(&candidate)?`) at `resolve_frozen_source_symlink`'s
+# `Normal` arm passed all 193 tests green, because nothing stopped the
+# resolver from reaching past the port.
+#
+# This list is crate-wide because `disallowed-methods` has no per-module
+# scope of its own. `src/drivers.rs` blanket-allows the lint at the top of
+# the file (most of the crate has a legitimate reason to call these methods
+# directly -- deployment staging, host executable-identity checks, artifact
+# digesting, and so on are not part of frozen-symlink resolution) and the
+# `frozen_symlink_port` submodule inside it re-denies the lint for its own
+# scope, which is the only place these calls must not appear outside the
+# port. A future edit that adds a bypass inside that module fails
+# `cargo clippy` with this list's reason text; a call anywhere else in the
+# crate is unaffected, exactly as before this batch.
+disallowed-methods = [
+    { path = "std::path::Path::canonicalize", reason = "frozen-symlink resolution must go through FrozenSymlinkFs::canonicalize (src/drivers.rs, frozen_symlink_port); this method is blanket-allowed outside that module" },
+    { path = "std::fs::canonicalize", reason = "frozen-symlink resolution must go through FrozenSymlinkFs::canonicalize (src/drivers.rs, frozen_symlink_port); this function is blanket-allowed outside that module" },
+    { path = "std::fs::symlink_metadata", reason = "frozen-symlink resolution must go through FrozenSymlinkFs::symlink_metadata (src/drivers.rs, frozen_symlink_port); this function is blanket-allowed outside that module" },
+    { path = "std::fs::read_link", reason = "frozen-symlink resolution must go through FrozenSymlinkFs::read_link (src/drivers.rs, frozen_symlink_port); this function is blanket-allowed outside that module" },
+]

@@ -1,3 +1,17 @@
+// R-I23 (Self's ruling, Cut 1's eighth fix batch, F1): `clippy.toml`'s
+// `disallowed-methods` list has no per-module scope, so it applies to the
+// whole crate by construction. This file uses `Path::canonicalize`,
+// `fs::canonicalize`, `fs::symlink_metadata` and `fs::read_link` directly in
+// many places that have nothing to do with frozen-symlink resolution
+// (deployment staging, host executable-identity checks, artifact digesting,
+// hardening, and more); the `frozen_symlink_port` submodule below is the one
+// place those calls must go through `FrozenSymlinkFs` instead. This blanket
+// allow, plus that submodule's own `#![deny(clippy::disallowed_methods)]`,
+// is the scoping clippy.toml itself cannot express: Rust's lint-level
+// attributes are lexically scoped, so the inner `deny` wins inside the
+// submodule regardless of this outer `allow`, and nowhere else changes.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
@@ -5909,6 +5923,18 @@ fn harden_frozen_source_tree(root: &Path, current: &Path) -> Result<()> {
     Ok(())
 }
 
+// R-I23 (Self's ruling, eighth Cut 1 fix batch, F1): everything the
+// frozen-symlink resolver can reach lives in this submodule so that
+// `#![deny(clippy::disallowed_methods)]` can cover exactly it -- the rest of
+// `drivers.rs` blanket-allows the lint (see the file's top attribute)
+// because most of the crate has a legitimate, unrelated reason to call
+// `Path::canonicalize`/`fs::canonicalize`/`fs::symlink_metadata`/
+// `fs::read_link` directly. Everything this module exports is re-exported
+// right below it so every existing caller and test keeps its current path.
+mod frozen_symlink_port {
+    #![deny(clippy::disallowed_methods)]
+    use super::*;
+
 /// S6 (Self's ruling, third Cut 1 fix batch): resolves a frozen source
 /// symlink's full chain against the tree's real, final published root. Every
 /// component the chain crosses that exists on disk is resolved for real
@@ -5936,7 +5962,7 @@ fn harden_frozen_source_tree(root: &Path, current: &Path) -> Result<()> {
 /// symlinks, doubling or not, now costs O(n) real reads no matter how many
 /// times its target text repeats a name.
 #[cfg(unix)]
-enum FrozenSymlinkStep {
+pub(crate) enum FrozenSymlinkStep {
     CurDir,
     ParentDir,
     Normal(std::ffi::OsString),
@@ -5955,12 +5981,12 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn reset_frozen_symlink_probe_calls() {
+pub(crate) fn reset_frozen_symlink_probe_calls() {
     FROZEN_SYMLINK_PROBE_CALLS.with(|calls| calls.set(0));
 }
 
 #[cfg(test)]
-fn frozen_symlink_probe_calls() -> u64 {
+pub(crate) fn frozen_symlink_probe_calls() -> u64 {
     FROZEN_SYMLINK_PROBE_CALLS.with(std::cell::Cell::get)
 }
 
@@ -5984,16 +6010,30 @@ fn record_frozen_symlink_probe_call() {}
 // longer drift apart. `resolve_frozen_source_symlink` and
 // `open_frozen_symlink_frame` are generic over this trait instead of
 // calling `Path::canonicalize`/`fs::symlink_metadata` directly.
+//
+// R-I23 (Self's ruling, eighth Cut 1 fix batch, F1): `read_link` joined the
+// port for the same reason -- Soul pass 8 found `open_frozen_symlink_frame`
+// still calling `fs::read_link` directly, the proof the convention leaks.
+// This module (`frozen_symlink_port`, below) is also now the only place in
+// the crate where `clippy::disallowed_methods` denies calling
+// `Path::canonicalize`, `fs::canonicalize`, `fs::symlink_metadata` or
+// `fs::read_link` outside this trait; see `clippy.toml` and the `#![allow]`
+// at the top of this file.
 #[cfg(unix)]
-trait FrozenSymlinkFs {
+pub(crate) trait FrozenSymlinkFs {
     fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf>;
     fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata>;
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf>;
 }
 
 #[cfg(unix)]
-struct StdFrozenSymlinkFs;
+pub(crate) struct StdFrozenSymlinkFs;
 
+// R-I23: this impl is the port's one production body, so it is the one
+// place inside `frozen_symlink_port` allowed to call the real syscalls the
+// rest of the module is denied from reaching around the port for.
 #[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
 impl FrozenSymlinkFs for StdFrozenSymlinkFs {
     fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
         record_frozen_symlink_probe_call();
@@ -6003,6 +6043,11 @@ impl FrozenSymlinkFs for StdFrozenSymlinkFs {
     fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
         record_frozen_symlink_probe_call();
         fs::symlink_metadata(path)
+    }
+
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+        record_frozen_symlink_probe_call();
+        fs::read_link(path)
     }
 }
 
@@ -6058,7 +6103,7 @@ fn open_frozen_symlink_frame<F: FrozenSymlinkFs>(
         symlink_path.display()
     );
     *budget -= 1;
-    let target = fs::read_link(symlink_path)?;
+    let target = fs_port.read_link(symlink_path)?;
     ensure!(target.is_relative(), "frozen source symlink is absolute");
     let parent = symlink_path
         .parent()
@@ -6082,7 +6127,7 @@ fn open_frozen_symlink_frame<F: FrozenSymlinkFs>(
 }
 
 #[cfg(unix)]
-fn resolve_frozen_source_symlink<F: FrozenSymlinkFs>(
+pub(crate) fn resolve_frozen_source_symlink<F: FrozenSymlinkFs>(
     fs_port: &F,
     canonical_root: &Path,
     path: &Path,
@@ -6224,10 +6269,19 @@ fn resolve_frozen_source_symlink<F: FrozenSymlinkFs>(
 }
 
 #[cfg(unix)]
-fn validate_frozen_source_symlink(root: &Path, path: &Path) -> Result<()> {
-    let canonical_root = root.canonicalize().context("resolving frozen source root")?;
+pub(crate) fn validate_frozen_source_symlink(root: &Path, path: &Path) -> Result<()> {
+    let canonical_root = StdFrozenSymlinkFs
+        .canonicalize(root)
+        .context("resolving frozen source root")?;
     resolve_frozen_source_symlink(&StdFrozenSymlinkFs, &canonical_root, path).map(|_| ())
 }
+
+} // mod frozen_symlink_port
+
+// R-I23: flattened back into `drivers`'s own namespace so every call site
+// above and every test below keeps referring to these by their bare names,
+// unchanged by the module boundary this batch drew around them.
+use frozen_symlink_port::*;
 
 /// S6: run once, against the tree's real, final published path -- after the
 /// atomic rename off `.partial`, in `freeze_exact`, and again (read-only)
@@ -11926,15 +11980,32 @@ mod tests {
     /// 11 ms/359 ms pair happened to straddle the clamp boundary, which is
     /// what made the ratio look decisive. This test replaces the clock with
     /// a call count: `record_frozen_symlink_probe_call` fires once per
-    /// `canonicalize()` in `open_frozen_symlink_frame` and once per
-    /// `symlink_metadata()` per real component in the `Normal` arm, so the
-    /// count is `components + 2` for one symlink with a k-component target,
-    /// deterministic under any host load. A cubic per-component
-    /// `canonicalize()` cannot come back unnoticed: it would leave the call
-    /// count linear (unchanged) while the removed work still ran, so this
-    /// pin cannot catch its *own* regression by call count alone -- it
-    /// keeps the wall-clock reading in the assertion message for a human to
-    /// notice, but asserts only on the deterministic count.
+    /// `canonicalize()`/`read_link()` in `open_frozen_symlink_frame`, once
+    /// per `canonicalize()` of the root in `validate_frozen_source_symlink`,
+    /// and once per `symlink_metadata()` per real component in the `Normal`
+    /// arm, so the count is `components + 4` for one symlink with a
+    /// k-component target, deterministic under any host load.
+    ///
+    /// R-I14 (seventh Cut 1 fix batch, F1) is the reason this doc used to
+    /// say the count "cannot catch its own regression" -- the port existed,
+    /// but nothing stopped a call site from reaching past it, and Soul pass
+    /// 8 proved that by restoring the S5-1 bug as `candidate.canonicalize()?`
+    /// in the `Normal` arm's `Ok(_)` case: every one of the 193 tests,
+    /// including this one, stayed green, because a per-component
+    /// `canonicalize()` that returns its own (already-correct) input adds
+    /// no call the counter sees. **That claim is now false, and the count is
+    /// no longer the thing that catches it.** R-I23 (Self's ruling, eighth
+    /// Cut 1 fix batch, F1) made `Path::canonicalize`, `fs::canonicalize`,
+    /// `fs::symlink_metadata` and `fs::read_link` a `cargo clippy` compile
+    /// error anywhere in `frozen_symlink_port` outside the port's own
+    /// `StdFrozenSymlinkFs` implementation (see `clippy.toml`); Soul's exact
+    /// mutation is that spelling, so it now fails to build under `cargo
+    /// clippy -- -D clippy::disallowed_methods`, independent of what this
+    /// count test asserts. What the count formula still cannot do, and
+    /// still does not claim to: distinguish a mutation that keeps every
+    /// call site and every call count the same while doing needless extra
+    /// work *inside* one of those calls -- that class was never this test's
+    /// job, and nothing here pretends otherwise.
     #[cfg(unix)]
     #[test]
     fn validate_frozen_source_symlinks_resolves_a_long_component_chain_with_a_linear_call_count(
@@ -11972,20 +12043,23 @@ mod tests {
         let (small_calls, small_elapsed) = resolve_and_count(50)?;
         let (large_calls, large_elapsed) = resolve_and_count(200)?;
 
-        // One symlink open (one canonicalize()) plus one symlink_metadata()
-        // per real component: components + 2, exactly -- not a bound, an
-        // exact formula, so a cubic term reappearing as *extra* probe calls
+        // R-I23 (Self's ruling, eighth Cut 1 fix batch, F1): one root
+        // canonicalize() in validate_frozen_source_symlink, one symlink open
+        // (one canonicalize() plus one read_link() in
+        // open_frozen_symlink_frame), and one symlink_metadata() per real
+        // component: components + 4, exactly -- not a bound, an exact
+        // formula, so a cubic term reappearing as *extra* probe calls
         // (rather than hidden extra work per call) would still be caught.
         assert_eq!(
             small_calls,
-            52,
-            "50 real components must cost exactly 50 + 2 = 52 canonicalize()/\
+            54,
+            "50 real components must cost exactly 50 + 4 = 54 canonicalize()/read_link()/\
              symlink_metadata() calls: {small_calls} (took {small_elapsed:?})"
         );
         assert_eq!(
             large_calls,
-            202,
-            "200 real components must cost exactly 200 + 2 = 202 canonicalize()/\
+            204,
+            "200 real components must cost exactly 200 + 4 = 204 canonicalize()/read_link()/\
              symlink_metadata() calls: {large_calls} (took {large_elapsed:?})"
         );
         // A 4x longer chain costing ~4x the calls (not ~64x, the cubic

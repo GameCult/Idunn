@@ -11,6 +11,16 @@
 //! Only the process layer is Windows-specific and it is confined to
 //! `platform`. Everything else is the same code Idunn runs on yggdrasil.
 
+// R-I23 (Self's ruling, Cut 1's eighth fix batch, F1): `clippy.toml`'s
+// `disallowed-methods` list (`Path::canonicalize`, `fs::canonicalize`,
+// `fs::symlink_metadata`, `fs::read_link`) exists to keep the frozen-symlink
+// resolver in `drivers.rs` from bypassing its `FrozenSymlinkFs` port; it has
+// no per-module scope of its own, so it applies to this file too even
+// though this file's own executable-identity comparisons have nothing to do
+// with that resolver. See `drivers.rs`'s matching attribute for the full
+// rationale.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;

@@ -1,0 +1,21 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  clippy:
+    # R-I23 (Self's ruling, Cut 1's eighth fix batch, F1): this repo had no
+    # CI surface at all before this batch, so "denied in CI" had nowhere to
+    # attach. This is that surface: `clippy.toml`'s `disallowed-methods`
+    # list only stops a bypass of the frozen-symlink resolver's
+    # `FrozenSymlinkFs` port (see `src/drivers.rs`, `frozen_symlink_port`)
+    # if something actually runs clippy with the lint promoted to an error.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --all-features -- -D clippy::disallowed_methods
