@@ -5973,6 +5973,39 @@ fn record_frozen_symlink_probe_call() {
 #[inline(always)]
 fn record_frozen_symlink_probe_call() {}
 
+// R-I14 (Self's ruling, seventh Cut 1 fix batch, F1): the counter above was
+// an honour system -- it only moved where a call site remembered to invoke
+// it by hand, so Soul pass 7 restored the S5-1 bug (a per-component
+// `canonicalize()`) without adding that call and the pin measured no
+// regression at all. This narrow port is the fix: `canonicalize()` and
+// `symlink_metadata()` are reachable from the resolver *only* through
+// `FrozenSymlinkFs`, and the one production implementation charges the
+// counter inside the same method that makes the syscall, so the two can no
+// longer drift apart. `resolve_frozen_source_symlink` and
+// `open_frozen_symlink_frame` are generic over this trait instead of
+// calling `Path::canonicalize`/`fs::symlink_metadata` directly.
+#[cfg(unix)]
+trait FrozenSymlinkFs {
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf>;
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata>;
+}
+
+#[cfg(unix)]
+struct StdFrozenSymlinkFs;
+
+#[cfg(unix)]
+impl FrozenSymlinkFs for StdFrozenSymlinkFs {
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        record_frozen_symlink_probe_call();
+        path.canonicalize()
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+        record_frozen_symlink_probe_call();
+        fs::symlink_metadata(path)
+    }
+}
+
 #[cfg(unix)]
 fn frozen_symlink_steps(target: &Path) -> Result<std::collections::VecDeque<FrozenSymlinkStep>> {
     let mut steps = std::collections::VecDeque::new();
@@ -6005,7 +6038,8 @@ struct FrozenSymlinkFrame {
 /// discovers -- the two call sites the old recursion covered with the same
 /// function.
 #[cfg(unix)]
-fn open_frozen_symlink_frame(
+fn open_frozen_symlink_frame<F: FrozenSymlinkFs>(
+    fs_port: &F,
     symlink_path: &Path,
     ceiling: u32,
     budget: &mut u32,
@@ -6029,8 +6063,7 @@ fn open_frozen_symlink_frame(
     let parent = symlink_path
         .parent()
         .context("frozen source symlink has no parent")?;
-    record_frozen_symlink_probe_call();
-    let resolved = parent.canonicalize().with_context(|| {
+    let resolved = fs_port.canonicalize(parent).with_context(|| {
         format!(
             "resolving frozen source symlink chain at {}",
             symlink_path.display()
@@ -6049,7 +6082,11 @@ fn open_frozen_symlink_frame(
 }
 
 #[cfg(unix)]
-fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<PathBuf> {
+fn resolve_frozen_source_symlink<F: FrozenSymlinkFs>(
+    fs_port: &F,
+    canonical_root: &Path,
+    path: &Path,
+) -> Result<PathBuf> {
     // Total distinct symlinks this one resolution may read, matching the old
     // `MAX_HOPS` chain-depth bound in spirit: a memoised re-visit is free, so
     // this is now a bound on real work rather than on nesting depth.
@@ -6068,8 +6105,12 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
     const MAX_LINK_TRAVERSALS: u32 = 40;
     let mut budget = MAX_LINK_TRAVERSALS;
     let mut memo: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
-    let mut stack: Vec<FrozenSymlinkFrame> =
-        vec![open_frozen_symlink_frame(path, MAX_LINK_TRAVERSALS, &mut budget)?];
+    let mut stack: Vec<FrozenSymlinkFrame> = vec![open_frozen_symlink_frame(
+        fs_port,
+        path,
+        MAX_LINK_TRAVERSALS,
+        &mut budget,
+    )?];
 
     loop {
         let top = stack.len() - 1;
@@ -6109,13 +6150,13 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
                     "frozen source symlink escapes its root"
                 );
                 let candidate = frame.resolved.clone();
-                record_frozen_symlink_probe_call();
-                match fs::symlink_metadata(&candidate) {
+                match fs_port.symlink_metadata(&candidate) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         if let Some(cached) = memo.get(&candidate) {
                             stack[top].resolved = cached.clone();
                         } else {
                             stack.push(open_frozen_symlink_frame(
+                                fs_port,
                                 &candidate,
                                 MAX_LINK_TRAVERSALS,
                                 &mut budget,
@@ -6185,7 +6226,7 @@ fn resolve_frozen_source_symlink(canonical_root: &Path, path: &Path) -> Result<P
 #[cfg(unix)]
 fn validate_frozen_source_symlink(root: &Path, path: &Path) -> Result<()> {
     let canonical_root = root.canonicalize().context("resolving frozen source root")?;
-    resolve_frozen_source_symlink(&canonical_root, path).map(|_| ())
+    resolve_frozen_source_symlink(&StdFrozenSymlinkFs, &canonical_root, path).map(|_| ())
 }
 
 /// S6: run once, against the tree's real, final published path -- after the
