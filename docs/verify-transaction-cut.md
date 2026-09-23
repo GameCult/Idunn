@@ -1602,3 +1602,129 @@ deleted. Hands found this by running the mutation, not by reading, and fixed
 the fixture to tamper where only the digest can see it. **A test that goes
 green for the wrong reason is the failure this campaign keeps producing**, and
 it is caught only by mutating against the final spelling of the code.
+
+## Soul pass 7 on Cut 1's sixth fix batch, 2026-09-23
+
+Opus. 183 passed / 0 failed / 2 ignored, reproduced twice on Yggdrasil. 12
+hand mutations, 9 not plain reverts, plus a privilege-surface probe on a real
+root-owned 0555 tree.
+
+**Verdict: four of six rulings hold. What this pass found is three pieces of
+verification that do not verify** — a pin blind to its own regression, a test
+that cannot fail, and a digest that got half its ruling.
+
+- **F1, CONFIRMED, medium. R-I8 traded a flaky pin for a deterministic blind
+  one.** The counter at `:11748` fires only where
+  `record_frozen_symlink_probe_call()` was hand-placed. Soul **restored the
+  original S5-1 bug** — the per-component `canonicalize()` this whole line of
+  rulings exists to keep out — **without instrumenting it. The test passed, in
+  0.39 s.** The count stays at 52/202 because the reintroduced syscall is not
+  counted. Hands' "deleting one probe call site turns it red" mutates the
+  instrumentation, not the code under test. **The batch record claimed the
+  regression "cannot come back unnoticed"; the test's own doc comment, four
+  lines below, says it "cannot catch its own regression by call count alone".
+  The code was honest and the record was not.** The formula itself is right —
+  `(symlinks opened) + (Normal steps walked)`, asserted only against its own
+  fixture, and a memoised revisit reduces it — so it is not a false red the
+  way the clock was. It is simply blind.
+- **F2, CONFIRMED, medium. The test the record says was deleted for lying is
+  in the tree, still lying.**
+  `digest_artifact_differs_across_a_symlink_target_boundary_shift` (`:12292`)
+  landed in `9e572bd`. Deleting the terminator it names leaves **the entire
+  suite green**. It cannot fail: the name is already NUL-terminated before the
+  target, so the two spellings differ whatever happens after it. Hands'
+  underlying reasoning was sound and Soul tested it — `symlink("a\0b")` and a
+  NUL in a filename both fail at `InvalidInput` before the kernel, and the
+  same closure covers path components, so the collision class really is
+  unreachable. **The gap is honest; the fixture built on top of it is not, and
+  it sits in the slot where this map says a fixture was removed for exactly
+  this.**
+- **F3, CONFIRMED, low-medium, privilege. A file capability is invisible to
+  both the validator and the digest.** On a real root-owned 0555 tree,
+  `security.capability` set to `cap_setuid=ep`: validator **ACCEPT**, digest
+  **unchanged**. That is the grant setuid used to be, with no bit for
+  `mode & 0o7777` to see. Any other xattr behaves the same; mtime and
+  hard-link count are also invisible and harmless, since content is hashed.
+  **What holds the line is not the digest** — both the runner and the systemd
+  workload require `no-new-privileges`, which neuters file capabilities
+  exactly as it neuters setuid, the same mitigation cited when the `nosuid`
+  ruling was withdrawn. So this is a **detection** gap, not a live escalation
+  on the deployment path, and it matters wherever anything else on the host
+  executes that tree. Under Cut 4 it means a `verify` verdict of "this is the
+  tree we froze" that is false for xattrs.
+- **F4, CONFIRMED, medium. R-I13's digest got half its ruling.** The ruling
+  said `digest_tree` gets the same treatment as the frozen-source digest,
+  which now hashes `mode & 0o7777` and gid for files and directories.
+  `digest_tree` got **a single executable boolean**. Measured blind: setuid,
+  setgid, uid, gid, and the read bits (`0o500` hashes as `0o555`); directories
+  get no mode term at all. This is the **artifact** digest, re-derived against
+  the sealed receipt immediately before launch, so **a post-install tamper
+  adding setuid to an installed binary re-verifies clean.**
+- **F5, CONFIRMED, low. R-I9's "each term gets a test" holds for the digest,
+  not the validator.** Narrowing the file mask to `0o5777` (blind to setgid on
+  a file) or the directory mask to `0o3777` (blind to setuid on a directory)
+  each leave 183 passing. **Only setuid-on-a-file is pinned.** A future edit
+  narrowing either mask readmits setgid or sticky with a green suite, and
+  setgid on a directory is the one with real semantics.
+- **F6, informational.** `nix_group_or_skip` (`:12248`) never skips — it
+  returns `Ok(1)` unconditionally, and its doc's reasoning about `/etc/group`
+  is moot because `chown(2)` never consults it. Three tests now hard-require
+  root. Not a new class, but the name says something the function does not do.
+
+**Promises that held.** **R-I13's `observe_frozen` fixture fix is real**:
+neutering the digest comparison turns the new end-to-end test red, so the
+second fixture does tamper where only the digest can see it. **R-I9 verified
+on a real filesystem rather than by reading the mask**: setuid, setgid and
+sticky on a file are each refused by name and each move the digest; a foreign
+gid is accepted by the validator, which still checks only uid, and now moves
+the digest. R-I10 holds. R-I11 and R-I12 match what Soul could re-derive, and
+the `:6105`-class check is correctly identified.
+
+**What Soul could not run.** No non-Linux arm. **No non-root attacker model** —
+the container is root, which gave F3's `setxattr` and every root-owned
+precondition free; nothing here shows an unprivileged process can reach any of
+these tampers. No cargo-mutants sweep, because two other campaigns held slots,
+so the budget went to twelve targeted hand mutations instead.
+
+**Rig parked at `F:\Projects\eureka-rigs\idunn-cut1-soul7\`** — outside the
+repo and the scratchpad: `privilege-surface-probe.rs`, `mutations.py` (the
+twelve, self-restoring), `README.md`.
+
+**Soul's judgement: Cut 1 is not done, but what is left is small and named.**
+The mechanism closed two passes ago and nothing built against it has moved.
+"If a seventh batch turns up the same shape again — a green test that proves
+nothing — that is a signal about how this file is being tested, not about the
+code."
+
+### Self's rulings for the seventh fix batch, 2026-09-23
+
+- **R-I14 (F1). Make the count total rather than conventional.** Put
+  `canonicalize` and `symlink_metadata` behind a **narrow injected port**, so
+  the resolver cannot reach the filesystem except through the counted path.
+  Then restoring the S5-1 bug raises the count and the pin fires. Doctrine
+  already asks for this shape — inputs as narrow ports, mockable probes — and
+  a counter that only counts the calls someone remembered to annotate is an
+  honour system. **Also correct this map**: it claimed the regression could
+  not return unnoticed, which was false when written.
+- **R-I15 (F2). Delete the boundary-shift test.** Not repair it — it cannot
+  fail, and the class it names is unreachable. The production comment saying
+  the term is not independently pinned is the true one; the test's doc comment
+  is the false one and goes with it. **The map's claim that this fixture was
+  already deleted is corrected above.**
+- **R-I16 (F4). `digest_tree` gets the ruling it was actually given**: full
+  `mode & 0o7777` and gid, for directories as well as files, each term pinned
+  by a test that fails when the term is removed. A tamper check re-derived
+  immediately before launch must not be blind to the bit that grants
+  privilege.
+- **R-I17 (F5). Each validator mask term gets its own test** — setgid and
+  sticky on a file, setuid, setgid and sticky on a directory — so narrowing
+  the mask cannot pass.
+- **R-I18 (F3). The digest covers extended attributes**, names and values, in
+  a defined order. `no-new-privileges` is a **prevention on our own deployment
+  path**; the digest is the **detection**, and Cut 4's verdict asserts "this
+  is the tree we froze", which is false today for any xattr. Record plainly
+  that the probe ran as root and does **not** establish that an unprivileged
+  attacker can set one.
+- **R-I19 (F6).** `nix_group_or_skip` either skips or is renamed for what it
+  does. A helper whose name promises a skip it never performs will mislead the
+  next reader.
