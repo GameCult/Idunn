@@ -1780,3 +1780,131 @@ a third pre-existing call site still using the old two-argument signature. The
 first Yggdrasil run caught it, exit 1, fixed in `a46b997`. Worth recording
 because it is the system working: the run happened before the report, not
 after.
+
+## Soul pass 8 on Cut 1's seventh fix batch, 2026-09-23
+
+Opus. 193 passed / 0 failed / 2 ignored, reproduced twice on Yggdrasil. **25
+hand mutations**, 11 not plain reverts, plus six probes on a real root-owned
+tree. One slot at a time, about 40 minutes held in total.
+
+**Judgement: Cut 1's mechanism is done. Its verification is not, and the
+reason is now structural rather than accidental.**
+
+- **F1, CONFIRMED, medium. The port can be walked around, and the pass-7
+  mutation still passes in two spellings.** At `:6174`, replacing the
+  assignment with `candidate.canonicalize()?` or `fs::canonicalize(&candidate)?`
+  restores the S5-1 cubic bug and leaves **all 193 green**. Only the spelling
+  that goes through the port turns it red. Nothing makes the resolver use the
+  port: no `clippy.toml`, no `disallowed-methods`, `Path` and `fs` both in
+  scope. **Proof by existence:** `open_frozen_symlink_frame` at `:6061`
+  already calls `fs::read_link` directly, and a probe measured a resolution
+  charging 16 port calls while making three uncounted `read_link` syscalls.
+  Hands' own commit message was honest — "written the way the surrounding code
+  is now written". **This map's record was not**: it said "the count is total
+  rather than conventional". It is still conventional. The convention merely
+  moved from "remember to call the counter" to "remember to use the port".
+- **F2, CONFIRMED, medium, privilege. `digest_artifact`'s single-file path
+  never got R-I16 — and it is the path the installed executable actually
+  takes.** `:7723-7727` returns a content-only sha256 for a regular file: no
+  mode, gid, uid or xattr. `host.rs:682` ("installed executable differs from
+  Expected", immediately before launch) and `host.rs:803` ("the installed
+  executable changed under the running process") both hand it a single
+  executable file. Measured: setuid **blind**, `0555` versus `0500` **blind**,
+  `security.capability=cap_setuid=ep` **blind**. **All three
+  `digest_artifact` tests wrap the file in a directory so `digest_tree` runs;
+  the fast path is untested** — and one of their doc comments claims it pins
+  "exactly Soul pass 7's post-install-tamper-adding-setuid-to-an-installed-binary
+  scenario". The real scenario is a bare file.
+- **F3, CONFIRMED, medium. The artifact digest has no xattr term at all.**
+  `digest_tree` got R-I16's mode and gid and none of R-I18, while
+  `hash_frozen_source_tree` got both. On an artifact tree:
+  `security.capability` blind, `user.*` blind, uid blind. **The asymmetry runs
+  the wrong way** — the frozen source is a 0555 root-owned tree nothing
+  executes; the artifact is the binary that gets exec'd and re-verified before
+  every launch.
+- **F4, CONFIRMED, medium. R-I18's framing and its non-file coverage are
+  pinned by nothing.** The encoding is genuinely self-delimiting and Soul
+  could not collide it across four adjacent-boundary attacks. **But the suite
+  does not know that.** All 193 stay green while dropping the value length
+  prefix, dropping the count prefix, dropping the name NUL, folding names to
+  lowercase (a real collision class, `user.A` against `user.a`), and — the
+  material one — **hashing names only and dropping values entirely. Nothing
+  proves an xattr value is hashed**, so `security.capability` edited from
+  `cap_setuid` to `cap_sys_admin` is covered by no test. Removing the xattr
+  term from the directory and symlink arms also passes; the code covers both,
+  confirmed on a real tree, but only the file arm is tested. `llistxattr` is
+  the right call and does work on symlinks.
+- **F5, CONFIRMED, low. The count test's doc still describes the pre-R-I14
+  machine** and still tells the reader the pin is blind (`:11908-11938`,
+  untouched across the batch). Pass 7 found code honest and record
+  overclaiming; this is the inverse of the same defect. The record says
+  "total", the test's own doc says "blind", and neither matches what Soul
+  measured.
+
+**Promises that held, with numbers.** R-I14's pin does fire through the port
+(three separate mutations, each red on exactly the count test). **R-I17's
+precision holds further than Hands claimed — all six mask bits, not two**:
+each of six narrowings fails exactly its own refusal test with the other five
+green. R-I16's term claims hold exactly: mode→0 fails three, gid→0 fails two,
+the directory arm alone fails exactly the two directory tests, the file arm
+alone exactly the three file tests. R-I18 does catch the finding it was
+written for. R-I15 is a real deletion and R-I19 a rename with nothing to
+falsify, correctly stated.
+
+**Remaining surface.** FIFOs, sockets and device nodes are refused by the
+validator and both digests — closed. ACLs are xattrs, so covered in the frozen
+source and uncovered in the artifact. Hard links accepted and harmless, mtime
+blind and harmless, artifact uid blind and never ruled on. `trusted.*` is
+invisible without `CAP_SYS_ADMIN`.
+
+**Could not run:** no non-Linux arm; **no non-root attacker model**, since the
+container is root and every `lsetxattr`, `chown` and `mknod` precondition came
+free; no cargo-mutants sweep.
+
+**Rig at `F:\Projects\eureka-rigs\idunn-cut1-soul8\`** with 25 self-restoring
+mutations and both raw logs. It documents its own defect: under
+`--nocapture --test-threads=1`, cargo's `test <name> ...` line has no newline,
+so a `grep "^P[0-9]"` silently eats each test's first `println!`. That cost a
+slot, and it is the second time this campaign has lost output to that exact
+artifact.
+
+### The cause Soul named
+
+> *"Every pin in this file is a convention a future edit steps around, and the
+> tests are all built on the fixture shape that is convenient rather than the
+> shape production uses."*
+
+The counter was an honour system; the port is an honour system one level up.
+The digest tests wrap a file in a directory; production hands `digest_artifact`
+a bare file. R-I18 tests presence against absence; the thing that carries
+privilege is the value. **One cause, three faces — and an eighth batch of
+point fixes would produce a ninth.**
+
+### Self's rulings for the eighth fix batch, 2026-09-23
+
+- **R-I20 (F2). Land this one regardless of anything else.** It is a real
+  detection hole on the launch path. `digest_artifact`'s file branch
+  **delegates to the same primitive `digest_tree` uses**, rather than growing
+  its own copy of the terms. **And its tests use the production shape — a bare
+  file — not a file wrapped in a directory.** The wrapped fixture is why this
+  survived: it exercised a path production does not take.
+- **R-I21 (F3). The artifact digest covers xattrs**, like the frozen-source
+  digest. The binary that gets executed deserves at least what the tree nobody
+  executes already has.
+- **R-I22 (F4). Pin the framing, not the presence.** Tests that fail when the
+  value is dropped, when the count prefix goes, when the name terminator goes,
+  and when names are case-folded; plus the directory and symlink arms. **The
+  value is the part that carries privilege**, and it is currently pinned by
+  nothing.
+- **R-I23 (F1). Make the bypass a compile error.** A `clippy.toml` with
+  `disallowed-methods` for `Path::canonicalize`, `fs::canonicalize`,
+  `fs::symlink_metadata` and `fs::read_link` within this module, denied in CI.
+  **This is what R-I14 was actually asking for**, and it is the doctrine's own
+  answer: move the authority instead of maintaining a convention. Convert
+  `open_frozen_symlink_frame`'s direct `fs::read_link` to the port in the same
+  pass, since it is the proof the convention leaks.
+- **R-I24 (F5).** Rewrite the count test's doc to describe the port. A comment
+  that tells the reader a live pin is blind is worse than no comment.
+- **Standing, and this one outlives the batch: a test's fixture must be the
+  shape production uses.** Where it cannot be, the test says so in one line.
+  Three of this pass's five findings are that rule being broken.
