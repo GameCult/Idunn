@@ -1728,3 +1728,55 @@ code."
 - **R-I19 (F6).** `nix_group_or_skip` either skips or is renamed for what it
   does. A helper whose name promises a skip it never performs will mislead the
   next reader.
+
+### The seventh fix batch landed, 2026-09-23
+
+Sonnet, three commits on `idunn/cut1-fix5` (`1edc49a`, `67d0f93`, `a46b997`).
+**193 passed, 0 failed, 2 ignored** (183 + 11 new − 1 deleted). One file,
+`src/drivers.rs`, +602 / −48. Two Yggdrasil runs, one slot at a time.
+
+**The pin now catches its own regression.** R-I14 put `canonicalize` and
+`symlink_metadata` behind a `FrozenSymlinkFs` port whose single production
+implementation charges the counter **inside the same method that makes the
+syscall**, so the two hand-placed call sites are gone and the count is total
+rather than conventional. Restoring the S5-1 bug through the port — exactly
+Soul's mutation, which passed in 0.39 s on pass 7 — now reads:
+
+```
+test ..._resolves_a_long_component_chain_with_a_linear_call_count ... FAILED
+```
+
+- **R-I15.** The unreachable boundary-shift test is deleted, with a comment in
+  its place saying why: the link name is NUL-terminated *before* the target,
+  so any two differing `(name, target)` pairs diverge there regardless, and no
+  real symlink target or filename can carry a NUL. The production comment that
+  pointed at the deleted test now points at that note. **No mutation to run —
+  the ruling was to stop claiming a defence that did not exist.**
+- **R-I16.** `digest_tree_is_executable` is replaced by `digest_tree_mode`
+  (`mode & 0o7777`) and `digest_tree_gid`, on both the file and directory
+  arms, with four new tests. Deleting the file term fails three tests;
+  deleting the directory term fails two.
+- **R-I17.** Five new refusal tests, no production change — the masks were
+  already `0o7777` from R-I9 and simply untested per bit. Narrowing the file
+  mask to `0o5777` fails exactly `..._refuses_a_setgid_file`; narrowing the
+  directory mask to `0o3777` fails exactly `..._refuses_a_setuid_directory`,
+  **with the other five refusal tests staying green in each run.** That
+  precision is the evidence the tests pin single bits rather than overlapping.
+- **R-I18.** `hash_frozen_source_xattrs` hashes names and values sorted by
+  name, count-prefixed and self-delimiting, on `libc::llistxattr`/`lgetxattr`
+  — an existing dependency, no new crate. Two tests: a general `user.`
+  namespace pin, and a direct reproduction of Soul's
+  `security.capability=cap_setuid,ep` finding, which **also asserts the
+  validator still legitimately accepts the tree**, since this ruling was
+  detection through the digest rather than refusal. Both doc comments state
+  plainly that the process runs as root and that this does not establish an
+  unprivileged attacker can reach the same path.
+- **R-I19.** `nix_group_or_skip` is renamed `second_gid_for_chown_fixture`. It
+  never skipped and never will; only the name lied. A rename has no behaviour
+  to falsify, and Hands said so rather than inventing a mutation for it.
+
+**Hands shipped a compile bug and caught it itself.** The first commit missed
+a third pre-existing call site still using the old two-argument signature. The
+first Yggdrasil run caught it, exit 1, fixed in `a46b997`. Worth recording
+because it is the system working: the run happened before the report, not
+after.
