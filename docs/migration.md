@@ -67,23 +67,20 @@ Migrate in dependency order, and migrate the authority's own dependencies last:
 2. **`repixelizer`** — second. No CultLib dependency at all, but runs a venv
    interpreter against a checkout, so it needs an artifact story for Python
    before a recipe means anything. Unit is `repixelizer-gui`.
-3. **`streampixels`** — **blocked, like Ghostlight.** The product has changed
-   direction: 2D animation could not express what the spec required, so it is
-   moving to a 3D-rendered overlay, and whether that runs in WebGL or needs
-   rendering infrastructure is undecided. Its deployment shape depends on that
-   answer — a WebGL overlay is the current two-unit shape, rendering
-   infrastructure is a new target class with hardware requirements. Do not
-   migrate it, and do not "fix" the 2D animation path: it is being replaced, not
-   repaired. There is a paying client, so coordinate rather than assume.
+3. **`streampixels-service` and `streampixels-web`** — migrate as two Idunn
+   targets from one repository. The native Unity renderer runs on each creator's
+   machine; Yggdrasil hosts only the TypeScript API and Next.js web app. Build
+   those two artifacts with the pinned Node runner, preserve Postgres and Redis
+   as external state owners, and admit the service before the web target that
+   consumes its API capability. The repository declares separate recipes at
+   `deployment/idunn/service.toml` and `deployment/idunn/web.toml`; each host
+   binding selects one recipe path.
 
-   **Their continuity is already broken, and has been.** The legacy actuator
-   restarts all three with
-   `docker compose -f /srv/compose/yggdrasil-apps.yaml restart <name>`, and that
-   file **does not exist** — `/srv/compose` holds only `odin`, `voidbot` and
-   `voidbot-retrieval`. The path is guarded by `require_root_owned_regular_path`,
-   so every restart of these three has been failing at the guard. They are
-   running only because nothing has asked them to restart. This is the
-   difference between a supervised service and a service that happens to be up.
+   **Retire the old continuity path during cutover.** The preview tarball,
+   checkout-based systemd units, and legacy deploy helper are not an alternate
+   recovery lane. The current host's live status and any existing creator data
+   must be inspected before stopping them. Preserve the public host and path
+   routing, with nginx pointing at Idunn's stable service and web endpoints.
 4. **`ghostlight`** — **blocked, not merely later.** A world-elaboration and
    ontology rebuild is running in it right now: commits landed 2026-09-05 across
    178 branches, with work parked on `codex/ghostlight-dungeon-mvp`. Adding
