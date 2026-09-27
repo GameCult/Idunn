@@ -79,9 +79,8 @@ ReadWritePaths=/etc/ufw
 # was inside the private root, where no workload could traverse to it.
 ReadWritePaths=/var/lib/gamecult/idunn /var/lib/gamecult/idunn-authority /var/lib/gamecult/idunn-projection
 ReadWritePaths=/srv/build
-# One entry per managed target: its runtime root, state root and release root.
-# A target Idunn cannot write is a target it cannot deploy, so this list grows
-# by exactly three paths per migration and is the honest blast radius.
+# Each managed target gets only its bound roots. A target Idunn cannot write is
+# a target it cannot deploy; keep this list aligned with operator bindings.
 ReadWritePaths=/etc/gamecult/heimdall /var/lib/gamecult/heimdall /srv/heimdall/app
 # Odin is a managed target like any other now, so its three roots are writable
 # on the same terms. This used to be ReadOnlyPaths, on the reasoning that Idunn
@@ -97,6 +96,10 @@ ReadWritePaths=/etc/gamecult/odin /var/lib/gamecult/odin /srv/odin
 # which also holds the credential originals Idunn reads but never writes.
 # The release root sits beside the legacy v1 actuator's /srv/ghostlight.
 ReadWritePaths=/etc/gamecult/ghostlight/runtime /var/lib/gamecult/ghostlight-world-v2 /srv/ghostlight-idunn
+# StreamPixels service: runtime bundle, rebuildable state boundary, and releases.
+ReadWritePaths=/etc/gamecult/streampixels-service/runtime /var/lib/gamecult/streampixels-service /srv/streampixels-idunn/releases/service
+# StreamPixels web is stateless; it needs only its runtime bundle and releases.
+ReadWritePaths=/etc/gamecult/streampixels-web/runtime /srv/streampixels-idunn/releases/web
 
 [Install]
 WantedBy=multi-user.target

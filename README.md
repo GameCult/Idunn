@@ -174,11 +174,12 @@ the all-seer's view, not Idunn's contract, and the two sets do not overlap.
 | `idunn-yggdrasil` | operator wrapper |
 | `idunn-yggdrasil.sudoers` | the narrow sudo grant the wrapper needs |
 
-The unit runs as a dedicated `idunn` user under `ProtectSystem=full`,
-`ProtectHome=yes`, `PrivateTmp=yes`. `ReadWritePaths` is Idunn's own state plus
-the build root; the operator anchor, the bindings, and Odin's correlation store
-are all `ReadOnlyPaths`. Idunn admits against operator authority — it does not
-author it.
+The unit runs as root under `ProtectSystem=full`,
+`ProtectHome=yes`, `PrivateTmp=yes`. `ReadWritePaths` contains Idunn's own state,
+the build root, and only the runtime, state, and release roots explicitly
+granted to each managed target. The operator anchor, bindings, and Odin's
+correlation store remain read-only. Idunn admits against operator authority —
+it does not author it.
 
 Note `Wants=docker.service`, not `Requires=`. Only the build step is
 containerized; warm, fence, promote, drain and restart run on systemd, and
