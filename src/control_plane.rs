@@ -6031,9 +6031,16 @@ impl Engine {
         if abort.candidate_cleanup == CleanupEvidence::Pending {
             let plan = required(&current.value.plan, "transaction plan")?;
             if let Some(workload) = &current.value.workload {
-                self.workload_for(plan)?
-                    .stop(workload)
-                    .context("stopping exact pre-fence candidate")?;
+                if let Err(error) = self.workload_for(plan)?.stop(workload) {
+                    let reason = format!("stopping exact pre-fence candidate: {error:#}");
+                    if current.value.last_error.as_deref() != Some(reason.as_str()) {
+                        return self.persist_same_phase(current, |next| {
+                            next.last_error = Some(reason);
+                            Ok(())
+                        });
+                    }
+                    return Err(anyhow!(reason));
+                }
             }
             self.workload_for(plan)?
                 .discard_prepared(
