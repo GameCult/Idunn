@@ -6574,7 +6574,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::drivers::SystemdWorkloadObservation;
+    use crate::drivers::{SystemdWorkloadObservation, incarnation_key};
 
     /// Fixed clock for the signing fixture; correlations must land inside
     /// DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS of it to authenticate.
