@@ -298,6 +298,13 @@ continuity restart does not fetch a branch, rebuild, rerun a migration, alter
 the launch contract, or consume the deployment brake. An explicit lifecycle
 brake may suspend this actuation without changing deployment authority.
 
+An admitted generation keeps its Ready and latest Odin receipts as durable
+proof of the exact activation at their recorded admission times. Dependency
+selection reauthenticates those receipts at those times; continuity and route
+observation own current workload health. Historical receipts do not expire
+merely because their provider remains admitted longer than the observation
+window.
+
 An Expected digest stays stable across continuity restarts, so the current
 activation at that projection key can be newer than the activation cached in an
 older admitted-generation receipt. During post-fencing rollback, Idunn first

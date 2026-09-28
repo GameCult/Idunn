@@ -3796,10 +3796,8 @@ impl Engine {
             let resolved =
                 self.source
                     .resolve(&loaded.binding, &current.value.transaction_id, now)?;
-            let providers = self.current_ready_provider_tokens(
-                &ControlSnapshot::read(&self.options.state_store)?,
-                now,
-            )?;
+            let provider_snapshot = ControlSnapshot::read(&self.options.state_store)?;
+            let providers = self.current_ready_provider_tokens(&provider_snapshot)?;
             let candidate_port = self.select_candidate_port(&loaded.binding)?;
             let plan = compile_deployment_plan(
                 &resolved.recipe_bytes,
@@ -3886,10 +3884,10 @@ impl Engine {
             }
         }
         validate_live_providers_for_deploy(current.value.command_kind, || {
-            self.validate_selected_providers_current(
-                required(&current.value.plan, "transaction plan")?,
-                now,
-            )
+            self.validate_selected_providers_current(required(
+                &current.value.plan,
+                "transaction plan",
+            )?)
         })?;
         next.phase = DeploymentPhase::Starting;
         next.updated_at_unix_millis = now;
@@ -3920,7 +3918,7 @@ impl Engine {
         }
         if current.value.activation.is_none() {
             validate_live_providers_for_deploy(current.value.command_kind, || {
-                self.validate_selected_providers_current(plan, now_millis()?)
+                self.validate_selected_providers_current(plan)
             })?;
             let now = now_millis()?;
             let runtime_instance_id = runtime_instance_id(&current.value.transaction_id)?;
@@ -4499,10 +4497,10 @@ impl Engine {
                 "Ready token belongs to another transaction"
             );
             validate_live_providers_for_deploy(admitted.value.command_kind, || {
-                self.validate_selected_providers_current(
-                    required(&admitted.value.plan, "transaction plan")?,
-                    now_millis()?,
-                )
+                self.validate_selected_providers_current(required(
+                    &admitted.value.plan,
+                    "transaction plan",
+                )?)
             })?;
             self.ensure_transaction_write_lease_current(&admitted.value, now_millis()?)?;
             let evidence = if expected.route.is_some() {
@@ -4601,10 +4599,10 @@ impl Engine {
         // and checked for semantic readiness immediately above.
         self.rehydrate_ready_token(&ready_current.value, now_millis()?, false)?;
         validate_live_providers_for_deploy(ready_current.value.command_kind, || {
-            self.validate_selected_providers_current(
-                required(&ready_current.value.plan, "transaction plan")?,
-                now_millis()?,
-            )
+            self.validate_selected_providers_current(required(
+                &ready_current.value.plan,
+                "transaction plan",
+            )?)
         })?;
 
         let expected = required(&ready_current.value.expected, "Expected projection")?;
@@ -4670,10 +4668,10 @@ impl Engine {
         let now = now_millis()?;
         self.rehydrate_ready_token(&commit_current.value, now, false)?;
         validate_live_providers_for_deploy(commit_current.value.command_kind, || {
-            self.validate_selected_providers_current(
-                required(&commit_current.value.plan, "transaction plan")?,
-                now,
-            )
+            self.validate_selected_providers_current(required(
+                &commit_current.value.plan,
+                "transaction plan",
+            )?)
         })?;
         self.workload_for(required(&commit_current.value.plan, "transaction plan")?)?
             .observe(
@@ -5585,14 +5583,13 @@ impl Engine {
     fn current_ready_provider_tokens(
         &self,
         snapshot: &ControlSnapshot,
-        now: u64,
     ) -> Result<Vec<SequenceAdmittedReady>> {
         let mut providers = Vec::new();
         for stored in &snapshot.admitted {
             // No pre-filter on ready == latest: a provider that published again
             // after going ready is still ready. rehydrate_admitted_ready owns
             // that judgment now, and reports why when it refuses.
-            match self.rehydrate_admitted_ready(snapshot, &stored.value, now) {
+            match self.rehydrate_admitted_ready(snapshot, &stored.value) {
                 Ok(provider) => providers.push(provider),
                 Err(error) => eprintln!(
                     "Idunn excluded non-current provider {}: {error:#}",
@@ -5607,7 +5604,6 @@ impl Engine {
         &self,
         snapshot: &ControlSnapshot,
         generation: &AdmittedGeneration,
-        now: u64,
     ) -> Result<SequenceAdmittedReady> {
         let authority = self.runtime_authority_parts(
             &generation.plan,
@@ -5621,12 +5617,12 @@ impl Engine {
             &authority,
             current_lease,
             &odin_authority.signer_public_key,
-            self.trusted_topology_context(now),
+            self.trusted_topology_context(generation.ready.admitted_at_unix_millis),
         )?;
         validate_authenticated_evidence(&generation.ready, &authenticated)?;
         ensure!(
             is_semantic_ready(&authenticated),
-            "admitted provider no longer has current exact Ready evidence"
+            "admitted provider's Ready receipt is not Ready at its admission time"
         );
         // A provider that published after going ready is the ordinary case, not
         // a stale one, so the cursor is authenticated on its own terms rather
@@ -5635,13 +5631,18 @@ impl Engine {
         // runtime_instance_id to match this generation's activation -- so a
         // separate identity check here would only restate it more weakly.
         // Note this is the cursor as frozen at admission, not a live read of
-        // Odin; making dependency evidence current is a separate question.
+        // Odin. Both receipts are historical proofs; current workload health
+        // is owned by continuity and route observation, not receipt age.
         let authenticated_latest = authenticate_odin_runtime_topology_correlation(
             &generation.latest_odin_observation.canonical_bytes,
             &authority,
             current_lease,
             &odin_authority.signer_public_key,
-            self.trusted_topology_context(now),
+            self.trusted_topology_context(
+                generation
+                    .latest_odin_observation
+                    .admitted_at_unix_millis,
+            ),
         )?;
         validate_authenticated_evidence(
             &generation.latest_odin_observation,
@@ -5649,7 +5650,7 @@ impl Engine {
         )?;
         ensure!(
             is_semantic_ready(&authenticated_latest),
-            "admitted provider's latest Odin observation is no longer Ready"
+            "admitted provider's latest receipt is not Ready at its admission time"
         );
         Ok(SequenceAdmittedReady {
             transaction_id: generation.transaction_id.clone(),
@@ -5662,7 +5663,6 @@ impl Engine {
     fn validate_selected_providers_current(
         &self,
         plan: &CompiledDeploymentPlan,
-        now: u64,
     ) -> Result<()> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         for selection in &plan.dependencies {
@@ -5688,7 +5688,7 @@ impl Engine {
             let admitted = snapshot
                 .admitted_for(target)
                 .context("selected managed dependency is no longer admitted")?;
-            let token = self.rehydrate_admitted_ready(&snapshot, &admitted.value, now)?;
+            let token = self.rehydrate_admitted_ready(&snapshot, &admitted.value)?;
             ensure!(
                 admitted.value.expected.incarnation_id == *incarnation_id
                     && admitted.value.plan.plan_id == *plan_id
