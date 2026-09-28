@@ -5969,10 +5969,11 @@ impl Engine {
             if let Some(incumbent) = self.exact_incumbent(&snapshot, &current.value)? {
                 let admitted_provider_anchor =
                     self.provider_anchor_for_plan(&incumbent.value.plan)?;
-                let expected_sha256 = topology.demote_current_activation_to_expected_only(
+                let expected_sha256 = topology.demote_to_expected_only(
                     &incumbent.value.expected,
                     &admitted_provider_anchor,
-                    &self.idunn_anchor,
+                    &incumbent.value.activation,
+                    incumbent.value.leasing.lease(),
                 )?;
                 ensure!(
                     expected_sha256 == incumbent.value.expected.canonical_sha256()?,

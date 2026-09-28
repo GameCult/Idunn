@@ -4421,35 +4421,19 @@ impl CultCacheTopologyDriver {
         activation: &IdunnRuntimeActivationRecord,
         lease: Option<&IdunnProcessWriteLeaseRecord>,
     ) -> Result<String> {
-        self.demote_projection(expected, provider_anchor, Some(activation), lease)
-    }
-
-    fn demote_projection(
-        &self,
-        expected: &IdunnExpectedIncarnationRecord,
-        provider_anchor: &ServiceIdentityTrustAnchor,
-        activation: Option<&IdunnRuntimeActivationRecord>,
-        lease: Option<&IdunnProcessWriteLeaseRecord>,
-    ) -> Result<String> {
         expected.validate()?;
-        if let Some(activation) = activation {
-            activation.validate()?;
-            ensure!(
-                activation.expected_projection_sha256 == expected.canonical_sha256()?,
-                "admitted activation does not bind the admitted Expected projection"
-            );
-        }
+        activation.validate()?;
+        ensure!(
+            activation.expected_projection_sha256 == expected.canonical_sha256()?,
+            "admitted activation does not bind the admitted Expected projection"
+        );
         if let Some(lease) = lease {
-            validate_topology_lease(
-                expected,
-                activation.context("demotion lease has no exact activation")?,
-                lease,
-            )?;
+            validate_topology_lease(expected, activation, lease)?;
         }
         let anchor = runtime_presence_trust_anchor(expected, provider_anchor)?;
         let key = incarnation_key(expected)?;
         self.mutate(|entries| {
-            let projected = ProjectedIncarnation::read(entries, expected, activation, lease)?;
+            let projected = ProjectedIncarnation::read(entries, expected, Some(activation), lease)?;
             let current_anchor = projection_entry(
                 entries,
                 GameCultServiceTrustAnchorRecord::TYPE,
@@ -4488,55 +4472,6 @@ impl CultCacheTopologyDriver {
             Ok(Some(replacement))
         })?;
         expected.canonical_sha256()
-    }
-
-    /// Demote the current projected activation after the owning transaction
-    /// has fenced the target. A continuity restart can replace the activation
-    /// under the same Expected key while the admitted-generation receipt still
-    /// carries the prior runtime instance. In that one post-fence recovery
-    /// path, trust the current projection only after verifying Idunn's
-    /// signature and exact Expected binding, and refuse while any projected
-    /// write lease remains.
-    pub fn demote_current_activation_to_expected_only(
-        &self,
-        expected: &IdunnExpectedIncarnationRecord,
-        provider_anchor: &ServiceIdentityTrustAnchor,
-        idunn_anchor: &ServiceIdentityTrustAnchor,
-    ) -> Result<String> {
-        expected.validate()?;
-        let entries = self.snapshot()?;
-        let key = incarnation_key(expected)?;
-        let projected_activation = projection_entry(
-            &entries,
-            IdunnRuntimeActivationRecord::TYPE,
-            &key,
-        )?
-        .map(|envelope| -> Result<IdunnRuntimeActivationRecord> {
-            ensure!(
-                envelope.schema_id.as_deref() == Some(IDUNN_RUNTIME_ACTIVATION_SCHEMA),
-                "projected activation schema is substituted"
-            );
-            let activation = IdunnRuntimeActivationRecord::decode_canonical(&envelope.payload)?;
-            activation.verify_for_expected(expected, idunn_anchor)?;
-            Ok(activation)
-        })
-        .transpose()?;
-        ensure!(
-            projection_entry(
-                &entries,
-                IdunnProcessWriteLeaseRecord::TYPE,
-                &key,
-            )?
-            .is_none(),
-            "cannot demote an incarnation while its projected write lease remains"
-        );
-
-        self.demote_projection(
-            expected,
-            provider_anchor,
-            projected_activation.as_ref(),
-            None,
-        )
     }
 
     /// Whether the projection currently names an activation for this
@@ -8465,7 +8400,7 @@ mod tests {
         IDUNN_PROCESS_WRITE_LEASE_SCHEMA, IdunnServiceIdentity,
         OdinRuntimeTopologyCorrelationPurpose, OdinTopologyAuthenticationContext,
         OdinTopologyIdentity, authenticate_odin_runtime_topology_correlation,
-        enroll_service_identity_at, open_service_identity_at, verify_runtime_authority,
+        enroll_service_identity_at, verify_runtime_authority,
     };
 
     fn digest(byte: char) -> String {
@@ -10838,12 +10773,7 @@ mod tests {
         );
         assert!(!driver.projected_activation_is_present(&incumbent)?);
         let idempotent_bytes = fs::read(&driver.projection_store)?;
-        driver.demote_to_expected_only(
-            &incumbent,
-            &provider_anchor,
-            &activation,
-            Some(&lease),
-        )?;
+        driver.demote_to_expected_only(&incumbent, &provider_anchor, &activation, Some(&lease))?;
         assert_eq!(fs::read(&driver.projection_store)?, idempotent_bytes);
 
         // A record under the incumbent's key that is not the incumbent's is a
@@ -10904,104 +10834,6 @@ mod tests {
             );
             assert_eq!(fs::read(&driver.projection_store)?, before);
         }
-        Ok(())
-    }
-
-    #[test]
-    fn fenced_demotion_uses_the_current_verified_activation() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let (expected, admitted_activation, warming, provider_anchor) =
-            authenticated_warming(temp.path())?;
-        let idunn = open_service_identity_at::<IdunnServiceIdentity>(&temp.path().join("idunn.cc"))?;
-        let replacement = IdunnRuntimeActivationLaunch::issue(
-            &expected,
-            digest('a'),
-            300,
-            &idunn,
-        )?
-        .activation()
-        .clone();
-        assert_ne!(admitted_activation, replacement);
-
-        let driver = topology_driver(temp.path(), "fenced-demotion");
-        driver.publish_expected(&expected, &provider_anchor)?;
-        project_activation(&driver, &expected, &admitted_activation)?;
-        let key = incarnation_key(&expected)?;
-        upsert_record(
-            &driver.projection_store,
-            activation_envelope(&key, &replacement)?,
-        )?;
-
-        assert_eq!(
-            driver.demote_current_activation_to_expected_only(
-                &expected,
-                &provider_anchor,
-                &idunn.trust_anchor()?,
-            )?,
-            expected.canonical_sha256()?
-        );
-        assert!(!driver.projected_activation_is_present(&expected)?);
-        let after = SingleFileMessagePackBackingStore::new(&driver.projection_store)
-            .pull_all_read_only_snapshot()?;
-        assert!(after.iter().any(|entry| {
-            entry.key == key && entry.r#type == IdunnExpectedIncarnationRecord::TYPE
-        }));
-        assert!(after.iter().all(|entry| {
-            !(entry.key == key
-                && (entry.r#type == IdunnRuntimeActivationRecord::TYPE
-                    || entry.r#type == IdunnProcessWriteLeaseRecord::TYPE))
-        }));
-
-        // Expected-only demotion is idempotent when the activation is already
-        // absent.
-        let settled = fs::read(&driver.projection_store)?;
-        driver.demote_current_activation_to_expected_only(
-            &expected,
-            &provider_anchor,
-            &idunn.trust_anchor()?,
-        )?;
-        assert_eq!(fs::read(&driver.projection_store)?, settled);
-
-        // A record with an invalid Idunn signature is not adopted as current
-        // authority, even after fencing.
-        let mut forged = replacement;
-        forged.runtime_instance_id = digest('b');
-        upsert_record(
-            &driver.projection_store,
-            activation_envelope(&key, &forged)?,
-        )?;
-        let before_forgery_attempt = fs::read(&driver.projection_store)?;
-        assert!(driver
-            .demote_current_activation_to_expected_only(
-                &expected,
-                &provider_anchor,
-                &idunn.trust_anchor()?,
-            )
-            .is_err());
-        assert_eq!(fs::read(&driver.projection_store)?, before_forgery_attempt);
-
-        // A remaining lease means the target has not reached the demotion
-        // boundary. The operation leaves every byte untouched.
-        let incumbent_lease = lease(&expected, &admitted_activation, &warming);
-        upsert_record(
-            &driver.projection_store,
-            CultCacheEnvelope {
-                key: key.clone(),
-                r#type: IdunnProcessWriteLeaseRecord::TYPE.into(),
-                payload: incumbent_lease.canonical_bytes()?,
-                stored_at: "2026-09-03T00:00:00Z".into(),
-                schema_id: Some(IDUNN_PROCESS_WRITE_LEASE_SCHEMA.into()),
-            },
-        )?;
-        let before_leased_attempt = fs::read(&driver.projection_store)?;
-        assert!(driver
-            .demote_current_activation_to_expected_only(
-                &expected,
-                &provider_anchor,
-                &idunn.trust_anchor()?,
-            )
-            .is_err());
-        assert_eq!(fs::read(&driver.projection_store)?, before_leased_attempt);
         Ok(())
     }
 
