@@ -1719,14 +1719,9 @@ fn parse_cancel(mut args: impl Iterator<Item = String>) -> Result<Command> {
     })
 }
 
-/// Withdraw a queued deployment command before it is frozen.
-///
-/// A command with a live transaction has already changed something and is
-/// not cancellable from here; the transaction's own abort paths own that. A
-/// queued one has changed nothing, so it is retired the way a rejected one
-/// is: a terminal refusal transaction naming the requester goes to history
-/// with the command, and `status` reports it as such rather than as a command
-/// that never ran.
+/// Withdraw queued work, or ask Idunn to clean up a live stateless candidate.
+/// Stateful candidates past fencing cannot be cancelled because their prior
+/// writer may already be stopped and its state boundary needs explicit repair.
 fn cancel(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()> {
     let snapshot = ControlSnapshot::read(store_path)?;
     let command = snapshot
@@ -1738,10 +1733,28 @@ fn cancel(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
         command.value.kind == CommandKind::Deploy,
         "only deployment commands can be cancelled; continuity is Idunn's own"
     );
-    ensure!(
-        snapshot.transaction_for_command(command_id).is_empty(),
-        "deployment command already has a live transaction; it is past cancellation"
-    );
+    let mut live = snapshot
+        .transactions
+        .iter()
+        .filter(|stored| stored.value.command_id == command_id && !stored.value.is_terminal());
+    if let Some(current) = live.next() {
+        ensure!(
+            live.next().is_none(),
+            "deployment command has multiple live transactions"
+        );
+        ensure!(
+            cancel_is_safe_for_live_stateless(&current.value),
+            "live deployment can only be cancelled after fencing when its candidate is stateless"
+        );
+        let error = format!("cancelled by {requested_by}");
+        let mut next = current.value.clone();
+        next.post_fencing_abort = Some(post_fencing_abort_intent(&next, &error));
+        next.last_error = Some(error);
+        next.updated_at_unix_millis = now_millis()?;
+        replace_transaction(store_path, current, &next)?;
+        println!("{command_id} cancellation requested; Idunn is performing exact candidate cleanup");
+        return Ok(());
+    }
     let now = now_millis()?;
     let refusal = DeploymentTransaction::rejected(
         &command.value,
@@ -1770,6 +1783,19 @@ fn cancel(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
     archive_terminal_transaction(store_path, &envelope)?;
     println!("{command_id} cancelled");
     Ok(())
+}
+
+fn cancel_is_safe_for_live_stateless(transaction: &DeploymentTransaction) -> bool {
+        transaction.command_kind == CommandKind::Deploy
+        && transaction.phase >= DeploymentPhase::Fencing
+        && matches!(
+            transaction.fencing.as_ref(),
+            Some(FencingEvidence::SkippedStateless)
+        )
+        && transaction.completion.is_none()
+        && transaction.pre_fencing_abort.is_none()
+        && transaction.post_fencing_abort.is_none()
+        && transaction.post_commit_cleanup.is_none()
 }
 
 fn parse_validate(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -5840,41 +5866,7 @@ impl Engine {
             current.value.post_fencing_abort.is_none(),
             "post-fencing abort intent is already durable"
         );
-        let abort = PostFencingAbort {
-            error: truncate(&format!("{error:#}"), 2048),
-            route_restoration: if current.value.route_preflight.is_some() {
-                CleanupEvidence::Pending
-            } else {
-                CleanupEvidence::Skipped
-            },
-            lease_withdrawal: if current
-                .value
-                .leasing
-                .as_ref()
-                .and_then(LeasingEvidence::lease)
-                .is_some()
-            {
-                CleanupEvidence::Pending
-            } else {
-                CleanupEvidence::Skipped
-            },
-            candidate_cleanup: candidate_cleanup_requirement(
-                current.value.activation.is_some(),
-                current.value.workload.is_some(),
-            ),
-            topology_reconciliation: if current.value.command_kind == CommandKind::Deploy
-                && current.value.expected_publication_sha256.is_some()
-            {
-                CleanupEvidence::Pending
-            } else {
-                CleanupEvidence::Skipped
-            },
-            source_cleanup: if current.value.command_kind == CommandKind::Deploy {
-                CleanupEvidence::Pending
-            } else {
-                CleanupEvidence::Skipped
-            },
-        };
+        let abort = post_fencing_abort_intent(&current.value, &truncate(&format!("{error:#}"), 2048));
         self.persist_same_phase(current, |next| {
             next.post_fencing_abort = Some(abort);
             Ok(())
@@ -6203,6 +6195,46 @@ fn incumbent_was_stopped_during_fencing(fencing: &FencingEvidence) -> bool {
             ..
         }
     )
+}
+
+fn post_fencing_abort_intent(
+    transaction: &DeploymentTransaction,
+    error: &str,
+) -> PostFencingAbort {
+    PostFencingAbort {
+        error: truncate(error, 2048),
+        route_restoration: if transaction.route_preflight.is_some() {
+            CleanupEvidence::Pending
+        } else {
+            CleanupEvidence::Skipped
+        },
+        lease_withdrawal: if transaction
+            .leasing
+            .as_ref()
+            .and_then(LeasingEvidence::lease)
+            .is_some()
+        {
+            CleanupEvidence::Pending
+        } else {
+            CleanupEvidence::Skipped
+        },
+        candidate_cleanup: candidate_cleanup_requirement(
+            transaction.activation.is_some(),
+            transaction.workload.is_some(),
+        ),
+        topology_reconciliation: if transaction.command_kind == CommandKind::Deploy
+            && transaction.expected_publication_sha256.is_some()
+        {
+            CleanupEvidence::Pending
+        } else {
+            CleanupEvidence::Skipped
+        },
+        source_cleanup: if transaction.command_kind == CommandKind::Deploy {
+            CleanupEvidence::Pending
+        } else {
+            CleanupEvidence::Skipped
+        },
+    }
 }
 
 fn candidate_cleanup_requirement(
@@ -7659,6 +7691,33 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[1] as u8 == pair[0] as u8 + 1)
         );
+    }
+
+    #[test]
+    fn only_live_stateless_deployments_can_be_cancelled_after_fencing() {
+        let command = command(CommandKind::Deploy);
+        let mut stateless =
+            DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100).unwrap();
+        stateless.phase = DeploymentPhase::Routing;
+        stateless.fencing = Some(FencingEvidence::SkippedStateless);
+        assert!(cancel_is_safe_for_live_stateless(&stateless));
+
+        let mut stateful = stateless.clone();
+        stateful.fencing = Some(FencingEvidence::Revoked {
+            incumbent_lease_sha256: None,
+            candidate_lease_path_verified_empty: true,
+        });
+        assert!(!cancel_is_safe_for_live_stateless(&stateful));
+
+        let mut unfenced = stateless.clone();
+        unfenced.phase = DeploymentPhase::Sealing;
+        assert!(!cancel_is_safe_for_live_stateless(&unfenced));
+
+        let mut committed = stateless;
+        committed.completion = Some(TransactionCompletion::Admitted {
+            generation_id: "generation-test".into(),
+        });
+        assert!(!cancel_is_safe_for_live_stateless(&committed));
     }
 
     #[test]
