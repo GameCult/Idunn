@@ -2,6 +2,14 @@
 
 Status: cut map, Imagination pass 0b (Opus), 2026-09-29. Nothing has landed.
 Ends are owned by route-continuity-target.md.
+**2026-09-29, Self (Eureka session "Codebase audit"; the campaign was handed
+over from the StreamPixels deployment session with the operator's
+confirmation).** The operator ruled all six questions in section 3, one at a
+time: **Q1 (b), Q2 (b), Q3 (b), Q4 (b), Q5 (a), and Q6 (a) with a Soul gate on
+the weekend branch before the merge.** Next: S1 in Hands, and the Q6 Soul gate
+on CultLib `codex/fix-node24-ajv-esm`. Behaviour cuts re-take their
+`file:line` anchors in their own briefs. The operator has asked for no live
+mitigation on Yggdrasil yet.
 
 Heads read for this map:
 
@@ -259,6 +267,8 @@ An empty or "none" cell is a finding. It is marked **(gap)**.
 **Q1. Readiness authority for a CultMesh-aware service such as
 `streampixels-service`.**
 
+**RULED (b) by the operator, 2026-09-29.**
+
 Options:
 - (a) Every non-Odin target proves Warming and Ready directly through Idunn's
   challenge. Odin only observes.
@@ -279,6 +289,8 @@ Odin-correlated targets (B5 covers that).
 
 **Q2. Where a dependent's provider currency comes from** (the `9f00e7a`
 replacement).
+
+**RULED (b) by the operator, 2026-09-29.**
 
 Options:
 - (a) The provider's Odin receipts, authenticated now. This is a strict revert,
@@ -301,6 +313,8 @@ dependents.
 **Q3. How a stateful post-fencing deadline resolves once the candidate may
 have written.**
 
+**RULED (b) by the operator, 2026-09-29.**
+
 Options:
 - (a) Always a terminal `OperatorRequired` record.
 - (b) Split on lease adoption (F0 evidence):
@@ -321,6 +335,8 @@ replacement for `idunn cancel`.
 
 **Q4. The operator's recovery verb after `8ae00a1` is deleted.**
 
+**RULED (b) by the operator, 2026-09-29.**
+
 Options:
 - (a) Delete it outright and let deadlines resolve everything.
 - (b) Replace it with `idunn expire <command>`. The command writes a typed
@@ -335,6 +351,8 @@ Depends on it: S2 scope and the CLI surface.
 **Q5. Whether a sustained route-proof failure on an admitted target restarts
 its unit.**
 
+**RULED (a) by the operator, 2026-09-29.**
+
 Options:
 - (a) No. The route is marked degraded, dependents stop selecting it (Q2b),
   and challenges back off. Restart happens only on workload death, as today.
@@ -347,6 +365,8 @@ observation back into actuation.
 Depends on it: B2.
 
 **Q6. Landing the CultLib Idunn TS runtime on `main`** (F15).
+
+**RULED (a), with one Soul pass on the ten weekend commits before the merge by the operator, 2026-09-29.**
 
 Options:
 - (a) Merge `codex/fix-node24-ajv-esm` into CultLib `main` as-is, then cut C1
