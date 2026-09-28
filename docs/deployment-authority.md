@@ -307,12 +307,6 @@ record, refuses if a projected write lease remains, and demotes the projection
 to Expected-only. The admitted receipt does not overwrite a newer signed
 activation, and no operator edits the CultCache projection by hand.
 
-At admission commit, Idunn stores each newly authenticated Odin sequence in
-the live transaction receipt. That receipt refresh is progress owned by the
-same transaction, so commit continues from the returned snapshot; the final
-compare-exchange rejects a later concurrent change. A live provider heartbeat
-does not defer admission to another scheduler tick indefinitely.
-
 Idunn starts and recovers from its own durable admitted state. Odin is the first
 managed semantic daemon, never an Idunn bootstrap dependency. Odin's initial
 admission is the sole graph-bootstrap exception: Idunn uses its root-admitted

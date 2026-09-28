@@ -4585,11 +4585,9 @@ impl Engine {
         else {
             return Ok(());
         };
-        // `admit_latest_topology` compare-checks the transaction before it
-        // writes and returns the updated snapshot. Its own sequence receipt
-        // refresh is progress, not an external mutation; continuing from this
-        // snapshot prevents a live publisher from starving the final commit.
-        // The terminal compare-exchange still rejects any later mutation.
+        if ready_current.envelope != current.envelope {
+            return Ok(());
+        }
         ensure!(
             is_semantic_ready(&authenticated),
             "latest Odin observation is not Ready at admission commit"
@@ -4662,6 +4660,9 @@ impl Engine {
         else {
             return Ok(());
         };
+        if commit_current.envelope != ready_current.envelope {
+            return Ok(());
+        }
         ensure!(
             is_semantic_ready(&authenticated),
             "latest Odin observation is not Ready after the final admission challenge"
