@@ -135,6 +135,13 @@ deterministically lowers the constrained launch contract through the configured
 workload driver; repository-owned raw unit or container-runtime text is not an
 input.
 
+For systemd `DynamicUser` workloads, systemd's reported primary user and group
+names are allocated runtime identities. When a binding declares no fixed state
+group, Idunn validates that the process primary UID and GID match instead of
+requiring an empty `Group` property. A declared state group remains an exact
+name and numeric GID contract because it grants the process its bounded write
+lease.
+
 ## Operator binding
 
 An operator binding is static root-admitted configuration, not observed state.

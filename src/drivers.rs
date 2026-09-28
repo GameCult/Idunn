@@ -2407,6 +2407,18 @@ pub struct SystemdTransientWorkloadDriver {
     pub credential_root: PathBuf,
 }
 
+fn systemd_group_matches_launch_contract(
+    expected_group: Option<(&str, u32)>,
+    observed_group: &str,
+    process_uid: u32,
+    process_gid: u32,
+) -> bool {
+    match expected_group {
+        Some((group, group_id)) => observed_group == group && process_gid == group_id,
+        None => process_uid == process_gid,
+    }
+}
+
 impl Default for SystemdTransientWorkloadDriver {
     fn default() -> Self {
         Self {
@@ -3342,13 +3354,15 @@ impl SystemdTransientWorkloadDriver {
         //
         // `systemd_user` is deliberately absent: systemd reports the identity it
         // allocated for a DynamicUser unit, so it is never empty for a running
-        // workload. See the same note in `observe_unit`.
+        // workload. The same applies to `Group` when no fixed state group is
+        // bound. In that case the numeric primary GID must match the allocated
+        // UID; a fixed state group still requires both its exact name and GID.
         let expected_load_credential = if regular_credential_names.is_empty() {
             ""
         } else {
             "[unprintable]"
         };
-        let launch_contract: [(bool, &str); 28] = [
+        let launch_contract: [(bool, &str); 27] = [
             (
                 observation.unit_description == expected_description,
                 "unit description",
@@ -3358,10 +3372,12 @@ impl SystemdTransientWorkloadDriver {
             (observation.kill_mode == "mixed", "kill mode"),
             (observation.dynamic_user, "dynamic user"),
             (
-                match expected_group {
-                    Some(group) => observation.systemd_group == group,
-                    None => observation.systemd_group.is_empty(),
-                },
+                systemd_group_matches_launch_contract(
+                    expected_group.zip(expected_group_id),
+                    &observation.systemd_group,
+                    observation.process_uids[0],
+                    observation.process_gids[0],
+                ),
                 "systemd group",
             ),
             (
@@ -3429,13 +3445,6 @@ impl SystemdTransientWorkloadDriver {
             (
                 observed_credential_names == regular_credential_names,
                 "credential names",
-            ),
-            (
-                match expected_group_id {
-                    Some(group_id) => observation.process_gids[0] == group_id,
-                    None => observation.process_gids[0] == observation.process_uids[0],
-                },
-                "process group id",
             ),
         ];
         for (holds, clause) in launch_contract {
@@ -8197,6 +8206,44 @@ mod tests {
             activation_signer_public_key: vec![1; 32],
             service_credentials: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dynamic_primary_group_is_checked_by_numeric_identity() {
+        assert!(systemd_group_matches_launch_contract(
+            None,
+            "_du12345",
+            61_000,
+            61_000
+        ));
+        assert!(!systemd_group_matches_launch_contract(
+            None,
+            "_du12345",
+            61_000,
+            61_001
+        ));
+    }
+
+    #[test]
+    fn fixed_state_group_keeps_its_name_and_gid_contract() {
+        assert!(systemd_group_matches_launch_contract(
+            Some(("streampixels-service-state", 61_234)),
+            "streampixels-service-state",
+            61_000,
+            61_234
+        ));
+        assert!(!systemd_group_matches_launch_contract(
+            Some(("streampixels-service-state", 61_234)),
+            "_du12345",
+            61_000,
+            61_234
+        ));
+        assert!(!systemd_group_matches_launch_contract(
+            Some(("streampixels-service-state", 61_234)),
+            "streampixels-service-state",
+            61_000,
+            61_235
+        ));
     }
 
     #[cfg(unix)]
