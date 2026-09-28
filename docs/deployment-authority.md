@@ -298,6 +298,15 @@ continuity restart does not fetch a branch, rebuild, rerun a migration, alter
 the launch contract, or consume the deployment brake. An explicit lifecycle
 brake may suspend this actuation without changing deployment authority.
 
+An Expected digest stays stable across continuity restarts, so the current
+activation at that projection key can be newer than the activation cached in an
+older admitted-generation receipt. During post-fencing rollback, Idunn first
+stops the candidate and withdraws the lease. It then verifies any current
+projected activation against Idunn's own trust anchor and the exact Expected
+record, refuses if a projected write lease remains, and demotes the projection
+to Expected-only. The admitted receipt does not overwrite a newer signed
+activation, and no operator edits the CultCache projection by hand.
+
 Idunn starts and recovers from its own durable admitted state. Odin is the first
 managed semantic daemon, never an Idunn bootstrap dependency. Odin's initial
 admission is the sole graph-bootstrap exception: Idunn uses its root-admitted
