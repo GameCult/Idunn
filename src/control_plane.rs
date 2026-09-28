@@ -3645,38 +3645,19 @@ impl Engine {
             .context("routed admitted generation has no operator route binding")?;
         let driver = NginxRouteDriver::new(route_binding);
 
-        let membership_is_exact =
-            driver.observe_membership(&current.value.expected, &observation.membership_sha256)?;
         let now = now_millis()?;
-        if membership_is_exact
+        if driver.observe_membership(&current.value.expected, &observation.membership_sha256)?
             && route_observation_is_current(
                 observation.observed_at_unix_millis,
                 now,
                 self.options.topology_maximum_age_millis,
                 self.options.topology_maximum_future_skew_millis,
             )
-            && current.value.route_repair_started_at_unix_millis.is_none()
         {
             return Ok(false);
         }
-        if current.value.route_repair_started_at_unix_millis.is_none() {
-            let mut next = current.value.clone();
-            next.route_repair_started_at_unix_millis = Some(now);
-            next.validate()?;
-            ensure!(
-                SingleFileMessagePackBackingStore::new(&self.options.state_store)
-                    .compare_exchange(
-                        &[CultCacheExpectedEnvelope {
-                            r#type: AdmittedGeneration::TYPE.into(),
-                            key: current.value.target.clone(),
-                            current: Some(current.envelope.clone()),
-                        }],
-                        &[admitted_envelope(&next, now)?],
-                    )?,
-                "admitted generation changed before route repair intent CAS"
-            );
-            return Ok(true);
-        }
+        // Actuates only when the fragment on disk differs from the admitted
+        // membership; an exact fragment makes this a no-op.
         driver
             .restore_admitted_membership(&current.value.expected, &observation.membership_sha256)?;
         let authority = self.runtime_authority_parts(
