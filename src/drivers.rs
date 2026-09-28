@@ -6,7 +6,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cultcache_rs::{
@@ -696,6 +696,8 @@ pub struct RouteSnapshotResponse {
 }
 
 const ROUTE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
+const ROUTE_CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(2);
+const ROUTE_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const ROUTE_SNAPSHOT_MAX_BYTES: usize = 1024 * 1024;
 const ROUTE_HTTP_MAX_HEADER_BYTES: usize = 32 * 1024;
 const ROUTE_HTTP_SNAPSHOT_PATH: &str = "/cultnet/snapshot";
@@ -5600,7 +5602,7 @@ impl NginxRouteDriver {
 }
 
 fn request_tcp_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
-    let mut stream = TcpStream::connect_timeout(&target, ROUTE_SNAPSHOT_TIMEOUT)
+    let mut stream = connect_route_socket(target)
         .with_context(|| format!("connecting stable CultNet TCP route {target}"))?;
     stream.set_read_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))?;
     stream.set_write_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))?;
@@ -5624,7 +5626,7 @@ fn request_tcp_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
-    let mut stream = TcpStream::connect_timeout(&target, ROUTE_SNAPSHOT_TIMEOUT)
+    let mut stream = connect_route_socket(target)
         .with_context(|| format!("connecting stable CultNet HTTP route {target}"))?;
     stream.set_read_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))?;
     stream.set_write_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))?;
@@ -5696,6 +5698,25 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> 
         "stable CultNet HTTP response body differs from its bounded Content-Length"
     );
     Ok(response[header_end..].to_vec())
+}
+
+/// nginx reload is signal-driven: `systemctl reload` can return before its
+/// replacement workers bind a newly admitted stable endpoint. Retry only the
+/// refused TCP connect during that bounded handoff window. Once connected, the
+/// caller still requires the normal exact signed route challenge.
+fn connect_route_socket(target: SocketAddr) -> std::io::Result<TcpStream> {
+    let deadline = Instant::now() + ROUTE_CONNECT_RETRY_WINDOW;
+    loop {
+        match TcpStream::connect_timeout(&target, ROUTE_SNAPSHOT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if error.kind() == ErrorKind::ConnectionRefused && Instant::now() < deadline =>
+            {
+                thread::sleep(ROUTE_CONNECT_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn exact_route_snapshot_response(
@@ -8058,6 +8079,27 @@ fn apply_identity(command: &mut Command, identity: Option<ProcessIdentity>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_connect_retries_connection_refused_until_listener_is_ready() -> Result<()> {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = reservation.local_addr()?;
+        drop(reservation);
+
+        let server = thread::spawn(move || -> std::io::Result<()> {
+            thread::sleep(Duration::from_millis(75));
+            let listener = std::net::TcpListener::bind(address)?;
+            let (_stream, _) = listener.accept()?;
+            Ok(())
+        });
+
+        let stream = connect_route_socket(address)?;
+        drop(stream);
+        server
+            .join()
+            .map_err(|_| anyhow!("route readiness test server panicked"))??;
+        Ok(())
+    }
 
     /// Admission audit, claim 3: `is_permanently_stopped` now lets the
     /// Isolation gate skip `prove_isolation` against the incumbent. Enumerate
