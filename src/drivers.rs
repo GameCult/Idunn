@@ -3858,9 +3858,78 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
                 .collect::<Vec<_>>(),
             &prior.parent_only_file_descriptors,
         )?;
+        if observed != *prior {
+            let mut changed_fields = Vec::new();
+            macro_rules! record_changed_fields {
+                ($($field:ident),+ $(,)?) => {
+                    $(
+                        if observed.$field != prior.$field {
+                            changed_fields.push(stringify!($field));
+                        }
+                    )+
+                };
+            }
+            record_changed_fields!(
+                unit,
+                unit_description,
+                invocation_id,
+                exec_main_start_timestamp_monotonic,
+                service_type,
+                restart_policy,
+                kill_mode,
+                dynamic_user,
+                systemd_user,
+                systemd_group,
+                supplementary_groups,
+                capability_bounding_set,
+                ambient_capabilities,
+                private_mounts,
+                private_pids,
+                protect_proc,
+                proc_subset,
+                no_new_privileges,
+                umask,
+                inaccessible_paths,
+                load_credential,
+                main_pid,
+                process_start_time,
+                process_uids,
+                process_gids,
+                process_groups,
+                process_cap_inheritable,
+                process_cap_permitted,
+                process_cap_effective,
+                process_cap_bounding,
+                process_cap_ambient,
+                process_no_new_privileges,
+                process_namespace_pids,
+                mount_namespace_id,
+                pid_namespace_id,
+                executable,
+                executable_device,
+                executable_inode,
+                executable_sha256,
+                runtime_instance_id,
+                working_directory,
+                runtime_bundle,
+                command_line_sha256,
+                environment_names,
+                environment_contract_sha256,
+                control_group,
+                credentials_directory,
+                parent_only_file_descriptors,
+                activation_signer_identity_id,
+                activation_signer_public_key,
+                service_credentials,
+            );
+            bail!(
+                "native workload identity changed after observation: {}",
+                changed_fields.join(", ")
+            );
+        }
         ensure!(
-            observed == *prior && observed.executable_sha256 == expected.artifact_sha256,
-            "native workload identity changed after observation"
+            observed.executable_sha256 == expected.artifact_sha256,
+            "native workload executable differs from the sealed artifact"
         );
         let credential_source = self.activation_credential_source(activation)?;
         remove_activation_credential_source(&credential_source)
