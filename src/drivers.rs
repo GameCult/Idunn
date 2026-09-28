@@ -488,6 +488,9 @@ pub struct SystemdWorkloadObservation {
     pub runtime_instance_id: String,
     pub working_directory: PathBuf,
     pub runtime_bundle: PathBuf,
+    /// Initial ExecStart evidence. Node runtimes may rewrite argv through
+    /// `process.title`, so this is validated at launch but is not incarnation
+    /// identity after the process starts.
     pub command_line_sha256: String,
     pub environment_names: Vec<String>,
     pub environment_contract_sha256: String,
@@ -2407,7 +2410,7 @@ pub struct SystemdTransientWorkloadDriver {
     pub credential_root: PathBuf,
 }
 
-fn changed_systemd_workload_fields(
+fn changed_systemd_workload_identity_fields(
     observed: &SystemdWorkloadObservation,
     prior: &SystemdWorkloadObservation,
 ) -> Vec<&'static str> {
@@ -2464,7 +2467,6 @@ fn changed_systemd_workload_fields(
         runtime_instance_id,
         working_directory,
         runtime_bundle,
-        command_line_sha256,
         environment_names,
         environment_contract_sha256,
         control_group,
@@ -3928,10 +3930,11 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
                 .collect::<Vec<_>>(),
             &prior.parent_only_file_descriptors,
         )?;
-        if observed != *prior {
+        let changed_fields = changed_systemd_workload_identity_fields(&observed, prior);
+        if !changed_fields.is_empty() {
             bail!(
                 "native workload identity changed after observation: {}",
-                changed_systemd_workload_fields(&observed, prior).join(", ")
+                changed_fields.join(", ")
             );
         }
         ensure!(
@@ -3956,7 +3959,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
             &prior.parent_only_file_descriptors,
         )?;
         ensure!(
-            after_unlink == observed,
+            changed_systemd_workload_identity_fields(&after_unlink, &observed).is_empty(),
             "native workload identity changed after recovered credential cleanup"
         );
         Ok(WorkloadObservation::Systemd(after_unlink))
@@ -3998,10 +4001,12 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
                     .collect::<Vec<_>>(),
                 &observation.parent_only_file_descriptors,
             )?;
-            if current != *observation {
+            let changed_fields =
+                changed_systemd_workload_identity_fields(&current, observation);
+            if !changed_fields.is_empty() {
                 bail!(
                     "refusing to stop a workload whose native identity changed: {}",
-                    changed_systemd_workload_fields(&current, observation).join(", ")
+                    changed_fields.join(", ")
                 );
             }
         } else {
@@ -8210,15 +8215,17 @@ mod tests {
     }
 
     #[test]
-    fn workload_identity_diagnostic_names_only_changed_fields() {
+    fn workload_identity_ignores_mutable_argv_but_names_real_identity_drift() {
         let prior = systemd_audit_observation("no", 61_000);
         let mut observed = prior.clone();
-        observed.main_pid += 1;
         observed.command_line_sha256 = format!("sha256-{}", "f".repeat(64));
+        assert!(changed_systemd_workload_identity_fields(&observed, &prior).is_empty());
+
+        observed.main_pid += 1;
 
         assert_eq!(
-            changed_systemd_workload_fields(&observed, &prior),
-            vec!["main_pid", "command_line_sha256"]
+            changed_systemd_workload_identity_fields(&observed, &prior),
+            vec!["main_pid"]
         );
     }
 
