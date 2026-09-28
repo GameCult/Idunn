@@ -147,3 +147,7 @@ builds on a Windows host with the stable toolchain and runs on Raven; it is
 not built on yggdrasil. The library compiles on both; unix-only code is
 `cfg(unix)`, and the Linux-shaped test fixtures pass on a Windows checkout
 except the one parent-only-descriptor test.
+
+Invoke Cargo directly as the container command or through a non-login shell.
+A login shell can reset `PATH` and hide the Rust toolchain installed in the
+build image.
