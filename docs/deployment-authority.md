@@ -312,6 +312,12 @@ observation own current workload health. Historical receipts do not expire
 merely because their provider remains admitted longer than the observation
 window.
 
+A failed continuity restart leaves its own candidate activation projected under
+the shared Expected key. Its abort demotes that key to Expected-only with the
+exact activation the transaction issued, so the projection never drifts from the
+admitted receipt. Rollback after fencing demotes the admitted generation's exact
+activation. No path adopts an activation the transaction did not issue.
+
 Idunn starts and recovers from its own durable admitted state. Odin is the first
 managed semantic daemon, never an Idunn bootstrap dependency. Odin's initial
 admission is the sole graph-bootstrap exception: Idunn uses its root-admitted

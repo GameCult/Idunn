@@ -795,6 +795,22 @@ impl DeploymentTransaction {
         Ok(transaction)
     }
 
+    /// Whether an abort owes the projection a reconciliation. A deployment
+    /// published its own Expected key. A continuity shares the admitted key,
+    /// whose Expected is never withdrawn, so it owes only the demotion of the
+    /// activation it issued.
+    fn abort_topology_reconciliation(&self) -> CleanupEvidence {
+        let owes = match self.command_kind {
+            CommandKind::Deploy => self.expected_publication_sha256.is_some(),
+            CommandKind::Continuity => self.activation.is_some(),
+        };
+        if owes {
+            CleanupEvidence::Pending
+        } else {
+            CleanupEvidence::Skipped
+        }
+    }
+
     fn rejected(command: &DeploymentCommand, error: anyhow::Error, now: u64) -> Result<Self> {
         let mut transaction = Self::new(command, command.selector.clone(), 0, None, now)?;
         let detail = truncate(&format!("{error:#}"), 2048);
@@ -1013,15 +1029,18 @@ impl DeploymentTransaction {
                 ),
                 "abort candidate cleanup differs from its prepared activation"
             );
-            let topology_cleanup_required = self.command_kind == CommandKind::Deploy
-                && self.expected_publication_sha256.is_some();
             ensure!(
                 matches!(
-                    (topology_cleanup_required, abort.topology_reconciliation),
-                    (true, CleanupEvidence::Pending | CleanupEvidence::Complete)
-                        | (false, CleanupEvidence::Skipped)
+                    (
+                        self.abort_topology_reconciliation(),
+                        abort.topology_reconciliation
+                    ),
+                    (
+                        CleanupEvidence::Pending,
+                        CleanupEvidence::Pending | CleanupEvidence::Complete
+                    ) | (CleanupEvidence::Skipped, CleanupEvidence::Skipped)
                 ),
-                "abort topology cleanup differs from published deployment Expected"
+                "abort topology cleanup differs from what the transaction projected"
             );
             ensure!(
                 matches!(
@@ -5819,13 +5838,7 @@ impl Engine {
                 current.value.activation.is_some(),
                 current.value.workload.is_some(),
             ),
-            topology_reconciliation: if current.value.command_kind == CommandKind::Deploy
-                && current.value.expected_publication_sha256.is_some()
-            {
-                CleanupEvidence::Pending
-            } else {
-                CleanupEvidence::Skipped
-            },
+            topology_reconciliation: current.value.abort_topology_reconciliation(),
             source_cleanup: if current.value.command_kind == CommandKind::Deploy {
                 CleanupEvidence::Pending
             } else {
@@ -5947,26 +5960,27 @@ impl Engine {
             });
         }
         if abort.topology_reconciliation == CleanupEvidence::Pending {
-            let expected = required(&current.value.expected, "failed Expected projection")?;
             let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-            // The failed candidate's records go, under its own key. Fencing
-            // stopped the incumbent and revoked its lease, so the incumbent is
-            // demoted to Expected-only under its key, which is what lets
-            // continuity bring it back; deployment does not restart it here.
+            // The failed candidate's projection is resolved first. For a
+            // deployment, fencing also stopped the incumbent and revoked its
+            // lease, so the incumbent is demoted to Expected-only under its
+            // key with its own exact activation, which is what lets
+            // continuity bring it back. A continuity candidate is the
+            // incumbent's key: it has nothing further to demote.
             let topology = self.topology();
             let failed_provider_anchor = self.provider_anchor_for_plan(required(
                 &current.value.plan,
                 "failed transaction plan",
             )?)?;
-            topology
-                .withdraw_incarnation(
-                    expected,
-                    &failed_provider_anchor,
-                    current.value.activation.as_ref(),
-                    None,
-                )
-                .context("withdrawing the failed candidate projection")?;
-            if let Some(incumbent) = self.exact_incumbent(&snapshot, &current.value)? {
+            reconcile_failed_candidate_projection(
+                &topology,
+                &current.value,
+                &failed_provider_anchor,
+            )?;
+            if let Some(incumbent) = self
+                .exact_incumbent(&snapshot, &current.value)?
+                .filter(|_| current.value.command_kind == CommandKind::Deploy)
+            {
                 let admitted_provider_anchor =
                     self.provider_anchor_for_plan(&incumbent.value.plan)?;
                 let expected_sha256 = topology.demote_to_expected_only(
@@ -6042,22 +6056,17 @@ impl Engine {
             });
         }
         if abort.topology_reconciliation == CleanupEvidence::Pending {
-            let expected = required(&current.value.expected, "failed Expected projection")?;
-            // Before fencing the incumbent was never touched: it is still
-            // running under its own key with its activation and lease. Only the
-            // failed candidate's records are withdrawn. The incumbent's
-            // projection is not demoted -- doing so would tell a live process
-            // it has no activation.
+            // Before fencing a deployment never touched its incumbent: it is
+            // still running under its own key with its activation and lease,
+            // so only the candidate's records are withdrawn. A continuity
+            // candidate shares the admitted key and demotes what it issued.
             let plan = required(&current.value.plan, "failed transaction plan")?;
             let provider_anchor = self.provider_anchor_for_plan(plan)?;
-            self.topology()
-                .withdraw_incarnation(
-                    expected,
-                    &provider_anchor,
-                    current.value.activation.as_ref(),
-                    None,
-                )
-                .context("withdrawing exact failed Expected projection")?;
+            reconcile_failed_candidate_projection(
+                &self.topology(),
+                &current.value,
+                &provider_anchor,
+            )?;
             return self.persist_same_phase(current, |next| {
                 next.pre_fencing_abort
                     .as_mut()
@@ -6184,6 +6193,37 @@ fn provider_warming_advanced(
         && candidate_signed_presence_sha256 != prior_signed_presence_sha256
 }
 
+/// Resolve the projection a failed candidate left. A deployment candidate owns
+/// its own incarnation key and withdraws it whole. A continuity candidate
+/// shares the admitted key: the admitted Expected is never withdrawn, and the
+/// only thing demoted is the activation this transaction issued, exactly.
+fn reconcile_failed_candidate_projection(
+    topology: &CultCacheTopologyDriver,
+    transaction: &DeploymentTransaction,
+    provider_anchor: &ServiceIdentityTrustAnchor,
+) -> Result<()> {
+    let expected = required(&transaction.expected, "failed Expected projection")?;
+    match transaction.command_kind {
+        CommandKind::Deploy => topology
+            .withdraw_incarnation(
+                expected,
+                provider_anchor,
+                transaction.activation.as_ref(),
+                None,
+            )
+            .context("withdrawing the failed candidate projection"),
+        CommandKind::Continuity => topology
+            .demote_to_expected_only(
+                expected,
+                provider_anchor,
+                required(&transaction.activation, "failed continuity activation")?,
+                None,
+            )
+            .map(drop)
+            .context("demoting the failed continuity activation"),
+    }
+}
+
 fn may_rollback_route_after_failed_proof(fencing: &FencingEvidence) -> bool {
     matches!(fencing, FencingEvidence::SkippedStateless)
 }
@@ -6223,13 +6263,7 @@ fn post_fencing_abort_intent(
             transaction.activation.is_some(),
             transaction.workload.is_some(),
         ),
-        topology_reconciliation: if transaction.command_kind == CommandKind::Deploy
-            && transaction.expected_publication_sha256.is_some()
-        {
-            CleanupEvidence::Pending
-        } else {
-            CleanupEvidence::Skipped
-        },
+        topology_reconciliation: transaction.abort_topology_reconciliation(),
         source_cleanup: if transaction.command_kind == CommandKind::Deploy {
             CleanupEvidence::Pending
         } else {
@@ -8294,5 +8328,207 @@ mod tests {
                 gid: 1002
             })
         );
+    }
+    /// The persisted projection a continuity restart leaves behind, read at
+    /// the file the daemon writes.
+    struct ContinuityProjection {
+        _temp: TempDir,
+        topology: CultCacheTopologyDriver,
+        provider_anchor: ServiceIdentityTrustAnchor,
+        expected: IdunnExpectedIncarnationRecord,
+        admitted_activation: IdunnRuntimeActivationRecord,
+        candidate_activation: IdunnRuntimeActivationRecord,
+    }
+
+    impl ContinuityProjection {
+        /// The production sequence: the admitted incarnation dies and is
+        /// demoted to Expected-only, then the continuity candidate publishes
+        /// its own activation under the same key once it is observed.
+        fn after_candidate_observed() -> Result<Self> {
+            let temp = TempDir::new()?;
+            let root = temp.path();
+            let idunn = enroll_service_identity_at::<IdunnServiceIdentity>(&root.join("idunn.cc"))?;
+            let provider = enroll_service_identity_at::<GameCultProviderHealthIdentity>(
+                &root.join("provider.cc"),
+            )?;
+            let provider_anchor = provider.trust_anchor()?;
+            let mut expected = TopologyFixture::new("ghostlight")?.expected;
+            expected.expected_signer_identity_id = provider.entry().identity_id.clone();
+            expected.artifact_sha256 = sha256_id(&[1]);
+            expected.validate()?;
+            let topology = CultCacheTopologyDriver {
+                projection_store: root.join("topology.cc"),
+                correlation_store: root.join("correlation.cc"),
+            };
+            let admitted = workload(1, 40, 50);
+            let candidate = workload(2, 41, 51);
+            let issue = |observation: &WorkloadObservation| -> Result<_> {
+                Ok(IdunnRuntimeActivationLaunch::issue(
+                    &expected,
+                    observation.runtime_instance_id().to_owned(),
+                    NOW,
+                    &idunn,
+                )?
+                .activation()
+                .clone())
+            };
+            let admitted_activation = issue(&admitted)?;
+            let candidate_activation = issue(&candidate)?;
+            assert_ne!(admitted_activation, candidate_activation);
+
+            topology.publish_expected(&expected, &provider_anchor)?;
+            topology.publish_observed_activation(&expected, &admitted_activation, &admitted)?;
+            topology.demote_to_expected_only(
+                &expected,
+                &provider_anchor,
+                &admitted_activation,
+                None,
+            )?;
+            topology.publish_expected(&expected, &provider_anchor)?;
+            topology.publish_observed_activation(&expected, &candidate_activation, &candidate)?;
+            Ok(Self {
+                _temp: temp,
+                topology,
+                provider_anchor,
+                expected,
+                admitted_activation,
+                candidate_activation,
+            })
+        }
+
+        fn continuity_transaction(&self) -> Result<DeploymentTransaction> {
+            let mut transaction = DeploymentTransaction::new(
+                &command(CommandKind::Continuity),
+                "ghostlight".into(),
+                0,
+                None,
+                100,
+            )?;
+            transaction.expected = Some(self.expected.clone());
+            transaction.activation = Some(self.candidate_activation.clone());
+            Ok(transaction)
+        }
+
+        /// Types of the records projected under the shared incarnation key.
+        fn projected_types(&self) -> Result<Vec<String>> {
+            let key = incarnation_key(&self.expected)?;
+            Ok(
+                SingleFileMessagePackBackingStore::new(&self.topology.projection_store)
+                    .pull_all_read_only_snapshot()?
+                    .into_iter()
+                    .filter(|entry| entry.key == key)
+                    .map(|entry| entry.r#type)
+                    .collect(),
+            )
+        }
+    }
+
+    #[test]
+    fn a_failed_continuity_demotes_its_own_activation_and_keeps_the_expected() -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        assert!(
+            world
+                .projected_types()?
+                .contains(&IdunnRuntimeActivationRecord::TYPE.to_owned())
+        );
+        let transaction = world.continuity_transaction()?;
+        assert_eq!(
+            transaction.abort_topology_reconciliation(),
+            CleanupEvidence::Pending
+        );
+        assert_eq!(
+            post_fencing_abort_intent(&transaction, "candidate died").topology_reconciliation,
+            CleanupEvidence::Pending
+        );
+
+        reconcile_failed_candidate_projection(
+            &world.topology,
+            &transaction,
+            &world.provider_anchor,
+        )?;
+
+        assert_eq!(
+            world.projected_types()?,
+            vec![IdunnExpectedIncarnationRecord::TYPE.to_owned()],
+            "the shared key must keep its Expected and nothing else"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_continuity_that_issued_no_activation_owes_no_projection_change() -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        let mut transaction = world.continuity_transaction()?;
+        transaction.activation = None;
+        assert_eq!(
+            transaction.abort_topology_reconciliation(),
+            CleanupEvidence::Skipped
+        );
+        assert_eq!(
+            post_fencing_abort_intent(&transaction, "candidate never started")
+                .topology_reconciliation,
+            CleanupEvidence::Skipped
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deploy_fencing_after_a_failed_continuity_resolves_with_the_admitted_activation()
+    -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        reconcile_failed_candidate_projection(
+            &world.topology,
+            &world.continuity_transaction()?,
+            &world.provider_anchor,
+        )?;
+        let settled = std::fs::read(&world.topology.projection_store)?;
+
+        // The deploy's post-fence rollback demotes the admitted generation's
+        // exact activation. The failed continuity left nothing standing, so it
+        // resolves instead of refusing as substituted.
+        world.topology.demote_to_expected_only(
+            &world.expected,
+            &world.provider_anchor,
+            &world.admitted_activation,
+            None,
+        )?;
+        assert_eq!(std::fs::read(&world.topology.projection_store)?, settled);
+        Ok(())
+    }
+
+    #[test]
+    fn no_path_adopts_an_activation_the_transaction_did_not_issue() -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        let before = std::fs::read(&world.topology.projection_store)?;
+
+        // The candidate's activation is still projected. The admitted
+        // generation's exact activation is not what stands there, so its
+        // demotion refuses rather than taking the newer one.
+        assert!(
+            world
+                .topology
+                .demote_to_expected_only(
+                    &world.expected,
+                    &world.provider_anchor,
+                    &world.admitted_activation,
+                    None,
+                )
+                .is_err()
+        );
+
+        // Nor may a continuity transaction demote an activation it did not
+        // issue.
+        let mut foreign = world.continuity_transaction()?;
+        foreign.activation = Some(world.admitted_activation.clone());
+        assert!(
+            reconcile_failed_candidate_projection(
+                &world.topology,
+                &foreign,
+                &world.provider_anchor
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&world.topology.projection_store)?, before);
+        Ok(())
     }
 }
