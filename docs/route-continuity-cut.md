@@ -37,6 +37,33 @@ transactions of routed targets with no Odin declaration (operator approved, 2026
 - Still open, for a fresh Hands: three survivors (boot re-proof by tag, config error as silence, first-Odin
   check by name) and `cargo mutants --in-diff`.
 
+**Live store, read-only decode of a copy, 2026-09-30 14:56 (operator-approved).**
+- `control.cc` holds 5 envelopes, all `admitted_generation.v2` (pre-F0), and **no transactions**.
+- `history.cc` holds 957 transaction v3 envelopes and 641 command v2 envelopes.
+- Admitted generations, all on Odin receipts:
+  - ghostlight: routed, declares Odin, stateful.
+  - odin: routed rudp, provides the rendezvous.
+  - raven-muninn: unrouted, no declaration, stateless. B3 class `Undeclared`, so **held**.
+  - streampixels-service: routed, declares Odin, stateful.
+  - streampixels-web: routed, declares Odin, needs `streampixels.service.api`.
+- **Heimdall is not admitted.** It drops out of the ship window. Its declaring recipe still merges. Its
+  first deploy will hit Soul pass 2's F2: a routed, Odin-correlated target must pass the stable-route
+  proof, and Heimdall answers no challenge. Record that for its own deploy.
+
+**B3 pass 2 (Soul, 86ee21d):** safe for the web ship. One same-window blocker:
+- **F1:** supervision mints a held continuity over a dead held generation, and that continuity owns the
+  target, so the declaring redeploy can never freeze. The fix is in Hands.
+- F5, bad answers read as Silent over HTTP keep-alive and TCP, is in the same batch.
+
+**Ship sequence:**
+1. B3 fix, then narrow Soul, then merge B3.
+2. Merge StreamPixels `route/s3-c2` and the Muninn and Heimdall `route/b3-declare` recipes.
+3. Build the Idunn release on its deploy path.
+4. Back up `control.cc` and `history.cc`. F0's lift is irreversible.
+5. Install Idunn.
+6. `idunn up` raven-muninn with the declaring recipe.
+7. `idunn up` streampixels (service, then web).
+
 **Rulings, 2026-09-30:**
 - A stored record whose evidence disagrees with its declared class is **held and reported, never aborted**
   by Idunn. B5's deadlines or the operator resolve it.
