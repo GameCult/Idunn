@@ -305,11 +305,11 @@ layer must call `.ps1` launchers directly instead of `cmdPath` trampolines.
 Those three live Raven tasks have been repaired and verified. The repair
 actuator now uploads its Raven PowerShell body with `sftp` and runs a tiny
 cleanup wrapper, so the hidden-task repair does not hit Windows command-line
-limits before it can run. The long-running Muninn serve bodies on Raven,
-Nightwing, and Starfire now also carry their own `--idunn-rudp-health`,
-`--idunn-daemon`, and `--idunn-health-contract` arguments, and live Idunn
-accepts those daemon-owned health records directly instead of relying on
-one-shot health commands for the truth.
+limits before it can run. The Muninn serve bodies no longer publish a
+daemon-health document: `--idunn-rudp-health`, `--idunn-daemon` and
+`--idunn-health-contract` are retired flags that the binary rejects. Raven's
+liveness is Odin-correlated runtime presence; Starfire and Nightwing are
+checked by their `scripts/health-*-muninn.ps1` witness scripts.
 
 From here on out, the work is not "teach another daemon to speak." It is
 "delete the witness masks and keep ownership where it belongs."
