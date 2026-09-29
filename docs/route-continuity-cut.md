@@ -55,6 +55,20 @@ transactions of routed targets with no Odin declaration (operator approved, 2026
   target, so the declaring redeploy can never freeze. The fix is in Hands.
 - F5, bad answers read as Silent over HTTP keep-alive and TCP, is in the same batch.
 
+**Odin diagnosis (Eyes, read-only, 2026-09-30).**
+- The 109 Odin route timeouts are self-inflicted. Live Idunn (`8ae00a1`, pre-S1) reloads nginx inside
+  `restore_admitted_membership` before every Odin challenge. The reload moves the reuseport UDP flow, so
+  the challenge misses. All 109 have a reload 3.05-3.12 s before them.
+- 2,977 reloads in 6 h. 479 shutting-down nginx workers, because the stream has no `proxy_timeout`.
+- The route timeouts do not block Ready correlation.
+- Odin has crashed twice right after a reload. A stray RUDP packet with a foreign connection id escapes
+  `cultnet-rs` `rudp.rs:1217` (`require_connection`) and ends the process. Each crash costs about 75 s
+  without a lease. The CultLib fix is in Hands on `hands/rudp-stray-packets`. Odin takes it at its next pin
+  bump, after the ship.
+
+**Operator ruling: Idunn first.** Install the new Idunn (B3 carries S1), then watch for about 15 minutes that
+reloads stop and Odin stays up. Only then redeploy raven-muninn and StreamPixels.
+
 **Ship sequence:**
 1. B3 fix, then narrow Soul, then merge B3.
 2. Merge StreamPixels `route/s3-c2` and the Muninn and Heimdall `route/b3-declare` recipes.
