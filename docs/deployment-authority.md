@@ -314,9 +314,19 @@ window.
 
 A failed continuity restart leaves its own candidate activation projected under
 the shared Expected key. Its abort demotes that key to Expected-only with the
-exact activation the transaction issued, so the projection never drifts from the
-admitted receipt. Rollback after fencing demotes the admitted generation's exact
-activation. No path adopts an activation the transaction did not issue.
+exact activation the transaction issued. Rollback after fencing demotes the
+admitted generation's exact activation. No path adopts an activation the
+transaction did not issue.
+
+A projection can still hold an activation the abort never resolved: a failure
+between preparing a candidate and publishing its observation, an abort written
+by an earlier Idunn, or an operator edit. Continuity therefore restarts a
+generation only from an Expected-only projection: when its own demotion is
+refused it mints no restart, records the deferral in the generation's
+continuity backoff, and tries again after it. At boot, Idunn demotes an
+activation still projected for a failed continuity in history, by that
+transaction's exact activation, and only reports one no failed transaction
+issued.
 
 Idunn starts and recovers from its own durable admitted state. Odin is the first
 managed semantic daemon, never an Idunn bootstrap dependency. Odin's initial

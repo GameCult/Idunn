@@ -4488,6 +4488,22 @@ impl CultCacheTopologyDriver {
         )
     }
 
+    /// The activation the projection currently names under this incarnation's
+    /// key, if any. Read-only: it never judges whether the activation is the
+    /// right one, so a caller can tell an exact issuer from a substitute
+    /// before it demotes anything.
+    pub fn projected_activation(
+        &self,
+        expected: &IdunnExpectedIncarnationRecord,
+    ) -> Result<Option<IdunnRuntimeActivationRecord>> {
+        let key = incarnation_key(expected)?;
+        let entries = self.snapshot()?;
+        projection_entry(&entries, IdunnRuntimeActivationRecord::TYPE, &key)?
+            .map(|envelope| IdunnRuntimeActivationRecord::decode_canonical(&envelope.payload))
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Every incarnation currently projected for one target, by its Expected.
     pub fn projected_incarnations(
         &self,
