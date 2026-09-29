@@ -99,6 +99,33 @@ Nothing is fenced, so the incumbent is untouched.
   <blob>". The fix, with a test, is in Hands on `fix/bulk-blob-fetch`: a promisor-style fetch with
   `--filter=blob:none` and `fetch.negotiationAlgorithm=noop`.
 
+**Ship completed, 2026-09-29 (host clock).**
+- **Bulk-fetch fix.** Merged at `583b2a7` and installed at 19:17. The Idunn sha is `01bde676`.
+- **The first streampixels-service redeploy failed after fencing.** The incumbent was restored, and every restart
+  was refused by Odin with "runtime presence publisher sequence was reordered". Cause: Odin compared publisher
+  sequences across incarnations, and the TS publisher counts from 1 per process.
+  - The operator ruled: fix Odin's rule.
+  - Odin `db041ec` compares sequences only while the stored presence still authenticates under the current
+    activation. Soul said deploy, with follow-ups; Odin was deployed at 19:4x.
+- **Admissions.**
+  - streampixels-service was admitted at 19:50 on s3-c2.
+  - The web binding dropped `STREAMPIXELS_ODIN_CULTMESH_RUDP`, and gamecult-ops `37b5ed9` does the same.
+  - streampixels-web was admitted with Odin-free readiness.
+- **Public cutover at 19:54.** The vhost upstreams moved to `:8833` (web) and `:8832` (service). The backup is
+  `/root/streampixels.gamecult.org.conf.bak-20260929-195415-pre-idunn-upstreams`.
+  - `https://streampixels.gamecult.org/api/catalog` returns 200 (120,893 B), after being 502 since migration 013.
+  - The overlay SSE stream answers `text/event-stream`, and the ops checker passes.
+- **Legacy units.** `streampixels-web.service` is disabled and stopped. `streampixels-service.service` is
+  disabled, and was already stopped.
+- **Follow-ups.**
+  - The C2 acceptance hour: sample the nginx reload counter at T0 and T0+60, with no rejected challenges.
+  - Nothing builds the Windows `idunn-host` in verification.
+  - Odin presence: pin the stored-at re-authentication time (Soul's M3 survived), and consider checking activation
+    identity directly rather than any failure to authenticate.
+  - The dead-hold report field (ruled).
+  - B2 rework on B3.
+  - Odin's CultLib pin bump, after the stray-packet merge.
+
 **Ruling, 2026-09-30 (operator): the dead-hold report is stored on the generation.**
 - Add an optional `last_error` to `AdmittedGeneration` (new key 21), and make `status` render admitted
   generations.
