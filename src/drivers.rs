@@ -1133,6 +1133,10 @@ impl GitSourceDriver {
     /// in depth: Git itself refuses a fetched tree with duplicate names
     /// before any of it reaches disk, independent of the explicit `fsck`
     /// call S1 added around the revision this bulk fetch serves.
+    /// The noop negotiation, `--recurse-submodules=no` and explicit
+    /// `--filter=blob:none` are the arguments Git's own lazy fetch uses for a
+    /// promisor remote; without them a hosted origin omits the wanted blob and
+    /// Git's connectivity check fails on the bare blob id.
     fn bulk_fetch_objects(&self, repository: &Path, objects: &[String]) -> Result<()> {
         if objects.is_empty() {
             return Ok(());
@@ -1155,11 +1159,15 @@ impl GitSourceDriver {
         let mut command = self.git_command([
             OsString::from("-c"),
             OsString::from("transfer.fsckObjects=true"),
+            OsString::from("-c"),
+            OsString::from("fetch.negotiationAlgorithm=noop"),
             OsString::from("-C"),
             repository.as_os_str().to_owned(),
             OsString::from("fetch"),
             OsString::from("--no-tags"),
             OsString::from("--no-write-fetch-head"),
+            OsString::from("--recurse-submodules=no"),
+            OsString::from("--filter=blob:none"),
             OsString::from("--stdin"),
             OsString::from("origin"),
         ])?;
