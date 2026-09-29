@@ -1438,6 +1438,18 @@ impl DeploymentTransaction {
         .err()
     }
 
+    /// The disagreement that holds this transaction: evidence collected under
+    /// another class is held and reported, not advanced and not repaired, since
+    /// no step can make it the right kind and running one anyway only fails it
+    /// every tick. What is finished, or being finished (a completion, or an
+    /// abort under way), never reads the class, so it is left to run.
+    fn held_disagreement(&self) -> Option<ReadinessDisagreement> {
+        let finishing = self.completion.is_some()
+            || self.pre_fencing_abort.is_some()
+            || self.post_fencing_abort.is_some();
+        self.readiness_disagreement().filter(|_| !finishing)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == DEPLOYMENT_TRANSACTION_SCHEMA,
@@ -4530,14 +4542,7 @@ impl Engine {
         {
             return Ok(false);
         }
-        // Evidence collected under another class is held and reported, not
-        // advanced and not repaired: no step can make it the right kind, and
-        // running one anyway only fails it every tick. An abort already under
-        // way does not read the class, so it is left to finish.
-        let aborting = current.value.completion.is_some()
-            || current.value.pre_fencing_abort.is_some()
-            || current.value.post_fencing_abort.is_some();
-        if let Some(disagreement) = current.value.readiness_disagreement().filter(|_| !aborting) {
+        if let Some(disagreement) = current.value.held_disagreement() {
             self.note_fault("holds transaction", id, &anyhow::Error::new(disagreement));
             return Ok(false);
         }
@@ -5585,8 +5590,7 @@ impl Engine {
             } else {
                 None
             };
-            let odin_can_observe = !is_odin || odin_observation.is_some();
-            let odin_observes_itself = is_odin && !odin_can_observe;
+            let odin_observes_itself = is_odin && odin_observation.is_none();
             if odin_observes_itself {
                 ensure!(
                     expected.write_lease_required,
@@ -10384,6 +10388,59 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn warming_evidence_is_shape_checked_whatever_its_source() {
+        let good = |evidence: &ReadinessEvidence| match evidence {
+            ReadinessEvidence::RouteProof { evidence } => evidence.clone(),
+            ReadinessEvidence::OdinCorrelated { .. } => unreachable!("a route-proof fixture"),
+        };
+        let presence = good(&route_proof_evidence());
+        for warming in [
+            WarmingEvidence::FirstOdinDirect { evidence: presence.clone() },
+            WarmingEvidence::RouteProofDirect { evidence: presence.clone() },
+            WarmingEvidence::OdinTopology { evidence: topology(3, 1) },
+        ] {
+            warming.validate_shape().expect("well-formed evidence");
+        }
+        let mut damaged = presence;
+        damaged.canonical_bytes.push(1);
+        for warming in [
+            WarmingEvidence::FirstOdinDirect { evidence: damaged.clone() },
+            WarmingEvidence::RouteProofDirect { evidence: damaged },
+            WarmingEvidence::OdinTopology {
+                evidence: TopologyEvidence {
+                    canonical_sha256: "sha256:not-the-digest".into(),
+                    ..topology(3, 1)
+                },
+            },
+        ] {
+            assert!(warming.validate_shape().is_err(), "{warming:?}");
+        }
+    }
+
+    #[test]
+    fn a_presence_disagreement_names_each_disagreement() {
+        let shortfall = PresenceDisagrees {
+            disagreements: vec![
+                OdinTopologyDisagreement {
+                    code: "capacity-below-minimum".into(),
+                    expected: Some("2".into()),
+                    observed: Some("1".into()),
+                },
+                OdinTopologyDisagreement {
+                    code: "state".into(),
+                    expected: None,
+                    observed: None,
+                },
+            ],
+        };
+        assert_eq!(
+            shortfall.to_string(),
+            "route proof answered with a runtime that disagrees with current authority: \
+             capacity-below-minimum (expected 2, observed 1); state (expected none, observed none)"
+        );
+    }
+
     fn route_proof_evidence() -> ReadinessEvidence {
         let canonical_bytes = vec![7, 7, 7];
         ReadinessEvidence::RouteProof {
@@ -11923,6 +11980,51 @@ mod tests {
             .context("commit wrote no admitted generation")?
             .value
             .clone())
+    }
+
+    #[test]
+    fn an_admitted_odin_correlated_generation_takes_a_newer_odin_reading_once() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
+        let first = seeded_sequence(None) + 1;
+        odin_reports_ready(&world, &seeded, first)?;
+        drive(&world, |transaction| transaction.phase == DeploymentPhase::Complete)?;
+        assert!(world.engine.retire_one_terminal_transaction()?);
+        let admitted = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("commit wrote no admitted generation")?
+            .value
+            .clone();
+        assert_eq!(admitted.readiness(), Ok(ReadinessClass::OdinCorrelated));
+        assert_eq!(admitted.odin_publisher_sequence_cursor, first);
+
+        // Nothing newer than what is held: nothing is written.
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        let current = snapshot.admitted_for("service").context("no generation")?;
+        let envelope = current.envelope.clone();
+        assert!(!world.engine.refresh_admitted_topology(&snapshot, current)?);
+        assert_eq!(incumbent_envelope(&world)?, envelope);
+
+        // A newer reading is adopted, once.
+        odin_republishes(&world, &seeded, first + 4)?;
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        let current = snapshot.admitted_for("service").context("no generation")?;
+        assert!(world.engine.refresh_admitted_topology(&snapshot, current)?);
+        let refreshed = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("no generation")?
+            .value
+            .clone();
+        assert_eq!(refreshed.odin_publisher_sequence_cursor, first + 4);
+        assert_eq!(
+            refreshed.latest_odin_observation.as_ref().map(|latest| latest.publisher_sequence),
+            Some(first + 4)
+        );
+        assert_eq!(refreshed.ready.odin().map(|ready| ready.publisher_sequence), Some(first + 4));
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        let current = snapshot.admitted_for("service").context("no generation")?;
+        assert!(!world.engine.refresh_admitted_topology(&snapshot, current)?);
+        Ok(())
     }
 
     /// Change the incumbent in the store, compare-and-swap.
@@ -15083,6 +15185,41 @@ mod tests {
                 "supervision reports the disagreement"
             );
             routed.assert_odin_untouched()?;
+            Ok(())
+        }
+
+        #[test]
+        fn only_a_transaction_that_still_reads_its_class_is_held_for_its_evidence() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            let at_routing = routed.transaction()?;
+            // What pre-B3 Idunn would have collected: an Odin receipt.
+            let mut legacy = at_routing.clone();
+            legacy.ready = Some(ReadinessEvidence::OdinCorrelated {
+                evidence: odin_receipt_for(&routed, &at_routing, 9)?,
+            });
+            let disagreement = legacy.readiness_disagreement();
+            assert!(disagreement.is_some());
+            assert_eq!(legacy.held_disagreement(), disagreement);
+
+            // Finished work, and an abort under way, never read the class.
+            let mut completed = legacy.clone();
+            completed.completion = Some(TransactionCompletion::Admitted {
+                generation_id: "generation-1".into(),
+            });
+            assert_eq!(completed.held_disagreement(), None);
+            let mut aborting = legacy.clone();
+            aborting.pre_fencing_abort = Some(PreFencingAbort {
+                error: "operator abort".into(),
+                candidate_cleanup: CleanupEvidence::Pending,
+                topology_reconciliation: CleanupEvidence::Pending,
+                source_cleanup: CleanupEvidence::Pending,
+            });
+            assert_eq!(aborting.held_disagreement(), None);
+            let mut aborting = legacy;
+            aborting.post_fencing_abort = Some(post_fencing_abort_intent(&aborting, "operator abort"));
+            assert_eq!(aborting.held_disagreement(), None);
             Ok(())
         }
 

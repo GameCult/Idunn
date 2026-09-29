@@ -5468,10 +5468,7 @@ impl NginxRouteDriver {
             .as_ref()
             .context("candidate challenge has no Expected route")
             .map_err(refused)?;
-        ensure_or_refuse(
-            route.route_id == self.binding.route_id,
-            "candidate challenge binding differs from Expected",
-        )?;
+        // Rendering holds the binding to the Expected route, id and endpoints.
         self.render(expected).map_err(refused)?;
         self.request_runtime_presence_at(expected, message_id, &route.candidate_endpoint)
     }
@@ -8206,19 +8203,30 @@ mod tests {
         port: u16,
         adjust: impl FnOnce(&mut IdunnExpectedIncarnationRecord),
     ) -> Result<RouteSnapshotResponse, ChallengeFailure> {
+        challenge_over("http", RouteDriver::NginxStreamTcp, port, adjust)
+    }
+
+    /// The same challenge over another transport: `transport` names both the
+    /// Expected's transport and the endpoint scheme.
+    fn challenge_over(
+        transport: &str,
+        driver: RouteDriver,
+        port: u16,
+        adjust: impl FnOnce(&mut IdunnExpectedIncarnationRecord),
+    ) -> Result<RouteSnapshotResponse, ChallengeFailure> {
         let temp = tempfile::tempdir().expect("a temporary directory");
         let mut candidate = expected();
         candidate.route = Some(cultnet_rs::IdunnExpectedRoute {
             route_id: "service".into(),
-            transport: "http".into(),
-            stable_endpoint: "http://127.0.0.1:17999".into(),
-            candidate_endpoint: format!("http://127.0.0.1:{port}"),
+            transport: transport.into(),
+            stable_endpoint: format!("{transport}://127.0.0.1:17999"),
+            candidate_endpoint: format!("{transport}://127.0.0.1:{port}"),
         });
         adjust(&mut candidate);
         NginxRouteDriver::new(RouteBinding {
-            driver: RouteDriver::NginxStreamTcp,
+            driver,
             route_id: "service".into(),
-            stable_endpoint: "http://127.0.0.1:17999".into(),
+            stable_endpoint: format!("{transport}://127.0.0.1:17999"),
             private_host: "127.0.0.1".into(),
             private_port_start: port,
             private_port_end: port,
@@ -8227,6 +8235,104 @@ mod tests {
         })
         .request_candidate_runtime_presence(&candidate, "candidate-probe")
     }
+    /// A TCP peer that reads one framed snapshot request and writes back the
+    /// bytes `reply` builds from the challenge id, verbatim.
+    fn framed_peer(reply: impl FnOnce(&str) -> Vec<u8> + Send + 'static) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().expect("a bound port").port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut header = [0_u8; 4];
+            if stream.read_exact(&mut header).is_err() {
+                return;
+            }
+            let mut request = vec![0_u8; u32::from_be_bytes(header) as usize];
+            if stream.read_exact(&mut request).is_err() {
+                return;
+            }
+            let Ok(CultNetMessage::SnapshotRequest { message_id, .. }) =
+                decode_cultnet_message_from_slice(&request, CultNetWireContract::CultNetSchemaV0)
+            else {
+                return;
+            };
+            let _ = stream.write_all(&reply(&message_id));
+        });
+        port
+    }
+
+    /// The body of an `honest` HTTP answer, framed for TCP.
+    fn framed_honest(message_id: &str) -> Vec<u8> {
+        let response = honest(message_id);
+        let body = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|end| &response[end + 4..])
+            .expect("an HTTP answer");
+        encode_frame(body).expect("a frame")
+    }
+
+    fn tcp_challenge(port: u16) -> Result<RouteSnapshotResponse, ChallengeFailure> {
+        challenge_over("tcp", RouteDriver::NginxStreamTcp, port, |_| {})
+    }
+
+    #[test]
+    fn a_tcp_challenge_takes_the_exact_framed_answer_and_waits_only_on_silence() {
+        let answer = tcp_challenge(framed_peer(framed_honest)).expect("the exact answer");
+        assert_eq!(answer.message_id, "candidate-probe");
+        assert_eq!(answer.canonical_presence, [1, 2, 3]);
+
+        assert_silent(tcp_challenge(framed_peer(|_| Vec::new())), "a peer that hangs up");
+        assert_silent(
+            tcp_challenge(framed_peer(|_| vec![0, 0, 0, 9, 1])),
+            "a frame that never finishes",
+        );
+
+        // A frame that claims more than the observation bound, or nothing, is
+        // an answer that is wrong, not one that is late.
+        assert_refused(
+            tcp_challenge(framed_peer(|_| {
+                ((ROUTE_SNAPSHOT_MAX_BYTES + 1) as u32).to_be_bytes().to_vec()
+            })),
+            "a frame over the bound",
+        );
+        assert_refused(
+            tcp_challenge(framed_peer(|_| 0_u32.to_be_bytes().to_vec())),
+            "an empty frame",
+        );
+        assert_refused(
+            tcp_challenge(framed_peer(|_| encode_frame(b"not cultnet").expect("a frame"))),
+            "a frame that is not CultNet",
+        );
+    }
+
+    #[test]
+    fn a_rudp_challenge_that_nothing_answers_is_silence() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a free port");
+        let port = socket.local_addr().expect("a bound port").port();
+        // Bound but never read: nothing answers, and nothing refuses either.
+        assert_silent(
+            challenge_over("rudp", RouteDriver::NginxStreamUdp, port, |_| {}),
+            "a rudp peer that never answers",
+        );
+        drop(socket);
+    }
+
+    /// A challenge that cannot be made says why, whatever the message.
+    #[test]
+    fn a_challenge_failure_shows_and_chains_its_cause() {
+        for failure in [
+            silent(anyhow!("cause of silence")),
+            refused(anyhow!("cause of refusal")),
+        ] {
+            let shown = failure.to_string();
+            assert!(shown.starts_with("cause of "), "{shown}");
+            let source = std::error::Error::source(&failure).expect("the underlying error");
+            assert_eq!(source.to_string(), shown);
+        }
+    }
+
 
     fn assert_silent(outcome: Result<RouteSnapshotResponse, ChallengeFailure>, why: &str) {
         assert!(

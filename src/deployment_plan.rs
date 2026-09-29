@@ -1585,12 +1585,14 @@ nodes = ["yggdrasil"]
         let provides_odin = |recipe: &str| {
             recipe.replace("capability = \"service.runtime\"", "capability = \"odin.verse-rendezvous\"")
         };
-        let cases: [(&str, String, &str, Option<u16>, Result<ReadinessClass, ()>); 5] = [
+        let cases: [(&str, String, &str, Option<u16>, Result<ReadinessClass, ()>); 6] = [
             ("depends on Odin, routed", RECIPE.to_owned(), BINDING, Some(18001), Ok(ReadinessClass::OdinCorrelated)),
             ("routed, no Odin", without_odin.clone(), BINDING, Some(18001), Ok(ReadinessClass::RouteProof)),
             ("unrouted, no Odin", unrouted(&without_odin), &unrouted_binding, None, Err(())),
             ("provides Odin, unrouted", provides_odin(&unrouted(&without_odin)), &unrouted_binding, None, Ok(ReadinessClass::OdinSelf)),
             ("depends on Odin, unrouted", unrouted(RECIPE), &unrouted_binding, None, Ok(ReadinessClass::OdinCorrelated)),
+            // Only the shared-infrastructure declaration is the declaration.
+            ("requires the Odin capability, routed", RECIPE.replace("kind = \"shared-infrastructure\"", "kind = \"required\""), BINDING, Some(18001), Ok(ReadinessClass::RouteProof)),
         ];
         for (name, recipe, binding, port, outcome) in cases {
             let providers = [ready_odin_provider("odin", "odin-yggdrasil", 1)];
