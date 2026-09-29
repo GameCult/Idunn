@@ -573,6 +573,19 @@ with no backoff.
 - The lease pickup contract is unchanged.
 - Tests are in the package. Verify under the node image on Yggdrasil.
 
+**C1 status, 2026-09-29 (Self).** Landed on CultLib `idunn-ts/route-c1` (`795fd10`). Soul closed
+it on conditions, and a fix batch is in Hands:
+- stateful, lease-bound Rust vectors;
+- the signer owns health (`reportHealth`), starting at `warming`;
+- the signer records every warming it signs, so a route-proof stateful target can take its lease;
+- one signer per authority, a frozen authority, and a subpath export without the Odin publisher.
+**Two consequences for later cuts:**
+- **C2 covers the StreamPixels service too.** `apps/service/src/app.ts:155` answers route
+  challenges through `publishRouteObservation`, which C1 removed, so the gitlink bump breaks
+  the service unless C2 moves it to `answerRouteObservation` and `reportHealth`.
+- **B3 surfaces the typed capacity shortfall** on the route path. Today it reads as a
+  generic "disagrees with current authority" (`control_plane.rs:5190`).
+
 **C2 — StreamPixels web binding proves invariant 3 end to end (StreamPixels,
 after C1, S3, B3).**
 - Point the gitlink at the C1 commit.
