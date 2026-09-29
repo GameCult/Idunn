@@ -10190,6 +10190,9 @@ mod tests {
         assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
         expected.dependencies.clear();
         assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
+        // Nothing to challenge: only Odin can report on an unrouted target.
+        expected.route = None;
+        assert_eq!(ReadinessClass::of(&expected), ReadinessClass::OdinCorrelated);
         Ok(())
     }
 
@@ -10274,7 +10277,7 @@ mod tests {
             .context("fixture generation has no Odin authority")?;
         let next = AdmittedGeneration::from_transaction(
             &committing,
-            authority.clone(),
+            Some(authority.clone()),
             Some(&incumbent),
             1_700_000_200_000,
         )?;
@@ -10287,7 +10290,7 @@ mod tests {
 
         let first = AdmittedGeneration::from_transaction(
             &committing,
-            authority,
+            Some(authority),
             None,
             1_700_000_200_000,
         )?;
@@ -11077,27 +11080,7 @@ mod tests {
     /// A route-proof generation from a real admission: the world's Expected
     /// declares no Odin dependency, so route proof is its class.
     fn route_proof_generation() -> Result<AdmittedGeneration> {
-        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
-        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
-        odin_reports_ready(&world, &seeded, 5)?;
-        drive(&world, |transaction| {
-            transaction.phase == DeploymentPhase::Committing
-        })?;
-        let mut committing = resident(&world)?.value;
-        assert_eq!(
-            ReadinessClass::of(committing.expected.as_ref().unwrap()),
-            ReadinessClass::RouteProof
-        );
-        committing.ready = Some(route_proof_evidence());
-        committing.latest_odin_observation = None;
-        let generation = AdmittedGeneration::from_transaction(
-            &committing,
-            world.engine.bootstrap_odin_authority.clone(),
-            None,
-            now_millis()?,
-        )?;
-        generation.validate()?;
-        Ok(generation)
+        route_proof::committed_generation()
     }
 
     #[test]
@@ -13264,5 +13247,646 @@ mod tests {
         assert!(!world.engine.supervise_one_admitted_generation()?);
         assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Route-proof readiness: a routed target that declares no Odin dependency
+    // is admitted by Idunn's own challenges. Odin is never read.
+    // ---------------------------------------------------------------------
+    mod route_proof {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        /// The runtime behind both endpoints, answering Idunn's snapshot
+        /// challenge the way the TypeScript signer does: locally, in the
+        /// reported health, with `route-observation:<id>` as the detail.
+        struct RuntimeStub {
+            expected: IdunnExpectedIncarnationRecord,
+            activation: IdunnRuntimeActivationRecord,
+            provider: cultnet_rs::ServiceIdentitySigner<GameCultProviderHealthIdentity>,
+            activation_signer: cultnet_rs::IdunnRuntimeActivationSigner,
+            state: Mutex<&'static str>,
+            capacity: AtomicU32,
+            sequence: AtomicU64,
+            candidate_hits: AtomicUsize,
+            stable_hits: AtomicUsize,
+            stop: AtomicBool,
+        }
+
+        impl RuntimeStub {
+            fn answer(&self, message_id: &str) -> Result<Vec<u8>> {
+                let expected = &self.expected;
+                let mut presence = cultnet_rs::GameCultRuntimePresenceHealthRecord {
+                    schema_version: cultnet_rs::GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into(),
+                    target: expected.target.clone(),
+                    expected_projection_sha256: self.activation.expected_projection_sha256.clone(),
+                    plan_id: expected.plan_id.clone(),
+                    incarnation_id: expected.incarnation_id.clone(),
+                    sealed_release_id: expected.sealed_release_id.clone(),
+                    activation_witness_sha256: self.activation.canonical_sha256()?,
+                    state_schema_generation: expected.state_schema_generation.clone(),
+                    state_contract_sha256: expected.state_contract_sha256.clone(),
+                    runtime_id: expected.runtime_id.clone(),
+                    runtime_instance_id: self.activation.runtime_instance_id.clone(),
+                    bound_endpoint: expected
+                        .route
+                        .as_ref()
+                        .map(|route| route.candidate_endpoint.clone()),
+                    capabilities: expected
+                        .capabilities
+                        .iter()
+                        .map(|capability| cultnet_rs::GameCultRuntimeCapability {
+                            capability: capability.capability.clone(),
+                            schema: capability.schema.clone(),
+                            compatibility: capability.compatibility.clone(),
+                            capacity: self.capacity.load(Ordering::SeqCst),
+                        })
+                        .collect(),
+                    health_contract: expected.health_contract.clone(),
+                    state: (*self.state.lock().unwrap()).into(),
+                    detail: format!("route-observation:{message_id}"),
+                    write_lease_sha256: None,
+                    signer_identity_id: self.provider.entry().identity_id.clone(),
+                    publisher_sequence: self.sequence.fetch_add(1, Ordering::SeqCst) + 1,
+                    observed_at_unix_millis: now_millis()?,
+                    signature_algorithm: "ed25519".into(),
+                    signature: Vec::new(),
+                    activation_signer_identity_id: self.activation_signer.identity_id(),
+                    activation_signature: Vec::new(),
+                };
+                let proof = presence.canonical_proof_payload()?;
+                presence.signature = self
+                    .provider
+                    .sign::<cultnet_rs::GameCultRuntimePresenceHealthPurpose>(&proof)
+                    .signature;
+                presence.activation_signature =
+                    self.activation_signer.sign_presence_proof(&presence)?;
+                Ok(rmp_serde::to_vec(&presence)?)
+            }
+
+            fn set_state(&self, state: &'static str) {
+                *self.state.lock().unwrap() = state;
+            }
+
+            fn serve_one(&self, mut stream: TcpStream) -> Result<()> {
+                stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let (header_end, length) = loop {
+                    let read = stream.read(&mut chunk)?;
+                    ensure!(read > 0, "stub client closed early");
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..index]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .context("stub request has no Content-Length")?
+                            .trim()
+                            .parse::<usize>()?;
+                        if request.len() >= index + 4 + length {
+                            break (index + 4, length);
+                        }
+                    }
+                };
+                let message = cultnet_rs::decode_cultnet_message_from_slice(
+                    &request[header_end..header_end + length],
+                    cultnet_rs::CultNetWireContract::CultNetSchemaV0,
+                )?;
+                let cultnet_rs::CultNetMessage::SnapshotRequest { message_id, .. } = message
+                else {
+                    bail!("stub received something other than a snapshot request");
+                };
+                let response = cultnet_rs::CultNetMessage::SnapshotResponseRaw {
+                    message_id: message_id.clone(),
+                    documents: vec![cultnet_rs::CultNetRawDocumentRecord {
+                        schema_id: cultnet_rs::GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into(),
+                        record_key: self.expected.target.clone(),
+                        stored_at: rfc3339_millis(now_millis()?)?,
+                        payload_encoding: cultnet_rs::CultNetRawPayloadEncoding::Messagepack,
+                        payload: self.answer(&message_id)?,
+                        source_runtime_id: None,
+                        source_agent_id: None,
+                        source_role: None,
+                        tags: None,
+                    }],
+                };
+                let body = cultnet_rs::encode_cultnet_message_to_vec(
+                    &response,
+                    cultnet_rs::CultNetWireContract::CultNetSchemaV0,
+                )?;
+                stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/msgpack\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )?;
+                stream.write_all(&body)?;
+                Ok(())
+            }
+
+            fn listen(self: &Arc<Self>, listener: TcpListener, candidate: bool) {
+                listener.set_nonblocking(true).expect("nonblocking listener");
+                let stub = Arc::clone(self);
+                std::thread::spawn(move || {
+                    while !stub.stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                stream.set_nonblocking(false).ok();
+                                let hits = if candidate {
+                                    &stub.candidate_hits
+                                } else {
+                                    &stub.stable_hits
+                                };
+                                hits.fetch_add(1, Ordering::SeqCst);
+                                let _ = stub.serve_one(stream);
+                            }
+                            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                        }
+                    }
+                });
+            }
+        }
+
+        impl Drop for RuntimeStub {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// Odin, as the world it runs in sees it.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Odin {
+            /// Every read of the correlation store fails.
+            Unreachable,
+            /// Odin publishes a correlation that says the target is not Ready.
+            NotReady,
+        }
+
+        struct RoutedWorld {
+            world: EngineFixture,
+            stub: Arc<RuntimeStub>,
+            odin: Odin,
+            poisoned: Vec<u8>,
+        }
+
+        /// A stateless, routed target that declares no Odin dependency, over
+        /// `minimum_capacity`, seeded at `phase` (Warming or Fencing): its
+        /// Warming evidence, when the phase needs it, is the candidate's own
+        /// answer to a real challenge. Listeners stand at both endpoints.
+        fn routed_world(
+            odin: Odin,
+            minimum_capacity: u32,
+            phase: DeploymentPhase,
+        ) -> Result<RoutedWorld> {
+            use crate::deployment_plan::tests::{
+                BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
+            };
+            let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+            let candidate_listener = TcpListener::bind("127.0.0.1:0")?;
+            let stable_listener = TcpListener::bind("127.0.0.1:0")?;
+            let candidate_port = candidate_listener.local_addr()?.port();
+            let stable_port = stable_listener.local_addr()?.port();
+
+            let provider_path = world.root.join("identities/provider.cc");
+            let provider_anchor = world.root.join("identities/provider-anchor.cc");
+            let provider =
+                enroll_service_identity_at::<GameCultProviderHealthIdentity>(&provider_path)?;
+            export_service_identity_trust_anchor(&provider, &provider_anchor)?;
+            let config = world.root.join("service.conf");
+            let binding = BINDING
+                .replace(
+                    "/etc/gamecult/trust/service.cc",
+                    &provider_anchor.display().to_string(),
+                )
+                .replace("service-runtime-signer", &provider.entry().identity_id)
+                .replace("127.0.0.1:17999", &format!("127.0.0.1:{stable_port}"))
+                .replace(
+                    "private_port_start = 18000",
+                    &format!("private_port_start = {candidate_port}"),
+                )
+                .replace(
+                    "private_port_end = 18009",
+                    &format!("private_port_end = {candidate_port}"),
+                )
+                .replace(
+                    "/etc/nginx/idunn-stream-routes/service.conf",
+                    &config.display().to_string().replace('\\', "/"),
+                );
+            let recipe = RECIPE
+                .split("[[dependencies]]")
+                .next()
+                .context("recipe is empty")?
+                .replace(
+                    "capability = \"service.runtime\"",
+                    &format!("capability = \"service.runtime\"\ncapacity = {minimum_capacity}"),
+                );
+            let plan = compile_deployment_plan(
+                recipe.as_bytes(),
+                binding.as_bytes(),
+                source(&recipe),
+                "service-incarnation-1",
+                Some(candidate_port),
+                110,
+                &[],
+            )?;
+            let release = SealedRelease::new(
+                &plan,
+                vec![artifact_receipt()],
+                vec![external_input_receipt()],
+                120,
+            )?;
+            let expected = release.expected_projection(&plan)?;
+            assert!(expected.route.is_some() && expected.dependencies.is_empty());
+            assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
+
+            let now = now_millis()?;
+            let command = DeploymentCommand {
+                schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+                command_id: "continuity-service".into(),
+                kind: CommandKind::Continuity,
+                selector: "service".into(),
+                requested_by: "test".into(),
+                requested_at_unix_millis: 100,
+            };
+            let mut transaction =
+                DeploymentTransaction::new(&command, "service".into(), 0, None, now)?;
+            transaction.lifecycle_authorized_at_unix_millis = Some(now);
+            let launch = IdunnRuntimeActivationLaunch::issue(
+                &expected,
+                runtime_instance_id(&transaction.transaction_id)?,
+                now,
+                &world.engine.idunn_signer,
+            )?;
+            let mut seed = Vec::new();
+            let activation = launch.write_credential(&mut seed)?;
+            let recorded = fixture_transaction(FIXTURE_TRANSACTIONS[0].1)?.1;
+            let mut workload = recorded.workload.clone().context("no recorded workload")?;
+            match &mut workload {
+                WorkloadObservation::Systemd(observed) => {
+                    observed.runtime_instance_id = activation.runtime_instance_id.clone();
+                    observed.executable_sha256 = expected.artifact_sha256.clone();
+                }
+                WorkloadObservation::Host(_) => bail!("recorded workload is not a systemd unit"),
+            }
+            transaction.isolation = recorded.isolation;
+            transaction.installed_release = Some(crate::drivers::InstalledReleaseObservation {
+                sealed_release_id: release.sealed_release_id.clone(),
+                root: PathBuf::from("/srv/service/releases/test"),
+            });
+            transaction.expected_publication_sha256 = Some(expected.canonical_sha256()?);
+            transaction.activation_publication_sha256 = Some(activation.canonical_sha256()?);
+            transaction.sealed_release = Some(release);
+            transaction.expected = Some(expected.clone());
+            transaction.activation = Some(activation.clone());
+            transaction.workload = Some(workload);
+            transaction.plan = Some(plan);
+
+            let stub = Arc::new(RuntimeStub {
+                expected,
+                activation,
+                provider: open_service_identity_at::<GameCultProviderHealthIdentity>(
+                    &provider_path,
+                )?,
+                activation_signer: cultnet_rs::IdunnRuntimeActivationSigner::from_credential_reader(
+                    &seed[..],
+                )?,
+                state: Mutex::new("warming"),
+                capacity: AtomicU32::new(minimum_capacity),
+                sequence: AtomicU64::new(0),
+                candidate_hits: AtomicUsize::new(0),
+                stable_hits: AtomicUsize::new(0),
+                stop: AtomicBool::new(false),
+            });
+            stub.listen(candidate_listener, true);
+            stub.listen(stable_listener, false);
+
+            if phase >= DeploymentPhase::Fencing {
+                let CandidateAnswer::Answered { evidence, .. } =
+                    world
+                        .engine
+                        .challenge_candidate(&transaction, &["warming"], None)?
+                else {
+                    bail!("the stub candidate did not answer");
+                };
+                transaction.warming = Some(WarmingEvidence::RouteProofDirect { evidence });
+                let rendered = NginxRouteDriver::new(
+                    transaction
+                        .plan
+                        .as_ref()
+                        .unwrap()
+                        .parsed_inputs()?
+                        .1
+                        .route
+                        .context("no route binding")?,
+                )
+                .render(transaction.expected.as_ref().unwrap())?;
+                transaction.route_preflight = Some(crate::drivers::RoutePreflightReceipt {
+                    route_id: "service".into(),
+                    candidate_runtime_instance_id: transaction
+                        .activation
+                        .as_ref()
+                        .unwrap()
+                        .runtime_instance_id
+                        .clone(),
+                    candidate_membership_sha256: sha256_id(&rendered),
+                    incumbent_runtime_instance_id: None,
+                    incumbent_membership_sha256: None,
+                    incumbent_configuration: None,
+                });
+            }
+            transaction.enter_phase(phase, now);
+            transaction.validate()?;
+            let store = SingleFileMessagePackBackingStore::new(&world.state_store);
+            assert!(store.compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: command.command_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: transaction.transaction_id.clone(),
+                        current: None,
+                    },
+                ],
+                &[
+                    command_envelope(&command, command.requested_at_unix_millis)?,
+                    transaction_envelope(&transaction, now)?,
+                ],
+            )?);
+
+            // Odin's world. Unreachable: the correlation store is bytes no
+            // reader can decode, so any read of it is an error. NotReady: a
+            // valid correlation that says the target is not Ready.
+            let store = &world.engine.options.odin_correlation_store;
+            let poisoned = match odin {
+                Odin::Unreachable => {
+                    let garbage = b"odin is not a cache".to_vec();
+                    std::fs::write(store, &garbage)?;
+                    garbage
+                }
+                Odin::NotReady => {
+                    let wrongly = signed_correlation(&world, &transaction, 9, false)?;
+                    SingleFileMessagePackBackingStore::new(store).insert_entry_if_absent(
+                        CultCacheEnvelope {
+                            key: crate::drivers::incarnation_key_of(
+                                &transaction.target,
+                                &transaction.expected.as_ref().unwrap().canonical_sha256()?,
+                            ),
+                            r#type: OdinRuntimeTopologyCorrelationRecord::TYPE.into(),
+                            payload: wrongly,
+                            stored_at: rfc3339_millis(now_millis()?)?,
+                            schema_id: Some(
+                                cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into(),
+                            ),
+                        },
+                    )?;
+                    Vec::new()
+                }
+            };
+            Ok(RoutedWorld {
+                world,
+                stub,
+                odin,
+                poisoned,
+            })
+        }
+
+        impl RoutedWorld {
+            fn step(&self) -> Result<()> {
+                self.world.engine.advance_transaction(&resident(&self.world)?)
+            }
+
+            fn run_to_routing(&self) -> Result<()> {
+                for _ in 0..12 {
+                    if self.transaction()?.phase == DeploymentPhase::Routing {
+                        return Ok(());
+                    }
+                    self.step()?;
+                }
+                bail!("the transaction never reached Routing")
+            }
+
+            fn transaction(&self) -> Result<DeploymentTransaction> {
+                Ok(resident(&self.world)?.value)
+            }
+
+            /// Odin was never read: the poisoned store is byte for byte what
+            /// it was, and no step failed on it.
+            fn assert_odin_untouched(&self) -> Result<()> {
+                if self.odin == Odin::Unreachable {
+                    assert_eq!(
+                        std::fs::read(&self.world.engine.options.odin_correlation_store)?,
+                        self.poisoned
+                    );
+                }
+                Ok(())
+            }
+
+            /// Routing installs an nginx fragment and needs the host's programs,
+            /// so the world writes the fragment itself and records the promotion
+            /// the stable challenge proves, then enters Committing.
+            fn promote_by_hand(&self) -> Result<()> {
+                let current = resident(&self.world)?;
+                let transaction = &current.value;
+                assert_eq!(transaction.phase, DeploymentPhase::Routing);
+                let expected = transaction.expected.as_ref().unwrap();
+                let binding = transaction.plan.as_ref().unwrap().parsed_inputs()?.1;
+                let driver = NginxRouteDriver::new(binding.route.unwrap());
+                let rendered = driver.render(expected)?;
+                std::fs::write(&driver.binding.config_path, &rendered)?;
+                let observation = self.world.engine.prove_stable_route(
+                    transaction,
+                    &driver,
+                    sha256_id(&rendered),
+                )?;
+                let mut next = transaction.clone();
+                next.routing = Some(RoutingEvidence::Promoted {
+                    promoted_at_unix_millis: observation.observed_at_unix_millis,
+                    observation,
+                });
+                next.enter_phase(DeploymentPhase::Committing, now_millis()?);
+                replace_transaction(&self.world.state_store, &current, &next)
+            }
+        }
+
+        /// A route-proof generation from a real admission.
+        pub(super) fn committed_generation() -> Result<AdmittedGeneration> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.promote_by_hand()?;
+            routed.step()?;
+            admitted(&routed)
+        }
+
+        fn admitted(world: &RoutedWorld) -> Result<AdmittedGeneration> {
+            Ok(ControlSnapshot::read(&world.world.state_store)?
+                .admitted
+                .into_iter()
+                .next()
+                .context("nothing was admitted")?
+                .value)
+        }
+
+        #[test]
+        fn a_route_proof_target_admits_with_odin_unreachable_and_never_reads_it() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
+            // Fencing, Leasing, AwaitingReady: the candidate is still warming.
+            for _ in 0..12 {
+                routed.step()?;
+                if routed.transaction()?.last_error.is_some() {
+                    break;
+                }
+            }
+            let waiting = routed.transaction()?;
+            assert_eq!(waiting.phase, DeploymentPhase::AwaitingReady);
+            assert!(waiting.ready.is_none());
+            assert_eq!(
+                waiting.last_error.as_deref(),
+                Some("candidate is still warming")
+            );
+            // The candidate finishes warming: Ready is its own Active answer.
+            routed.stub.set_state("active");
+            routed.step()?;
+            assert!(matches!(
+                routed.transaction()?.ready,
+                Some(ReadinessEvidence::RouteProof { .. })
+            ));
+            routed.step()?;
+            assert_eq!(routed.transaction()?.phase, DeploymentPhase::Routing);
+            routed.promote_by_hand()?;
+            routed.step()?;
+
+            let generation = admitted(&routed)?;
+            generation.validate()?;
+            assert_eq!(generation.ready.class(), ReadinessClass::RouteProof);
+            assert!(generation.odin_authority.is_none());
+            assert!(generation.latest_odin_observation.is_none());
+            assert!(generation.route_supervision.is_some());
+            // Idunn's own challenges carried every proof: the seed's warming,
+            // two Ready polls; the stable endpoint proved the route twice.
+            assert_eq!(routed.stub.candidate_hits.load(Ordering::SeqCst), 3);
+            assert!(routed.stub.stable_hits.load(Ordering::SeqCst) >= 2);
+            routed.assert_odin_untouched()?;
+
+            // Boot and supervision read no Odin either: the topology refresh
+            // returns before it opens Odin's store, and durable authority
+            // skips a route-proof generation's receipts.
+            let stored = ControlSnapshot::read(&routed.world.state_store)?;
+            let current = stored.admitted.first().context("no admitted generation")?;
+            assert!(!routed.world.engine.refresh_admitted_topology(&stored, current)?);
+            routed.world.engine.validate_durable_authority(&stored)?;
+            routed.assert_odin_untouched()?;
+            Ok(())
+        }
+
+        #[test]
+        fn an_odin_correlation_about_a_route_proof_target_decides_nothing() -> Result<()> {
+            let routed = routed_world(Odin::NotReady, 1, DeploymentPhase::Fencing)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.promote_by_hand()?;
+            routed.step()?;
+            let generation = admitted(&routed)?;
+            assert_eq!(generation.ready.class(), ReadinessClass::RouteProof);
+            // The valid, not-Ready correlation was neither admitted as a
+            // receipt nor consulted: the record carries no Odin cursor.
+            assert_eq!(generation.odin_publisher_sequence_cursor, 0);
+            Ok(())
+        }
+
+        #[test]
+        fn a_route_proof_candidate_that_has_not_answered_is_waited_on_not_aborted() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming)?;
+            routed.step()?;
+            let warmed = routed.transaction()?;
+            assert_eq!(warmed.phase, DeploymentPhase::Warming);
+            let Some(WarmingEvidence::RouteProofDirect { evidence }) = &warmed.warming else {
+                bail!("Warming evidence is not the candidate's own presence");
+            };
+            assert!(evidence.message_id.starts_with("candidate-"));
+            assert_eq!(routed.stub.candidate_hits.load(Ordering::SeqCst), 1);
+            routed.assert_odin_untouched()?;
+
+            // Nothing listens: the same step waits, and says why.
+            let silent = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming)?;
+            silent.stub.stop.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            silent.step()?;
+            let waiting = silent.transaction()?;
+            assert!(waiting.warming.is_none() && waiting.pre_fencing_abort.is_none());
+            assert!(
+                waiting
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("candidate endpoint did not answer")),
+                "{:?}",
+                waiting.last_error
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn a_capacity_below_the_expected_minimum_is_named_on_the_route_path() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 2, DeploymentPhase::Fencing)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.promote_by_hand()?;
+            routed.stub.capacity.store(1, Ordering::SeqCst);
+            let failure = format!("{:#}", routed.step().expect_err("a shortfall must be refused"));
+            assert!(
+                failure.contains("expected-capability-000-capacity"),
+                "{failure}"
+            );
+            assert!(admitted(&routed).is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn odin_itself_is_never_route_proof() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming)?;
+            let mut expected = routed.stub.expected.clone();
+            assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
+            // Odin provides the rendezvous capability and declares no dependency.
+            expected.capabilities[0].capability = ODIN_RENDEZVOUS_CAPABILITY.into();
+            assert!(expected.dependencies.is_empty());
+            assert_eq!(ReadinessClass::of(&expected), ReadinessClass::OdinSelf);
+
+            // Route-proof evidence for it is refused: its admitted generation
+            // is what names the Odin authority, so it must carry one.
+            let (_, mut odin) = fixture_generation(FIXTURE_GENERATION)?;
+            odin.target = "odin".into();
+            odin.expected = expected;
+            odin.ready = route_proof_evidence();
+            odin.latest_odin_observation = None;
+            odin.odin_authority = None;
+            assert!(error_text(odin.validate()).contains("declares Odin"));
+            Ok(())
+        }
+
+        #[test]
+        fn a_store_of_route_proof_generations_boots_and_resolves_the_bootstrap_authority()
+        -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.promote_by_hand()?;
+            routed.step()?;
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            routed.world.engine.validate_durable_authority(&snapshot)?;
+            assert_eq!(
+                routed.world.engine.current_odin_authority(&snapshot)?,
+                routed.world.engine.bootstrap_odin_authority
+            );
+            Ok(())
+        }
     }
 }

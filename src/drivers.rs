@@ -5128,7 +5128,7 @@ impl NginxRouteDriver {
         Ok(output)
     }
 
-    fn render(&self, expected: &IdunnExpectedIncarnationRecord) -> Result<Vec<u8>> {
+    pub(crate) fn render(&self, expected: &IdunnExpectedIncarnationRecord) -> Result<Vec<u8>> {
         expected.validate()?;
         let expected_projection_sha256 = expected.canonical_sha256()?;
         let route = expected
