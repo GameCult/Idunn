@@ -13671,6 +13671,9 @@ mod tests {
             ForeignChallengeId,
             /// An HTTP error where the snapshot should be.
             HttpFailure,
+            /// A first Odin candidate answering its Warming challenge: the
+            /// detail names the challenge as `idunn-warming:<id>`.
+            FirstOdinWarming,
         }
 
         impl RuntimeStub {
@@ -13704,7 +13707,10 @@ mod tests {
                         .collect(),
                     health_contract: expected.health_contract.clone(),
                     state: (*self.state.lock().unwrap()).into(),
-                    detail: format!("route-observation:{message_id}"),
+                    detail: match *self.reply.lock().unwrap() {
+                        Reply::FirstOdinWarming => format!("idunn-warming:{message_id}"),
+                        _ => format!("route-observation:{message_id}"),
+                    },
                     write_lease_sha256: self.lease.lock().unwrap().clone(),
                     signer_identity_id: self.provider.entry().identity_id.clone(),
                     publisher_sequence: self.sequence.fetch_add(1, Ordering::SeqCst) + 1,
@@ -14901,8 +14907,17 @@ mod tests {
             transaction: &DeploymentTransaction,
             sequence: u64,
         ) -> Result<TopologyEvidence> {
+            odin_receipt_with(routed, transaction, sequence, true)
+        }
+
+        fn odin_receipt_with(
+            routed: &RoutedWorld,
+            transaction: &DeploymentTransaction,
+            sequence: u64,
+            ready: bool,
+        ) -> Result<TopologyEvidence> {
             let now = now_millis()?;
-            let bytes = signed_correlation(&routed.world, transaction, sequence, true)?;
+            let bytes = signed_correlation(&routed.world, transaction, sequence, ready)?;
             let authenticated = routed.world.engine.authenticate_topology_bytes(
                 &ControlSnapshot::read(&routed.world.state_store)?,
                 transaction,
@@ -15011,14 +15026,18 @@ mod tests {
 
             let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
             let current = snapshot.admitted.first().context("nothing was admitted")?;
-            let receipt = odin_receipt_for(&routed, &at_routing, 9)?;
+            // Receipts that would not survive being re-proved: authentic, but
+            // not Ready. Boot re-proves against the current Odin authority and
+            // requires exact semantic Ready, never what a generation stores, so
+            // this record is only bootable if boot does not re-prove it.
+            let receipt = odin_receipt_with(&routed, &at_routing, 9, false)?;
             let mut legacy = current.value.clone();
             legacy.ready = ReadinessEvidence::OdinCorrelated {
                 evidence: receipt.clone(),
             };
             legacy.latest_odin_observation = Some(receipt);
-            // Receipts that would not authenticate if they were re-proved: the
-            // authority is another key's. Held generations are not re-proved.
+            // The stored authority is present because an Odin-tagged record
+            // carries one; it is not what boot reads.
             let stranger = cultnet_rs::enroll_service_identity_at::<OdinTopologyIdentity>(
                 &routed.world.root.join("identities/stranger.cc"),
             )?;
@@ -15198,6 +15217,43 @@ mod tests {
                 .engine
                 .authenticate_first_odin_warming_presence(&named, "warming-probe", 1, 2, &[1])
                 .expect_err("a target named odin that is not Odin");
+            assert!(
+                format!("{error:#}").contains("reserved for a stateful Odin incarnation"),
+                "{error:#}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn a_stateful_target_that_provides_the_rendezvous_is_observed_directly_whatever_it_is_named()
+        -> Result<()> {
+            let provider = build_routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, true, true)?;
+            let transaction = provider.transaction()?;
+            assert_eq!(transaction.target, "service");
+            assert!(transaction.expected.as_ref().unwrap().write_lease_required);
+            provider.stub.set_state("warming");
+            *provider.stub.reply.lock().unwrap() = Reply::FirstOdinWarming;
+            let challenged_at = now_millis()?;
+            let answer = provider.stub.answer("warming-probe")?;
+            provider.world.engine.authenticate_first_odin_warming_presence(
+                &transaction,
+                "warming-probe",
+                challenged_at,
+                now_millis()?,
+                &answer,
+            )?;
+
+            // The reverse: named odin, stateful, but nothing provides the
+            // rendezvous.
+            let stateful = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Warming)?;
+            let mut named = stateful.transaction()?;
+            assert!(named.expected.as_ref().unwrap().write_lease_required);
+            named.target = "odin".into();
+            let error = stateful
+                .world
+                .engine
+                .authenticate_first_odin_warming_presence(&named, "warming-probe", 1, 2, &[1])
+                .expect_err("a stateful target named odin that does not provide the rendezvous");
             assert!(
                 format!("{error:#}").contains("reserved for a stateful Odin incarnation"),
                 "{error:#}"

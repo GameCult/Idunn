@@ -8391,6 +8391,44 @@ Content-Le".to_vec()), |_| {}),
         );
     }
 
+    /// The candidate path renders the Expected first, and rendering parses the
+    /// same endpoints, so it never reaches the parse in the challenge. The
+    /// stable path does not render: a bound stable endpoint that is not a plain
+    /// host and port is caught by the challenge's own parse, and it is a
+    /// configuration error, not a listener that has not answered yet.
+    #[test]
+    fn a_stable_endpoint_that_does_not_parse_is_an_error_not_a_wait() {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let driver = NginxRouteDriver::new(RouteBinding {
+            driver: RouteDriver::NginxStreamTcp,
+            route_id: "service".into(),
+            stable_endpoint: "http://127.0.0.1:17999".into(),
+            private_host: "127.0.0.1".into(),
+            private_port_start: 17998,
+            private_port_end: 17998,
+            config_path: temp.path().join("service.conf"),
+            reload_unit: "nginx.service".into(),
+        });
+        let mut candidate = expected();
+        candidate.route = Some(cultnet_rs::IdunnExpectedRoute {
+            route_id: "service".into(),
+            transport: "http".into(),
+            stable_endpoint: "http://127.0.0.1:17999".into(),
+            candidate_endpoint: "http://127.0.0.1:17998".into(),
+        });
+        for endpoint in [
+            "http://127.0.0.1",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:17999/path",
+            "tcp://127.0.0.1:17999",
+        ] {
+            assert_refused(
+                driver.request_runtime_presence_at(&candidate, "stable-probe", endpoint),
+                endpoint,
+            );
+        }
+    }
+
     #[test]
     fn route_connect_retries_connection_refused_until_listener_is_ready() -> Result<()> {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
