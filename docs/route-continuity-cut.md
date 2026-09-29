@@ -457,6 +457,29 @@ reverted (Idunn).**
   closed first.
 
 **B2 — Bounded, backed-off route and unit repair (Idunn).**
+
+*Widened 2026-09-29 by Self, from Soul's S1 pass.* S1 closed the healthy-target storm, and
+Soul found two storm paths S1 does not claim. Both are B2's:
+- **A failing reload deletes the fragment** (`restore_admitted_membership`,
+  `drivers.rs:5472-5478`). The next tick reads the file as missing, treats that as drift, and
+  restores again: one `systemd-run`, ufw, `nginx -t` and reload every 500 ms, unbounded.
+  This was probed over 4 ticks. A broken global nginx config does the same through the
+  private-mount unit.
+- **`NginxRouteDriver::install` (`drivers.rs:5402`) runs ufw, `nginx -t` and reload
+  unconditionally.** The Routing phase re-runs it on every resume, and a post-fence proof
+  failure resumes forever (F17), so a candidate failing its proof reloads every tick. A
+  stateless candidate reloads twice (install, then rollback). The post-fence abort's
+  `withdraw_candidate_membership` then calls `restore`, which does the same.
+
+So B2's actuation ceiling covers **`install`, `restore` and `restore_admitted_membership`**,
+not only supervision. B2 also adds the seam Soul specified: the route actuator program paths
+and `preflight_root` on `RuntimeOptions`, defaulting to today's paths and used at every
+`NginxRouteDriver::new` site, plus a routed `Stored<AdmittedGeneration>` fixture beside
+`EngineFixture`. Deleting `supervise_admitted_route`'s body currently survives every test
+(cargo-mutants), and B2's reload-count timeline test needs the same seam. A failed proof
+marks the route degraded (Q5 a). Today nothing is written and the next tick re-challenges
+with no backoff.
+
 - Challenges back off exponentially per target on consecutive failures, with a
   floor at max age and a cap.
 - Route actuations (write, reload, ufw) go through a per-target rolling
