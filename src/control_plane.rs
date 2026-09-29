@@ -4945,6 +4945,21 @@ impl Engine {
             }
             let workload_error = operational_error
                 .context("admitted operational state has neither observation nor error")?;
+            // A held generation is a record the recipe never declared
+            // readiness for. Idunn reports it and does not decide for it: a
+            // continuity minted over it copies the undeclared Expected, is
+            // held at once, and owns the target forever, so the declaring
+            // redeploy that would clear the hold could never freeze. The dead
+            // held target stays down and free. Nothing yields to it either:
+            // there is no continuity to yield to.
+            if current.value.readiness().is_err() {
+                self.note_fault(
+                    "holds a dead admitted generation down; declare readiness in its recipe and redeploy",
+                    &format!("generation-down:{}", current.value.target),
+                    &anyhow!("admitted generation {} is not running", current.value.generation_id),
+                );
+                continue;
+            }
             // Continuity restarts a release; it cannot repair one. When the
             // admitted release will not start, rescheduling it forever keeps
             // the target permanently occupied -- and a target with a live
@@ -5001,6 +5016,8 @@ impl Engine {
                     && refused_restarts < CONTINUITY_RESTART_ATTEMPTS
                     && blocker.value.phase < DeploymentPhase::Fencing
                     && blocker.value.pre_fencing_abort.is_none()
+                    // A held record is reported and never aborted by Idunn.
+                    && blocker.value.held_disagreement().is_none()
                 {
                     self.begin_pre_fencing_abort(
                         blocker,
@@ -13726,6 +13743,197 @@ mod tests {
             planned.plan.as_ref().map(CompiledDeploymentPlan::readiness_class).transpose()?,
             Some(ReadinessClass::OdinSelf)
         );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // A held record is reported and never decided for. Supervision mints no
+    // continuity over a held generation, and nothing yields to a held record.
+    // ---------------------------------------------------------------------
+
+    /// Rewrite the world's admitted generation into what a pre-B3 binary left
+    /// behind: no Odin declaration, admitted on Odin receipts.
+    fn undeclare_incumbent(world: &EngineFixture) -> Result<AdmittedGeneration> {
+        let now = now_millis()?;
+        let mut failure = None;
+        let next = edit_incumbent(world, |generation| {
+            generation.expected.dependencies.clear();
+            match IdunnRuntimeActivationLaunch::issue(
+                &generation.expected,
+                generation.activation.runtime_instance_id.clone(),
+                now,
+                &world.engine.idunn_signer,
+            ) {
+                Ok(launch) => generation.activation = launch.activation().clone(),
+                Err(error) => failure = Some(error),
+            }
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        ControlSnapshot::read(&world.state_store).context("store with the undeclared generation")?;
+        assert!(matches!(next.readiness(), Err(ReadinessDisagreement::Undeclared(_))));
+        Ok(next)
+    }
+
+    /// Queue the operator's declaring redeploy of `service`.
+    fn queue_declaring_redeploy(world: &EngineFixture, command_id: &str) -> Result<()> {
+        use crate::deployment_plan::tests::BINDING;
+        let (binding_head, binding_tail) = BINDING.split_once("[route]").context("route")?;
+        let binding = format!(
+            "{binding_head}[brakes]{}",
+            binding_tail.split_once("[brakes]").context("brakes")?.1
+        );
+        std::fs::create_dir_all(world.root.join("bindings"))?;
+        std::fs::write(world.root.join("bindings/service.toml"), binding)?;
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: command_id.into(),
+            kind: CommandKind::Deploy,
+            selector: "service".into(),
+            requested_by: "operator".into(),
+            requested_at_unix_millis: now_millis()?,
+        };
+        assert!(SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: DeploymentCommand::TYPE.into(),
+                key: command.command_id.clone(),
+                current: None,
+            }],
+            &[command_envelope(&command, command.requested_at_unix_millis)?],
+        )?);
+        Ok(())
+    }
+
+    /// Every transaction the store knows: live, then archived.
+    fn every_transaction(world: &EngineFixture) -> Result<Vec<DeploymentTransaction>> {
+        let mut all = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .map(|stored| stored.value)
+            .collect::<Vec<_>>();
+        all.extend(read_history_transactions(&world.state_store));
+        Ok(all)
+    }
+
+    fn is_continuity_over(transaction: &DeploymentTransaction, held: &AdmittedGeneration) -> bool {
+        transaction.command_kind == CommandKind::Continuity
+            && transaction.incumbent_generation_id.as_deref() == Some(held.generation_id.as_str())
+    }
+
+    #[test]
+    fn a_held_generation_that_dies_mints_no_continuity_and_leaves_its_target_free() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        let held = undeclare_incumbent(&world)?;
+        world.engine.validate_durable_authority(&ControlSnapshot::read(&world.state_store)?)?;
+
+        workload.kill();
+        for _ in 0..4 {
+            assert!(!world.engine.supervise_one_admitted_generation()?);
+        }
+        assert!(
+            ControlSnapshot::read(&world.state_store)?.transactions.is_empty(),
+            "supervision minted a transaction over a held generation"
+        );
+        // Reported, once per state change: the same text is not offered again.
+        let reports = world.engine.fault_reports.lock().unwrap();
+        let down = reports.get("generation-down:service").context("the dead hold is not reported")?;
+        let last = down.last.lock().unwrap().clone();
+        assert!(last.is_some());
+        assert!(down.offer(last).is_none());
+        drop(reports);
+
+        // The target is free: the declaring redeploy freezes and is not
+        // displaced by a continuity.
+        queue_declaring_redeploy(&world, "up-service-declared")?;
+        for _ in 0..8 {
+            let _ = world.engine.run_scheduler_tick();
+        }
+        let all = every_transaction(&world)?;
+        assert!(
+            all.iter().all(|transaction| !is_continuity_over(transaction, &held)),
+            "a continuity was minted over the held generation"
+        );
+        assert!(
+            all.iter().any(|transaction| transaction.command_id == "up-service-declared"),
+            "the declaring redeploy never froze"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_declaring_redeploy_is_not_yielded_to_a_continuity_when_the_held_incumbent_dies() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        let held = undeclare_incumbent(&world)?;
+        let redeploy =
+            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&held))?;
+        assert_eq!(redeploy.held_disagreement(), None);
+        workload.kill();
+        for _ in 0..40 {
+            let _ = world.engine.run_scheduler_tick();
+        }
+        let all = every_transaction(&world)?;
+        assert!(
+            all.iter().all(|transaction| !is_continuity_over(transaction, &held)),
+            "a continuity was minted over the held incumbent"
+        );
+        let redeploy = all
+            .iter()
+            .find(|transaction| transaction.transaction_id == redeploy.transaction_id)
+            .context("the redeploy is nowhere")?;
+        // The fixture's one workload is the candidate too, so the redeploy may
+        // fail for its own reasons; it is never yielded away.
+        assert!(
+            redeploy
+                .pre_fencing_abort
+                .as_ref()
+                .is_none_or(|abort| !abort.error.contains("yielded to continuity")),
+            "the redeploy yielded: {:?}",
+            redeploy.pre_fencing_abort
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_predeploy_transaction_is_not_aborted_to_yield_to_continuity() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        // The incumbent is declared; the Deploy in front of it is the held one.
+        let seeded =
+            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        let mut bare = seeded.clone();
+        // Undeclare the Expected and re-derive what is bound to its digest.
+        let expected = bare.expected.as_mut().context("no expected")?;
+        expected.dependencies.clear();
+        bare.expected_publication_sha256 = Some(expected.canonical_sha256()?);
+        let activation = IdunnRuntimeActivationLaunch::issue(
+            expected,
+            seeded.activation.as_ref().context("no activation")?.runtime_instance_id.clone(),
+            now_millis()?,
+            &world.engine.idunn_signer,
+        )?
+        .activation()
+        .clone();
+        bare.activation_publication_sha256 = Some(activation.canonical_sha256()?);
+        bare.activation = Some(activation);
+        bare.validate()?;
+        let stored = resident(&world)?;
+        replace_transaction(&world.state_store, &stored, &bare)?;
+        assert!(bare.held_disagreement().is_some());
+
+        workload.kill();
+        for _ in 0..4 {
+            let _ = world.engine.supervise_one_admitted_generation()?;
+        }
+        let after = resident(&world)?.value;
+        assert_eq!(after.transaction_id, seeded.transaction_id);
+        assert!(after.pre_fencing_abort.is_none(), "Idunn aborted a held record");
+        assert!(after.completion.is_none());
         Ok(())
     }
 
