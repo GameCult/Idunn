@@ -11623,7 +11623,11 @@ mod tests {
             .continuity_backoff
             .next_restart_at_unix_millis
             .context("the failed demotion was not recorded")?;
-        assert!(deferred >= before + CONTINUITY_DEFERRAL_MILLIS);
+        let after = now_millis()?;
+        assert!(
+            (before + CONTINUITY_DEFERRAL_MILLIS..=after + CONTINUITY_DEFERRAL_MILLIS)
+                .contains(&deferred)
+        );
 
         // Deferred: the next tick neither retries nor writes.
         let envelope = incumbent_envelope(&world)?;
@@ -11720,6 +11724,28 @@ mod tests {
             world.engine.reconcile_failed_continuity_projections()?,
             ProjectionReconciliation::default()
         );
+        // ...and for nobody else's.
+        topology.withdraw_stale_incarnation(&incumbent.expected, &anchor)?;
+        let mut other = stranger.clone();
+        let other_activation = IdunnRuntimeActivationLaunch::issue(
+            &incumbent.expected,
+            runtime_instance_id("tx-someone-else")?,
+            now_millis()?,
+            &world.engine.idunn_signer,
+        )?
+        .activation()
+        .clone();
+        if let Some(WorkloadObservation::Systemd(observed)) = other.workload.as_mut() {
+            observed.runtime_instance_id = other_activation.runtime_instance_id.clone();
+        }
+        other.activation = Some(other_activation);
+        project_candidate(&world, &other, true)?;
+        assert_eq!(
+            world.engine.reconcile_failed_continuity_projections()?.unexplained,
+            vec!["service".to_owned()]
+        );
+        topology.withdraw_stale_incarnation(&incumbent.expected, &anchor)?;
+        project_candidate(&world, &stranger, true)?;
         // ...and once it is gone, nothing does.
         let seeded = resident(&world)?;
         let command = ControlSnapshot::read(&world.state_store)?
@@ -11874,6 +11900,64 @@ mod tests {
         std::fs::remove_file(history_store_path(&world.state_store))?;
         assert!(world.engine.freeze_one_queued_command()?);
         assert_eq!(ControlSnapshot::read(&world.state_store)?.transactions.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn the_legacy_lift_owes_only_a_continuity_that_issued_an_activation() -> Result<()> {
+        let envelope = fixture_envelope(
+            FIXTURE_PRE_B1_ABORTS[0].1,
+            DeploymentTransaction::TYPE,
+        )?;
+        let written = lift_legacy_transaction(&envelope)?;
+        let owed = |transaction: &DeploymentTransaction| {
+            transaction
+                .pre_fencing_abort
+                .as_ref()
+                .map(|abort| abort.topology_reconciliation)
+        };
+        assert_eq!(owed(&written), Some(CleanupEvidence::Skipped));
+
+        let mut lifted = written.clone();
+        owe_legacy_continuity_projection(&mut lifted);
+        assert_eq!(owed(&lifted), Some(CleanupEvidence::Pending));
+
+        // A deployment published its own key and recorded what it owed.
+        let mut deploy = written.clone();
+        deploy.command_kind = CommandKind::Deploy;
+        owe_legacy_continuity_projection(&mut deploy);
+        assert_eq!(owed(&deploy), Some(CleanupEvidence::Skipped));
+
+        // A continuity that issued nothing owes nothing.
+        let mut unissued = written;
+        unissued.activation = None;
+        owe_legacy_continuity_projection(&mut unissued);
+        assert_eq!(owed(&unissued), Some(CleanupEvidence::Skipped));
+        Ok(())
+    }
+
+    #[test]
+    fn continuity_stops_after_three_refused_restarts_counted_from_history() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        for round in 0..CONTINUITY_RESTART_ATTEMPTS {
+            let failed = seeded_transaction(
+                &world,
+                DeploymentPhase::Warming,
+                CommandKind::Continuity,
+                Some(&incumbent),
+            )?;
+            world
+                .engine
+                .begin_pre_fencing_abort(&resident(&world)?, anyhow!("refused {round}"))?;
+            drive(&world, |transaction| transaction.completion.is_some())?;
+            assert!(record_of(&world, &failed.transaction_id)?.is_terminal());
+        }
+        workload.kill();
+        // Three refusals are in history and none is live: the ceiling holds.
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
         Ok(())
     }
 }
