@@ -13904,6 +13904,19 @@ mod tests {
         }
 
         #[test]
+        fn route_admission_gets_past_its_gate_without_reading_odin() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            // The host's nginx is not here, so the step fails at installing the
+            // route: past the admission gate, which would have failed on Odin.
+            let failure = format!("{:#}", routed.step().expect_err("no nginx in the test world"));
+            assert!(failure.contains("XXXX"), "{failure}");
+            routed.assert_odin_untouched()?;
+            Ok(())
+        }
+
+        #[test]
         fn a_stateless_candidate_that_finished_warming_first_still_warms() -> Result<()> {
             let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
             routed.stub.set_state("active");
