@@ -39,7 +39,8 @@ use crate::deployment_plan::{
 use crate::drivers::{
     ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
     GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
-    ProcessIdentity, RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
+    ProcessIdentity, RouteActuation, RouteActuationGate, RouteActuationRefused, RouteActuators,
+    RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
     SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
     WriteLeasePort,
 };
@@ -52,15 +53,32 @@ const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
 const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v4";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V3: &str = "idunn.deployment_transaction.v3";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V2: &str = "idunn.deployment_transaction.v2";
-const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v3";
+const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v4";
+const ADMITTED_GENERATION_SCHEMA_V3: &str = "idunn.admitted_generation.v3";
 const ADMITTED_GENERATION_SCHEMA_V2: &str = "idunn.admitted_generation.v2";
 /// The capability whose declaration makes a target Odin-correlated.
 pub(crate) const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
-/// How many times continuity will restart one admitted release before it
-/// concludes the release itself is the problem. More than one because a start
-/// can fail for a passing reason -- a port still held, a peer not yet up --
-/// and few because each attempt holds the target against any deployment.
-const CONTINUITY_RESTART_ATTEMPTS: usize = 3;
+const TARGET_SUPERVISION_SCHEMA: &str = "idunn.target_supervision.v1";
+/// How many times continuity will restart one target inside one window before
+/// it concludes the target itself is the problem. More than one because a
+/// start can fail for a passing reason -- a port still held, a peer not yet up
+/// -- and bounded because each attempt holds the target against any
+/// deployment. Counted per target, so a restart that succeeds and dies again
+/// does not start the count over.
+const CONTINUITY_RESTART_ATTEMPTS: usize = 6;
+const CONTINUITY_RESTART_WINDOW_MILLIS: u64 = 3_600_000;
+/// The wait after the first restart in a window; it doubles with each further one.
+const CONTINUITY_RESTART_BACKOFF_MILLIS: u64 = 5_000;
+
+/// Forward route actuations (fragment write, firewall, `nginx -t`, reload,
+/// private-mount validation) one target may perform per sliding window. A
+/// healthy target performs none; a legitimate deployment performs one or two.
+/// Survival actuations are counted against it but never refused.
+const ROUTE_ACTUATION_CEILING: usize = 12;
+const ROUTE_ACTUATION_WINDOW_MILLIS: u64 = 3_600_000;
+/// The longest wait between route challenges while proofs keep failing. The
+/// shortest is the observation max age.
+const ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS: u64 = 600_000;
 
 /// How long continuity waits after it could not prepare a restart (the
 /// projection would not demote) before trying again.
@@ -858,8 +876,10 @@ enum TerminalRecovery {
     },
 }
 
-/// Route supervision's durable memory for one admitted routed target. Carried
-/// across commits except for the per-incarnation parts.
+/// Route supervision's durable memory for one admitted routed incarnation:
+/// challenge pacing and the degradation mark. It belongs to the incarnation, so
+/// a new generation starts from `default()`. What a target may actuate outlives
+/// every generation and lives in `TargetSupervision`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RouteSupervisionState {
@@ -869,56 +889,199 @@ struct RouteSupervisionState {
     /// Set while route proof keeps failing. Marks the route degraded so
     /// dependents stop selecting it; it never authorizes a restart.
     degraded_since_unix_millis: Option<u64>,
-    actuations: ActuationWindow,
-}
-
-/// Route actuations (write, reload, firewall) inside a rolling window, so a
-/// per-target ceiling survives an Idunn restart.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActuationWindow {
-    window_started_at_unix_millis: u64,
-    count: u32,
 }
 
 impl RouteSupervisionState {
-    /// A new incarnation starts unobserved and undegraded, but inherits the
-    /// target's actuation window: a ceiling that reset on every commit would
-    /// not be a ceiling.
-    fn for_new_incarnation(incumbent: Option<&Self>) -> Self {
-        Self {
-            actuations: incumbent.map(|state| state.actuations).unwrap_or_default(),
-            ..Self::default()
-        }
+    /// The next challenge is not due yet.
+    fn is_waiting(&self, now: u64, maximum_age_millis: u64) -> bool {
+        self.next_challenge_at_unix_millis.is_some_and(|next| {
+            is_waiting(
+                now,
+                next,
+                ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS.max(maximum_age_millis),
+            )
+        })
+    }
+
+    /// A failed proof, or a failed repair of the fragment it needs. Observation
+    /// state only: the route is marked degraded and the next challenge waits,
+    /// twice as long each time, from the observation max age up to a cap.
+    fn record_failed_challenge(&mut self, now: u64, maximum_age_millis: u64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let doublings = self.consecutive_failures.saturating_sub(1).min(16);
+        let wait = maximum_age_millis
+            .saturating_mul(1 << doublings)
+            .min(ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS)
+            .max(maximum_age_millis);
+        self.last_challenge_at_unix_millis = Some(now);
+        self.next_challenge_at_unix_millis = Some(now.saturating_add(wait));
+        self.degraded_since_unix_millis.get_or_insert(now);
+    }
+
+    fn record_proved_challenge(&mut self, now: u64) {
+        self.consecutive_failures = 0;
+        self.last_challenge_at_unix_millis = Some(now);
+        self.next_challenge_at_unix_millis = None;
+        self.degraded_since_unix_millis = None;
     }
 
     fn validate(&self) -> Result<()> {
         if let Some(since) = self.degraded_since_unix_millis {
             ensure!(since > 0, "route degradation has no start time");
         }
-        ensure!(
-            self.actuations.count == 0 || self.actuations.window_started_at_unix_millis > 0,
-            "route actuation window has a count but no start"
-        );
         Ok(())
     }
 }
 
-/// Continuity restarts of one target inside a rolling window. Belongs to the
-/// target, not the generation: a restart that succeeds must not reset it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ContinuityBackoff {
-    window_started_at_unix_millis: Option<u64>,
-    attempts: u32,
-    next_restart_at_unix_millis: Option<u64>,
+/// What one target has been allowed to do, kept across every generation and
+/// present before the first: route actuations and continuity restarts, each a
+/// sliding log of the times they happened. Owned by the meter primitives below;
+/// the route driver only asks, and no generation write carries it.
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(
+    type = "idunn.target_supervision",
+    schema = "idunn.target_supervision.v1"
+)]
+struct TargetSupervision {
+    #[cultcache(key = 0)]
+    schema_version: String,
+    #[cultcache(key = 1)]
+    target: String,
+    /// The newest `ROUTE_ACTUATION_CEILING` actuation times, ascending.
+    #[cultcache(key = 2)]
+    route_actuations: Vec<u64>,
+    /// The newest `CONTINUITY_RESTART_ATTEMPTS` restart times, ascending.
+    #[cultcache(key = 3)]
+    continuity_restarts: Vec<u64>,
+    /// A restart whose projection could not be prepared waits until this time.
+    #[cultcache(key = 4)]
+    continuity_deferred_until: Option<u64>,
+    #[cultcache(key = 5)]
+    continuity_deferral_reason: Option<String>,
 }
 
-impl ContinuityBackoff {
+/// The entries of a sliding log still inside `window` at `now`. An entry from
+/// the future means the clock stepped back; it counts as `now`, so a backwards
+/// step holds a meter for at most one window however far the clock moved.
+fn live_entries(log: &[u64], now: u64, window: u64) -> Vec<u64> {
+    log.iter()
+        .map(|&at| at.min(now))
+        .filter(|&at| now - at < window)
+        .collect()
+}
+
+/// Record `now`, keeping the newest `limit` entries. That is exact for "at most
+/// `limit` in any window", even after a forced entry pushes past the limit.
+fn record_entry(log: &mut Vec<u64>, now: u64, limit: usize) {
+    for at in log.iter_mut() {
+        *at = (*at).min(now);
+    }
+    log.push(now);
+    if log.len() > limit {
+        log.drain(..log.len() - limit);
+    }
+}
+
+impl TargetSupervision {
+    fn new(target: &str) -> Self {
+        Self {
+            schema_version: TARGET_SUPERVISION_SCHEMA.into(),
+            target: target.into(),
+            route_actuations: Vec::new(),
+            continuity_restarts: Vec::new(),
+            continuity_deferred_until: None,
+            continuity_deferral_reason: None,
+        }
+    }
+
+    fn route_used(&self, now: u64) -> usize {
+        live_entries(&self.route_actuations, now, ROUTE_ACTUATION_WINDOW_MILLIS).len()
+    }
+
+    /// When the oldest counted actuation leaves the window, if the ceiling is reached.
+    fn route_reopens_at(&self, now: u64) -> Option<u64> {
+        let live = live_entries(&self.route_actuations, now, ROUTE_ACTUATION_WINDOW_MILLIS);
+        (live.len() >= ROUTE_ACTUATION_CEILING)
+            .then(|| live[live.len() - ROUTE_ACTUATION_CEILING] + ROUTE_ACTUATION_WINDOW_MILLIS)
+    }
+
+    /// Count one route actuation. Only a `Forward` change can be refused; a
+    /// `Survival` is always admitted and always counted.
+    fn charge_route(&mut self, now: u64, kind: RouteActuation) -> Result<(), RouteActuationRefused> {
+        if kind == RouteActuation::Forward
+            && let Some(reopens_at) = self.route_reopens_at(now)
+        {
+            return Err(RouteActuationRefused {
+                target: self.target.clone(),
+                used: self.route_used(now),
+                reopens_at_unix_millis: reopens_at,
+            });
+        }
+        record_entry(&mut self.route_actuations, now, ROUTE_ACTUATION_CEILING);
+        Ok(())
+    }
+
+    fn restarts_used(&self, now: u64) -> usize {
+        live_entries(&self.continuity_restarts, now, CONTINUITY_RESTART_WINDOW_MILLIS).len()
+    }
+
+    fn restarts_exhausted(&self, now: u64) -> bool {
+        self.restarts_used(now) >= CONTINUITY_RESTART_ATTEMPTS
+    }
+
+    /// The next restart is due one doubling wait after the last, from the
+    /// number of restarts still inside the window.
+    fn next_restart_at(&self, now: u64) -> Option<u64> {
+        let live = live_entries(&self.continuity_restarts, now, CONTINUITY_RESTART_WINDOW_MILLIS);
+        let last = *live.last()?;
+        Some(last.saturating_add(CONTINUITY_RESTART_BACKOFF_MILLIS << (live.len() - 1)))
+    }
+
+    /// Whether continuity must still wait: the doubling wait after the last
+    /// restart, or the deferral after a projection that would not demote.
+    fn continuity_is_waiting(&self, now: u64) -> bool {
+        self.next_restart_at(now).is_some_and(|due| {
+            is_waiting(
+                now,
+                due,
+                CONTINUITY_RESTART_BACKOFF_MILLIS << (CONTINUITY_RESTART_ATTEMPTS - 1),
+            )
+        }) || self
+            .continuity_deferred_until
+            .is_some_and(|due| is_waiting(now, due, CONTINUITY_DEFERRAL_MILLIS))
+    }
+
+    /// One restart scheduled. It ends any deferral: the projection was prepared.
+    fn record_restart(&mut self, now: u64) {
+        record_entry(&mut self.continuity_restarts, now, CONTINUITY_RESTART_ATTEMPTS);
+        self.continuity_deferred_until = None;
+        self.continuity_deferral_reason = None;
+    }
+
+    fn defer_continuity(&mut self, now: u64, reason: &str) {
+        self.continuity_deferred_until = Some(now.saturating_add(CONTINUITY_DEFERRAL_MILLIS));
+        self.continuity_deferral_reason = Some(reason.to_owned());
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.attempts == 0 || self.window_started_at_unix_millis.is_some(),
-            "continuity backoff has attempts but no window"
+            self.schema_version == TARGET_SUPERVISION_SCHEMA,
+            "target supervision schema is unsupported"
+        );
+        require_id(&self.target, "supervised target")?;
+        for (log, limit, what) in [
+            (&self.route_actuations, ROUTE_ACTUATION_CEILING, "route actuation"),
+            (&self.continuity_restarts, CONTINUITY_RESTART_ATTEMPTS, "continuity restart"),
+        ] {
+            ensure!(log.len() <= limit, "{what} log exceeds its bound");
+            ensure!(
+                log.iter().all(|&at| at > 0) && log.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{what} log is not an ascending list of times"
+            );
+        }
+        ensure!(
+            self.continuity_deferred_until.is_some() == self.continuity_deferral_reason.is_some(),
+            "continuity deferral has a time or a reason but not both"
         );
         Ok(())
     }
@@ -1936,7 +2099,7 @@ impl AdmittedOdinAuthority {
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(
     type = "idunn.admitted_generation",
-    schema = "idunn.admitted_generation.v3"
+    schema = "idunn.admitted_generation.v4"
 )]
 struct AdmittedGeneration {
     #[cultcache(key = 0)]
@@ -1979,14 +2142,16 @@ struct AdmittedGeneration {
     /// Meaningful only for an Odin-correlated generation.
     #[cultcache(key = 17)]
     odin_publisher_sequence_cursor: u64,
-    /// Still readable, decides nothing new: route supervision state replaces it.
-    #[cultcache(key = 18)]
-    route_repair_started_at_unix_millis: Option<u64>,
+    // Keys 18 (route repair start) and 20 (continuity backoff) are retired.
+    // The slots stay as gaps: the layout is positional, so a slot cannot be
+    // reused without a bump.
     /// Present exactly when `routing` is Promoted.
     #[cultcache(key = 19)]
     route_supervision: Option<RouteSupervisionState>,
-    #[cultcache(key = 20)]
-    continuity_backoff: ContinuityBackoff,
+    /// Why this generation is held or down, for `status`. Cleared when the
+    /// generation is replaced.
+    #[cultcache(key = 21)]
+    last_error: Option<String>,
 }
 
 /// The Odin-side receipts of an Odin-correlated generation. Decisions that
@@ -2023,7 +2188,6 @@ impl AdmittedGeneration {
     fn from_transaction(
         transaction: &DeploymentTransaction,
         odin_authority: Option<AdmittedOdinAuthority>,
-        incumbent: Option<&AdmittedGeneration>,
         now: u64,
     ) -> Result<Self> {
         ensure!(
@@ -2042,11 +2206,8 @@ impl AdmittedGeneration {
             ReadinessEvidence::RouteProof { .. } => (None, None),
         };
         let routing = required(&transaction.routing, "route disposition")?.clone();
-        let route_supervision = matches!(&routing, RoutingEvidence::Promoted { .. }).then(|| {
-            RouteSupervisionState::for_new_incarnation(
-                incumbent.and_then(|value| value.route_supervision.as_ref()),
-            )
-        });
+        let route_supervision = matches!(&routing, RoutingEvidence::Promoted { .. })
+            .then(RouteSupervisionState::default);
         let generation = Self {
             schema_version: ADMITTED_GENERATION_SCHEMA.into(),
             target: transaction.target.clone(),
@@ -2067,11 +2228,8 @@ impl AdmittedGeneration {
             routing,
             odin_authority,
             odin_publisher_sequence_cursor: transaction.odin_publisher_sequence_cursor,
-            route_repair_started_at_unix_millis: None,
             route_supervision,
-            continuity_backoff: incumbent
-                .map(|value| value.continuity_backoff.clone())
-                .unwrap_or_default(),
+            last_error: None,
         };
         generation.validate()?;
         Ok(generation)
@@ -2136,13 +2294,6 @@ impl AdmittedGeneration {
                 "admitted route observation belongs to another runtime instance"
             );
         }
-        if let Some(started_at) = self.route_repair_started_at_unix_millis {
-            ensure!(started_at > 0, "admitted route repair has no start time");
-            ensure!(
-                matches!(&self.routing, RoutingEvidence::Promoted { .. }),
-                "only a promoted routed generation can own route repair intent"
-            );
-        }
         ensure!(
             self.route_supervision.is_some()
                 == matches!(&self.routing, RoutingEvidence::Promoted { .. }),
@@ -2151,7 +2302,6 @@ impl AdmittedGeneration {
         if let Some(state) = &self.route_supervision {
             state.validate()?;
         }
-        self.continuity_backoff.validate()?;
         Ok(())
     }
 }
@@ -2175,6 +2325,9 @@ struct RuntimeOptions {
     /// can be served; a binding that names one then fails at its first
     /// driver call, not at startup, so an Idunn without hosts is unchanged.
     host_actuator_bind: Option<SocketAddr>,
+    /// Where route drivers find nginx, systemctl, ufw and systemd-run, and
+    /// their scratch directory. Every route driver is built from this.
+    route_actuators: RouteActuators,
 }
 
 impl Default for RuntimeOptions {
@@ -2200,6 +2353,7 @@ impl Default for RuntimeOptions {
             topology_maximum_future_skew_millis: DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS,
             poll_millis: 500,
             host_actuator_bind: None,
+            route_actuators: RouteActuators::default(),
         }
     }
 }
@@ -2565,6 +2719,7 @@ struct ControlSnapshot {
     commands: Vec<Stored<DeploymentCommand>>,
     transactions: Vec<Stored<DeploymentTransaction>>,
     admitted: Vec<Stored<AdmittedGeneration>>,
+    targets: Vec<Stored<TargetSupervision>>,
 }
 
 impl ControlSnapshot {
@@ -2607,6 +2762,19 @@ impl ControlSnapshot {
                     );
                     snapshot.admitted.push(Stored { envelope, value });
                 }
+                TargetSupervision::TYPE => {
+                    ensure!(
+                        envelope.schema_id.as_deref() == Some(TARGET_SUPERVISION_SCHEMA),
+                        "Idunn control store contains an unsupported target supervision record"
+                    );
+                    let value: TargetSupervision = decode_record(&envelope)?;
+                    value.validate()?;
+                    ensure!(
+                        envelope.key == value.target,
+                        "target supervision key is not its target"
+                    );
+                    snapshot.targets.push(Stored { envelope, value });
+                }
                 _ => bail!("Idunn control store contains a foreign document"),
             }
         }
@@ -2641,6 +2809,15 @@ impl ControlSnapshot {
         ensure!(
             admitted_targets.len() == self.admitted.len(),
             "Idunn control store contains duplicate current generations"
+        );
+        ensure!(
+            self.targets
+                .iter()
+                .map(|stored| stored.value.target.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+                == self.targets.len(),
+            "Idunn control store contains duplicate target supervision records"
         );
         for transaction in &self.transactions {
             let command = self
@@ -2728,6 +2905,19 @@ impl ControlSnapshot {
         self.admitted
             .iter()
             .find(|stored| stored.value.target == target)
+    }
+
+    fn supervision_for(&self, target: &str) -> Option<&Stored<TargetSupervision>> {
+        self.targets
+            .iter()
+            .find(|stored| stored.value.target == target)
+    }
+
+    /// The target's meters, or empty ones: a target that was never metered has
+    /// used nothing.
+    fn supervision_or_new(&self, target: &str) -> TargetSupervision {
+        self.supervision_for(target)
+            .map_or_else(|| TargetSupervision::new(target), |stored| stored.value.clone())
     }
 
     /// The admitted generation of the target that provides
@@ -3016,7 +3206,8 @@ struct LegacyAdmittedGeneration {
 impl LegacyAdmittedGeneration {
     /// Every v2 generation was admitted on Odin receipts, so it migrates as
     /// Odin-correlated with those receipts unchanged. Route supervision state
-    /// starts empty for a promoted route; backoff starts empty.
+    /// starts empty for a promoted route. The v2 repair start decided nothing
+    /// after S1 and is not carried.
     fn into_current(self) -> AdmittedGeneration {
         let route_supervision = matches!(&self.routing, RoutingEvidence::Promoted { .. })
             .then(RouteSupervisionState::default);
@@ -3041,10 +3232,130 @@ impl LegacyAdmittedGeneration {
             routing: self.routing,
             odin_authority: Some(self.odin_authority),
             odin_publisher_sequence_cursor: self.odin_publisher_sequence_cursor,
-            route_repair_started_at_unix_millis: self.route_repair_started_at_unix_millis,
             route_supervision,
-            continuity_backoff: ContinuityBackoff::default(),
+            last_error: None,
         }
+    }
+}
+
+/// The v3 admitted-generation layout. Its meters (`actuations`, the continuity
+/// backoff, the repair start) are retired: no released Idunn ever wrote a
+/// nonzero one, and a record that shows one is refused instead of lifted.
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(
+    type = "idunn.admitted_generation",
+    schema = "idunn.admitted_generation.v3"
+)]
+struct LegacyAdmittedGenerationV3 {
+    #[cultcache(key = 0)]
+    schema_version: String,
+    #[cultcache(key = 1)]
+    target: String,
+    #[cultcache(key = 2)]
+    generation_id: String,
+    #[cultcache(key = 3)]
+    command_id: String,
+    #[cultcache(key = 4)]
+    transaction_id: String,
+    #[cultcache(key = 5)]
+    admitted_at_unix_millis: u64,
+    #[cultcache(key = 6)]
+    plan: CompiledDeploymentPlan,
+    #[cultcache(key = 7)]
+    sealed_release: SealedRelease,
+    #[cultcache(key = 8)]
+    installed_release: InstalledReleaseObservation,
+    #[cultcache(key = 9)]
+    expected: IdunnExpectedIncarnationRecord,
+    #[cultcache(key = 10)]
+    activation: IdunnRuntimeActivationRecord,
+    #[cultcache(key = 11)]
+    workload: WorkloadObservation,
+    #[cultcache(key = 12)]
+    leasing: LeasingEvidence,
+    #[cultcache(key = 13)]
+    ready: ReadinessEvidence,
+    #[cultcache(key = 14)]
+    latest_odin_observation: Option<TopologyEvidence>,
+    #[cultcache(key = 15)]
+    routing: RoutingEvidence,
+    #[cultcache(key = 16)]
+    odin_authority: Option<AdmittedOdinAuthority>,
+    #[cultcache(key = 17)]
+    odin_publisher_sequence_cursor: u64,
+    #[cultcache(key = 18)]
+    route_repair_started_at_unix_millis: Option<u64>,
+    #[cultcache(key = 19)]
+    route_supervision: Option<LegacyRouteSupervisionStateV3>,
+    #[cultcache(key = 20)]
+    continuity_backoff: LegacyContinuityBackoffV3,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRouteSupervisionStateV3 {
+    last_challenge_at_unix_millis: Option<u64>,
+    consecutive_failures: u32,
+    next_challenge_at_unix_millis: Option<u64>,
+    degraded_since_unix_millis: Option<u64>,
+    actuations: LegacyActuationWindowV3,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyActuationWindowV3 {
+    window_started_at_unix_millis: u64,
+    count: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyContinuityBackoffV3 {
+    window_started_at_unix_millis: Option<u64>,
+    attempts: u32,
+    next_restart_at_unix_millis: Option<u64>,
+}
+
+impl LegacyAdmittedGenerationV3 {
+    /// Drops the retired meters. The lift creates no `TargetSupervision`: every
+    /// target starts unmetered, which is what no released binary ever changed.
+    fn into_current(self) -> Result<AdmittedGeneration> {
+        ensure!(
+            self.continuity_backoff.attempts == 0
+                && self
+                    .route_supervision
+                    .as_ref()
+                    .is_none_or(|state| state.actuations.count == 0),
+            "admitted generation of {} records route actuations or continuity restarts that no released Idunn wrote; refusing to drop them",
+            self.target
+        );
+        Ok(AdmittedGeneration {
+            schema_version: ADMITTED_GENERATION_SCHEMA.into(),
+            target: self.target,
+            generation_id: self.generation_id,
+            command_id: self.command_id,
+            transaction_id: self.transaction_id,
+            admitted_at_unix_millis: self.admitted_at_unix_millis,
+            plan: self.plan,
+            sealed_release: self.sealed_release,
+            installed_release: self.installed_release,
+            expected: self.expected,
+            activation: self.activation,
+            workload: self.workload,
+            leasing: self.leasing,
+            ready: self.ready,
+            latest_odin_observation: self.latest_odin_observation,
+            routing: self.routing,
+            odin_authority: self.odin_authority,
+            odin_publisher_sequence_cursor: self.odin_publisher_sequence_cursor,
+            route_supervision: self.route_supervision.map(|state| RouteSupervisionState {
+                last_challenge_at_unix_millis: state.last_challenge_at_unix_millis,
+                consecutive_failures: state.consecutive_failures,
+                next_challenge_at_unix_millis: state.next_challenge_at_unix_millis,
+                degraded_since_unix_millis: state.degraded_since_unix_millis,
+            }),
+            last_error: None,
+        })
     }
 }
 
@@ -3097,12 +3408,23 @@ fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTra
     }
 }
 
-/// Read one stored admitted generation, lifting a v2 record to the current
-/// shape by the same rule as `read_transaction_record`.
+/// Read one stored admitted generation, lifting a v2 or v3 record to the
+/// current shape by the same rule as `read_transaction_record`.
 fn read_generation_record(envelope: &CultCacheEnvelope) -> Result<AdmittedGeneration> {
     match envelope.schema_id.as_deref() {
         Some(ADMITTED_GENERATION_SCHEMA) => {
             let value: AdmittedGeneration = decode_record(envelope)?;
+            value.validate()?;
+            Ok(value)
+        }
+        Some(ADMITTED_GENERATION_SCHEMA_V3) => {
+            let legacy: LegacyAdmittedGenerationV3 = rmp_serde::from_slice(&envelope.payload)
+                .context("decoding a v3 admitted generation")?;
+            ensure!(
+                legacy.schema_version == ADMITTED_GENERATION_SCHEMA_V3,
+                "stored generation schema differs from its envelope"
+            );
+            let value = legacy.into_current()?;
             value.validate()?;
             Ok(value)
         }
@@ -3121,7 +3443,7 @@ fn read_generation_record(envelope: &CultCacheEnvelope) -> Result<AdmittedGenera
     }
 }
 
-/// Rewrite every v2 and v3 record as current, once, before the engine runs.
+/// Rewrite every older record as current, once, before the engine runs.
 ///
 /// The read path lifts older records on its own, so this is convergence rather
 /// than correctness: without it the store keeps records in several shapes for
@@ -3145,7 +3467,10 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
                     Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2 | DEPLOYMENT_TRANSACTION_SCHEMA_V3)
                 ))
                 || (envelope.r#type == AdmittedGeneration::TYPE
-                    && schema == Some(ADMITTED_GENERATION_SCHEMA_V2))
+                    && matches!(
+                        schema,
+                        Some(ADMITTED_GENERATION_SCHEMA_V2 | ADMITTED_GENERATION_SCHEMA_V3)
+                    ))
         })
         .collect::<Vec<_>>();
     let mut migrated = 0;
@@ -3200,6 +3525,17 @@ fn admitted_envelope(value: &AdmittedGeneration, now: u64) -> Result<CultCacheEn
         &value.target,
         AdmittedGeneration::TYPE,
         ADMITTED_GENERATION_SCHEMA,
+        value,
+        now,
+    )
+}
+
+fn target_supervision_envelope(value: &TargetSupervision, now: u64) -> Result<CultCacheEnvelope> {
+    value.validate()?;
+    typed_envelope(
+        &value.target,
+        TargetSupervision::TYPE,
+        TARGET_SUPERVISION_SCHEMA,
         value,
         now,
     )
@@ -3347,9 +3683,11 @@ fn backoff_wait(poll_millis: u64, failures: u32) -> u64 {
         .min(RESUME_BACKOFF_CEILING_MILLIS)
 }
 
-/// Whether an attempt due at `not_before` must still wait at `now`.
-fn is_waiting(now: u64, not_before: u64) -> bool {
-    now < not_before
+/// Whether an attempt due at `not_before` must still wait at `now`. A due time
+/// further ahead than any wait its owner can set means the clock stepped back,
+/// so the attempt is due: a step stalls nothing longer than the wait itself.
+fn is_waiting(now: u64, not_before: u64, longest_wait: u64) -> bool {
+    now < not_before && not_before - now <= longest_wait
 }
 
 /// Whether a transaction moved between two reads. An error note (`last_error`)
@@ -3751,7 +4089,81 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
             }
         }
     }
+    // What supervision holds for each target: the union of the admitted
+    // generations and the metered targets, so a target that has only been
+    // deployed to (no generation yet) still shows what it has used.
+    let now = now_millis()?;
+    let targets = snapshot
+        .admitted
+        .iter()
+        .map(|stored| stored.value.target.as_str())
+        .chain(snapshot.targets.iter().map(|stored| stored.value.target.as_str()))
+        .collect::<BTreeSet<_>>();
+    for target in targets {
+        for line in render_supervision(
+            target,
+            snapshot.admitted_for(target).map(|stored| &stored.value),
+            snapshot.supervision_for(target).map(|stored| &stored.value),
+            now,
+        ) {
+            println!("{line}");
+        }
+    }
     Ok(())
+}
+
+/// One target's meters and route pacing, one line each, times in unix
+/// milliseconds. The counts are what is still inside the window at `now`.
+fn render_supervision(
+    target: &str,
+    generation: Option<&AdmittedGeneration>,
+    supervision: Option<&TargetSupervision>,
+    now: u64,
+) -> Vec<String> {
+    let at = |time: Option<u64>| time.map_or("none".to_owned(), |millis| millis.to_string());
+    let meters = supervision.cloned().unwrap_or_else(|| TargetSupervision::new(target));
+    let mut lines = vec![format!(
+        "target {target} {}",
+        generation.map_or("no-admitted-generation", |value| value.generation_id.as_str())
+    )];
+    if let Some(reason) = generation.and_then(|value| value.last_error.as_deref()) {
+        lines.push(format!("  held: {reason}"));
+    }
+    lines.push(format!(
+        "  continuity restarts {}/{} next-restart-at {}",
+        meters.restarts_used(now),
+        CONTINUITY_RESTART_ATTEMPTS,
+        at(meters.next_restart_at(now))
+    ));
+    if let (Some(until), Some(reason)) = (
+        meters.continuity_deferred_until,
+        &meters.continuity_deferral_reason,
+    ) {
+        lines.push(format!("  continuity deferred until {until}: {reason}"));
+    }
+    if let Some(route) = generation.and_then(|value| value.route_supervision.as_ref()) {
+        lines.push(format!(
+            "  route {} consecutive-failures {} last-challenge-at {} next-challenge-at {}",
+            match route.degraded_since_unix_millis {
+                Some(since) => format!("degraded-since {since}"),
+                None => "healthy".to_owned(),
+            },
+            route.consecutive_failures,
+            at(route.last_challenge_at_unix_millis),
+            at(route.next_challenge_at_unix_millis)
+        ));
+    }
+    if generation.is_none_or(|value| value.route_supervision.is_some())
+        || !meters.route_actuations.is_empty()
+    {
+        lines.push(format!(
+            "  route actuations {}/{} in window, reopens-at {}",
+            meters.route_used(now),
+            ROUTE_ACTUATION_CEILING,
+            at(meters.route_reopens_at(now))
+        ));
+    }
+    lines
 }
 
 fn derived_command_status(transactions: &[&DeploymentTransaction]) -> (&'static str, String) {
@@ -3870,6 +4282,19 @@ struct Engine {
     resume_backoff: Mutex<BTreeMap<String, ResumeBackoff>>,
 }
 
+/// The route driver's door to the actuation ceiling: every group of host
+/// mutations a driver makes for `target` is counted through here.
+struct EngineRouteGate<'a> {
+    engine: &'a Engine,
+    target: &'a str,
+}
+
+impl RouteActuationGate for EngineRouteGate<'_> {
+    fn admit(&self, kind: RouteActuation) -> Result<()> {
+        self.engine.charge_route_actuation(self.target, kind)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ResumeBackoff {
     failures: u32,
@@ -3939,6 +4364,90 @@ impl Engine {
 
     fn host_anchors(&self) -> BTreeMap<String, ServiceIdentityTrustAnchor> {
         host_anchors_from(&self.options.bindings_dir)
+    }
+
+    /// Every route driver comes from here, so the actuator paths are the
+    /// options' and nothing else's.
+    fn route_driver(&self, binding: RouteBinding) -> NginxRouteDriver {
+        NginxRouteDriver::with_actuators(binding, &self.options.route_actuators)
+    }
+
+    fn route_gate<'a>(&'a self, target: &'a str) -> EngineRouteGate<'a> {
+        EngineRouteGate {
+            engine: self,
+            target,
+        }
+    }
+
+    /// Count one route actuation against the target's sliding ceiling, in its
+    /// `TargetSupervision`, before the driver acts. The record is created by
+    /// the first charge, so a first deployment is metered like any other. A
+    /// refused `Forward` is the typed `RouteActuationRefused`; a `Survival`
+    /// is always counted and never refused.
+    fn charge_route_actuation(&self, target: &str, kind: RouteActuation) -> Result<()> {
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let mut next = snapshot.supervision_or_new(target);
+        let now = now_millis()?;
+        next.charge_route(now, kind).map_err(anyhow::Error::new)?;
+        self.write_target_supervision(snapshot.supervision_for(target), &next, now)
+    }
+
+    /// Replace a target's meters, or create them when `seen` is `None`, by
+    /// compare-exchange against exactly what was read.
+    fn write_target_supervision(
+        &self,
+        seen: Option<&Stored<TargetSupervision>>,
+        next: &TargetSupervision,
+        now: u64,
+    ) -> Result<()> {
+        ensure!(
+            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: TargetSupervision::TYPE.into(),
+                    key: next.target.clone(),
+                    current: seen.map(|stored| stored.envelope.clone()),
+                }],
+                &[target_supervision_envelope(next, now)?],
+            )?,
+            "target supervision changed before its meters were written"
+        );
+        Ok(())
+    }
+
+    /// Replace an admitted generation by compare-exchange against the envelope
+    /// that was read.
+    fn replace_generation(
+        &self,
+        seen: &Stored<AdmittedGeneration>,
+        next: &AdmittedGeneration,
+        now: u64,
+    ) -> Result<()> {
+        ensure!(
+            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: AdmittedGeneration::TYPE.into(),
+                    key: seen.value.target.clone(),
+                    current: Some(seen.envelope.clone()),
+                }],
+                &[admitted_envelope(next, now)?],
+            )?,
+            "admitted generation changed before its write"
+        );
+        Ok(())
+    }
+
+    /// Say a fault once while it lasts, under `key`.
+    fn report_once(&self, key: &str, message: String) {
+        let offered = self
+            .fault_reports
+            .lock()
+            .expect("fault report mutex")
+            .entry(key.to_string())
+            .or_default()
+            .offer(Some(message));
+        if let Some(message) = offered {
+            eprintln!("{message}");
+        }
     }
 
     fn host_access(&self) -> Result<HostActuatorAccess<'_>> {
@@ -4550,7 +5059,9 @@ impl Engine {
             .expect("resume backoff mutex")
             .get(id)
             .is_some_and(|backoff| {
-                now_millis().is_ok_and(|now| is_waiting(now, backoff.not_before_unix_millis))
+                now_millis().is_ok_and(|now| {
+                    is_waiting(now, backoff.not_before_unix_millis, RESUME_BACKOFF_CEILING_MILLIS)
+                })
             })
         {
             return Ok(false);
@@ -4977,41 +5488,15 @@ impl Engine {
             // admitted release will not start, rescheduling it forever keeps
             // the target permanently occupied -- and a target with a live
             // transaction accepts no deployment, so the one action that could
-            // fix it is exactly the one that is locked out. Give up after a few
-            // attempts and leave the target free for a replacement.
-            //
-            // Counted against this generation id, so a successful restart --
-            // which admits a new generation -- starts the count over rather
-            // than carrying old failures forward.
-            // Failed restarts retire to history the moment they finish, so
-            // the count must read history: counting only the live set found
-            // zero every time and restarted a release that could not start
-            // forever, which is the loop the give-up exists to end.
-            let is_refused_restart = |transaction: &DeploymentTransaction| {
-                transaction.target == current.value.target
-                    && transaction.command_kind == CommandKind::Continuity
-                    && transaction.incumbent_generation_id.as_deref()
-                        == Some(current.value.generation_id.as_str())
-                    && matches!(
-                        transaction.completion,
-                        Some(TransactionCompletion::FailedBeforeFencing { .. })
-                            | Some(TransactionCompletion::FailedAfterFencing { .. })
-                    )
-            };
-            // An unreadable history counts as zero refusals only by lying:
-            // the ceiling would never trip. Without it, nothing is actuated.
-            let Some(history) = self.history_for_decision() else {
-                continue;
-            };
-            let refused_restarts = snapshot
-                .transactions
-                .iter()
-                .filter(|stored| is_refused_restart(&stored.value))
-                .count()
-                + history
-                    .iter()
-                    .filter(|transaction| is_refused_restart(transaction))
-                    .count();
+            // fix it is exactly the one that is locked out. Restarts are
+            // counted in the target's own log, in a sliding window, and spaced
+            // by a doubling wait. The log outlives every generation, so a
+            // release that starts, dies and starts again is bounded the same as
+            // one that never starts. Nothing here reads history: an unreadable
+            // history file must not stop crash recovery.
+            let now = now_millis()?;
+            let supervision = snapshot.supervision_or_new(&current.value.target);
+            let continuity_key = format!("continuity:{}", current.value.target);
 
             if let Some(blocker) = blocker {
                 // Yielding a *deployment* to continuity is right: the incumbent
@@ -5026,7 +5511,7 @@ impl Engine {
                 // the deployment is the only thing left that can fix the
                 // target -- aborting it would close the last door.
                 if blocker.value.command_kind == CommandKind::Deploy
-                    && refused_restarts < CONTINUITY_RESTART_ATTEMPTS
+                    && !supervision.restarts_exhausted(now)
                     && blocker.value.phase < DeploymentPhase::Fencing
                     && blocker.value.pre_fencing_abort.is_none()
                     // A held record is reported and never aborted by Idunn.
@@ -5042,11 +5527,19 @@ impl Engine {
                 }
                 continue;
             }
-            if refused_restarts >= CONTINUITY_RESTART_ATTEMPTS {
-                eprintln!(
-                    "Idunn stopped restarting admitted {}: its release failed to start {} times.                      The target is free for a deployment to replace it: {workload_error:#}",
-                    current.value.target, refused_restarts
+            if supervision.restarts_exhausted(now) {
+                self.report_once(
+                    &continuity_key,
+                    format!(
+                        "Idunn stopped restarting admitted {}: {} restarts inside the window. The target is free for a deployment to replace it: {workload_error:#}",
+                        current.value.target,
+                        supervision.restarts_used(now)
+                    ),
                 );
+                continue;
+            }
+            self.clear_fault(&continuity_key);
+            if supervision.continuity_is_waiting(now) {
                 continue;
             }
 
@@ -5058,17 +5551,6 @@ impl Engine {
             // Demote to Expected-only, the same shape an aborted deployment
             // leaves, and let the restart publish its own activation once it is
             // observed.
-            let now = now_millis()?;
-            // A restart whose projection could not be prepared is deferred in
-            // the generation's own backoff, not retried every tick.
-            if current
-                .value
-                .continuity_backoff
-                .next_restart_at_unix_millis
-                .is_some_and(|not_before| now < not_before)
-            {
-                continue;
-            }
             let demotion = (|| -> Result<()> {
                 let topology = self.topology();
                 let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
@@ -5094,7 +5576,13 @@ impl Engine {
                     "Idunn deferred continuity for admitted {} after refusing to demote its projection: {error:#}",
                     current.value.target
                 );
-                self.defer_continuity_restart(current, now)?;
+                let mut deferred = supervision.clone();
+                deferred.defer_continuity(now, &truncate(&format!("{error:#}"), 2048));
+                self.write_target_supervision(
+                    snapshot.supervision_for(&current.value.target),
+                    &deferred,
+                    now,
+                )?;
                 progressed = true;
                 continue;
             }
@@ -5118,6 +5606,10 @@ impl Engine {
             command.validate()?;
             let transaction =
                 DeploymentTransaction::from_continuity(&command, &current.value, now)?;
+            // The restart is counted in the same CAS that mints it, so a crash
+            // cannot schedule one the ceiling never saw.
+            let mut counted = supervision;
+            counted.record_restart(now);
             ensure!(
                 SingleFileMessagePackBackingStore::new(&self.options.state_store)
                     .compare_exchange(
@@ -5132,47 +5624,31 @@ impl Engine {
                                 key: transaction.transaction_id.clone(),
                                 current: None,
                             },
+                            CultCacheExpectedEnvelope {
+                                r#type: TargetSupervision::TYPE.into(),
+                                key: counted.target.clone(),
+                                current: snapshot
+                                    .supervision_for(&counted.target)
+                                    .map(|stored| stored.envelope.clone()),
+                            },
                         ],
                         &[
                             command_envelope(&command, now)?,
                             transaction_envelope(&transaction, now)?,
+                            target_supervision_envelope(&counted, now)?,
                         ],
                     )?,
-                "continuity scheduling lost its command/transaction CAS"
+                "continuity scheduling lost its command/transaction/meter CAS"
             );
             progressed = true;
         }
         Ok(progressed)
     }
 
-    /// Record that continuity may not restart this generation before
-    /// `now + CONTINUITY_DEFERRAL_MILLIS`. The generation's `ContinuityBackoff`
-    /// owns "not before": only its `next_restart_at_unix_millis` is written,
-    /// so the attempts and window that count real restarts are untouched.
-    fn defer_continuity_restart(&self, current: &Stored<AdmittedGeneration>, now: u64) -> Result<()> {
-        let mut next = current.value.clone();
-        next.continuity_backoff.next_restart_at_unix_millis =
-            Some(now + CONTINUITY_DEFERRAL_MILLIS);
-        next.validate()?;
-        ensure!(
-            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
-                &[CultCacheExpectedEnvelope {
-                    r#type: AdmittedGeneration::TYPE.into(),
-                    key: current.value.target.clone(),
-                    current: Some(current.envelope.clone()),
-                }],
-                &[admitted_envelope(&next, now)?],
-            )?,
-            "admitted generation changed before continuity deferral CAS"
-        );
-        Ok(())
-    }
-
     fn supervise_admitted_route(&self, current: &Stored<AdmittedGeneration>) -> Result<bool> {
         let Some(expected_route) = current.value.expected.route.as_ref() else {
             ensure!(
-                matches!(&current.value.routing, RoutingEvidence::SkippedUnrouted)
-                    && current.value.route_repair_started_at_unix_millis.is_none(),
+                matches!(&current.value.routing, RoutingEvidence::SkippedUnrouted),
                 "unrouted admitted generation carries route authority"
             );
             return Ok(false);
@@ -5184,6 +5660,17 @@ impl Engine {
         else {
             bail!("routed admitted generation has no promoted route receipt")
         };
+        let now = now_millis()?;
+        // A route whose proofs keep failing is challenged on a widening
+        // schedule, not every tick.
+        if current
+            .value
+            .route_supervision
+            .as_ref()
+            .is_some_and(|state| state.is_waiting(now, self.options.topology_maximum_age_millis))
+        {
+            return Ok(false);
+        }
         ensure!(
             observation.route_id == expected_route.route_id
                 && observation.runtime_instance_id == current.value.activation.runtime_instance_id,
@@ -5208,9 +5695,9 @@ impl Engine {
         let route_binding = binding
             .route
             .context("routed admitted generation has no operator route binding")?;
-        let driver = NginxRouteDriver::new(route_binding);
+        let driver = self.route_driver(route_binding);
+        let gate = self.route_gate(&current.value.target);
 
-        let now = now_millis()?;
         if driver.observe_membership(&current.value.expected, &observation.membership_sha256)?
             && route_observation_is_current(
                 observation.observed_at_unix_millis,
@@ -5221,51 +5708,79 @@ impl Engine {
         {
             return Ok(false);
         }
-        // Actuates only when the fragment on disk differs from the admitted
-        // membership; an exact fragment makes this a no-op.
-        driver
-            .restore_admitted_membership(&current.value.expected, &observation.membership_sha256)?;
-        let authority = self.runtime_authority_parts(
-            &current.value.plan,
-            &current.value.expected,
-            &current.value.activation,
-        )?;
-        let refreshed = self.prove_stable_route_against(
-            &current.value.expected,
-            &current.value.activation,
-            &authority,
-            current.value.leasing.lease_sha256(),
-            &driver,
-            observation.membership_sha256.clone(),
-        )?;
-        ensure!(
-            driver.observe_membership(&current.value.expected, &refreshed.membership_sha256)?,
-            "admitted route membership changed during its continuity challenge"
-        );
-        if let (Some(lease_driver), Some(lease)) = (&lease_driver, current.value.leasing.lease()) {
+        let route_key = format!("route:{}", current.value.target);
+        // A failed repair or a failed proof changes observation state only: it
+        // marks the route degraded and widens the wait. It is a write, so it
+        // ends this target's supervision pass (`Ok(true)`), exactly as a
+        // proved challenge does: the caller's snapshot no longer matches the
+        // generation, and a later step in the same pass would lose its CAS.
+        let challenge = (|| -> Result<RouteObservation> {
+            // Actuates only when the fragment on disk differs from the
+            // admitted membership; an exact fragment makes this a no-op. It is
+            // survival: restoring the admitted route is never refused.
+            driver.restore_admitted_membership(
+                &current.value.expected,
+                &observation.membership_sha256,
+                &gate,
+            )?;
+            let authority = self.runtime_authority_parts(
+                &current.value.plan,
+                &current.value.expected,
+                &current.value.activation,
+            )?;
+            let refreshed = self.prove_stable_route_against(
+                &current.value.expected,
+                &current.value.activation,
+                &authority,
+                current.value.leasing.lease_sha256(),
+                &driver,
+                observation.membership_sha256.clone(),
+            )?;
             ensure!(
-                lease_driver.observe_exact(lease)?,
-                "admitted process write lease changed during its continuity challenge"
+                driver.observe_membership(&current.value.expected, &refreshed.membership_sha256)?,
+                "admitted route membership changed during its continuity challenge"
             );
-        }
+            if let (Some(lease_driver), Some(lease)) = (&lease_driver, current.value.leasing.lease())
+            {
+                ensure!(
+                    lease_driver.observe_exact(lease)?,
+                    "admitted process write lease changed during its continuity challenge"
+                );
+            }
+            Ok(refreshed)
+        })();
         let mut next = current.value.clone();
-        next.routing = RoutingEvidence::Promoted {
-            observation: refreshed,
-            promoted_at_unix_millis: *promoted_at_unix_millis,
-        };
-        next.route_repair_started_at_unix_millis = None;
-        next.validate()?;
-        ensure!(
-            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
-                &[CultCacheExpectedEnvelope {
-                    r#type: AdmittedGeneration::TYPE.into(),
-                    key: current.value.target.clone(),
-                    current: Some(current.envelope.clone()),
-                }],
-                &[admitted_envelope(&next, now)?],
-            )?,
-            "admitted generation changed before route continuity receipt CAS"
-        );
+        match challenge {
+            Ok(refreshed) => {
+                next.routing = RoutingEvidence::Promoted {
+                    observation: refreshed,
+                    promoted_at_unix_millis: *promoted_at_unix_millis,
+                };
+                if let Some(state) = next.route_supervision.as_mut() {
+                    state.record_proved_challenge(now);
+                }
+                self.clear_fault(&route_key);
+                self.replace_generation(current, &next, now)?;
+            }
+            Err(error) => {
+                if let Some(state) = next.route_supervision.as_mut() {
+                    state.record_failed_challenge(now, self.options.topology_maximum_age_millis);
+                }
+                self.report_once(
+                    &route_key,
+                    format!(
+                        "Idunn could not prove admitted {} on its stable route: {error:#}",
+                        current.value.target
+                    ),
+                );
+                if let Err(record) = self.replace_generation(current, &next, now) {
+                    eprintln!(
+                        "Idunn could not record the failed route challenge of {}: {record:#}",
+                        current.value.target
+                    );
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -5698,11 +6213,12 @@ impl Engine {
             let route_binding = binding
                 .route
                 .context("routed Expected lost route binding")?;
-            let driver = NginxRouteDriver::new(route_binding);
+            let driver = self.route_driver(route_binding);
             let receipt = driver.preflight(
                 expected,
                 &activation.runtime_instance_id,
                 incumbent_route.as_ref(),
+                &self.route_gate(&current.value.target),
             )?;
             return self.persist_same_phase(current, |next| {
                 next.route_preflight = Some(receipt);
@@ -6148,7 +6664,8 @@ impl Engine {
                 let binding = admitted.value.plan.as_ref().unwrap().parsed_inputs()?.1;
                 let route_binding = binding.route.context("routed plan has no route binding")?;
                 let preflight = required(&admitted.value.route_preflight, "route preflight")?;
-                let driver = NginxRouteDriver::new(route_binding);
+                let driver = self.route_driver(route_binding);
+                let gate = self.route_gate(&admitted.value.target);
                 ensure!(
                     preflight.candidate_runtime_instance_id == activation.runtime_instance_id,
                     "route preflight belongs to another runtime instance"
@@ -6162,6 +6679,7 @@ impl Engine {
                     &activation.runtime_instance_id,
                     preflight,
                     rollback_allowed,
+                    &gate,
                 )?;
                 let observation = match self.prove_stable_route(
                     &admitted.value,
@@ -6179,6 +6697,7 @@ impl Engine {
                             expected,
                             &activation.runtime_instance_id,
                             preflight,
+                            &gate,
                         ) {
                             Ok(()) => Err(proof_error)
                                 .context("candidate did not answer its stable route challenge"),
@@ -6277,7 +6796,7 @@ impl Engine {
                 .parsed_inputs()?
                 .1;
             let driver =
-                NginxRouteDriver::new(binding.route.context("routed plan has no route binding")?);
+                self.route_driver(binding.route.context("routed plan has no route binding")?);
             ensure!(
                 driver.observe_membership(expected, &route.membership_sha256)?,
                 "route membership changed before admission commit"
@@ -6346,7 +6865,6 @@ impl Engine {
         let generation = AdmittedGeneration::from_transaction(
             &commit_current.value,
             odin_authority,
-            incumbent.map(|stored| &stored.value),
             now,
         )?;
         let post_commit_cleanup = PostCommitCleanup {
@@ -6982,7 +7500,7 @@ impl Engine {
         let binding = required(&transaction.plan, "first Odin plan")?
             .parsed_inputs()?
             .1;
-        let driver = NginxRouteDriver::new(
+        let driver = self.route_driver(
             binding
                 .route
                 .context("first Odin bootstrap has no candidate route binding")?,
@@ -7320,7 +7838,7 @@ impl Engine {
         let binding = required(&transaction.plan, "candidate plan")?
             .parsed_inputs()?
             .1;
-        let driver = NginxRouteDriver::new(
+        let driver = self.route_driver(
             binding
                 .route
                 .context("route-proof candidate has no route binding")?,
@@ -7649,9 +8167,9 @@ impl Engine {
             let preflight = required(&current.value.route_preflight, "route preflight receipt")?;
             let binding = current.value.plan.as_ref().unwrap().parsed_inputs()?.1;
             let driver =
-                NginxRouteDriver::new(binding.route.context("routed plan has no route binding")?);
+                self.route_driver(binding.route.context("routed plan has no route binding")?);
             driver
-                .withdraw_candidate_membership(preflight)
+                .withdraw_candidate_membership(preflight, &self.route_gate(&current.value.target))
                 .context("restoring the route the candidate found")?;
             return self.persist_same_phase(current, |next| {
                 next.post_fencing_abort.as_mut().unwrap().route_restoration =

@@ -5055,15 +5055,81 @@ pub struct NginxRouteDriver {
     pub preflight_root: PathBuf,
 }
 
+/// The host programs and scratch directory the route driver actuates through.
+/// The daemon owns one value and every driver is built from it, so the paths
+/// are chosen in one place and a test can point them at stubs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteActuators {
+    pub nginx: PathBuf,
+    pub systemd_run: PathBuf,
+    pub systemctl: PathBuf,
+    pub ufw: PathBuf,
+    pub preflight_root: PathBuf,
+}
+
+impl Default for RouteActuators {
+    fn default() -> Self {
+        Self {
+            nginx: PathBuf::from("/usr/sbin/nginx"),
+            systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+            systemctl: PathBuf::from("/usr/bin/systemctl"),
+            ufw: PathBuf::from("/usr/sbin/ufw"),
+            preflight_root: PathBuf::from("/run/idunn/route-preflight"),
+        }
+    }
+}
+
+/// Why a route actuation is being asked for. Only a `Forward` change can be
+/// refused: restoring the admitted or incumbent route is survival, not
+/// deployment, so a `Survival` is always admitted and always counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteActuation {
+    Forward,
+    Survival,
+}
+
+/// A forward route actuation the ceiling refused. `reopens_at_unix_millis` is
+/// when the oldest counted actuation leaves the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteActuationRefused {
+    pub target: String,
+    pub used: usize,
+    pub reopens_at_unix_millis: u64,
+}
+
+impl std::fmt::Display for RouteActuationRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "route actuation ceiling reached for {}: {} in the window, reopens at unix ms {}",
+            self.target, self.used, self.reopens_at_unix_millis
+        )
+    }
+}
+
+impl std::error::Error for RouteActuationRefused {}
+
+/// The one rate authority over route actuation. The driver asks it before
+/// every group of host mutations (fragment write, firewall, `nginx -t`,
+/// reload, private-mount validation) and does none of them when it refuses.
+/// Its owner keeps the count durably, so the ceiling survives a restart.
+pub trait RouteActuationGate {
+    fn admit(&self, kind: RouteActuation) -> Result<()>;
+}
+
 impl NginxRouteDriver {
     pub fn new(binding: RouteBinding) -> Self {
+        Self::with_actuators(binding, &RouteActuators::default())
+    }
+
+    pub fn with_actuators(binding: RouteBinding, actuators: &RouteActuators) -> Self {
         Self {
             binding,
-            nginx_program: PathBuf::from("/usr/sbin/nginx"),
-            systemd_run_program: PathBuf::from("/usr/bin/systemd-run"),
-            systemctl_program: PathBuf::from("/usr/bin/systemctl"),
-            ufw_program: PathBuf::from("/usr/sbin/ufw"),
-            preflight_root: PathBuf::from("/run/idunn/route-preflight"),
+            nginx_program: actuators.nginx.clone(),
+            systemd_run_program: actuators.systemd_run.clone(),
+            systemctl_program: actuators.systemctl.clone(),
+            ufw_program: actuators.ufw.clone(),
+            preflight_root: actuators.preflight_root.clone(),
         }
     }
 
@@ -5265,7 +5331,8 @@ impl NginxRouteDriver {
         }
     }
 
-    fn restore(&self, prior: Option<&[u8]>) -> Result<()> {
+    fn restore(&self, prior: Option<&[u8]>, gate: &dyn RouteActuationGate) -> Result<()> {
+        gate.admit(RouteActuation::Survival)?;
         self.write_fragment(prior)?;
         self.reload()?;
         // No prior membership means the stable endpoint no longer routes to
@@ -5281,8 +5348,9 @@ impl NginxRouteDriver {
         prior: Option<&[u8]>,
         failure: anyhow::Error,
         context: &str,
+        gate: &dyn RouteActuationGate,
     ) -> Result<T> {
-        match self.restore(prior) {
+        match self.restore(prior, gate) {
             Ok(()) => Err(failure).context(context.to_owned()),
             Err(rollback) => Err(failure).context(format!(
                 "{context}; route rollback also failed: {rollback:#}"
@@ -5295,6 +5363,7 @@ impl NginxRouteDriver {
         expected: &IdunnExpectedIncarnationRecord,
         runtime_instance_id: &str,
         incumbent: Option<&RouteObservation>,
+        gate: &dyn RouteActuationGate,
     ) -> Result<RoutePreflightReceipt> {
         let rendered = self.render(expected)?;
         ensure!(!rendered.is_empty(), "candidate route rendered empty");
@@ -5312,6 +5381,7 @@ impl NginxRouteDriver {
                 "route preflight found an unadmitted incumbent"
             ),
         }
+        gate.admit(RouteActuation::Forward)?;
         self.validate_candidate_in_private_mount(&rendered)?;
         let after = self.current_configuration()?;
         ensure!(
@@ -5341,6 +5411,7 @@ impl NginxRouteDriver {
         runtime_instance_id: &str,
         preflight: &RoutePreflightReceipt,
         rollback_allowed: bool,
+        gate: &dyn RouteActuationGate,
     ) -> Result<String> {
         preflight.validate()?;
         let rendered = self.render(expected)?;
@@ -5359,6 +5430,7 @@ impl NginxRouteDriver {
                     && prior_sha256 == preflight.incumbent_membership_sha256),
             "route baseline changed after preflight"
         );
+        gate.admit(RouteActuation::Forward)?;
         if !candidate_already_written {
             atomic_replace(&self.binding.config_path, &rendered)?;
         }
@@ -5368,6 +5440,7 @@ impl NginxRouteDriver {
                     preflight.incumbent_configuration.as_deref(),
                     error,
                     "candidate route validation or reload failed",
+                    gate,
                 );
             }
             return Err(error).context(
@@ -5406,13 +5479,17 @@ impl NginxRouteDriver {
     /// candidate's membership was installed, so restoring it is precise whether
     /// there was an incumbent (its bytes) or none (removal). Used when a
     /// transaction is abandoned after the fence.
-    pub fn withdraw_candidate_membership(&self, preflight: &RoutePreflightReceipt) -> Result<()> {
+    pub fn withdraw_candidate_membership(
+        &self,
+        preflight: &RoutePreflightReceipt,
+        gate: &dyn RouteActuationGate,
+    ) -> Result<()> {
         preflight.validate()?;
         ensure!(
             preflight.route_id == self.binding.route_id,
             "route preflight receipt describes another route"
         );
-        self.restore(preflight.incumbent_configuration.as_deref())
+        self.restore(preflight.incumbent_configuration.as_deref(), gate)
     }
 
     /// A fragment already equal to the admitted membership is left alone: no
@@ -5421,6 +5498,7 @@ impl NginxRouteDriver {
         &self,
         expected: &IdunnExpectedIncarnationRecord,
         membership_sha256: &str,
+        gate: &dyn RouteActuationGate,
     ) -> Result<()> {
         let rendered = self.render(expected)?;
         ensure!(
@@ -5430,6 +5508,7 @@ impl NginxRouteDriver {
         if self.current_configuration()?.as_deref() == Some(rendered.as_slice()) {
             return Ok(());
         }
+        gate.admit(RouteActuation::Survival)?;
         self.validate_candidate_in_private_mount(&rendered)?;
         atomic_replace(&self.binding.config_path, &rendered)?;
         if let Err(reload) = self.admit_endpoint().and_then(|()| self.reload()) {
@@ -5557,6 +5636,7 @@ impl NginxRouteDriver {
         expected: &IdunnExpectedIncarnationRecord,
         runtime_instance_id: &str,
         preflight: &RoutePreflightReceipt,
+        gate: &dyn RouteActuationGate,
     ) -> Result<()> {
         preflight.validate()?;
         let rendered = self.render(expected)?;
@@ -5570,7 +5650,7 @@ impl NginxRouteDriver {
             self.current_configuration()?.as_deref() == Some(rendered.as_slice()),
             "candidate route changed before rollback"
         );
-        self.restore(preflight.incumbent_configuration.as_deref())
+        self.restore(preflight.incumbent_configuration.as_deref(), gate)
     }
 }
 
@@ -8247,6 +8327,15 @@ fn apply_identity(command: &mut Command, identity: Option<ProcessIdentity>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gate that never refuses, for driver tests that are not about the ceiling.
+    struct Unmetered;
+
+    impl RouteActuationGate for Unmetered {
+        fn admit(&self, _kind: RouteActuation) -> Result<()> {
+            Ok(())
+        }
+    }
 
     // ---------------------------------------------------------------------
     // A direct challenge fails one of two ways. Silence waits; a bad answer,
@@ -11530,13 +11619,160 @@ Content-Le".to_vec()), |_| {}),
             "allow in to 10.77.0.1 port 17971 proto udp"
         );
 
-        driver.restore(None)?;
+        driver.restore(None, &Unmetered)?;
         assert_eq!(
             fs::read_to_string(ufw.with_extension("calls"))?,
             "delete allow in to 10.77.0.1 port 17971 proto udp\n"
         );
         fs::write(ufw.with_extension("absent"), b"gone\n")?;
-        driver.restore(None)?;
+        driver.restore(None, &Unmetered)?;
+        Ok(())
+    }
+
+    /// Refuses every `Forward` actuation, admits every `Survival`, and records
+    /// what it was asked.
+    struct ForwardRefusing(std::cell::RefCell<Vec<RouteActuation>>);
+
+    impl RouteActuationGate for ForwardRefusing {
+        fn admit(&self, kind: RouteActuation) -> Result<()> {
+            self.0.borrow_mut().push(kind);
+            match kind {
+                RouteActuation::Forward => Err(RouteActuationRefused {
+                    target: "service".into(),
+                    used: 12,
+                    reopens_at_unix_millis: 99,
+                }
+                .into()),
+                RouteActuation::Survival => Ok(()),
+            }
+        }
+    }
+
+    /// Stub host programs that log every call, a driver over them, and a
+    /// candidate whose membership it can render.
+    #[cfg(unix)]
+    fn stubbed_route_driver(
+        temp: &Path,
+    ) -> Result<(NginxRouteDriver, IdunnExpectedIncarnationRecord, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let calls = temp.join("calls");
+        let program = |name: &str| -> Result<PathBuf> {
+            let path = temp.join(name);
+            fs::write(
+                &path,
+                format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\nexit 0\n", calls.display()),
+            )?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+            Ok(path)
+        };
+        let driver = NginxRouteDriver::with_actuators(
+            RouteBinding {
+                driver: RouteDriver::NginxStreamTcp,
+                route_id: "service-route".into(),
+                stable_endpoint: "http://127.0.0.1:4103".into(),
+                private_host: "127.0.0.1".into(),
+                private_port_start: 4104,
+                private_port_end: 4109,
+                config_path: temp.join("service.conf"),
+                reload_unit: "nginx.service".into(),
+            },
+            &RouteActuators {
+                nginx: program("nginx")?,
+                systemd_run: program("systemd-run")?,
+                systemctl: program("systemctl")?,
+                ufw: program("ufw")?,
+                preflight_root: temp.join("preflight"),
+            },
+        );
+        let mut candidate = expected();
+        candidate.route = Some(cultnet_rs::IdunnExpectedRoute {
+            route_id: "service-route".into(),
+            transport: "http".into(),
+            stable_endpoint: "http://127.0.0.1:4103".into(),
+            candidate_endpoint: "http://127.0.0.1:4104".into(),
+        });
+        Ok((driver, candidate, calls))
+    }
+
+    #[cfg(unix)]
+    fn preflight_receipt(
+        driver: &NginxRouteDriver,
+        candidate: &IdunnExpectedIncarnationRecord,
+    ) -> Result<RoutePreflightReceipt> {
+        Ok(RoutePreflightReceipt {
+            route_id: "service-route".into(),
+            candidate_runtime_instance_id: digest('a'),
+            candidate_membership_sha256: sha256_id(&driver.render(candidate)?),
+            incumbent_runtime_instance_id: None,
+            incumbent_membership_sha256: None,
+            incumbent_configuration: None,
+        })
+    }
+
+    /// A refused forward change stops before any host mutation: no program
+    /// runs, no fragment is written, and no private-mount unit starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_forward_actuation_runs_no_program_and_writes_nothing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (driver, candidate, calls) = stubbed_route_driver(temp.path())?;
+        let gate = ForwardRefusing(Default::default());
+        let receipt = preflight_receipt(&driver, &candidate)?;
+
+        let refused = driver
+            .preflight(&candidate, &digest('a'), None, &gate)
+            .unwrap_err();
+        assert!(refused.downcast_ref::<RouteActuationRefused>().is_some());
+        let refused = driver
+            .install(&candidate, &digest('a'), &receipt, true, &gate)
+            .unwrap_err();
+        assert!(refused.downcast_ref::<RouteActuationRefused>().is_some());
+
+        assert!(!calls.exists(), "a refused actuation must run no program");
+        assert!(!driver.binding.config_path.exists());
+        assert_eq!(
+            *gate.0.borrow(),
+            [RouteActuation::Forward, RouteActuation::Forward]
+        );
+        Ok(())
+    }
+
+    /// Restoring the admitted or incumbent route is never refused, whatever
+    /// the gate says about forward changes, and is always asked as survival.
+    #[cfg(unix)]
+    #[test]
+    fn survival_actuations_run_under_a_gate_that_refuses_forward_changes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (driver, candidate, calls) = stubbed_route_driver(temp.path())?;
+        let gate = ForwardRefusing(Default::default());
+        let receipt = preflight_receipt(&driver, &candidate)?;
+        let rendered = driver.render(&candidate)?;
+        let membership = sha256_id(&rendered);
+        let reloads = || -> Result<usize> {
+            Ok(fs::read_to_string(&calls)?
+                .lines()
+                .filter(|line| line.starts_with("systemctl reload"))
+                .count())
+        };
+
+        fs::write(&driver.binding.config_path, b"drifted bytes\n")?;
+        driver.restore_admitted_membership(&candidate, &membership, &gate)?;
+        assert_eq!(fs::read(&driver.binding.config_path)?, rendered);
+        assert_eq!(reloads()?, 1);
+
+        driver.withdraw_candidate_membership(&receipt, &gate)?;
+        assert!(!driver.binding.config_path.exists());
+        assert_eq!(reloads()?, 2);
+
+        fs::write(&driver.binding.config_path, &rendered)?;
+        driver.rollback(&candidate, &digest('a'), &receipt, &gate)?;
+        assert_eq!(reloads()?, 3);
+
+        assert_eq!(
+            *gate.0.borrow(),
+            [RouteActuation::Survival, RouteActuation::Survival, RouteActuation::Survival]
+        );
         Ok(())
     }
 
@@ -11596,22 +11832,22 @@ Content-Le".to_vec()), |_| {}),
 
         fs::write(&config, &rendered)?;
         let modified = fs::metadata(&config)?.modified()?;
-        driver.restore_admitted_membership(&candidate, &membership_sha256)?;
-        driver.restore_admitted_membership(&candidate, &membership_sha256)?;
+        driver.restore_admitted_membership(&candidate, &membership_sha256, &Unmetered)?;
+        driver.restore_admitted_membership(&candidate, &membership_sha256, &Unmetered)?;
         assert!(!calls.exists(), "an exact fragment must run no program");
         assert!(!driver.preflight_root.exists());
         assert_eq!(fs::read(&config)?, rendered);
         assert_eq!(fs::metadata(&config)?.modified()?, modified);
 
         fs::write(&config, b"drifted bytes\n")?;
-        driver.restore_admitted_membership(&candidate, &membership_sha256)?;
+        driver.restore_admitted_membership(&candidate, &membership_sha256, &Unmetered)?;
         assert_eq!(fs::read(&config)?, rendered);
         assert_eq!(count("systemctl reload")?, 1);
         assert_eq!(count("systemd-run")?, 1);
         assert_eq!(count("ufw allow")?, 1);
         assert_eq!(count("nginx -t")?, 1);
 
-        driver.restore_admitted_membership(&candidate, &membership_sha256)?;
+        driver.restore_admitted_membership(&candidate, &membership_sha256, &Unmetered)?;
         assert_eq!(count("systemctl reload")?, 1, "restored bytes never reload again");
         assert_eq!(count("ufw")?, 1);
         Ok(())
@@ -11733,13 +11969,13 @@ Content-Le".to_vec()), |_| {}),
             stable_endpoint: "http://127.0.0.1:4103".into(),
             candidate_endpoint: "http://127.0.0.1:4104".into(),
         });
-        let preflight = driver.preflight(&candidate, &digest('a'), None)?;
+        let preflight = driver.preflight(&candidate, &digest('a'), None, &Unmetered)?;
         assert!(!config.exists());
         assert_eq!(fs::read_dir(&driver.preflight_root)?.count(), 0);
 
         let candidate_bytes = driver.render(&candidate)?;
         fs::write(&config, &candidate_bytes)?;
-        let membership_sha256 = driver.install(&candidate, &digest('a'), &preflight, true)?;
+        let membership_sha256 = driver.install(&candidate, &digest('a'), &preflight, true, &Unmetered)?;
         assert_eq!(
             fs::read_to_string(systemctl.with_extension("calls"))?,
             "reload\n"
@@ -11761,24 +11997,24 @@ Content-Le".to_vec()), |_| {}),
             observed_at_unix_millis: 1,
         };
 
-        let next_preflight = driver.preflight(&candidate, &digest('b'), Some(&admitted))?;
+        let next_preflight = driver.preflight(&candidate, &digest('b'), Some(&admitted), &Unmetered)?;
         assert_eq!(fs::read(&config)?, admitted_bytes);
         fs::write(systemctl.with_extension("fail"), b"fail\n")?;
         assert!(
             driver
-                .install(&candidate, &digest('b'), &next_preflight, false)
+                .install(&candidate, &digest('b'), &next_preflight, false, &Unmetered)
                 .is_err()
         );
         assert_eq!(fs::read(&config)?, admitted_bytes);
         fs::remove_file(systemctl.with_extension("fail"))?;
-        driver.install(&candidate, &digest('b'), &next_preflight, false)?;
+        driver.install(&candidate, &digest('b'), &next_preflight, false, &Unmetered)?;
         fs::write(&config, b"foreign route\n")?;
         assert!(
             driver
-                .install(&candidate, &digest('b'), &next_preflight, true)
+                .install(&candidate, &digest('b'), &next_preflight, true, &Unmetered)
                 .is_err()
         );
-        driver.restore_admitted_membership(&candidate, &admitted.membership_sha256)?;
+        driver.restore_admitted_membership(&candidate, &admitted.membership_sha256, &Unmetered)?;
         assert_eq!(fs::read(&config)?, admitted_bytes);
         assert!(driver.observe_membership(&candidate, &admitted.membership_sha256)?);
 
@@ -11786,12 +12022,12 @@ Content-Le".to_vec()), |_| {}),
         fs::write(systemctl.with_extension("fail"), b"fail\n")?;
         assert!(
             driver
-                .restore_admitted_membership(&candidate, &admitted.membership_sha256)
+                .restore_admitted_membership(&candidate, &admitted.membership_sha256, &Unmetered)
                 .is_err()
         );
         assert!(!config.exists());
         fs::remove_file(systemctl.with_extension("fail"))?;
-        driver.restore_admitted_membership(&candidate, &admitted.membership_sha256)?;
+        driver.restore_admitted_membership(&candidate, &admitted.membership_sha256, &Unmetered)?;
         assert_eq!(fs::read(&config)?, admitted_bytes);
         Ok(())
     }
