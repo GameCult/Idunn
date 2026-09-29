@@ -9526,13 +9526,16 @@ mod tests {
     }
 
     /// A Continuity transaction for an unrouted, stateless target, sitting at
-    /// Fencing with every earlier phase's evidence in place. The plan, sealed
+    /// `phase` (Warming or later) with every earlier phase's evidence in place. The plan, sealed
     /// release, Expected, activation and Warming evidence are the real
     /// constructions; only the workload and isolation observations are
     /// borrowed from a recorded transaction. Continuity is chosen because a
     /// Deploy would need a frozen source and a signed brake record, which no
     /// phase past Fencing reads.
-    fn transaction_at_fencing(world: &EngineFixture) -> Result<DeploymentTransaction> {
+    fn transaction_at(
+        world: &EngineFixture,
+        phase: DeploymentPhase,
+    ) -> Result<DeploymentTransaction> {
         use crate::deployment_plan::tests::{
             BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
         };
@@ -9639,7 +9642,7 @@ mod tests {
             evidence: TopologyEvidence::from_authenticated(&authenticated, now)?,
         });
         transaction.odin_publisher_sequence_cursor = 4;
-        transaction.enter_phase(DeploymentPhase::Fencing, now);
+        transaction.enter_phase(phase, now);
         transaction.validate()?;
 
         let store = SingleFileMessagePackBackingStore::new(&world.state_store);
@@ -9788,7 +9791,7 @@ mod tests {
     #[test]
     fn an_admission_runs_from_fencing_to_complete_and_commits() -> Result<()> {
         let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
-        let seeded = transaction_at_fencing(&world)?;
+        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
         odin_reports_ready(&world, &seeded, 5)?;
 
         let phases = drive(&world, |transaction| {
@@ -9821,9 +9824,31 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_fence_abort_runs_to_complete_without_a_deadline() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        transaction_at(&world, DeploymentPhase::Warming)?;
+        let warming = resident(&world)?;
+        assert_eq!(warming.value.phase_deadline, None);
+
+        world
+            .engine
+            .begin_pre_fencing_abort(&warming, anyhow!("candidate refused"))?;
+        drive(&world, |transaction| transaction.completion.is_some())?;
+        let finished = latest(&world)?;
+        assert_eq!(finished.phase, DeploymentPhase::Complete);
+        assert_eq!(finished.phase_deadline, None);
+        assert!(matches!(
+            finished.completion,
+            Some(TransactionCompletion::FailedBeforeFencing { .. })
+        ));
+        assert!(finished.is_terminal());
+        Ok(())
+    }
+
+    #[test]
     fn a_post_fence_abort_runs_to_complete() -> Result<()> {
         let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
-        let seeded = transaction_at_fencing(&world)?;
+        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
         odin_reports_ready(&world, &seeded, 5)?;
         drive(&world, |transaction| {
             transaction.phase == DeploymentPhase::Routing
@@ -9997,7 +10022,7 @@ mod tests {
     /// declares no Odin dependency, so route proof is its class.
     fn route_proof_generation() -> Result<AdmittedGeneration> {
         let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
-        let seeded = transaction_at_fencing(&world)?;
+        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
         odin_reports_ready(&world, &seeded, 5)?;
         drive(&world, |transaction| {
             transaction.phase == DeploymentPhase::Committing
@@ -10226,7 +10251,7 @@ mod tests {
     fn a_newer_odin_reading_refreshes_the_receipt_before_awaiting_ready_or_routing_advance()
     -> Result<()> {
         let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
-        let seeded = transaction_at_fencing(&world)?;
+        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
         odin_reports_ready(&world, &seeded, 5)?;
 
         // AwaitingReady: the receipt is written, then confirmed, then the
