@@ -37,7 +37,7 @@ use crate::deployment_plan::{
     CompiledDeploymentPlan, DependencyProviderAuthority, SealedRelease, compile_deployment_plan,
 };
 use crate::drivers::{
-    CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
+    ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
     GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
     ProcessIdentity, RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
     SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
@@ -55,7 +55,7 @@ const DEPLOYMENT_TRANSACTION_SCHEMA_V2: &str = "idunn.deployment_transaction.v2"
 const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v3";
 const ADMITTED_GENERATION_SCHEMA_V2: &str = "idunn.admitted_generation.v2";
 /// The capability whose declaration makes a target Odin-correlated.
-const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
+pub(crate) const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
 /// How many times continuity will restart one admitted release before it
 /// concludes the release itself is the problem. More than one because a start
 /// can fail for a passing reason -- a port still held, a peer not yet up --
@@ -276,12 +276,10 @@ impl WarmingEvidence {
         }
     }
 
-    fn canonical_sha256(&self) -> &str {
+    fn voucher(&self) -> Voucher {
         match self {
-            Self::OdinTopology { evidence } => &evidence.canonical_sha256,
-            Self::FirstOdinDirect { evidence } | Self::RouteProofDirect { evidence } => {
-                &evidence.canonical_sha256
-            }
+            Self::OdinTopology { .. } | Self::FirstOdinDirect { .. } => Voucher::Odin,
+            Self::RouteProofDirect { .. } => Voucher::Candidate,
         }
     }
 
@@ -303,7 +301,6 @@ impl WarmingEvidence {
 #[derive(Clone, Debug)]
 pub struct SequenceAdmittedWarming {
     transaction_id: String,
-    evidence: WarmingEvidence,
     signed_presence_sha256: String,
     runtime_instance_id: String,
 }
@@ -311,7 +308,6 @@ pub struct SequenceAdmittedWarming {
 impl SequenceAdmittedWarming {
     fn from_topology(
         transaction_id: String,
-        evidence: TopologyEvidence,
         authenticated: AuthenticatedOdinRuntimeTopologyCorrelation,
     ) -> Result<Self> {
         let record = authenticated.record();
@@ -325,7 +321,6 @@ impl SequenceAdmittedWarming {
             .context("Warming topology has no runtime instance")?;
         Ok(Self {
             transaction_id,
-            evidence: WarmingEvidence::OdinTopology { evidence },
             signed_presence_sha256,
             runtime_instance_id,
         })
@@ -348,7 +343,6 @@ impl SequenceAdmittedWarming {
         Ok(Self {
             transaction_id,
             signed_presence_sha256: evidence.canonical_sha256.clone(),
-            evidence: warming,
             runtime_instance_id,
         })
     }
@@ -357,7 +351,6 @@ impl SequenceAdmittedWarming {
     pub(crate) fn for_test(
         transaction_id: impl Into<String>,
         authenticated: AuthenticatedOdinRuntimeTopologyCorrelation,
-        admitted_at_unix_millis: u64,
     ) -> Result<Self> {
         let record = authenticated.record();
         ensure!(
@@ -370,8 +363,6 @@ impl SequenceAdmittedWarming {
         );
         let transaction_id = transaction_id.into();
         require_id(&transaction_id, "test transaction id")?;
-        let evidence =
-            TopologyEvidence::from_authenticated(&authenticated, admitted_at_unix_millis)?;
         let signed_presence_sha256 = record
             .signed_presence_sha256
             .clone()
@@ -380,7 +371,7 @@ impl SequenceAdmittedWarming {
             .runtime_instance_id
             .clone()
             .context("test Warming receipt has no runtime instance")?;
-        let token = Self::from_topology(transaction_id, evidence, authenticated)?;
+        let token = Self::from_topology(transaction_id, authenticated)?;
         ensure!(
             token.signed_presence_sha256 == signed_presence_sha256
                 && token.runtime_instance_id == runtime_instance_id,
@@ -391,10 +382,6 @@ impl SequenceAdmittedWarming {
 
     pub(crate) fn transaction_id(&self) -> &str {
         &self.transaction_id
-    }
-
-    pub(crate) fn evidence_sha256(&self) -> &str {
-        self.evidence.canonical_sha256()
     }
 
     pub(crate) fn signed_presence_sha256(&self) -> &str {
@@ -557,6 +544,40 @@ fn route_proof_warming_states(expected: &IdunnExpectedIncarnationRecord) -> &'st
     }
 }
 
+/// A challenged runtime answered as something that disagrees with current
+/// authority. Each disagreement is named, so a capacity below the Expected
+/// minimum reads as that and not as a generic refusal. It stays the error's
+/// typed value; callers read `disagreements`, and the text is only its
+/// rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PresenceDisagrees {
+    pub(crate) disagreements: Vec<OdinTopologyDisagreement>,
+}
+
+impl std::fmt::Display for PresenceDisagrees {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let named = self
+            .disagreements
+            .iter()
+            .map(|disagreement| {
+                format!(
+                    "{} (expected {}, observed {})",
+                    disagreement.code,
+                    disagreement.expected.as_deref().unwrap_or("none"),
+                    disagreement.observed.as_deref().unwrap_or("none"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            formatter,
+            "route proof answered with a runtime that disagrees with current authority: {named}"
+        )
+    }
+}
+
+impl std::error::Error for PresenceDisagrees {}
+
 /// What a direct challenge to a candidate endpoint produced.
 enum CandidateAnswer {
     /// No answer: the reason it is still being waited on.
@@ -567,46 +588,161 @@ enum CandidateAnswer {
     },
 }
 
-/// Which kind of proof admits a target as Ready. Derived from the target's
-/// Expected, never stored: Expected is digest-bound, so the class cannot drift
-/// from the incarnation it describes. A target that declares a
-/// `shared-infrastructure odin.verse-rendezvous` dependency advertises into the
-/// Verse and is Odin-correlated; a routed one that declares none is
-/// route-proof. Odin itself provides the rendezvous capability rather than
-/// depending on it. It collects the same receipts an Odin-correlated target
-/// does, and its admitted generation is what names the Odin authority, so it
-/// is never route-proof. A target with no route has no endpoint to challenge,
-/// so only Odin can report on it and it stays Odin-correlated.
+//// Which kind of proof admits a target as Ready, derived from what the target's
+/// recipe declares and from nothing else. Idunn infers no way to prove
+/// readiness: a target that provides `odin.verse-rendezvous` is Odin itself, one
+/// that declares a `shared-infrastructure odin.verse-rendezvous` dependency
+/// advertises into the Verse and is Odin-correlated, and a routed one that
+/// declares neither answers Idunn's own challenge and is route-proof. A target
+/// with no route and no Odin dependency declares no proof at all, and is
+/// refused. Odin collects the same receipts an Odin-correlated target does, and
+/// its admitted generation is what names the Odin authority, so it is never
+/// route-proof.
+///
+/// `of` is the only place a class is decided, and Expected is digest-bound, so
+/// the class cannot drift from the incarnation it describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadinessClass {
+pub(crate) enum ReadinessClass {
     OdinSelf,
     OdinCorrelated,
     RouteProof,
 }
 
+/// A recipe that declares neither a route nor an Odin dependency, and is not
+/// Odin: it has said nothing about how it proves readiness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UndeclaredReadiness {
+    pub(crate) target: String,
+}
+
+impl std::fmt::Display for UndeclaredReadiness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "target {} declares no way to prove readiness: its recipe must declare a route \
+             (Idunn challenges it) or a shared-infrastructure {ODIN_RENDEZVOUS_CAPABILITY} \
+             dependency (Odin correlates it)",
+            self.target
+        )
+    }
+}
+
+impl std::error::Error for UndeclaredReadiness {}
+
 impl ReadinessClass {
-    fn of(expected: &IdunnExpectedIncarnationRecord) -> Self {
-        let provides_odin = expected
-            .capabilities
-            .iter()
-            .any(|capability| capability.capability == ODIN_RENDEZVOUS_CAPABILITY);
-        let declares_odin = expected.dependencies.iter().any(|dependency| {
-            dependency.kind == "shared-infrastructure"
-                && dependency.capability == ODIN_RENDEZVOUS_CAPABILITY
-        });
+    /// The class of a recipe's declarations. Plan compilation and `of` both
+    /// call it, so admission refuses exactly what `of` would refuse.
+    pub(crate) fn declared(
+        target: &str,
+        provides_odin: bool,
+        declares_odin: bool,
+        routed: bool,
+    ) -> Result<Self, UndeclaredReadiness> {
         if provides_odin {
-            Self::OdinSelf
-        } else if declares_odin || expected.route.is_none() {
-            Self::OdinCorrelated
+            Ok(Self::OdinSelf)
+        } else if declares_odin {
+            Ok(Self::OdinCorrelated)
+        } else if routed {
+            Ok(Self::RouteProof)
         } else {
-            Self::RouteProof
+            Err(UndeclaredReadiness {
+                target: target.to_owned(),
+            })
+        }
+    }
+
+    fn of(expected: &IdunnExpectedIncarnationRecord) -> Result<Self, UndeclaredReadiness> {
+        Self::declared(
+            &expected.target,
+            expected
+                .capabilities
+                .iter()
+                .any(|capability| capability.capability == ODIN_RENDEZVOUS_CAPABILITY),
+            expected.dependencies.iter().any(|dependency| {
+                dependency.kind == "shared-infrastructure"
+                    && dependency.capability == ODIN_RENDEZVOUS_CAPABILITY
+            }),
+            expected.route.is_some(),
+        )
+    }
+
+    /// The class of `expected`, provided every receipt collected under it was
+    /// vouched for by that class's voucher. The one way a stored record is
+    /// asked what class it is.
+    fn confirmed(
+        expected: &IdunnExpectedIncarnationRecord,
+        collected: impl IntoIterator<Item = Voucher>,
+    ) -> Result<Self, ReadinessDisagreement> {
+        let required = Self::of(expected).map_err(ReadinessDisagreement::Undeclared)?;
+        match collected
+            .into_iter()
+            .find(|voucher| *voucher != required.voucher())
+        {
+            None => Ok(required),
+            Some(collected) => Err(ReadinessDisagreement::WrongVoucher {
+                target: expected.target.clone(),
+                required,
+                collected,
+            }),
+        }
+    }
+
+    /// Who vouches for a target of this class: Odin's correlation, or the
+    /// candidate answering Idunn.
+    fn voucher(self) -> Voucher {
+        match self {
+            Self::OdinSelf | Self::OdinCorrelated => Voucher::Odin,
+            Self::RouteProof => Voucher::Candidate,
         }
     }
 }
 
-/// The receipt that admitted a candidate as Ready, tagged by the class of proof
-/// that produced it. The tag records what was collected; the class a target
-/// must collect is `ReadinessClass::of(expected)`.
+/// Who vouched for a piece of stored readiness evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Voucher {
+    Odin,
+    Candidate,
+}
+
+/// A stored record whose readiness evidence is not what its own Expected
+/// requires. A record admitted before the target's recipe declared how it
+/// proves readiness looks like this. It is reported and held, never repaired:
+/// re-deriving the evidence around it would make the evidence tag a second
+/// authority for the class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReadinessDisagreement {
+    Undeclared(UndeclaredReadiness),
+    WrongVoucher {
+        target: String,
+        required: ReadinessClass,
+        collected: Voucher,
+    },
+}
+
+impl std::fmt::Display for ReadinessDisagreement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undeclared(undeclared) => write!(formatter, "{undeclared}"),
+            Self::WrongVoucher {
+                target,
+                required,
+                collected,
+            } => write!(
+                formatter,
+                "target {target} is {required:?} but its stored readiness evidence was vouched \
+                 for by {collected:?}: it was collected under a different class, and is held \
+                 until the target is redeployed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReadinessDisagreement {}
+
+/// The receipt that admitted a candidate as Ready, tagged by who vouched for
+/// it. The tag records what was collected; what a target must collect is
+/// `ReadinessClass::of(expected)`, and a tag that differs is a
+/// `ReadinessDisagreement`, never a second opinion about the class.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "kebab-case", deny_unknown_fields)]
 enum ReadinessEvidence {
@@ -615,10 +751,10 @@ enum ReadinessEvidence {
 }
 
 impl ReadinessEvidence {
-    fn class(&self) -> ReadinessClass {
+    fn voucher(&self) -> Voucher {
         match self {
-            Self::OdinCorrelated { .. } => ReadinessClass::OdinCorrelated,
-            Self::RouteProof { .. } => ReadinessClass::RouteProof,
+            Self::OdinCorrelated { .. } => Voucher::Odin,
+            Self::RouteProof { .. } => Voucher::Candidate,
         }
     }
 
@@ -637,7 +773,7 @@ impl ReadinessEvidence {
     }
 }
 
-/// Signed evidence that the candidate process picked up the lease Idunn
+// Signed evidence that the candidate process picked up the lease Idunn
 /// granted: its presence carries `write_lease_sha256` equal to the grant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1286,6 +1422,20 @@ impl DeploymentTransaction {
                 .is_some_and(|cleanup| !cleanup.is_complete())
     }
 
+    /// Where what this transaction has collected disagrees with what its own
+    /// Expected requires. There is nothing to disagree with before Expected.
+    fn readiness_disagreement(&self) -> Option<ReadinessDisagreement> {
+        let expected = self.expected.as_ref()?;
+        ReadinessClass::confirmed(
+            expected,
+            self.warming
+                .iter()
+                .map(WarmingEvidence::voucher)
+                .chain(self.ready.iter().map(ReadinessEvidence::voucher)),
+        )
+        .err()
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == DEPLOYMENT_TRANSACTION_SCHEMA,
@@ -1369,10 +1519,15 @@ impl DeploymentTransaction {
         }
         if let Some(ready) = &self.ready {
             ready.validate_shape()?;
-            if let (ReadinessClass::RouteProof, Some(expected)) = (ready.class(), &self.expected) {
+            // A candidate-vouched receipt is only ever written by this code, so
+            // one on a target that is not route-proof is forged. The other
+            // direction -- an Odin receipt on a route-proof target -- is what a
+            // pre-B3 record looks like, and is a ReadinessDisagreement to hold,
+            // not a record to refuse: refusing it would refuse to boot.
+            if let (Voucher::Candidate, Some(expected)) = (ready.voucher(), &self.expected) {
                 ensure!(
-                    ReadinessClass::of(expected) == ReadinessClass::RouteProof,
-                    "route-proof Ready evidence for a target that declares Odin"
+                    ReadinessClass::of(expected).is_ok_and(|class| class == ReadinessClass::RouteProof),
+                    "route-proof Ready evidence for a target that is not route-proof"
                 );
             }
         }
@@ -1384,14 +1539,16 @@ impl DeploymentTransaction {
                     "Warming topology evidence exceeds the transaction replay cursor"
                 ),
                 WarmingEvidence::FirstOdinDirect { .. } => ensure!(
-                    self.target == "odin",
+                    self.expected.as_ref().is_some_and(|expected| {
+                        ReadinessClass::of(expected).is_ok_and(|class| class == ReadinessClass::OdinSelf)
+                    }),
                     "direct Warming evidence is reserved for Odin observing itself"
                 ),
                 WarmingEvidence::RouteProofDirect { .. } => ensure!(
                     self.expected.as_ref().is_none_or(|expected| {
-                        ReadinessClass::of(expected) == ReadinessClass::RouteProof
+                        ReadinessClass::of(expected).is_ok_and(|class| class == ReadinessClass::RouteProof)
                     }),
-                    "direct route-proof Warming evidence for a target Odin observes"
+                    "direct route-proof Warming evidence for a target that is not route-proof"
                 ),
             }
         }
@@ -1827,6 +1984,12 @@ struct OdinReceipts<'a> {
 }
 
 impl AdmittedGeneration {
+    /// This generation's class, or where its evidence disagrees with it. The
+    /// class comes from its Expected, never from the tag on its Ready receipt.
+    fn readiness(&self) -> Result<ReadinessClass, ReadinessDisagreement> {
+        ReadinessClass::confirmed(&self.expected, [self.ready.voucher()])
+    }
+
     fn odin_receipts(&self) -> Result<OdinReceipts<'_>> {
         match (
             &self.ready,
@@ -1930,8 +2093,8 @@ impl AdmittedGeneration {
                 );
             }
             (ReadinessEvidence::RouteProof { .. }, None, None) => ensure!(
-                ReadinessClass::of(&self.expected) == ReadinessClass::RouteProof,
-                "route-proof Ready evidence for a target that declares Odin"
+                ReadinessClass::of(&self.expected).is_ok_and(|class| class == ReadinessClass::RouteProof),
+                "route-proof Ready evidence for a target that is not route-proof"
             ),
             _ => bail!("admitted readiness evidence and Odin receipts disagree"),
         }
@@ -2538,6 +2701,16 @@ impl ControlSnapshot {
         self.admitted
             .iter()
             .find(|stored| stored.value.target == target)
+    }
+
+    /// The admitted generation of the target that provides
+    /// `odin.verse-rendezvous`: Odin is whichever target says so, not
+    /// whichever is named "odin".
+    fn admitted_odin(&self) -> Option<&Stored<AdmittedGeneration>> {
+        self.admitted.iter().find(|stored| {
+            ReadinessClass::of(&stored.value.expected)
+                .is_ok_and(|class| class == ReadinessClass::OdinSelf)
+        })
     }
 
     fn transaction_for_command(&self, command_id: &str) -> Vec<&DeploymentTransaction> {
@@ -3843,7 +4016,7 @@ impl Engine {
         // is, its own generation names the authority; an admitted Odin that
         // carries none has no authority to name, and falling back to the
         // bootstrap key would let a stale key vouch for the Verse.
-        let authority = match snapshot.admitted_for("odin") {
+        let authority = match snapshot.admitted_odin() {
             None => self.bootstrap_odin_authority.clone(),
             Some(stored) => stored.value.odin_authority.clone().with_context(|| {
                 "admitted Odin generation carries no Odin authority (route-proof readiness)"
@@ -3990,7 +4163,11 @@ impl Engine {
         let odin_authority = self.current_odin_authority(snapshot)?;
         for stored in &snapshot.admitted {
             let generation = &stored.value;
-            if generation.ready.class() == ReadinessClass::RouteProof {
+            // Only a generation whose own Expected says Odin vouches for it has
+            // Odin receipts to re-prove. One whose evidence disagrees with its
+            // class is held and reported by supervision, not re-proved here.
+            if !matches!(generation.readiness(), Ok(class) if class != ReadinessClass::RouteProof)
+            {
                 continue;
             }
             let odin = generation.odin_receipts()?;
@@ -4351,6 +4528,17 @@ impl Engine {
         {
             return Ok(false);
         }
+        // Evidence collected under another class is held and reported, not
+        // advanced and not repaired: no step can make it the right kind, and
+        // running one anyway only fails it every tick. An abort already under
+        // way does not read the class, so it is left to finish.
+        let aborting = current.value.completion.is_some()
+            || current.value.pre_fencing_abort.is_some()
+            || current.value.post_fencing_abort.is_some();
+        if let Some(disagreement) = current.value.readiness_disagreement().filter(|_| !aborting) {
+            self.note_fault("holds transaction", id, &anyhow::Error::new(disagreement));
+            return Ok(false);
+        }
         let advanced = self.advance_transaction(current);
         if advanced.is_ok() {
             // The step ran and succeeded: the fault, if any, has recovered, so
@@ -4582,6 +4770,13 @@ impl Engine {
         let mut admitted = snapshot.admitted.iter().collect::<Vec<_>>();
         admitted.sort_by_key(|stored| stored.value.target.as_str());
         for current in admitted {
+            if let Err(disagreement) = current.value.readiness() {
+                self.note_fault(
+                    "holds admitted generation",
+                    &format!("generation:{}", current.value.target),
+                    &anyhow::Error::new(disagreement),
+                );
+            }
             let blocker = snapshot.transactions.iter().find(|stored| {
                 stored.value.target == current.value.target
                     && stored.value.blocks_new_target_mutation()
@@ -5042,7 +5237,7 @@ impl Engine {
         snapshot: &ControlSnapshot,
         current: &Stored<AdmittedGeneration>,
     ) -> Result<bool> {
-        if current.value.ready.class() == ReadinessClass::RouteProof {
+        if !matches!(current.value.readiness(), Ok(class) if class != ReadinessClass::RouteProof) {
             return Ok(false);
         }
         let odin = current.value.odin_receipts()?;
@@ -5152,6 +5347,9 @@ impl Engine {
                 now,
                 &providers,
             )?;
+            // Idunn infers no way to prove readiness. A recipe that declares
+            // none is refused here, before anything is frozen, built or installed.
+            plan.readiness_class()?;
             return self.persist_same_phase(current, |next| {
                 next.plan = Some(plan);
                 next.updated_at_unix_millis = now;
@@ -5333,7 +5531,8 @@ impl Engine {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let incumbent_lease_sha256 =
             self.incumbent_lease_sha256_for_warming(&snapshot, &current.value)?;
-        if current.value.warming.is_none() && ReadinessClass::of(expected) == ReadinessClass::RouteProof {
+        let class = ReadinessClass::of(expected)?;
+        if current.value.warming.is_none() && class == ReadinessClass::RouteProof {
             // A route-proof target's warming is Idunn's own challenge to the
             // candidate endpoint. No Odin is read: the target declared no
             // reason to be aware of one.
@@ -5375,16 +5574,17 @@ impl Engine {
             // Asked once. Admitting the latest topology persists the sequence
             // cursor, so asking twice with the same record fails the second
             // time as "transaction changed before topology admission".
-            let odin_observation = if current.value.target == "odin"
-                && snapshot.admitted_for("odin").is_some()
+            let is_odin = class == ReadinessClass::OdinSelf;
+            let odin_observation = if is_odin
+                && snapshot.admitted_odin().is_some()
                 && current.value.command_kind != CommandKind::Continuity
             {
                 self.admit_latest_topology(current, None)?
             } else {
                 None
             };
-            let odin_can_observe = current.value.target != "odin" || odin_observation.is_some();
-            let odin_observes_itself = current.value.target == "odin" && !odin_can_observe;
+            let odin_can_observe = !is_odin || odin_observation.is_some();
+            let odin_observes_itself = is_odin && !odin_can_observe;
             if odin_observes_itself {
                 ensure!(
                     expected.write_lease_required,
@@ -5435,7 +5635,6 @@ impl Engine {
                 let evidence = latest.clone();
                 let _token = SequenceAdmittedWarming::from_topology(
                     admitted.value.transaction_id.clone(),
-                    evidence.clone(),
                     authenticated,
                 )?;
                 return self.persist_same_phase(&admitted, |next| {
@@ -5785,7 +5984,7 @@ impl Engine {
                 "candidate process write lease is no longer exact"
             );
         }
-        if ReadinessClass::of(expected) == ReadinessClass::RouteProof {
+        if ReadinessClass::of(expected)? == ReadinessClass::RouteProof {
             // Ready is the candidate answering Idunn's own challenge Active,
             // holding the exact lease Idunn granted. Once recorded it is
             // history; the stable route's challenge is what keeps proving it.
@@ -5858,7 +6057,7 @@ impl Engine {
         let activation = required(&current.value.activation, "activation")?;
         self.observe_candidate_before_waiting(&current.value)?;
         if current.value.routing.is_none() {
-            let admitted = if ReadinessClass::of(expected) == ReadinessClass::RouteProof {
+            let admitted = if ReadinessClass::of(expected)? == ReadinessClass::RouteProof {
                 // Ready is the candidate's own proof, recorded in AwaitingReady.
                 // No Odin correlation is read to admit a route.
                 ensure!(
@@ -5986,7 +6185,7 @@ impl Engine {
         let route_proof = ReadinessClass::of(required(
             &current.value.expected,
             "Expected projection",
-        )?) == ReadinessClass::RouteProof;
+        )?)? == ReadinessClass::RouteProof;
         let ready_current = if route_proof {
             // The candidate's Ready proof is durable, and the stable route's
             // challenge below is its currency. No Odin is read to commit.
@@ -6239,7 +6438,8 @@ impl Engine {
                 // caller and failed the refresh. What the refresh owes is
                 // freshness, and the replay check below is what provides it.
                 ensure!(
-                    current.value.target == "odin",
+                    ReadinessClass::of(required(&current.value.expected, "Warming Expected")?)?
+                        == ReadinessClass::OdinSelf,
                     "direct Warming refresh is reserved for Odin"
                 );
                 let (evidence, present) = self.observe_first_odin_warming(&current.value)?;
@@ -6301,7 +6501,6 @@ impl Engine {
                 }
                 let token = SequenceAdmittedWarming::from_topology(
                     admitted.value.transaction_id.clone(),
-                    fresh_evidence.clone(),
                     authenticated,
                 )?;
                 if !provider_warming_advanced(
@@ -6670,20 +6869,10 @@ impl Engine {
         )?;
         let correlation = correlate_runtime_presence_claim(authenticated, authority)?;
         if !correlation.disagreements().is_empty() {
-            let named = correlation
-                .disagreements()
-                .iter()
-                .map(|disagreement| {
-                    format!(
-                        "{} (expected {}, observed {})",
-                        disagreement.code,
-                        disagreement.expected.as_deref().unwrap_or("none"),
-                        disagreement.observed.as_deref().unwrap_or("none"),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            bail!("route proof answered with a runtime that disagrees with current authority: {named}");
+            return Err(PresenceDisagrees {
+                disagreements: correlation.disagreements().to_vec(),
+            }
+            .into());
         }
         let present = correlation.into_undisputed_present()?;
         let presence = present.record();
@@ -6727,9 +6916,10 @@ impl Engine {
         // Odin ever been admitted" test only contradicted that caller. What is
         // still checked is what this function itself depends on -- the target
         // is Odin, and the incarnation is stateful.
+        let expected = required(&transaction.expected, "Odin Expected")?;
         ensure!(
-            transaction.target == "odin"
-                && required(&transaction.expected, "Odin Expected")?.write_lease_required,
+            ReadinessClass::of(expected)? == ReadinessClass::OdinSelf
+                && expected.write_lease_required,
             "direct Warming presence is reserved for a stateful Odin incarnation"
         );
         ensure!(
@@ -7027,7 +7217,6 @@ impl Engine {
                 );
                 SequenceAdmittedWarming::from_topology(
                     transaction.transaction_id.clone(),
-                    evidence,
                     authenticated,
                 )
             }
@@ -7097,7 +7286,9 @@ impl Engine {
     /// One direct challenge to a route-proof target's candidate endpoint.
     /// Failing to reach or hear the candidate is only silence: a process that
     /// is still starting does not answer, and that is waiting, not a fault.
-    /// What does answer is authenticated, and a bad answer is an error.
+    /// What does answer is authenticated, and a bad answer is an error, as is
+    /// a challenge Idunn could not make: those stay a `ChallengeFailure` in the
+    /// error's chain.
     fn challenge_candidate(
         &self,
         transaction: &DeploymentTransaction,
@@ -7117,16 +7308,13 @@ impl Engine {
         let challenged_at_unix_millis = now_millis()?;
         let response = match driver.request_candidate_runtime_presence(expected, &message_id) {
             Ok(response) => response,
-            Err(error) => {
+            Err(ChallengeFailure::Silent(error)) => {
                 return Ok(CandidateAnswer::Silent(format!(
                     "candidate endpoint did not answer its challenge: {error:#}"
                 )));
             }
+            Err(bad @ ChallengeFailure::Refused(_)) => return Err(bad.into()),
         };
-        ensure!(
-            response.message_id == message_id,
-            "candidate transport substituted its challenge identity"
-        );
         let admitted_at_unix_millis = now_millis()?;
         let authority = self.runtime_authority(transaction)?;
         let present = self.authenticate_challenged_presence(
@@ -10009,7 +10197,7 @@ mod tests {
                 lifted.odin_publisher_sequence_cursor,
                 legacy.odin_publisher_sequence_cursor
             );
-            assert_eq!(lifted.ready.class(), ReadinessClass::OdinCorrelated);
+            assert_eq!(lifted.ready.voucher(), Voucher::Odin);
             // The repair intent still decides whatever it decided.
             assert_eq!(
                 lifted.route_repair_started_at_unix_millis,
@@ -10176,18 +10364,36 @@ mod tests {
             dependency.kind == "shared-infrastructure"
                 && dependency.capability == ODIN_RENDEZVOUS_CAPABILITY
         }));
-        assert_eq!(ReadinessClass::of(&expected), ReadinessClass::OdinCorrelated);
+        assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::OdinCorrelated));
         for dependency in &mut expected.dependencies {
             // Same capability, other kind: only the shared-infrastructure
             // declaration makes a target Odin-correlated.
             dependency.kind = "required".into();
         }
-        assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
+        assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::RouteProof));
         expected.dependencies.clear();
-        assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
-        // Nothing to challenge: only Odin can report on an unrouted target.
+        assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::RouteProof));
+        // Nothing to challenge and no Odin dependency: the recipe has declared
+        // no way to prove readiness, and Idunn does not pick one.
         expected.route = None;
-        assert_eq!(ReadinessClass::of(&expected), ReadinessClass::OdinCorrelated);
+        assert_eq!(
+            ReadinessClass::of(&expected),
+            Err(UndeclaredReadiness {
+                target: expected.target.clone()
+            })
+        );
+        // Declaring the Odin dependency is the declaration, routed or not: a
+        // routed target that only publishes to Odin is Odin-correlated.
+        let odin_dependency = generation.expected.dependencies.clone();
+        expected.dependencies = odin_dependency.clone();
+        assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::OdinCorrelated));
+        expected.route = generation.expected.route.clone();
+        assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::OdinCorrelated));
+        // Providing the rendezvous is being Odin, whatever else is declared.
+        expected.dependencies.clear();
+        expected.route = None;
+        expected.capabilities[0].capability = ODIN_RENDEZVOUS_CAPABILITY.into();
+        assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::OdinSelf));
         Ok(())
     }
 
@@ -10522,6 +10728,27 @@ mod tests {
         })
     }
 
+    /// The declaration that makes an unrouted fixture target Odin-correlated.
+    /// Idunn infers no way to prove readiness, and a target with no route has
+    /// nothing for Idunn to challenge, so the world says outright that Odin
+    /// reports on it. The plan selects no provider: these worlds never plan
+    /// against Odin, they only read its correlation, which names the provider
+    /// Expected does.
+    fn declare_odin(expected: &mut IdunnExpectedIncarnationRecord) {
+        expected.dependencies.push(cultnet_rs::IdunnExpectedDependency {
+            kind: "shared-infrastructure".into(),
+            capability: ODIN_RENDEZVOUS_CAPABILITY.into(),
+            schema: "odin.verse-topology.v1".into(),
+            compatibility: "v1".into(),
+            minimum_capacity: 1,
+            startup: "before-promotion".into(),
+            provider_id: Some("odin".into()),
+            provider_authority: Some("managed-incarnation".into()),
+            provider_expected_projection_sha256: Some(sha256_id(b"odin expected projection")),
+            provider_endpoint: None,
+        });
+    }
+
     /// A transaction for an unrouted, stateless target, sitting at `phase`
     /// (Warming or later) with every earlier phase's evidence in place. The
     /// plan, sealed release, Expected, activation and Warming evidence are the
@@ -10607,8 +10834,9 @@ mod tests {
                 (plan, release)
             }
         };
-        let expected = release.expected_projection(&plan)?;
+        let mut expected = release.expected_projection(&plan)?;
         assert!(!expected.write_lease_required && expected.route.is_none());
+        declare_odin(&mut expected);
 
         let now = now_millis()?;
         let command = DeploymentCommand {
@@ -10755,7 +10983,25 @@ mod tests {
             runtime_instance_id: Some(activation.runtime_instance_id.clone()),
             present: true,
             ready,
-            dependencies: Vec::new(),
+            dependencies: expected
+                .dependencies
+                .iter()
+                .map(|dependency| cultnet_rs::OdinRuntimeDependencyEvidence {
+                    kind: dependency.kind.clone(),
+                    capability: dependency.capability.clone(),
+                    schema: dependency.schema.clone(),
+                    compatibility: dependency.compatibility.clone(),
+                    provider_id: dependency.provider_id.clone(),
+                    provider_authority: dependency.provider_authority.clone(),
+                    provider_expected_projection_sha256: dependency
+                        .provider_expected_projection_sha256
+                        .clone(),
+                    provider_endpoint: dependency.provider_endpoint.clone(),
+                    observed_capacity: Some(dependency.minimum_capacity),
+                    provider_evidence_sha256: Some(sha256_id(b"odin provider evidence")),
+                    ready: true,
+                })
+                .collect(),
             disagreements: Vec::new(),
             signer_identity_id: world.odin_signer.entry().identity_id.clone(),
             publisher_sequence: sequence,
@@ -11029,6 +11275,10 @@ mod tests {
 
         let (_, mut odin) = fixture_generation(FIXTURE_GENERATION)?;
         odin.target = "odin".into();
+        // Odin is the target that provides the rendezvous, whatever it is named.
+        odin.expected.target = "odin".into();
+        odin.expected.dependencies.clear();
+        odin.expected.capabilities[0].capability = ODIN_RENDEZVOUS_CAPABILITY.into();
         odin.odin_authority = Some(AdmittedOdinAuthority::from_anchor(
             &world.odin_signer.trust_anchor()?,
         )?);
@@ -11081,7 +11331,7 @@ mod tests {
     #[test]
     fn a_route_proof_generation_is_admitted_only_in_its_exact_shape() -> Result<()> {
         let generation = route_proof_generation()?;
-        assert_eq!(generation.ready.class(), ReadinessClass::RouteProof);
+        assert_eq!(generation.ready.voucher(), Voucher::Candidate);
         assert!(generation.odin_authority.is_none());
         assert!(generation.latest_odin_observation.is_none());
         assert!(generation.odin_receipts().is_err());
@@ -11247,7 +11497,7 @@ mod tests {
         assert_eq!(snapshot.admitted.len(), 1);
         let lifted = &snapshot.admitted[0].value;
         assert_eq!(lifted.target, envelope.key);
-        assert_eq!(lifted.ready.class(), ReadinessClass::OdinCorrelated);
+        assert_eq!(lifted.ready.voucher(), Voucher::Odin);
         assert!(snapshot.admitted_for(&envelope.key).is_some());
 
         // The lifted record is held to the same key rule as a current one.
@@ -13270,6 +13520,10 @@ mod tests {
             candidate_hits: AtomicUsize,
             stable_hits: AtomicUsize,
             stop: AtomicBool,
+            /// Accept the connection and close it without a word: a process
+            /// that is up but not answering. Unlike a closed port, no other
+            /// test's listener can be handed the address.
+            hang_up: AtomicBool,
         }
 
         impl RuntimeStub {
@@ -13399,7 +13653,9 @@ mod tests {
                                     &stub.stable_hits
                                 };
                                 hits.fetch_add(1, Ordering::SeqCst);
-                                let _ = stub.serve_one(stream);
+                                if !stub.hang_up.load(Ordering::SeqCst) {
+                                    let _ = stub.serve_one(stream);
+                                }
                             }
                             Err(_) => std::thread::sleep(Duration::from_millis(5)),
                         }
@@ -13508,11 +13764,11 @@ mod tests {
             assert!(expected.route.is_some() && expected.dependencies.is_empty());
             assert_eq!(
                 ReadinessClass::of(&expected),
-                if provides_odin {
+                Ok(if provides_odin {
                     ReadinessClass::OdinSelf
                 } else {
                     ReadinessClass::RouteProof
-                }
+                })
             );
 
             let now = now_millis()?;
@@ -13572,6 +13828,7 @@ mod tests {
                 candidate_hits: AtomicUsize::new(0),
                 stable_hits: AtomicUsize::new(0),
                 stop: AtomicBool::new(false),
+                hang_up: AtomicBool::new(false),
             });
             stub.listen(candidate_listener, true);
             stub.listen(stable_listener, false);
@@ -13798,7 +14055,7 @@ mod tests {
 
             let generation = admitted(&routed)?;
             generation.validate()?;
-            assert_eq!(generation.ready.class(), ReadinessClass::RouteProof);
+            assert_eq!(generation.ready.voucher(), Voucher::Candidate);
             assert!(generation.odin_authority.is_none());
             assert!(generation.latest_odin_observation.is_none());
             assert!(generation.route_supervision.is_some());
@@ -13827,7 +14084,7 @@ mod tests {
             routed.promote_by_hand()?;
             routed.step()?;
             let generation = admitted(&routed)?;
-            assert_eq!(generation.ready.class(), ReadinessClass::RouteProof);
+            assert_eq!(generation.ready.voucher(), Voucher::Candidate);
             // The valid, not-Ready correlation was neither admitted as a
             // receipt nor consulted: the record carries no Odin cursor.
             assert_eq!(generation.odin_publisher_sequence_cursor, 0);
@@ -13847,10 +14104,9 @@ mod tests {
             assert_eq!(routed.stub.candidate_hits.load(Ordering::SeqCst), 1);
             routed.assert_odin_untouched()?;
 
-            // Nothing listens: the same step waits, and says why.
+            // Nothing answers: the same step waits, and says why.
             let silent = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
-            silent.stub.stop.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(50));
+            silent.stub.hang_up.store(true, Ordering::SeqCst);
             silent.step()?;
             let waiting = silent.transaction()?;
             assert!(waiting.warming.is_none() && waiting.pre_fencing_abort.is_none());
@@ -13885,11 +14141,11 @@ mod tests {
         fn odin_itself_is_never_route_proof() -> Result<()> {
             let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
             let mut expected = routed.stub.expected.clone();
-            assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
+            assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::RouteProof));
             // Odin provides the rendezvous capability and declares no dependency.
             expected.capabilities[0].capability = ODIN_RENDEZVOUS_CAPABILITY.into();
             assert!(expected.dependencies.is_empty());
-            assert_eq!(ReadinessClass::of(&expected), ReadinessClass::OdinSelf);
+            assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::OdinSelf));
 
             // Route-proof evidence for it is refused: its admitted generation
             // is what names the Odin authority, so it must carry one.
@@ -13899,7 +14155,7 @@ mod tests {
             odin.ready = route_proof_evidence();
             odin.latest_odin_observation = None;
             odin.odin_authority = None;
-            assert!(error_text(odin.validate()).contains("declares Odin"));
+            assert!(error_text(odin.validate()).contains("not route-proof"));
             Ok(())
         }
 
@@ -14024,7 +14280,7 @@ mod tests {
             routed.step()?;
             let generation = admitted(&routed)?;
             generation.validate()?;
-            assert_eq!(generation.ready.class(), ReadinessClass::OdinCorrelated);
+            assert_eq!(generation.ready.voucher(), Voucher::Odin);
             assert_eq!(
                 generation.odin_authority,
                 Some(routed.world.engine.bootstrap_odin_authority.clone())

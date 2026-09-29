@@ -5453,7 +5453,7 @@ impl NginxRouteDriver {
                 && route.stable_endpoint == self.binding.stable_endpoint,
             "route challenge binding differs from Expected"
         );
-        self.request_runtime_presence_at(expected, message_id, &route.stable_endpoint)
+        Ok(self.request_runtime_presence_at(expected, message_id, &route.stable_endpoint)?)
     }
 
     /// The bootstrap exception for the first managed Odin observes Warming on
@@ -5462,16 +5462,17 @@ impl NginxRouteDriver {
         &self,
         expected: &IdunnExpectedIncarnationRecord,
         message_id: &str,
-    ) -> Result<RouteSnapshotResponse> {
+    ) -> Result<RouteSnapshotResponse, ChallengeFailure> {
         let route = expected
             .route
             .as_ref()
-            .context("candidate challenge has no Expected route")?;
-        ensure!(
+            .context("candidate challenge has no Expected route")
+            .map_err(refused)?;
+        ensure_or_refuse(
             route.route_id == self.binding.route_id,
-            "candidate challenge binding differs from Expected"
-        );
-        self.render(expected)?;
+            "candidate challenge binding differs from Expected",
+        )?;
+        self.render(expected).map_err(refused)?;
         self.request_runtime_presence_at(expected, message_id, &route.candidate_endpoint)
     }
 
@@ -5480,13 +5481,14 @@ impl NginxRouteDriver {
         expected: &IdunnExpectedIncarnationRecord,
         message_id: &str,
         endpoint: &str,
-    ) -> Result<RouteSnapshotResponse> {
-        expected.validate()?;
-        require_driver_id(message_id, "route challenge message")?;
+    ) -> Result<RouteSnapshotResponse, ChallengeFailure> {
+        expected.validate().map_err(refused)?;
+        require_driver_id(message_id, "route challenge message").map_err(refused)?;
         let route = expected
             .route
             .as_ref()
-            .context("route challenge has no Expected route")?;
+            .context("route challenge has no Expected route")
+            .map_err(refused)?;
         let request = CultNetMessage::SnapshotRequest {
             message_id: message_id.to_owned(),
             schema_ids: Some(vec![GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into()]),
@@ -5496,27 +5498,34 @@ impl NginxRouteDriver {
             "http" => "http://",
             "tcp" => "tcp://",
             "rudp" => "rudp://",
-            _ => bail!("route challenge transport is unsupported"),
+            _ => return Err(refused(anyhow!("route challenge transport is unsupported"))),
         };
-        let (host, port) = endpoint_host_port(endpoint, endpoint_prefix)?;
+        let (host, port) = endpoint_host_port(endpoint, endpoint_prefix).map_err(refused)?;
         let target = SocketAddr::new(
             host.parse()
-                .context("route challenge endpoint host is not an IP address")?,
+                .context("route challenge endpoint host is not an IP address")
+                .map_err(refused)?,
             port,
         );
         let response = match route.transport.as_str() {
             "http" => {
                 let payload =
-                    encode_cultnet_message_to_vec(&request, CultNetWireContract::CultNetSchemaV0)?;
+                    encode_cultnet_message_to_vec(&request, CultNetWireContract::CultNetSchemaV0)
+                        .map_err(refused)?;
                 let response = request_http_snapshot(target, &payload)?;
-                decode_cultnet_message_from_slice(&response, CultNetWireContract::CultNetSchemaV0)?
+                decode_cultnet_message_from_slice(&response, CultNetWireContract::CultNetSchemaV0)
+                    .map_err(refused)?
             }
             "tcp" => {
                 let payload =
-                    encode_cultnet_message_to_vec(&request, CultNetWireContract::CultNetSchemaV0)?;
+                    encode_cultnet_message_to_vec(&request, CultNetWireContract::CultNetSchemaV0)
+                        .map_err(refused)?;
                 let response = request_tcp_snapshot(target, &payload)?;
-                decode_cultnet_message_from_slice(&response, CultNetWireContract::CultNetSchemaV0)?
+                decode_cultnet_message_from_slice(&response, CultNetWireContract::CultNetSchemaV0)
+                    .map_err(refused)?
             }
+            // The RUDP client reports every failure as prose, so a bad answer
+            // cannot be told from no answer here: all of it reads as silence.
             "rudp" => request_raw_snapshot_from_rudp_catalog(CultMeshRudpSnapshotOptions {
                 target,
                 runtime_id: "idunn-route-observer".into(),
@@ -5524,10 +5533,11 @@ impl NginxRouteDriver {
                 schema_ids: Some(vec![GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into()]),
                 record_keys: Some(vec![expected.target.clone()]),
                 ..CultMeshRudpSnapshotOptions::default()
-            })?,
-            _ => bail!("route challenge transport is unsupported"),
+            })
+            .map_err(silent)?,
+            _ => return Err(refused(anyhow!("route challenge transport is unsupported"))),
         };
-        exact_route_snapshot_response(response, message_id, &expected.target)
+        exact_route_snapshot_response(response, message_id, &expected.target).map_err(refused)
     }
 
     /// Restore the exact preflight baseline. This may only replace the exact
@@ -5555,51 +5565,125 @@ impl NginxRouteDriver {
     }
 }
 
-fn request_tcp_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
+/// Why a direct presence challenge produced no document to authenticate.
+#[derive(Debug)]
+pub enum ChallengeFailure {
+    /// Nothing answered: the connection was refused, timed out, or dropped, or
+    /// the peer closed it without a byte. A process still starting does this,
+    /// and it is waiting, not a fault.
+    Silent(anyhow::Error),
+    /// Something answered wrongly, or the challenge could not be made: a
+    /// malformed or foreign answer, an oversized one, or a local configuration
+    /// error. Waiting does not fix it.
+    Refused(anyhow::Error),
+}
+
+impl std::fmt::Display for ChallengeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Silent(error) | Self::Refused(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ChallengeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Silent(error) | Self::Refused(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+fn silent(error: impl Into<anyhow::Error>) -> ChallengeFailure {
+    ChallengeFailure::Silent(error.into())
+}
+
+fn refused(error: impl Into<anyhow::Error>) -> ChallengeFailure {
+    ChallengeFailure::Refused(error.into())
+}
+
+fn ensure_or_refuse(condition: bool, message: &'static str) -> Result<(), ChallengeFailure> {
+    if condition {
+        Ok(())
+    } else {
+        Err(refused(anyhow!(message)))
+    }
+}
+
+fn request_tcp_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, ChallengeFailure> {
     let mut stream = connect_route_socket(target)
-        .with_context(|| format!("connecting stable CultNet TCP route {target}"))?;
-    stream.set_read_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))?;
-    stream.set_write_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))?;
-    stream.write_all(&encode_frame(payload)?)?;
-    stream.flush()?;
+        .with_context(|| format!("connecting stable CultNet TCP route {target}"))
+        .map_err(silent)?;
+    stream
+        .set_read_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))
+        .map_err(refused)?;
+    stream
+        .set_write_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))
+        .map_err(refused)?;
+    stream
+        .write_all(&encode_frame(payload).map_err(refused)?)
+        .and_then(|()| stream.flush())
+        .map_err(silent)?;
 
     let mut header = [0_u8; 4];
     stream
         .read_exact(&mut header)
-        .context("reading stable CultNet TCP response frame")?;
+        .context("reading stable CultNet TCP response frame")
+        .map_err(silent)?;
     let length = u32::from_be_bytes(header) as usize;
-    ensure!(
+    ensure_or_refuse(
         (1..=ROUTE_SNAPSHOT_MAX_BYTES).contains(&length),
-        "stable CultNet TCP response exceeds the route observation bound"
-    );
+        "stable CultNet TCP response exceeds the route observation bound",
+    )?;
     let mut response = vec![0_u8; length];
     stream
         .read_exact(&mut response)
-        .context("reading stable CultNet TCP response payload")?;
+        .context("reading stable CultNet TCP response payload")
+        .map_err(silent)?;
     Ok(response)
 }
 
-fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
+fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, ChallengeFailure> {
     let mut stream = connect_route_socket(target)
-        .with_context(|| format!("connecting stable CultNet HTTP route {target}"))?;
-    stream.set_read_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))?;
-    stream.set_write_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))?;
+        .with_context(|| format!("connecting stable CultNet HTTP route {target}"))
+        .map_err(silent)?;
+    stream
+        .set_read_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))
+        .map_err(refused)?;
+    stream
+        .set_write_timeout(Some(ROUTE_SNAPSHOT_TIMEOUT))
+        .map_err(refused)?;
     let head = format!(
         "POST {ROUTE_HTTP_SNAPSHOT_PATH} HTTP/1.1\r\nHost: {target}\r\nContent-Type: application/msgpack\r\nAccept: application/msgpack\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()?;
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(payload))
+        .and_then(|()| stream.flush())
+        .map_err(silent)?;
 
     let maximum = ROUTE_HTTP_MAX_HEADER_BYTES
         .checked_add(ROUTE_SNAPSHOT_MAX_BYTES)
-        .context("route HTTP response bound overflow")?;
+        .context("route HTTP response bound overflow")
+        .map_err(refused)?;
     let mut response = Vec::new();
     (&mut stream)
         .take((maximum + 1) as u64)
         .read_to_end(&mut response)
-        .context("reading stable CultNet HTTP response")?;
+        .context("reading stable CultNet HTTP response")
+        .map_err(silent)?;
+    if response.is_empty() {
+        return Err(silent(anyhow!(
+            "stable CultNet HTTP route closed the connection without answering"
+        )));
+    }
+    parse_http_snapshot(&response, maximum).map_err(refused)
+}
+
+/// The body of an HTTP snapshot response that arrived, or why what arrived is
+/// not one.
+fn parse_http_snapshot(response: &[u8], maximum: usize) -> Result<Vec<u8>> {
     ensure!(
         response.len() <= maximum,
         "stable CultNet HTTP response exceeds the route observation bound"
@@ -10194,7 +10278,7 @@ mod tests {
                 maximum_future_skew_millis: 5,
             },
         )?;
-        let warming = SequenceAdmittedWarming::for_test("test-transaction", warming, 120)?;
+        let warming = SequenceAdmittedWarming::for_test("test-transaction", warming)?;
         Ok((expected, activation, warming, provider.trust_anchor()?))
     }
 

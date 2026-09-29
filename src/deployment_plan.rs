@@ -10,7 +10,7 @@ use cultnet_rs::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::control_plane::SequenceAdmittedReady;
+use crate::control_plane::{ODIN_RENDEZVOUS_CAPABILITY, ReadinessClass, SequenceAdmittedReady};
 use crate::deployment::{
     CapabilityDependency, DeadlineBinding, DependencyKind, ExternalCapabilityBinding, OperatorBinding,
     ServiceTransport, SourceSelectionPolicy, StartupOrder, StateDeclaration, TargetDeclaration,
@@ -638,6 +638,25 @@ impl CompiledDeploymentPlan {
         let binding = OperatorBinding::parse(binding_text)?;
         binding.admit(&declaration)?;
         Ok((declaration, binding))
+    }
+
+    /// How this plan's target proves readiness, from its recipe's declarations
+    /// and its binding's route, or the typed refusal that it declares none.
+    /// Admission asks this before anything is sealed or installed.
+    pub(crate) fn readiness_class(&self) -> Result<ReadinessClass> {
+        let (declaration, binding) = self.parsed_inputs()?;
+        Ok(ReadinessClass::declared(
+            &declaration.target,
+            declaration
+                .provides
+                .iter()
+                .any(|provided| provided.capability == ODIN_RENDEZVOUS_CAPABILITY),
+            declaration.dependencies.iter().any(|dependency| {
+                dependency.kind == DependencyKind::SharedInfrastructure
+                    && dependency.capability == ODIN_RENDEZVOUS_CAPABILITY
+            }),
+            binding.route.is_some(),
+        )?)
     }
 
     fn recomputed_plan_id(&self) -> Result<String> {
