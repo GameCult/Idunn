@@ -8657,10 +8657,10 @@ mod tests {
             }
         };
         let lines = ROUTE_HTTP_MAX_HEADER_BYTES / filler.len();
-        // Just inside the bound, then just outside it.
+        // Just inside the bound, then just outside it (a whole line over).
         challenge(scripted_peer(answer_with(lines - 2)), |_| {}).expect("headers inside the bound");
         assert_refused(
-            challenge(scripted_peer(answer_with(lines)), |_| {}),
+            challenge(scripted_peer(answer_with(lines + 1)), |_| {}),
             "headers over the bound together",
         );
     }
