@@ -29,6 +29,20 @@ Verdict: safe to merge for the StreamPixels web ship. The fix batch, in Hands, c
 Before `idunn up`, one read-only decode of a *copy* of the live `control.cc` checks for non-terminal
 transactions of routed targets with no Odin declaration (operator approved, 2026-09-30).
 
+**B3 fix batch, 2026-09-30.** Pushed `6ea824b` and `e11b457`; 275 tests pass.
+- `ReadinessClass::of` is the only class authority. The evidence tag is demoted to `Voucher`.
+- `ChallengeFailure::{Silent, Refused}` separates silence from a refused answer.
+- `PresenceDisagrees` makes the capacity shortfall a typed value.
+- The recipes are on `route/b3-declare`: Heimdall `d5acc94`, Muninn `2260853`.
+- Still open, for a fresh Hands: three survivors (boot re-proof by tag, config error as silence, first-Odin
+  check by name) and `cargo mutants --in-diff`.
+
+**Rulings, 2026-09-30:**
+- A stored record whose evidence disagrees with its declared class is **held and reported, never aborted**
+  by Idunn. B5's deadlines or the operator resolve it.
+- **Heimdall and raven-muninn are redeployed with their declaring recipes in the same window as Idunn B3
+  and the StreamPixels ship.**
+
 **Ruling, 2026-09-30: the recipe declares readiness; Idunn infers nothing.** This settles the fork
 Hands raised against a literal Q1(b). An unrouted target whose recipe declares neither a route nor an
 Odin dependency is refused at admission with a typed error. It does not fall back to Odin correlation
