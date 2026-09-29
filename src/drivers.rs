@@ -8458,14 +8458,18 @@ mod tests {
     // answered.
     // ---------------------------------------------------------------------
 
-    fn http_chunked(body: &[u8], chunk: usize) -> Vec<u8> {
+    fn http_chunked(body: &[u8], chunk: usize, trailer: bool) -> Vec<u8> {
         let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
         for piece in body.chunks(chunk) {
             response.extend_from_slice(format!("{:x};ext=1\r\n", piece.len()).as_bytes());
             response.extend_from_slice(piece);
             response.extend_from_slice(b"\r\n");
         }
-        response.extend_from_slice(b"0\r\nTrailer: x\r\n\r\n");
+        response.extend_from_slice(if trailer {
+            b"0\r\nTrailer: x\r\n\r\n"
+        } else {
+            b"0\r\n\r\n"
+        });
         response
     }
 
@@ -8487,14 +8491,16 @@ mod tests {
         assert_eq!(answer.canonical_presence, [1, 2, 3]);
         assert!(started.elapsed() < LINGER / 2, "the challenge waited on the socket");
 
-        let started = Instant::now();
-        let answer = challenge(
-            lingering_peer(|id| http_chunked(&honest_body(id), 7), LINGER),
-            |_| {},
-        )
-        .expect("a chunked answer");
-        assert_eq!(answer.canonical_presence, [1, 2, 3]);
-        assert!(started.elapsed() < LINGER / 2, "the challenge waited on the socket");
+        for trailer in [true, false] {
+            let started = Instant::now();
+            let answer = challenge(
+                lingering_peer(move |id| http_chunked(&honest_body(id), 7, trailer), LINGER),
+                |_| {},
+            )
+            .expect("a chunked answer");
+            assert_eq!(answer.canonical_presence, [1, 2, 3]);
+            assert!(started.elapsed() < LINGER / 2, "the challenge waited on the socket");
+        }
     }
 
     #[test]
@@ -8651,9 +8657,10 @@ mod tests {
             }
         };
         let lines = ROUTE_HTTP_MAX_HEADER_BYTES / filler.len();
-        challenge(scripted_peer(answer_with(lines / 2)), |_| {}).expect("headers inside the bound");
+        // Just inside the bound, then just outside it.
+        challenge(scripted_peer(answer_with(lines - 2)), |_| {}).expect("headers inside the bound");
         assert_refused(
-            challenge(scripted_peer(answer_with(lines * 2)), |_| {}),
+            challenge(scripted_peer(answer_with(lines)), |_| {}),
             "headers over the bound together",
         );
     }
