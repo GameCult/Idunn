@@ -2447,8 +2447,8 @@ fn parse_cancel(mut args: impl Iterator<Item = String>) -> Result<Command> {
     })
 }
 
-/// Withdraw queued work, or ask Idunn to clean up a live stateless candidate.
-/// Stateful candidates past fencing cannot be cancelled because their prior
+/// Withdraw queued work, a held deployment that has not fenced, or ask Idunn to
+/// clean up a live stateless candidate. Stateful candidates past fencing cannot be cancelled because their prior
 /// writer may already be stopped and its state boundary needs explicit repair.
 fn cancel(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()> {
     let snapshot = ControlSnapshot::read(store_path)?;
@@ -2471,12 +2471,17 @@ fn cancel(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
             "deployment command has multiple live transactions"
         );
         ensure!(
-            cancel_is_safe_for_live_stateless(&current.value),
-            "live deployment can only be cancelled after fencing when its candidate is stateless"
+            cancel_is_safe_for_live_stateless(&current.value)
+                || cancel_is_safe_for_held_prefence(&current.value),
+            "live deployment can only be cancelled before fencing when Idunn holds it, or after fencing when its candidate is stateless"
         );
         let error = format!("cancelled by {requested_by}");
         let mut next = current.value.clone();
-        next.post_fencing_abort = Some(post_fencing_abort_intent(&next, &error));
+        if cancel_is_safe_for_held_prefence(&next) {
+            next.pre_fencing_abort = Some(pre_fencing_abort_intent(&next, &error));
+        } else {
+            next.post_fencing_abort = Some(post_fencing_abort_intent(&next, &error));
+        }
         next.last_error = Some(error);
         next.updated_at_unix_millis = now_millis()?;
         replace_transaction(store_path, current, &next)?;
@@ -2511,6 +2516,14 @@ fn cancel(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
     archive_terminal_transaction(store_path, &envelope)?;
     println!("{command_id} cancelled");
     Ok(())
+}
+
+/// A deployment Idunn holds before it fenced anything has touched nothing of
+/// the incumbent, so an operator may withdraw it. Idunn never does so itself.
+fn cancel_is_safe_for_held_prefence(transaction: &DeploymentTransaction) -> bool {
+    transaction.command_kind == CommandKind::Deploy
+        && transaction.phase < DeploymentPhase::Fencing
+        && transaction.held_disagreement().is_some()
 }
 
 fn cancel_is_safe_for_live_stateless(transaction: &DeploymentTransaction) -> bool {
@@ -7582,19 +7595,7 @@ impl Engine {
             current.value.pre_fencing_abort.is_none(),
             "pre-fencing abort intent is already durable"
         );
-        let abort = PreFencingAbort {
-            error: truncate(&format!("{error:#}"), 2048),
-            candidate_cleanup: candidate_cleanup_requirement(
-                current.value.activation.is_some(),
-                current.value.workload.is_some(),
-            ),
-            topology_reconciliation: current.value.abort_topology_reconciliation(),
-            source_cleanup: if current.value.command_kind == CommandKind::Deploy {
-                CleanupEvidence::Pending
-            } else {
-                CleanupEvidence::Skipped
-            },
-        };
+        let abort = pre_fencing_abort_intent(&current.value, &format!("{error:#}"));
         self.persist_same_phase(current, |next| {
             next.pre_fencing_abort = Some(abort);
             Ok(())
@@ -7985,6 +7986,22 @@ fn incumbent_was_stopped_during_fencing(fencing: &FencingEvidence) -> bool {
             ..
         }
     )
+}
+
+fn pre_fencing_abort_intent(transaction: &DeploymentTransaction, error: &str) -> PreFencingAbort {
+    PreFencingAbort {
+        error: truncate(error, 2048),
+        candidate_cleanup: candidate_cleanup_requirement(
+            transaction.activation.is_some(),
+            transaction.workload.is_some(),
+        ),
+        topology_reconciliation: transaction.abort_topology_reconciliation(),
+        source_cleanup: if transaction.command_kind == CommandKind::Deploy {
+            CleanupEvidence::Pending
+        } else {
+            CleanupEvidence::Skipped
+        },
+    }
 }
 
 fn post_fencing_abort_intent(
@@ -13864,7 +13881,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declaring_redeploy_is_not_yielded_to_a_continuity_when_the_held_incumbent_dies() -> Result<()> {
+    fn a_declaring_redeploy_is_not_yielded_when_the_held_incumbent_dies() -> Result<()> {
         let workload = SwitchWorkload::new();
         let world = EngineFixture::with_workload(workload.clone())?;
         admit_incumbent(&world)?;
@@ -13873,39 +13890,45 @@ mod tests {
             seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&held))?;
         assert_eq!(redeploy.held_disagreement(), None);
         workload.kill();
-        for _ in 0..40 {
-            let _ = world.engine.run_scheduler_tick();
+        for _ in 0..4 {
+            let _ = world.engine.supervise_one_admitted_generation()?;
         }
         let all = every_transaction(&world)?;
         assert!(
             all.iter().all(|transaction| !is_continuity_over(transaction, &held)),
             "a continuity was minted over the held incumbent"
         );
-        let redeploy = all
-            .iter()
-            .find(|transaction| transaction.transaction_id == redeploy.transaction_id)
-            .context("the redeploy is nowhere")?;
-        // The fixture's one workload is the candidate too, so the redeploy may
-        // fail for its own reasons; it is never yielded away.
+        let after = resident(&world)?.value;
+        assert_eq!(after.transaction_id, redeploy.transaction_id);
         assert!(
-            redeploy
-                .pre_fencing_abort
-                .as_ref()
-                .is_none_or(|abort| !abort.error.contains("yielded to continuity")),
+            after.pre_fencing_abort.is_none(),
             "the redeploy yielded: {:?}",
-            redeploy.pre_fencing_abort
+            after.pre_fencing_abort
         );
         Ok(())
     }
 
+    /// The control for the test above: the same redeploy over a dead incumbent
+    /// that is not held is yielded to continuity.
     #[test]
-    fn a_held_predeploy_transaction_is_not_aborted_to_yield_to_continuity() -> Result<()> {
+    fn a_declaring_redeploy_still_yields_to_continuity_when_the_incumbent_is_not_held() -> Result<()> {
         let workload = SwitchWorkload::new();
         let world = EngineFixture::with_workload(workload.clone())?;
         let incumbent = admit_incumbent(&world)?;
-        // The incumbent is declared; the Deploy in front of it is the held one.
-        let seeded =
+        assert!(incumbent.readiness().is_ok());
+        let redeploy =
             seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        workload.kill();
+        world.engine.supervise_one_admitted_generation()?;
+        let after = resident(&world)?.value;
+        assert_eq!(after.transaction_id, redeploy.transaction_id);
+        let abort = after.pre_fencing_abort.context("the redeploy was not yielded")?;
+        assert!(abort.error.contains("yielded to continuity"), "{}", abort.error);
+        Ok(())
+    }
+
+    /// `seeded` with its own Expected undeclared, so Idunn holds it.
+    fn undeclared(world: &EngineFixture, seeded: &DeploymentTransaction) -> Result<DeploymentTransaction> {
         let mut bare = seeded.clone();
         // Undeclare the Expected and re-derive what is bound to its digest.
         let expected = bare.expected.as_mut().context("no expected")?;
@@ -13922,18 +13945,90 @@ mod tests {
         bare.activation_publication_sha256 = Some(activation.canonical_sha256()?);
         bare.activation = Some(activation);
         bare.validate()?;
-        let stored = resident(&world)?;
-        replace_transaction(&world.state_store, &stored, &bare)?;
         assert!(bare.held_disagreement().is_some());
+        Ok(bare)
+    }
+
+    /// A pre-fence Deploy whose own Expected is undeclared, stored in place.
+    fn held_predeploy(
+        world: &EngineFixture,
+        incumbent: &AdmittedGeneration,
+    ) -> Result<DeploymentTransaction> {
+        let seeded =
+            seeded_transaction(world, DeploymentPhase::Warming, CommandKind::Deploy, Some(incumbent))?;
+        let bare = undeclared(world, &seeded)?;
+        replace_transaction(&world.state_store, &resident(world)?, &bare)?;
+        Ok(bare)
+    }
+
+    #[test]
+    fn a_held_predeploy_transaction_is_not_aborted_to_yield_to_continuity() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        // The incumbent is declared; the Deploy in front of it is the held one.
+        let held = held_predeploy(&world, &incumbent)?;
 
         workload.kill();
         for _ in 0..4 {
             let _ = world.engine.supervise_one_admitted_generation()?;
         }
         let after = resident(&world)?.value;
-        assert_eq!(after.transaction_id, seeded.transaction_id);
+        assert_eq!(after.transaction_id, held.transaction_id);
         assert!(after.pre_fencing_abort.is_none(), "Idunn aborted a held record");
         assert!(after.completion.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_withdraws_a_held_predeploy_and_leaves_the_incumbent_untouched() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        let held = held_predeploy(&world, &incumbent)?;
+        let before = incumbent_envelope(&world)?;
+
+        cancel(&world.state_store, &held.command_id, "operator")?;
+        let cancelling = resident(&world)?.value;
+        assert_eq!(
+            cancelling.pre_fencing_abort.as_ref().map(|abort| abort.error.as_str()),
+            Some("cancelled by operator")
+        );
+        assert!(cancelling.post_fencing_abort.is_none());
+
+        drive(&world, |transaction| transaction.completion.is_some())?;
+        let finished = latest(&world)?;
+        assert!(matches!(
+            finished.completion,
+            Some(TransactionCompletion::FailedBeforeFencing { .. })
+        ));
+        assert!(finished.is_terminal());
+        // The target is released and nothing of the incumbent was touched.
+        assert!(!finished.blocks_new_target_mutation());
+        assert_eq!(incumbent_envelope(&world)?, before);
+        assert!(
+            every_transaction(&world)?
+                .iter()
+                .all(|transaction| !is_continuity_over(transaction, &incumbent)),
+            "cancelling the redeploy minted a continuity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_refuses_a_predeploy_that_is_not_held_and_a_held_one_past_the_fence() -> Result<()> {
+        let world = EngineFixture::with_workload(SwitchWorkload::new())?;
+        let incumbent = admit_incumbent(&world)?;
+        let seeded =
+            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        assert!(seeded.held_disagreement().is_none());
+        assert!(cancel(&world.state_store, &seeded.command_id, "operator").is_err());
+        assert!(resident(&world)?.value.pre_fencing_abort.is_none());
+
+        let mut past_the_fence = undeclared(&world, &seeded)?;
+        past_the_fence.enter_phase(DeploymentPhase::Fencing, now_millis()?);
+        assert!(past_the_fence.held_disagreement().is_some());
+        assert!(!cancel_is_safe_for_held_prefence(&past_the_fence));
         Ok(())
     }
 
