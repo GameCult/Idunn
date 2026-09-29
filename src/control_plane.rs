@@ -745,27 +745,133 @@ enum TransactionCompletion {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum CleanupEvidence {
-    Pending,
-    Skipped,
-    Complete,
-    /// Set only by the legacy lift, on a terminal continuity abort written
-    /// before the single resolution rule: it issued an activation and recorded
-    /// `Skipped`. Boot reconciliation, not the record, owes that residue's
-    /// demotion. The marker is what lets validation accept the old shape
-    /// without reopening a finished transaction.
-    LegacySkippedBeforeB1,
+use cleanup_evidence::CleanupEvidence;
+
+/// Where the legacy marker lives, so that only the lift can make one.
+///
+/// `LegacyLift` has a private field: outside this module no expression can
+/// construct it, so no other code can write `CleanupEvidence::Legacy(..)`.
+/// Decoding a stored record is the one other way in, and it stays here too.
+/// `transaction_envelope` refuses a record carrying the marker; the schema
+/// migration, which persists what the lift produced, writes through
+/// `migrated_transaction_envelope`, defined here beside the only constructor.
+mod cleanup_evidence {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct LegacyLift(());
+
+    const LEGACY_MARKER: &str = "legacy-skipped-before-b1";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum CleanupEvidence {
+        Pending,
+        Skipped,
+        Complete,
+        /// Set only by the legacy lift, on a terminal continuity abort written
+        /// before the single resolution rule: it issued an activation and
+        /// recorded `Skipped`. Boot reconciliation, not the record, owes that
+        /// residue's demotion. The marker is what lets validation accept the
+        /// old shape without reopening a finished transaction.
+        Legacy(LegacyLift),
+    }
+
+    impl CleanupEvidence {
+        pub(super) fn is_complete(self) -> bool {
+            !matches!(self, Self::Pending)
+        }
+
+        pub(super) fn is_legacy_marker(self) -> bool {
+            matches!(self, Self::Legacy(_))
+        }
+    }
+
+    impl Serialize for CleanupEvidence {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(match self {
+                Self::Pending => "pending",
+                Self::Skipped => "skipped",
+                Self::Complete => "complete",
+                Self::Legacy(_) => LEGACY_MARKER,
+            })
+        }
+    }
+
+    impl<'de> Deserialize<'de> for CleanupEvidence {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let text = String::deserialize(deserializer)?;
+            match text.as_str() {
+                "pending" => Ok(Self::Pending),
+                "skipped" => Ok(Self::Skipped),
+                "complete" => Ok(Self::Complete),
+                LEGACY_MARKER => Ok(Self::Legacy(LegacyLift(()))),
+                other => Err(serde::de::Error::unknown_variant(
+                    other,
+                    &["pending", "skipped", "complete", LEGACY_MARKER],
+                )),
+            }
+        }
+    }
+
+    impl DeploymentTransaction {
+        pub(super) fn carries_legacy_marker(&self) -> bool {
+            self.pre_fencing_abort
+                .as_ref()
+                .map(|abort| abort.topology_reconciliation)
+                .into_iter()
+                .chain(
+                    self.post_fencing_abort
+                        .as_ref()
+                        .map(|abort| abort.topology_reconciliation),
+                )
+                .any(CleanupEvidence::is_legacy_marker)
+        }
+    }
+
+    /// The envelope for a record the schema migration persists, the one write
+    /// path that may carry the marker.
+    pub(super) fn migrated_transaction_envelope(
+        value: &DeploymentTransaction,
+        now: u64,
+    ) -> Result<CultCacheEnvelope> {
+        encode_transaction(value, now)
+    }
+
+/// A continuity abort written before the single resolution rule recorded no
+/// projection cleanup although its transaction had issued an activation, and
+/// so left that activation standing.
+///
+/// Nothing is reopened. A record already terminal keeps its terminal phase and
+/// completion and is marked the legacy marker, the one shape validation
+/// accepts for a terminal abort that owes nothing yet issued an activation;
+/// boot reconciliation, the single owner of that residue, demotes it by exact
+/// activation. A record still in flight lifts to `Pending`: it already holds
+/// its target's authority (a live record claims it before and after the lift),
+/// so the lift adds no claimant, and its own abort demotes the activation.
+/// Only the control store's read applies this: history describes what happened
+/// and is lifted unchanged.
+pub(super) fn owe_legacy_continuity_projection(transaction: &mut DeploymentTransaction) {
+    if transaction.command_kind != CommandKind::Continuity || transaction.activation.is_none() {
+        return;
+    }
+    let terminal = transaction.completion.is_some();
+    if let Some(abort) = transaction.pre_fencing_abort.as_mut()
+        && abort.topology_reconciliation == CleanupEvidence::Skipped
+    {
+        abort.topology_reconciliation = if terminal {
+            CleanupEvidence::Legacy(LegacyLift(()))
+        } else {
+            CleanupEvidence::Pending
+        };
+    }
+    if let Some(abort) = transaction.post_fencing_abort.as_mut()
+        && abort.topology_reconciliation == CleanupEvidence::Skipped
+        && !terminal
+    {
+        abort.topology_reconciliation = CleanupEvidence::Pending;
+    }
 }
 
-impl CleanupEvidence {
-    fn is_complete(self) -> bool {
-        matches!(
-            self,
-            Self::Skipped | Self::Complete | Self::LegacySkippedBeforeB1
-        )
-    }
 }
 
 /// Rollback of a transaction that has already fenced the incumbent.
@@ -1316,7 +1422,7 @@ impl DeploymentTransaction {
                 ) || (self.command_kind == CommandKind::Continuity
                     && self.phase == DeploymentPhase::Complete
                     && self.completion.is_some()
-                    && abort.topology_reconciliation == CleanupEvidence::LegacySkippedBeforeB1),
+                    && abort.topology_reconciliation.is_legacy_marker()),
                 "abort topology cleanup differs from what the transaction projected"
             );
             ensure!(
@@ -2710,45 +2816,10 @@ fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTra
         }
         _ => {
             let mut value = lift_legacy_transaction(envelope)?;
-            owe_legacy_continuity_projection(&mut value);
+            cleanup_evidence::owe_legacy_continuity_projection(&mut value);
             value.validate()?;
             Ok(value)
         }
-    }
-}
-
-/// A continuity abort written before the single resolution rule recorded no
-/// projection cleanup although its transaction had issued an activation, and
-/// so left that activation standing.
-///
-/// Nothing is reopened. A record already terminal keeps its terminal phase and
-/// completion and is marked `LegacySkippedBeforeB1`, the one shape validation
-/// accepts for a terminal abort that owes nothing yet issued an activation;
-/// boot reconciliation, the single owner of that residue, demotes it by exact
-/// activation. A record still in flight lifts to `Pending`: it already holds
-/// its target's authority (a live record claims it before and after the lift),
-/// so the lift adds no claimant, and its own abort demotes the activation.
-/// Only the control store's read applies this: history describes what happened
-/// and is lifted unchanged.
-fn owe_legacy_continuity_projection(transaction: &mut DeploymentTransaction) {
-    if transaction.command_kind != CommandKind::Continuity || transaction.activation.is_none() {
-        return;
-    }
-    let terminal = transaction.completion.is_some();
-    if let Some(abort) = transaction.pre_fencing_abort.as_mut()
-        && abort.topology_reconciliation == CleanupEvidence::Skipped
-    {
-        abort.topology_reconciliation = if terminal {
-            CleanupEvidence::LegacySkippedBeforeB1
-        } else {
-            CleanupEvidence::Pending
-        };
-    }
-    if let Some(abort) = transaction.post_fencing_abort.as_mut()
-        && abort.topology_reconciliation == CleanupEvidence::Skipped
-        && !terminal
-    {
-        abort.topology_reconciliation = CleanupEvidence::Pending;
     }
 }
 
@@ -2807,7 +2878,10 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
     for envelope in stale {
         let (record_type, key, mut next) = if envelope.r#type == DeploymentTransaction::TYPE {
             let value = read_transaction_record(&envelope)?;
-            let next = transaction_envelope(&value, value.updated_at_unix_millis)?;
+            let next = cleanup_evidence::migrated_transaction_envelope(
+                &value,
+                value.updated_at_unix_millis,
+            )?;
             (DeploymentTransaction::TYPE, value.transaction_id, next)
         } else {
             let value = read_generation_record(&envelope)?;
@@ -2832,6 +2906,14 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
 }
 
 fn transaction_envelope(value: &DeploymentTransaction, now: u64) -> Result<CultCacheEnvelope> {
+    ensure!(
+        !value.carries_legacy_marker(),
+        "only the legacy lift may produce a legacy-marked record; it cannot be written as a new one"
+    );
+    encode_transaction(value, now)
+}
+
+fn encode_transaction(value: &DeploymentTransaction, now: u64) -> Result<CultCacheEnvelope> {
     value.validate()?;
     typed_envelope(
         &value.transaction_id,
@@ -2985,6 +3067,15 @@ fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
             Vec::new()
         }
     }
+}
+
+/// Whether a transaction moved between two reads. An error note (`last_error`)
+/// and its timestamp are commentary on a stuck step, not a step.
+fn state_advanced(before: &DeploymentTransaction, after: &DeploymentTransaction) -> bool {
+    let mut after = after.clone();
+    after.last_error.clone_from(&before.last_error);
+    after.updated_at_unix_millis = before.updated_at_unix_millis;
+    &after != before
 }
 
 /// Says a fault once while it lasts. A scheduler tick that hits the same
@@ -3486,7 +3577,24 @@ struct Engine {
     systemd_workload: Arc<dyn WorkloadPort>,
     host_actuators: Option<SharedHostActuatorHub>,
     history_report: ReportOnce,
+    /// One `ReportOnce` per faulting record, so one wedged transaction says
+    /// its fault once and never drowns another's.
+    fault_reports: Mutex<BTreeMap<String, ReportOnce>>,
+    /// Retry pacing for a transaction whose step keeps failing, by
+    /// transaction id: consecutive failures and the earliest next attempt.
+    /// Process-local on purpose: a restart retries at once, and no schema
+    /// carries a clock that only pacing reads.
+    resume_backoff: Mutex<BTreeMap<String, ResumeBackoff>>,
 }
+
+#[derive(Clone, Copy)]
+struct ResumeBackoff {
+    failures: u32,
+    not_before_unix_millis: u64,
+}
+
+/// Longest wait between attempts at a failing transaction step.
+const RESUME_BACKOFF_CEILING_MILLIS: u64 = 60_000;
 
 impl Engine {
     fn open(options: RuntimeOptions) -> Result<Self> {
@@ -3541,6 +3649,8 @@ impl Engine {
             systemd_workload,
             host_actuators,
             history_report: ReportOnce::default(),
+            fault_reports: Mutex::default(),
+            resume_backoff: Mutex::default(),
         })
     }
 
@@ -3834,12 +3944,18 @@ impl Engine {
     fn reconcile_failed_continuity_projections(&self) -> Result<ProjectionReconciliation> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let mut outcome = ProjectionReconciliation::default();
-        let Some(history) = self.history_for_decision() else {
-            return Ok(outcome);
-        };
+        // Resident issuers need no history; only the history issuers wait on it.
+        let history = self.history_for_decision();
+        if history.is_none() {
+            eprintln!(
+                "Idunn cannot read history at boot: failed continuities archived there are not \
+                 reconciled, resident ones still are"
+            );
+        }
         let topology = self.topology();
         let issuers = history
             .iter()
+            .flatten()
             .chain(snapshot.transactions.iter().map(|stored| &stored.value))
             .filter(|transaction| {
                 transaction.command_kind == CommandKind::Continuity
@@ -3990,9 +4106,10 @@ impl Engine {
                     );
                     return Ok(true);
                 }
-                Err(error) => eprintln!(
-                    "Idunn could not retire terminal transaction {}: {error:#}",
-                    stored.value.transaction_id
+                Err(error) => self.note_fault(
+                    "could not retire terminal transaction",
+                    &stored.value.transaction_id,
+                    &error,
                 ),
             }
         }
@@ -4008,7 +4125,68 @@ impl Engine {
         }
         let transaction_progress = self.resume_one_transaction()?;
         let continuity_progress = self.supervise_one_admitted_generation()?;
-        Ok(!transaction_progress && !continuity_progress && self.freeze_one_queued_command()?)
+        // Freezing is not gated on the others' progress: a queued command
+        // whose target is free must not wait behind an unrelated target's
+        // wedge. `freeze_command` already refuses a busy target, so this is
+        // still at most one freeze per tick and never a second claimant.
+        let froze = self.freeze_one_queued_command()?;
+        Ok(transaction_progress || continuity_progress || froze)
+    }
+
+    /// Say a per-record fault once while it lasts and leave it in the
+    /// record's `last_error`, which status renders. Recording is best effort:
+    /// a store too broken to take the note is already in stderr.
+    fn note_fault(&self, what: &str, transaction_id: &str, error: &anyhow::Error) {
+        let detail = truncate(&format!("{error:#}"), 2048);
+        let offered = {
+            let mut reports = self.fault_reports.lock().expect("fault report mutex");
+            reports
+                .entry(transaction_id.to_string())
+                .or_default()
+                .offer(Some(detail.clone()))
+        };
+        if offered.is_some() {
+            eprintln!("Idunn {what} {transaction_id}: {detail}");
+        }
+        let _ = self.record_last_error(transaction_id, &detail);
+    }
+
+    fn clear_fault(&self, transaction_id: &str) {
+        self.fault_reports
+            .lock()
+            .expect("fault report mutex")
+            .remove(transaction_id);
+    }
+
+    /// Write `detail` as the record's `last_error`, touching nothing else and
+    /// not archiving: a terminal record whose archive is the fault stays put.
+    fn record_last_error(&self, transaction_id: &str, detail: &str) -> Result<()> {
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let Some(stored) = snapshot
+            .transactions
+            .iter()
+            .find(|stored| stored.value.transaction_id == transaction_id)
+        else {
+            return Ok(());
+        };
+        if stored.value.last_error.as_deref() == Some(detail) {
+            return Ok(());
+        }
+        let mut next = stored.value.clone();
+        next.last_error = Some(detail.to_string());
+        let envelope = transaction_envelope(&next, next.updated_at_unix_millis)?;
+        ensure!(
+            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: transaction_id.to_string(),
+                    current: Some(stored.envelope.clone()),
+                }],
+                &[envelope],
+            )?,
+            "transaction changed before its fault note"
+        );
+        Ok(())
     }
 
     /// Startup and every later loop use the same order: unfinished ownership
@@ -4035,11 +4213,17 @@ impl Engine {
                 continue;
             }
             match self.resume_candidate(current) {
-                Ok(moved) => progressed |= moved,
-                Err(error) => eprintln!(
-                    "Idunn could not resume transaction {}: {error:#}",
-                    current.value.transaction_id
-                ),
+                Ok(moved) => {
+                    self.clear_fault(&current.value.transaction_id);
+                    progressed |= moved;
+                }
+                Err(error) => {
+                    self.note_fault(
+                        "could not resume transaction",
+                        &current.value.transaction_id,
+                        &error,
+                    );
+                }
             }
         }
         Ok(progressed)
@@ -4047,8 +4231,32 @@ impl Engine {
 
     /// Advance one transaction, turning its failure into the durable record
     /// its phase calls for. Returns whether its record changed.
+    ///
+    /// "Moved" means the transaction's state advanced: a phase change, a
+    /// completion, or a durable abort step. Rewriting `last_error` to say the
+    /// same step failed again in new words is not movement, or a wedged
+    /// transaction would report progress every tick.
     fn resume_candidate(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
-        if let Err(error) = self.advance_transaction(current) {
+        let id = current.value.transaction_id.as_str();
+        if self
+            .resume_backoff
+            .lock()
+            .expect("resume backoff mutex")
+            .get(id)
+            .is_some_and(|backoff| {
+                now_millis().is_ok_and(|now| now < backoff.not_before_unix_millis)
+            })
+        {
+            return Ok(false);
+        }
+        let advanced = self.advance_transaction(current);
+        if advanced.is_ok() {
+            self.resume_backoff
+                .lock()
+                .expect("resume backoff mutex")
+                .remove(id);
+        }
+        if let Err(error) = advanced {
             let latest_snapshot = ControlSnapshot::read(&self.options.state_store)?;
             let latest = latest_snapshot
                 .transactions
@@ -4056,8 +4264,13 @@ impl Engine {
                 .find(|stored| stored.value.transaction_id == current.value.transaction_id)
                 .context("transaction disappeared while recording an execution error")?;
             if latest.value.is_terminal() {
+                self.resume_backoff
+                    .lock()
+                    .expect("resume backoff mutex")
+                    .remove(id);
                 return Ok(true);
             }
+            self.back_off(id)?;
             if latest.value.phase < DeploymentPhase::Fencing {
                 // Before the fence an abort that cannot finish a step is
                 // resumable, never a post-fence abort: that path refuses a
@@ -4086,7 +4299,28 @@ impl Engine {
             .iter()
             .find(|stored| stored.value.transaction_id == current.value.transaction_id)
             .context("transaction disappeared while checking scheduler progress")?;
-        Ok(live.envelope != current.envelope)
+        Ok(state_advanced(&current.value, &live.value))
+    }
+
+    /// Wait twice as long after each consecutive failure of a transaction's
+    /// step, from one poll interval up to a ceiling.
+    fn back_off(&self, transaction_id: &str) -> Result<()> {
+        let now = now_millis()?;
+        let mut all = self.resume_backoff.lock().expect("resume backoff mutex");
+        let failures = all.get(transaction_id).map_or(0, |backoff| backoff.failures);
+        let wait = self
+            .options
+            .poll_millis
+            .saturating_mul(1u64 << failures.min(20))
+            .min(RESUME_BACKOFF_CEILING_MILLIS);
+        all.insert(
+            transaction_id.to_string(),
+            ResumeBackoff {
+                failures: failures.saturating_add(1),
+                not_before_unix_millis: now.saturating_add(wait),
+            },
+        );
+        Ok(())
     }
 
     fn freeze_one_queued_command(&self) -> Result<bool> {
@@ -11576,9 +11810,8 @@ mod tests {
             let lifted = read_transaction_record(&envelope)?;
             let terminal = archived.completion.is_some();
             if terminal {
-                assert_eq!(
-                    abort_owed(&lifted),
-                    Some(CleanupEvidence::LegacySkippedBeforeB1),
+                assert!(
+                    abort_owed(&lifted).is_some_and(CleanupEvidence::is_legacy_marker),
                     "{name}"
                 );
                 assert!(lifted.is_terminal(), "{name}: the lift reopened a finished record");
@@ -11647,7 +11880,11 @@ mod tests {
         let mut second = first.clone();
         second.transaction_id = "tx-second-legacy".into();
         second.command_id = "continuity-second-legacy".into();
-        make_resident(&world, &second, transaction_envelope(&second, 200)?)?;
+        make_resident(
+            &world,
+            &second,
+            cleanup_evidence::migrated_transaction_envelope(&second, 200)?,
+        )?;
 
         // The store reads: three records, one of them live, none of the
         // finished ones claiming the target.
@@ -11825,9 +12062,8 @@ mod tests {
             )?
         );
 
-        // The first pass records the error and reports progress; the same
-        // error again changes nothing.
-        assert!(world.engine.resume_one_transaction()?);
+        // Recording the error is not progress, and neither is repeating it.
+        assert!(!world.engine.resume_one_transaction()?);
         assert!(!world.engine.resume_one_transaction()?);
         // Every tick answers: the wedged abort records its error and waits,
         // and the rest of the scheduler goes on to freeze the queued command.
@@ -11864,6 +12100,259 @@ mod tests {
         let stuck = record_of(&world, &dead.transaction_id)?;
         assert!(!stuck.is_terminal());
         assert!(stuck.last_error.is_some());
+        Ok(())
+    }
+
+    /// A wedged abort whose `stop()` error carries a changing counter, as
+    /// systemctl output with a PID or timestamp would.
+    struct ChangingErrorWorkload(std::sync::atomic::AtomicU32);
+
+    impl WorkloadPort for ChangingErrorWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            WedgedWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            WedgedWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            WedgedWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            WedgedWorkload.discard_prepared(plan, expected, activation)
+        }
+        fn observe(
+            &self,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+            prior: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            WedgedWorkload.observe(expected, activation, prior)
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bail!("the unit will not stop (main pid {n})")
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn queue_deploy_for_nowhere(world: &EngineFixture) -> Result<DeploymentCommand> {
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "up-nowhere".into(),
+            kind: CommandKind::Deploy,
+            selector: "nowhere".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command.command_id.clone(),
+                    current: None,
+                }],
+                &[command_envelope(&command, 100)?],
+            )?
+        );
+        Ok(command)
+    }
+
+    #[test]
+    fn a_wedge_whose_error_text_changes_every_tick_does_not_starve_other_targets() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(ChangingErrorWorkload(
+            std::sync::atomic::AtomicU32::new(0),
+        )))?;
+        transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let command = queue_deploy_for_nowhere(&world)?;
+        write_service_binding(&world)?;
+        for _ in 0..20 {
+            world.engine.run_scheduler_tick()?;
+        }
+        assert!(
+            read_history_transactions(&world.state_store)
+                .iter()
+                .any(|transaction| transaction.command_id == command.command_id),
+            "the queued command was starved by another target's wedge"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rewriting_last_error_is_not_progress() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let before = transaction_at(&world, DeploymentPhase::Warming)?;
+        let mut noted = before.clone();
+        noted.last_error = Some("the unit will not stop (main pid 7)".into());
+        noted.updated_at_unix_millis += 1;
+        assert!(!state_advanced(&before, &noted));
+        let mut moved = noted.clone();
+        moved.phase = DeploymentPhase::AwaitingReady;
+        assert!(state_advanced(&before, &moved));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failing_step_is_retried_after_a_backoff_not_every_tick() -> Result<()> {
+        let workload = Arc::new(ChangingErrorWorkload(std::sync::atomic::AtomicU32::new(0)));
+        let world = EngineFixture::with_workload(workload.clone())?;
+        transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        for _ in 0..10 {
+            world.engine.run_scheduler_tick()?;
+        }
+        assert_eq!(
+            workload.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wedged step was retried inside its backoff"
+        );
+        Ok(())
+    }
+
+    /// A candidate that fails to advance and is dead for good.
+    struct DeadCandidateWorkload;
+
+    impl WorkloadPort for DeadCandidateWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            StillWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            StillWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            StillWorkload.discard_prepared(plan, expected, activation)
+        }
+        fn observe(
+            &self,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+            _: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            bail!("the candidate is gone")
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            Ok(())
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn a_permanently_dead_candidate_past_the_fence_begins_its_post_fence_abort() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(DeadCandidateWorkload))?;
+        let dead = transaction_at(&world, DeploymentPhase::Fencing)?;
+        assert!(record_of(&world, &dead.transaction_id)?.post_fencing_abort.is_none());
+        for _ in 0..8 {
+            world.engine.resume_one_transaction()?;
+        }
+        assert!(
+            record_of(&world, &dead.transaction_id)?
+                .post_fencing_abort
+                .is_some(),
+            "a dead candidate past the fence was retried instead of aborted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_resume_fault_is_reported_once_and_left_in_the_record() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let live = transaction_at(&world, DeploymentPhase::Warming)?;
+        let error = anyhow!("store hiccup 1");
+        world
+            .engine
+            .note_fault("could not resume transaction", &live.transaction_id, &error);
+        assert_eq!(
+            record_of(&world, &live.transaction_id)?.last_error.as_deref(),
+            Some("store hiccup 1")
+        );
+        let reports = world.engine.fault_reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[&live.transaction_id].offer(Some("store hiccup 1".into())).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_record_cannot_carry_the_legacy_marker() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let lifted = read_transaction_record(&envelope)?;
+        assert!(lifted.carries_legacy_marker());
+        let error = error_text(transaction_envelope(&lifted, 1).map(|_| ()));
+        assert!(error.contains("legacy lift"), "{error}");
+        // The migration's own path still writes it, and it reads back.
+        let migrated = cleanup_evidence::migrated_transaction_envelope(&lifted, 1)?;
+        assert!(read_transaction_record(&migrated)?.carries_legacy_marker());
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_history_does_not_skip_resident_residue_at_boot() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let first = read_transaction_record(&envelope)?;
+        make_resident(&world, &first, envelope)?;
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+        let expected = first.expected.clone().context("no Expected")?;
+        project_candidate(&world, &first, true)?;
+        assert_eq!(projected_under(&world, &expected)?.len(), 2);
+        corrupt_history(&world)?;
+        let outcome = world.engine.reconcile_failed_continuity_projections()?;
+        assert_eq!(outcome.demoted.len(), 1);
+        assert_eq!(projected_under(&world, &expected)?, expected_only());
         Ok(())
     }
 
@@ -12274,19 +12763,19 @@ mod tests {
         assert_eq!(owed(&written), Some(CleanupEvidence::Skipped));
 
         let mut lifted = written.clone();
-        owe_legacy_continuity_projection(&mut lifted);
+        cleanup_evidence::owe_legacy_continuity_projection(&mut lifted);
         assert_eq!(owed(&lifted), Some(CleanupEvidence::Pending));
 
         // A deployment published its own key and recorded what it owed.
         let mut deploy = written.clone();
         deploy.command_kind = CommandKind::Deploy;
-        owe_legacy_continuity_projection(&mut deploy);
+        cleanup_evidence::owe_legacy_continuity_projection(&mut deploy);
         assert_eq!(owed(&deploy), Some(CleanupEvidence::Skipped));
 
         // A continuity that issued nothing owes nothing.
         let mut unissued = written;
         unissued.activation = None;
-        owe_legacy_continuity_projection(&mut unissued);
+        cleanup_evidence::owe_legacy_continuity_projection(&mut unissued);
         assert_eq!(owed(&unissued), Some(CleanupEvidence::Skipped));
         Ok(())
     }
