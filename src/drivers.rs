@@ -5566,9 +5566,10 @@ impl NginxRouteDriver {
 /// Why a direct presence challenge produced no document to authenticate.
 #[derive(Debug)]
 pub enum ChallengeFailure {
-    /// Nothing answered: the connection was refused, timed out, or dropped, or
-    /// the peer closed it without a byte. A process still starting does this,
-    /// and it is waiting, not a fault.
+    /// Nothing answered: the connection was refused, or no byte arrived before
+    /// the timeout, or the peer closed with zero bytes. A process still
+    /// starting does this, and it is waiting, not a fault. Once any byte has
+    /// arrived, a stall or a stop is `Refused`, not this.
     Silent(anyhow::Error),
     /// Something answered wrongly, or the challenge could not be made: a
     /// malformed or foreign answer, an oversized one, or a local configuration
@@ -5725,8 +5726,9 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
     // answered in full.
     let mut answer = Answer::new(BufReader::new(stream));
     let mut head_bytes = 0_usize;
-    let mut head_line = |answer: &mut Answer<BufReader<TcpStream>>| {
-        let line = answer.read_line(ROUTE_HTTP_MAX_HEADER_BYTES, "before its headers ended")?;
+    // Headers and chunked trailers draw on the one budget.
+    let mut head_line = |answer: &mut Answer<BufReader<TcpStream>>, what: &str| {
+        let line = answer.read_line(ROUTE_HTTP_MAX_HEADER_BYTES, what)?;
         head_bytes += line.len() + 2;
         ensure_or_refuse(
             head_bytes <= ROUTE_HTTP_MAX_HEADER_BYTES,
@@ -5734,7 +5736,8 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
         )?;
         Ok::<_, ChallengeFailure>(line)
     };
-    let status = head_line(&mut answer)?;
+    let headers = "before its headers ended";
+    let status = head_line(&mut answer, headers)?;
     let status = std::str::from_utf8(&status)
         .context("stable CultNet HTTP response status is not UTF-8")
         .map_err(refused)?;
@@ -5747,7 +5750,7 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
     let mut content_length = None;
     let mut chunked = false;
     loop {
-        let line = head_line(&mut answer)?;
+        let line = head_line(&mut answer, headers)?;
         if line.is_empty() {
             break;
         }
@@ -5758,6 +5761,12 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
             .split_once(':')
             .context("stable CultNet HTTP response contains a malformed header")
             .map_err(refused)?;
+        // RFC 9112 5.1: a name with whitespace around it (or none) is not a
+        // field name, and a recipient must not guess which one was meant.
+        ensure_or_refuse(
+            !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace()),
+            "stable CultNet HTTP response has a malformed header name",
+        )?;
         if name.eq_ignore_ascii_case("transfer-encoding") {
             ensure_or_refuse(
                 value.trim().eq_ignore_ascii_case("chunked"),
@@ -5771,9 +5780,7 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
                 "stable CultNet HTTP response repeats Content-Length",
             )?;
             content_length = Some(
-                value
-                    .trim()
-                    .parse::<usize>()
+                parse_digits(value.trim_matches([' ', '\t']), 10)
                     .context("stable CultNet HTTP Content-Length is invalid")
                     .map_err(refused)?,
             );
@@ -5798,12 +5805,12 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
                 let size = std::str::from_utf8(&size)
                     .ok()
                     .and_then(|size| size.split(';').next())
-                    .and_then(|size| usize::from_str_radix(size.trim(), 16).ok())
+                    .and_then(|size| parse_digits(size.trim_matches([' ', '\t']), 16))
                     .context("stable CultNet HTTP chunk size is invalid")
                     .map_err(refused)?;
                 if size == 0 {
                     // Trailers, if any, end at the empty line.
-                    while !answer.read_line(ROUTE_HTTP_MAX_HEADER_BYTES, body)?.is_empty() {}
+                    while !head_line(&mut answer, body)?.is_empty() {}
                     return Ok(response);
                 }
                 ensure_or_refuse(
@@ -5822,6 +5829,16 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
             "stable CultNet HTTP response has no single body framing"
         ))),
     }
+}
+
+/// A number written only in digits of `radix`: no sign, no whitespace, not
+/// empty. `from_str_radix` alone accepts a leading `+`, which RFC 9112 does
+/// not.
+fn parse_digits(text: &str, radix: u32) -> Option<usize> {
+    if text.is_empty() || !text.chars().all(|digit| digit.is_digit(radix)) {
+        return None;
+    }
+    usize::from_str_radix(text, radix).ok()
 }
 
 /// A 2xx status line of HTTP/1.0 or HTTP/1.1.
@@ -8662,6 +8679,244 @@ mod tests {
         assert_refused(
             challenge(scripted_peer(answer_with(lines + 1)), |_| {}),
             "headers over the bound together",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The reader's limits are pinned at their edges, on answers that are
+    // honest in every other way, so only the limit under test can refuse them
+    // and a peer that simply stops is not what refuses.
+    // ---------------------------------------------------------------------
+
+    const CHUNKED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    fn snapshot_request() -> Vec<u8> {
+        encode_cultnet_message_to_vec(
+            &CultNetMessage::SnapshotRequest {
+                message_id: "probe".into(),
+                schema_ids: None,
+                record_keys: None,
+            },
+            CultNetWireContract::CultNetSchemaV0,
+        )
+        .expect("an encodable request")
+    }
+
+    /// The raw body the HTTP reader hands back, with no document judgment.
+    fn http_body(
+        reply: impl FnOnce(&str) -> Vec<u8> + Send + 'static,
+    ) -> Result<Vec<u8>, ChallengeFailure> {
+        let port = scripted_peer(reply);
+        request_http_snapshot(SocketAddr::from(([127, 0, 0, 1], port)), &snapshot_request())
+    }
+
+    fn tcp_body(
+        reply: impl FnOnce(&str) -> Vec<u8> + Send + 'static,
+    ) -> Result<Vec<u8>, ChallengeFailure> {
+        let port = framed_peer(reply);
+        request_tcp_snapshot(SocketAddr::from(([127, 0, 0, 1], port)), &snapshot_request())
+    }
+
+    fn assert_body_refused(outcome: Result<Vec<u8>, ChallengeFailure>, why: &str) {
+        assert!(
+            matches!(outcome, Err(ChallengeFailure::Refused(_))),
+            "{why} must be refused: {:?}",
+            outcome.map(|body| body.len())
+        );
+    }
+
+    fn chunked(pieces: &[usize]) -> Vec<u8> {
+        let mut reply = CHUNKED_HEAD.to_vec();
+        for size in pieces {
+            reply.extend_from_slice(format!("{size:x}\r\n").as_bytes());
+            reply.extend(std::iter::repeat_n(b'a', *size));
+            reply.extend_from_slice(b"\r\n");
+        }
+        reply.extend_from_slice(b"0\r\n\r\n");
+        reply
+    }
+
+    #[test]
+    fn every_framing_takes_exactly_the_bound_and_refuses_one_byte_more() {
+        let most = ROUTE_SNAPSHOT_MAX_BYTES;
+        // Whole answers are sent in every case, so only the bound refuses.
+        let http_ok_of = |length: usize| move |_: &str| http_ok(&vec![b'a'; length]);
+        assert_eq!(http_body(http_ok_of(most)).expect("Content-Length at the bound").len(), most);
+        assert_body_refused(http_body(http_ok_of(most + 1)), "Content-Length over the bound");
+
+        for (pieces, taken) in [
+            (vec![most], true),
+            (vec![most + 1], false),
+            (vec![most - 1, 1], true),
+            (vec![most - 1, 2], false),
+        ] {
+            let outcome = http_body(move |_| chunked(&pieces));
+            if taken {
+                assert_eq!(outcome.expect("chunks at the bound").len(), most);
+            } else {
+                assert_body_refused(outcome, "chunks over the bound");
+            }
+        }
+
+        let framed = |length: usize| move |_: &str| encode_frame(&vec![b'a'; length]).expect("a frame");
+        assert_eq!(tcp_body(framed(most)).expect("a frame at the bound").len(), most);
+        assert_eq!(tcp_body(framed(1)).expect("the smallest frame").len(), 1);
+        assert_body_refused(tcp_body(framed(most + 1)), "a frame over the bound");
+        assert_body_refused(tcp_body(|_| 0_u32.to_be_bytes().to_vec()), "an empty frame");
+    }
+
+    #[test]
+    fn a_peer_that_sends_one_byte_and_stops_is_refused_not_silent() {
+        assert_body_refused(http_body(|_| b"H".to_vec()), "one HTTP byte");
+        assert_body_refused(tcp_body(|_| vec![0]), "one TCP byte");
+        assert!(matches!(http_body(|_| Vec::new()), Err(ChallengeFailure::Silent(_))));
+        assert!(matches!(tcp_body(|_| Vec::new()), Err(ChallengeFailure::Silent(_))));
+    }
+
+    /// An honest chunked answer with `after_body` in place of its end.
+    fn chunked_honest_then(id: &str, after_body: &[u8]) -> Vec<u8> {
+        let body = honest_body(id);
+        let mut reply = CHUNKED_HEAD.to_vec();
+        reply.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        reply.extend_from_slice(&body);
+        reply.extend_from_slice(b"\r\n");
+        reply.extend_from_slice(after_body);
+        reply
+    }
+
+    #[test]
+    fn a_chunked_answer_must_end_its_trailers_and_terminate_each_chunk() {
+        // The same answer, ended properly, is taken.
+        challenge(scripted_peer(|id| chunked_honest_then(id, b"0\r\n\r\n")), |_| {})
+            .expect("an honest chunked answer");
+        challenge(scripted_peer(|id| chunked_honest_then(id, b"0\r\nT: 1\r\nU: 2\r\n\r\n")), |_| {})
+            .expect("an honest chunked answer with trailers");
+
+        // A trailer that begins and then the peer stops.
+        assert_refused(
+            challenge(scripted_peer(|id| chunked_honest_then(id, b"0\r\nT: 1\r\n")), |_| {}),
+            "a partial trailer section",
+        );
+
+        // Chunk data followed by something other than CRLF, from a peer that
+        // then carries on as though nothing were wrong.
+        assert_refused(
+            challenge(
+                lingering_peer(
+                    |id| {
+                        let body = honest_body(id);
+                        let mut reply = CHUNKED_HEAD.to_vec();
+                        reply.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+                        reply.extend_from_slice(&body);
+                        reply.extend_from_slice(b"XX0\r\n\r\n");
+                        reply
+                    },
+                    LINGER,
+                ),
+                |_| {},
+            ),
+            "a chunk that is not terminated",
+        );
+    }
+
+    /// Headers and trailers draw on one budget. The head is fixed, so the
+    /// trailer line that lands the total exactly on the bound is computed.
+    #[test]
+    fn trailers_share_the_header_budget_and_are_bounded_at_its_edge() {
+        // The trailer line is `T: <padding>`, counted with its CRLF, plus the
+        // empty line ending the trailers (2): together they fill what the head
+        // left of the budget.
+        let padding = ROUTE_HTTP_MAX_HEADER_BYTES - CHUNKED_HEAD.len() - 2 - 2 - "T: ".len();
+        let reply_with = move |padding: usize| {
+            move |id: &str| {
+                let mut trailers = format!("0\r\nT: {}\r\n", "a".repeat(padding)).into_bytes();
+                trailers.extend_from_slice(b"\r\n");
+                chunked_honest_then(id, &trailers)
+            }
+        };
+        challenge(scripted_peer(reply_with(padding)), |_| {}).expect("trailers exactly at the bound");
+
+        let started = Instant::now();
+        assert_refused(
+            challenge(lingering_peer(reply_with(padding + 1), LINGER), |_| {}),
+            "trailers one byte over the bound",
+        );
+        assert!(started.elapsed() < ROUTE_SNAPSHOT_TIMEOUT / 2, "the refusal waited on the socket");
+
+        // Trailers that never end are cut off at the bound, not at the timeout.
+        let started = Instant::now();
+        assert_refused(
+            challenge(
+                lingering_peer(
+                    |id| {
+                        let line = b"T: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+                        let mut endless = b"0\r\n".to_vec();
+                        endless.extend_from_slice(
+                            &line.repeat(2 * ROUTE_HTTP_MAX_HEADER_BYTES / line.len()),
+                        );
+                        chunked_honest_then(id, &endless)
+                    },
+                    LINGER,
+                ),
+                |_| {},
+            ),
+            "trailers that never end",
+        );
+        assert!(started.elapsed() < ROUTE_SNAPSHOT_TIMEOUT / 2, "the refusal waited on the socket");
+    }
+
+    /// RFC 9112 strictness, on answers that are honest but for the one field.
+    #[test]
+    fn numbers_and_header_names_are_read_strictly() {
+        // `{field}:{value}` then the true length, so a value of " +" is a signed one.
+        let content_length = |field: &'static str, value: &'static str| {
+            move |id: &str| {
+                let body = honest_body(id);
+                let mut reply =
+                    format!("HTTP/1.1 200 OK\r\n{field}:{value}{}\r\n\r\n", body.len()).into_bytes();
+                reply.extend_from_slice(&body);
+                reply
+            }
+        };
+        // Optional whitespace around a value is allowed.
+        challenge(scripted_peer(content_length("Content-Length", " \t ")), |_| {})
+            .expect("Content-Length with optional whitespace");
+        for (why, field, value) in [
+            ("a signed Content-Length", "Content-Length", " +"),
+            ("whitespace before the colon", "Content-Length ", " "),
+            ("a header name with leading whitespace", " Content-Length", " "),
+        ] {
+            assert_refused(challenge(scripted_peer(content_length(field, value)), |_| {}), why);
+        }
+        assert_refused(
+            challenge(
+                scripted_peer(|id| {
+                    let body = honest_body(id);
+                    let mut reply = format!(
+                        "HTTP/1.1 200 OK\r\nX-Other : y\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    reply.extend_from_slice(&body);
+                    reply
+                }),
+                |_| {},
+            ),
+            "whitespace before the colon of another header",
+        );
+        assert_refused(
+            challenge(
+                scripted_peer(|id| {
+                    let body = honest_body(id);
+                    let mut reply = CHUNKED_HEAD.to_vec();
+                    reply.extend_from_slice(format!("+{:x}\r\n", body.len()).as_bytes());
+                    reply.extend_from_slice(&body);
+                    reply.extend_from_slice(b"\r\n0\r\n\r\n");
+                    reply
+                }),
+                |_| {},
+            ),
+            "a signed chunk size",
         );
     }
 
