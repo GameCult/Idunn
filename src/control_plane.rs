@@ -942,6 +942,18 @@ struct DeploymentTransaction {
 }
 
 impl DeploymentTransaction {
+    /// The one writer of `phase`. It stamps the update time and the phase
+    /// deadline together, so a record outside Fencing..=Committing carries no
+    /// deadline by construction. No other code assigns `phase`.
+    fn enter_phase(&mut self, phase: DeploymentPhase, now: u64) {
+        self.phase = phase;
+        self.updated_at_unix_millis = now;
+        self.phase_deadline = self
+            .plan
+            .as_ref()
+            .and_then(|plan| PhaseDeadline::entering(phase, plan, now));
+    }
+
     /// Whether this transaction's binding declares stop-then-start. A
     /// transaction without a plan yet cannot, so it reads as false.
     fn rollout_stops_incumbent_first(&self) -> bool {
@@ -1020,8 +1032,7 @@ impl DeploymentTransaction {
     fn rejected(command: &DeploymentCommand, error: anyhow::Error, now: u64) -> Result<Self> {
         let mut transaction = Self::new(command, command.selector.clone(), 0, None, now)?;
         let detail = truncate(&format!("{error:#}"), 2048);
-        transaction.phase = DeploymentPhase::Complete;
-        transaction.updated_at_unix_millis = now;
+        transaction.enter_phase(DeploymentPhase::Complete, now);
         transaction.last_error = Some(detail.clone());
         transaction.pre_fencing_abort = Some(PreFencingAbort {
             error: detail.clone(),
@@ -1081,8 +1092,7 @@ impl DeploymentTransaction {
         require_id(&self.command_id, "transaction command id")?;
         require_id(&self.target, "transaction target")?;
         ensure!(
-            self.created_at_unix_millis > 0
-                && self.updated_at_unix_millis >= self.created_at_unix_millis,
+            self.created_at_unix_millis > 0 && self.updated_at_unix_millis > 0,
             "deployment transaction timestamps are invalid"
         );
         if let Some(generation) = &self.incumbent_generation_id {
@@ -1231,7 +1241,6 @@ impl DeploymentTransaction {
                     && (DeploymentPhase::Fencing..=DeploymentPhase::Committing)
                         .contains(&deadline.phase)
                     && deadline.entered_at_unix_millis > 0
-                    && deadline.entered_at_unix_millis <= self.updated_at_unix_millis
                     && deadline.deadline_at_unix_millis > deadline.entered_at_unix_millis,
                 "phase deadline does not describe the current post-fencing phase"
             );
@@ -1440,11 +1449,7 @@ impl DeploymentTransaction {
             }) = &self.routing
             {
                 observation.validate()?;
-                ensure!(
-                    *promoted_at_unix_millis > 0
-                        && *promoted_at_unix_millis <= self.updated_at_unix_millis,
-                    "route promotion time is outside the durable transaction timeline"
-                );
+                ensure!(*promoted_at_unix_millis > 0, "route promotion has no time");
             }
             if self.phase == DeploymentPhase::Complete {
                 ensure!(
@@ -3316,12 +3321,24 @@ struct Engine {
     bootstrap_odin_authority: AdmittedOdinAuthority,
     source: GitSourceDriver,
     docker_runner: DockerRunnerDriver,
-    systemd_workload: SystemdTransientWorkloadDriver,
+    systemd_workload: Arc<dyn WorkloadPort>,
     host_actuators: Option<SharedHostActuatorHub>,
 }
 
 impl Engine {
     fn open(options: RuntimeOptions) -> Result<Self> {
+        Self::open_with_systemd_workload(
+            options,
+            Arc::new(SystemdTransientWorkloadDriver::default()),
+        )
+    }
+
+    /// `open` with the systemd workload port supplied. It is the seam that
+    /// lets the phase engine run past Fencing without a systemd to talk to.
+    fn open_with_systemd_workload(
+        options: RuntimeOptions,
+        systemd_workload: Arc<dyn WorkloadPort>,
+    ) -> Result<Self> {
         let idunn_signer =
             open_service_identity_at::<IdunnServiceIdentity>(&options.idunn_identity_store)
                 .context("opening Idunn activation identity")?;
@@ -3358,7 +3375,7 @@ impl Engine {
             bootstrap_odin_authority,
             source,
             docker_runner: DockerRunnerDriver::default(),
-            systemd_workload: SystemdTransientWorkloadDriver::default(),
+            systemd_workload,
             host_actuators,
         })
     }
@@ -3426,11 +3443,11 @@ impl Engine {
     }
 
     /// The workload driver the plan's binding declares.
-    fn workload_for(&self, plan: &CompiledDeploymentPlan) -> Result<Box<dyn WorkloadPort + '_>> {
+    fn workload_for(&self, plan: &CompiledDeploymentPlan) -> Result<Arc<dyn WorkloadPort + '_>> {
         let (_, binding) = plan.parsed_inputs()?;
         Ok(match &binding.workload {
-            WorkloadBinding::SystemdTransient(_) => Box::new(self.systemd_workload.clone()),
-            WorkloadBinding::HostActuator(_) => Box::new(HostActuatorWorkloadDriver {
+            WorkloadBinding::SystemdTransient(_) => Arc::clone(&self.systemd_workload),
+            WorkloadBinding::HostActuator(_) => Arc::new(HostActuatorWorkloadDriver {
                 access: self.host_access()?,
             }),
         })
@@ -4520,8 +4537,7 @@ impl Engine {
                 "transaction plan",
             )?)
         })?;
-        next.phase = DeploymentPhase::Starting;
-        next.updated_at_unix_millis = now;
+        next.enter_phase(DeploymentPhase::Starting, now);
         next.last_error = None;
         replace_transaction(&self.options.state_store, current, &next)
     }
@@ -4607,8 +4623,7 @@ impl Engine {
             });
         }
         let mut next = current.value.clone();
-        next.phase = DeploymentPhase::Warming;
-        next.updated_at_unix_millis = now_millis()?;
+        next.enter_phase(DeploymentPhase::Warming, now_millis()?);
         next.last_error = None;
         replace_transaction(&self.options.state_store, current, &next)
     }
@@ -5345,8 +5360,7 @@ impl Engine {
             },
         };
         let mut complete = commit_current.value.clone();
-        complete.phase = DeploymentPhase::Complete;
-        complete.updated_at_unix_millis = now;
+        complete.enter_phase(DeploymentPhase::Complete, now);
         complete.last_error = None;
         complete.completion = Some(TransactionCompletion::Admitted {
             generation_id: generation.generation_id.clone(),
@@ -6385,12 +6399,7 @@ impl Engine {
             "deployment phase transition is not adjacent"
         );
         let mut next = current.value.clone();
-        next.phase = next_phase;
-        next.updated_at_unix_millis = now_millis()?;
-        next.phase_deadline = next
-            .plan
-            .as_ref()
-            .and_then(|plan| PhaseDeadline::entering(next_phase, plan, next.updated_at_unix_millis));
+        next.enter_phase(next_phase, now_millis()?);
         next.last_error = None;
         replace_transaction(&self.options.state_store, current, &next)
     }
@@ -6615,8 +6624,7 @@ impl Engine {
             "post-fencing abort cleanup is incomplete"
         );
         let mut next = current.value.clone();
-        next.phase = DeploymentPhase::Complete;
-        next.updated_at_unix_millis = now_millis()?;
+        next.enter_phase(DeploymentPhase::Complete, now_millis()?);
         next.last_error = Some(abort.error.clone());
         next.completion = Some(TransactionCompletion::FailedAfterFencing {
             error: abort.error.clone(),
@@ -6693,8 +6701,7 @@ impl Engine {
             "pre-fencing abort cleanup is incomplete"
         );
         let mut next = current.value.clone();
-        next.phase = DeploymentPhase::Complete;
-        next.updated_at_unix_millis = now_millis()?;
+        next.enter_phase(DeploymentPhase::Complete, now_millis()?);
         next.last_error = Some(abort.error.clone());
         next.completion = Some(TransactionCompletion::FailedBeforeFencing {
             error: abort.error.clone(),
@@ -7263,10 +7270,25 @@ mod tests {
         _temp: TempDir,
         engine: Engine,
         state_store: PathBuf,
+        odin_signer: ServiceIdentitySigner<OdinTopologyIdentity>,
+        root: PathBuf,
     }
 
     impl EngineFixture {
         fn new() -> Result<Self> {
+            Self::build(None)
+        }
+
+        /// An Engine whose systemd workload port is `workload`, so the phase
+        /// machine can run without systemd. This is the whole seam: nginx,
+        /// systemctl and the network are never reached on an unrouted,
+        /// stateless target, and the Odin evidence is signed by the key this
+        /// fixture enrolled.
+        fn with_workload(workload: Arc<dyn WorkloadPort>) -> Result<Self> {
+            Self::build(Some(workload))
+        }
+
+        fn build(workload: Option<Arc<dyn WorkloadPort>>) -> Result<Self> {
             let temp = TempDir::new()?;
             let root = temp.path();
             std::fs::create_dir_all(root.join("identities"))?;
@@ -7290,11 +7312,16 @@ mod tests {
                 deployment_brake_operator_anchor: root.join("brake-anchor.cc"),
                 ..RuntimeOptions::default()
             };
-            let engine = Engine::open(options)?;
+            let engine = match workload {
+                Some(workload) => Engine::open_with_systemd_workload(options, workload)?,
+                None => Engine::open(options)?,
+            };
             Ok(Self {
+                root: root.to_path_buf(),
                 _temp: temp,
                 engine,
                 state_store,
+                odin_signer,
             })
         }
     }
@@ -9381,10 +9408,425 @@ mod tests {
         let mut backwards = transaction.clone();
         backwards.phase_deadline.as_mut().unwrap().deadline_at_unix_millis = now;
         assert!(backwards.validate().is_err());
-        let mut from_the_future = transaction;
-        from_the_future.phase_deadline =
+        // Entry is not ordered against the wall-clock stamp of later writes.
+        let mut entered_after_the_stamp = transaction;
+        entered_after_the_stamp.phase_deadline =
             PhaseDeadline::entering(DeploymentPhase::AwaitingReady, &plan, now + 1);
-        assert!(from_the_future.validate().is_err());
+        entered_after_the_stamp.validate()?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // The phase machine, driven by the real Engine past Fencing.
+    // ---------------------------------------------------------------------
+
+    /// A workload port with no systemd behind it: observing a workload
+    /// returns what was observed, stopping and discarding succeed, and
+    /// anything that would launch a process refuses.
+    struct StillWorkload;
+
+    impl WorkloadPort for StillWorkload {
+        fn install(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            bail!("StillWorkload launches nothing")
+        }
+        fn prepare_activation(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &IdunnExpectedIncarnationRecord,
+            _: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            bail!("StillWorkload launches nothing")
+        }
+        fn start_prepared(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &SealedRelease,
+            _: &crate::drivers::InstalledReleaseObservation,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            bail!("StillWorkload launches nothing")
+        }
+        fn discard_prepared(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn observe(
+            &self,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+            prior: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            Ok(prior.clone())
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            Ok(())
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// A Continuity transaction for an unrouted, stateless target, sitting at
+    /// Fencing with every earlier phase's evidence in place. The plan, sealed
+    /// release, Expected, activation and Warming evidence are the real
+    /// constructions; only the workload and isolation observations are
+    /// borrowed from a recorded transaction. Continuity is chosen because a
+    /// Deploy would need a frozen source and a signed brake record, which no
+    /// phase past Fencing reads.
+    fn transaction_at_fencing(world: &EngineFixture) -> Result<DeploymentTransaction> {
+        use crate::deployment_plan::tests::{
+            BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
+        };
+        let provider = enroll_service_identity_at::<GameCultProviderHealthIdentity>(
+            &world.root.join("identities/provider.cc"),
+        )?;
+        let provider_anchor = world.root.join("identities/provider-anchor.cc");
+        export_service_identity_trust_anchor(&provider, &provider_anchor)?;
+
+        let (binding_head, binding_tail) = BINDING
+            .split_once("[route]")
+            .context("binding has no route table")?;
+        let binding = format!(
+            "{binding_head}[brakes]{}",
+            binding_tail
+                .split_once("[brakes]")
+                .context("binding has no brakes table")?
+                .1
+        )
+        .replace(
+            "/etc/gamecult/trust/service.cc",
+            &provider_anchor.display().to_string(),
+        )
+        .replace("service-runtime-signer", &provider.entry().identity_id);
+        let recipe = RECIPE
+            .split("[[dependencies]]")
+            .next()
+            .context("recipe is empty")?
+            .replace("route_required = true", "route_required = false")
+            .replace(
+                r#"["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+                r#"["GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+            );
+        let plan = compile_deployment_plan(
+            recipe.as_bytes(),
+            binding.as_bytes(),
+            source(&recipe),
+            "service-incarnation-1",
+            None,
+            110,
+            &[],
+        )?;
+        let release = SealedRelease::new(
+            &plan,
+            vec![artifact_receipt()],
+            vec![external_input_receipt()],
+            120,
+        )?;
+        let expected = release.expected_projection(&plan)?;
+        assert!(!expected.write_lease_required && expected.route.is_none());
+
+        let now = now_millis()?;
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "continuity-service".into(),
+            kind: CommandKind::Continuity,
+            selector: "service".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        let mut transaction = DeploymentTransaction::new(&command, "service".into(), 0, None, now)?;
+        let activation = IdunnRuntimeActivationLaunch::issue(
+            &expected,
+            runtime_instance_id(&transaction.transaction_id)?,
+            now,
+            &world.engine.idunn_signer,
+        )?
+        .activation()
+        .clone();
+        let mut workload = fixture_transaction(FIXTURE_TRANSACTIONS[0].1)?
+            .1
+            .workload
+            .context("recorded transaction has no workload")?;
+        transaction.lifecycle_authorized_at_unix_millis = Some(now);
+        transaction.expected_publication_sha256 = Some(expected.canonical_sha256()?);
+        transaction.activation_publication_sha256 = Some(activation.canonical_sha256()?);
+        match &mut workload {
+            WorkloadObservation::Systemd(observed) => {
+                observed.runtime_instance_id = activation.runtime_instance_id.clone();
+            }
+            WorkloadObservation::Host(_) => bail!("recorded workload is not a systemd unit"),
+        }
+        let recorded = fixture_transaction(FIXTURE_TRANSACTIONS[0].1)?.1;
+        transaction.isolation = recorded.isolation;
+        transaction.installed_release = Some(crate::drivers::InstalledReleaseObservation {
+            sealed_release_id: release.sealed_release_id.clone(),
+            root: PathBuf::from("/srv/service/releases/test"),
+        });
+        transaction.sealed_release = Some(release);
+        transaction.expected = Some(expected);
+        transaction.activation = Some(activation);
+        transaction.workload = Some(workload);
+        transaction.plan = Some(plan);
+        // Odin's first word about the candidate, before it was Ready.
+        let warming = signed_correlation(world, &transaction, 4, false)?;
+        let authenticated = world.engine.authenticate_topology_bytes(
+            &ControlSnapshot::read(&world.state_store)?,
+            &transaction,
+            &warming,
+            None,
+            now,
+        )?;
+        transaction.warming = Some(WarmingEvidence::OdinTopology {
+            evidence: TopologyEvidence::from_authenticated(&authenticated, now)?,
+        });
+        transaction.odin_publisher_sequence_cursor = 4;
+        transaction.enter_phase(DeploymentPhase::Fencing, now);
+        transaction.validate()?;
+
+        let store = SingleFileMessagePackBackingStore::new(&world.state_store);
+        assert!(store.compare_exchange(
+            &[
+                CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command.command_id.clone(),
+                    current: None,
+                },
+                CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: transaction.transaction_id.clone(),
+                    current: None,
+                },
+            ],
+            &[
+                command_envelope(&command, command.requested_at_unix_millis)?,
+                transaction_envelope(&transaction, now)?,
+            ],
+        )?);
+        Ok(transaction)
+    }
+
+    /// Odin's correlation for the transaction's incarnation, signed by the key
+    /// the Engine trusts and stamped now.
+    fn signed_correlation(
+        world: &EngineFixture,
+        transaction: &DeploymentTransaction,
+        sequence: u64,
+        ready: bool,
+    ) -> Result<Vec<u8>> {
+        let expected = transaction.expected.as_ref().context("no Expected")?;
+        let activation = transaction.activation.as_ref().context("no activation")?;
+        let mut record = OdinRuntimeTopologyCorrelationRecord {
+            schema_version: cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into(),
+            target: expected.target.clone(),
+            expected_projection_sha256: expected.canonical_sha256()?,
+            expected: true,
+            current_activation_sha256: Some(activation.canonical_sha256()?),
+            signed_presence_sha256: Some(sha256_id(b"presence")),
+            observed_presence_state: Some("active".into()),
+            observed_presence_publisher_sequence: Some(sequence),
+            observed_write_lease_sha256: None,
+            observed_capabilities: expected
+                .capabilities
+                .iter()
+                .map(|capability| cultnet_rs::GameCultRuntimeCapability {
+                    capability: capability.capability.clone(),
+                    schema: capability.schema.clone(),
+                    compatibility: capability.compatibility.clone(),
+                    capacity: 1,
+                })
+                .collect(),
+            runtime_id: expected.runtime_id.clone(),
+            runtime_instance_id: Some(activation.runtime_instance_id.clone()),
+            present: true,
+            ready,
+            dependencies: Vec::new(),
+            disagreements: Vec::new(),
+            signer_identity_id: world.odin_signer.entry().identity_id.clone(),
+            publisher_sequence: sequence,
+            observed_at_unix_millis: now_millis()?,
+            signature_algorithm: "ed25519".into(),
+            signature: Vec::new(),
+        };
+        record.signature = world
+            .odin_signer
+            .sign::<OdinRuntimeTopologyCorrelationPurpose>(&record.unsigned_signature_payload()?)
+            .signature;
+        record.canonical_bytes()
+    }
+
+    /// Odin publishes its Ready correlation for the transaction incarnation.
+    fn odin_reports_ready(
+        world: &EngineFixture,
+        transaction: &DeploymentTransaction,
+        sequence: u64,
+    ) -> Result<()> {
+        let expected = transaction.expected.as_ref().context("no Expected")?;
+        SingleFileMessagePackBackingStore::new(&world.engine.options.odin_correlation_store)
+            .insert_entry_if_absent(CultCacheEnvelope {
+                key: crate::drivers::incarnation_key_of(
+                    &expected.target,
+                    &expected.canonical_sha256()?,
+                ),
+                r#type: OdinRuntimeTopologyCorrelationRecord::TYPE.into(),
+                payload: signed_correlation(world, transaction, sequence, true)?,
+                stored_at: rfc3339_millis(now_millis()?)?,
+                schema_id: Some(cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into()),
+            })?;
+        Ok(())
+    }
+
+    fn resident(world: &EngineFixture) -> Result<Stored<DeploymentTransaction>> {
+        ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .next()
+            .context("the transaction left the live set")
+    }
+
+    /// The transaction wherever it now lives: live, or archived once terminal.
+    fn latest(world: &EngineFixture) -> Result<DeploymentTransaction> {
+        match resident(world) {
+            Ok(stored) => Ok(stored.value),
+            Err(_) => read_history_transactions(&world.state_store)
+                .into_iter()
+                .next()
+                .context("the transaction is in neither the live set nor history"),
+        }
+    }
+
+    /// One engine step at a time until `stop` holds, recording each phase
+    /// entered and checking after every step that the deadline on the record
+    /// is exactly the current post-fencing phase's, and absent outside one.
+    fn drive(
+        world: &EngineFixture,
+        stop: impl Fn(&DeploymentTransaction) -> bool,
+    ) -> Result<Vec<DeploymentPhase>> {
+        let mut phases = Vec::new();
+        for _ in 0..40 {
+            let Ok(current) = resident(world) else {
+                return Ok(phases);
+            };
+            if stop(&current.value) {
+                return Ok(phases);
+            }
+            world.engine.advance_transaction(&current)?;
+            let after = latest(world)?;
+            match &after.phase_deadline {
+                Some(deadline) => assert_eq!(deadline.phase, after.phase),
+                None => assert!(
+                    !(DeploymentPhase::Fencing..=DeploymentPhase::Committing)
+                        .contains(&after.phase),
+                    "a post-fencing record lost its deadline"
+                ),
+            }
+            if phases.last() != Some(&after.phase) {
+                phases.push(after.phase);
+            }
+        }
+        bail!("the transaction did not reach the stop condition in 40 steps")
+    }
+
+    #[test]
+    fn an_admission_runs_from_fencing_to_complete_and_commits() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let seeded = transaction_at_fencing(&world)?;
+        odin_reports_ready(&world, &seeded, 5)?;
+
+        let phases = drive(&world, |transaction| {
+            transaction.phase == DeploymentPhase::Complete
+        })?;
+        assert_eq!(
+            phases,
+            [
+                DeploymentPhase::Fencing,
+                DeploymentPhase::Leasing,
+                DeploymentPhase::AwaitingReady,
+                DeploymentPhase::Routing,
+                DeploymentPhase::Committing,
+                DeploymentPhase::Complete,
+            ]
+        );
+        let finished = latest(&world)?;
+        assert_eq!(finished.phase_deadline, None);
+        assert!(matches!(
+            finished.completion,
+            Some(TransactionCompletion::Admitted { .. })
+        ));
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        let admitted = snapshot
+            .admitted_for("service")
+            .context("commit wrote no admitted generation")?;
+        assert_eq!(admitted.value.transaction_id, finished.transaction_id);
+        assert_eq!(Some(&admitted.value.expected), seeded.expected.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn a_post_fence_abort_runs_to_complete() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let seeded = transaction_at_fencing(&world)?;
+        odin_reports_ready(&world, &seeded, 5)?;
+        drive(&world, |transaction| {
+            transaction.phase == DeploymentPhase::Routing
+        })?;
+        let routing = resident(&world)?;
+        assert!(routing.value.phase_deadline.is_some());
+
+        world
+            .engine
+            .begin_post_fencing_abort(&routing, anyhow!("candidate refused"))?;
+        drive(&world, |transaction| transaction.completion.is_some())?;
+        let finished = latest(&world)?;
+        assert_eq!(finished.phase, DeploymentPhase::Complete);
+        assert_eq!(finished.phase_deadline, None);
+        assert!(matches!(
+            finished.completion,
+            Some(TransactionCompletion::FailedAfterFencing { .. })
+        ));
+        assert!(
+            ControlSnapshot::read(&world.state_store)?
+                .admitted_for("service")
+                .is_none(),
+            "an aborted candidate was admitted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn entering_a_phase_owns_the_deadline_and_a_stepped_clock_cannot_wedge_it() -> Result<()> {
+        let (_, mut transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[4].1)?;
+        let plan = transaction.plan.clone().unwrap();
+        let base = transaction.created_at_unix_millis;
+        transaction.enter_phase(DeploymentPhase::Routing, base + 1_000);
+        let deadline = transaction.phase_deadline.context("no deadline on entry")?;
+        assert_eq!(deadline.phase, DeploymentPhase::Routing);
+        assert_eq!(
+            deadline.deadline_at_unix_millis,
+            base + 1_000 + u64::from(plan.phase_deadlines().routing_seconds) * 1000
+        );
+        // A same-phase write after the wall clock stepped backwards is still a
+        // valid record: the deadline is fixed at entry, not ordered against
+        // later stamps, and neither is the creation time.
+        transaction.updated_at_unix_millis = deadline.entered_at_unix_millis - 1;
+        transaction.validate()?;
+        transaction.updated_at_unix_millis = base - 1;
+        transaction.validate()?;
+        transaction.enter_phase(DeploymentPhase::Committing, base + 2_000);
+        assert_eq!(
+            transaction.phase_deadline.unwrap().phase,
+            DeploymentPhase::Committing
+        );
+        transaction.enter_phase(DeploymentPhase::Complete, base + 3_000);
+        assert_eq!(transaction.phase_deadline, None);
         Ok(())
     }
 

@@ -1098,7 +1098,7 @@ fn sha256_id(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cultnet_rs::{
         GameCultProviderHealthIdentity, GameCultRuntimeCapability, IdunnRuntimeActivationLaunch,
@@ -1109,7 +1109,7 @@ mod tests {
         verify_runtime_authority,
     };
 
-    const RECIPE: &str = r#"
+    pub(crate) const RECIPE: &str = r#"
 schema = "gamecult.idunn.target_declaration.v1"
 target = "service"
 source_stamp_environment = "SERVICE_BUILD_COMMIT"
@@ -1172,7 +1172,7 @@ schema = "odin.verse-topology.v1"
 compatibility = "v1"
 "#;
 
-    const BINDING: &str = r#"
+    pub(crate) const BINDING: &str = r#"
 schema = "gamecult.idunn.operator_binding.v2"
 target = "service"
 
@@ -1247,7 +1247,7 @@ nodes = ["yggdrasil"]
         format!("sha256-{}", char::from(byte).to_string().repeat(64))
     }
 
-    fn source(recipe: &str) -> SourceSelectionFacts {
+    pub(crate) fn source(recipe: &str) -> SourceSelectionFacts {
         SourceSelectionFacts {
             schema: SOURCE_SELECTION_FACTS_SCHEMA.into(),
             origin: "https://github.com/GameCult/Service.git".into(),
@@ -1387,7 +1387,7 @@ nodes = ["yggdrasil"]
         .unwrap()
     }
 
-    fn artifact_receipt() -> ArtifactReceipt {
+    pub(crate) fn artifact_receipt() -> ArtifactReceipt {
         ArtifactReceipt {
             artifact_id: "daemon".into(),
             destination: "service".into(),
@@ -1397,7 +1397,7 @@ nodes = ["yggdrasil"]
         }
     }
 
-    fn external_input_receipt() -> ExternalInputMaterializationReceipt {
+    pub(crate) fn external_input_receipt() -> ExternalInputMaterializationReceipt {
         ExternalInputMaterializationReceipt {
             input_id: "toolchain-index".into(),
             url: "https://example.invalid/toolchain-index".into(),
