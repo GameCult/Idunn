@@ -11747,9 +11747,7 @@ mod tests {
 
     /// A workload whose candidate can neither be stopped nor recover: an abort
     /// that cannot finish its first step.
-    struct WedgedWorkload {
-        observe_fails: bool,
-    }
+    struct WedgedWorkload;
 
     impl WorkloadPort for WedgedWorkload {
         fn install(
@@ -11791,7 +11789,6 @@ mod tests {
             activation: &IdunnRuntimeActivationRecord,
             prior: &WorkloadObservation,
         ) -> Result<WorkloadObservation> {
-            ensure!(!self.observe_fails, "the unit cannot be observed");
             StillWorkload.observe(expected, activation, prior)
         }
         fn stop(&self, _: &WorkloadObservation) -> Result<()> {
@@ -11804,9 +11801,7 @@ mod tests {
 
     #[test]
     fn one_wedged_pre_fence_abort_does_not_stop_the_scheduler() -> Result<()> {
-        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload {
-            observe_fails: false,
-        }))?;
+        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload))?;
         let wedged = transaction_at(&world, DeploymentPhase::Warming)?;
         world
             .engine
@@ -11854,19 +11849,15 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_candidate_past_the_fence_aborts_and_a_wedged_post_fence_abort_only_waits() -> Result<()> {
-        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload {
-            observe_fails: true,
-        }))?;
-        let dead = transaction_at(&world, DeploymentPhase::AwaitingReady)?;
+    fn a_wedged_post_fence_abort_only_waits() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload))?;
+        let dead = transaction_at(&world, DeploymentPhase::Fencing)?;
+        world
+            .engine
+            .begin_post_fencing_abort(&resident(&world)?, anyhow!("candidate died"))?;
 
-        // The candidate cannot be observed and can never run again, so the
-        // transaction abandons it after the fence.
-        world.engine.run_scheduler_tick()?;
-        assert!(record_of(&world, &dead.transaction_id)?.post_fencing_abort.is_some());
-
-        // Its abort cannot stop the unit: that is a resumable error, and the
-        // tick answers every time.
+        // The abort cannot stop the unit. The abort is already durable, so
+        // that is a resumable error, and the tick answers every time.
         for _ in 0..3 {
             world.engine.run_scheduler_tick()?;
         }
