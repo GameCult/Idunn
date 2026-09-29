@@ -126,6 +126,16 @@ Nothing is fenced, so the incumbent is untouched.
   - B2 rework on B3.
   - Odin's CultLib pin bump, after the stray-packet merge.
 
+**C2 acceptance hour passed, 2026-09-29 19:55-20:55 UTC (21:55-22:55 CEST).**
+- 1 nginx reload, which was Odin's own route promotion during its `5c37860` deploy.
+- 0 rejected StreamPixels challenges, 0 Odin continuity timeouts, and Idunn `NRestarts=0`.
+- One running unit each for service, web and Odin. Public `/` and `/api/catalog` return 200.
+- Also deployed in the window: Odin `5c37860`, carrying CultLib `3bf1c0c` (RUDP stray-packet hardening in every
+  runtime), Sleipnir removed, and presence ordering decided by activation identity.
+- Still open for Odin: it exits when its 64-slot RUDP session table fills, because its own heartbeat publish
+  fails. Publishers that never Disconnect hold slots for 30 s. The fix is in Hands.
+- The second run, with Odin broken on purpose, remains the operator's to schedule.
+
 **Ruling, 2026-09-30 (operator): the dead-hold report is stored on the generation.**
 - Add an optional `last_error` to `AdmittedGeneration` (new key 21), and make `status` render admitted
   generations.
