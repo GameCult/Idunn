@@ -13997,13 +13997,15 @@ mod tests {
         assert!(cancelling.post_fencing_abort.is_none());
 
         drive(&world, |transaction| transaction.completion.is_some())?;
-        let finished = latest(&world)?;
-        assert!(
-            matches!(finished.completion, Some(TransactionCompletion::FailedBeforeFencing { .. })),
-            "{:?} / {:?}",
+        // History also holds the incumbent's own admission: find ours by id.
+        let finished = every_transaction(&world)?
+            .into_iter()
+            .find(|transaction| transaction.transaction_id == held.transaction_id)
+            .context("the cancelled redeploy is nowhere")?;
+        assert!(matches!(
             finished.completion,
-            finished.pre_fencing_abort
-        );
+            Some(TransactionCompletion::FailedBeforeFencing { .. })
+        ));
         assert!(finished.is_terminal());
         // The target is released and nothing of the incumbent was touched.
         assert!(!finished.blocks_new_target_mutation());
