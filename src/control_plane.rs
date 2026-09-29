@@ -751,11 +751,20 @@ enum CleanupEvidence {
     Pending,
     Skipped,
     Complete,
+    /// Set only by the legacy lift, on a terminal continuity abort written
+    /// before the single resolution rule: it issued an activation and recorded
+    /// `Skipped`. Boot reconciliation, not the record, owes that residue's
+    /// demotion. The marker is what lets validation accept the old shape
+    /// without reopening a finished transaction.
+    LegacySkippedBeforeB1,
 }
 
 impl CleanupEvidence {
     fn is_complete(self) -> bool {
-        matches!(self, Self::Skipped | Self::Complete)
+        matches!(
+            self,
+            Self::Skipped | Self::Complete | Self::LegacySkippedBeforeB1
+        )
     }
 }
 
@@ -1304,7 +1313,10 @@ impl DeploymentTransaction {
                         CleanupEvidence::Pending,
                         CleanupEvidence::Pending | CleanupEvidence::Complete
                     ) | (CleanupEvidence::Skipped, CleanupEvidence::Skipped)
-                ),
+                ) || (self.command_kind == CommandKind::Continuity
+                    && self.phase == DeploymentPhase::Complete
+                    && self.completion.is_some()
+                    && abort.topology_reconciliation == CleanupEvidence::LegacySkippedBeforeB1),
                 "abort topology cleanup differs from what the transaction projected"
             );
             ensure!(
@@ -2707,31 +2719,34 @@ fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTra
 
 /// A continuity abort written before the single resolution rule recorded no
 /// projection cleanup although its transaction had issued an activation, and
-/// so left that activation standing. The current rule owes the demotion, so a
-/// resident record of that shape lifts to `Pending`: the one resolution then
-/// demotes the transaction's own activation and cleans the residue too.
+/// so left that activation standing.
 ///
-/// A record already terminal under the old rule is reopened at Starting (a
-/// pre-fencing failure is before Fencing by definition) with its completion
-/// dropped, because a terminal record cannot owe work. Only the control
-/// store's read applies this: history describes what happened and is lifted
-/// unchanged.
+/// Nothing is reopened. A record already terminal keeps its terminal phase and
+/// completion and is marked `LegacySkippedBeforeB1`, the one shape validation
+/// accepts for a terminal abort that owes nothing yet issued an activation;
+/// boot reconciliation, the single owner of that residue, demotes it by exact
+/// activation. A record still in flight lifts to `Pending`: it already holds
+/// its target's authority (a live record claims it before and after the lift),
+/// so the lift adds no claimant, and its own abort demotes the activation.
+/// Only the control store's read applies this: history describes what happened
+/// and is lifted unchanged.
 fn owe_legacy_continuity_projection(transaction: &mut DeploymentTransaction) {
     if transaction.command_kind != CommandKind::Continuity || transaction.activation.is_none() {
         return;
     }
+    let terminal = transaction.completion.is_some();
     if let Some(abort) = transaction.pre_fencing_abort.as_mut()
         && abort.topology_reconciliation == CleanupEvidence::Skipped
     {
-        abort.topology_reconciliation = CleanupEvidence::Pending;
-        if transaction.completion.take().is_some() {
-            transaction.phase = DeploymentPhase::Starting;
-            transaction.phase_deadline = None;
-        }
+        abort.topology_reconciliation = if terminal {
+            CleanupEvidence::LegacySkippedBeforeB1
+        } else {
+            CleanupEvidence::Pending
+        };
     }
     if let Some(abort) = transaction.post_fencing_abort.as_mut()
         && abort.topology_reconciliation == CleanupEvidence::Skipped
-        && transaction.completion.is_none()
+        && !terminal
     {
         abort.topology_reconciliation = CleanupEvidence::Pending;
     }
@@ -3885,7 +3900,10 @@ impl Engine {
     }
 }
 
-fn serve(options: RuntimeOptions) -> Result<()> {
+/// Everything the daemon does once, before its loop: lock, migrate, validate,
+/// reconcile the projection. The lock is returned so the caller holds it for as
+/// long as the engine runs.
+fn boot(options: RuntimeOptions) -> Result<(ProcessLock, Engine)> {
     for path in [
         &options.state_store,
         &options.topology_store,
@@ -3900,7 +3918,7 @@ fn serve(options: RuntimeOptions) -> Result<()> {
         fs::create_dir_all(directory)
             .with_context(|| format!("creating Idunn directory {}", directory.display()))?;
     }
-    let _lock = ProcessLock::acquire(&options.state_store)?;
+    let lock = ProcessLock::acquire(&options.state_store)?;
     let migrated = migrate_control_store_to_current_schema(&options.state_store)
         .context("migrating Idunn control records to the current schema")?;
     if migrated > 0 {
@@ -3925,7 +3943,11 @@ fn serve(options: RuntimeOptions) -> Result<()> {
         }
         Err(error) => eprintln!("Idunn boot projection reconciliation failed: {error:#}"),
     }
+    Ok((lock, engine))
+}
 
+fn serve(options: RuntimeOptions) -> Result<()> {
+    let (_lock, engine) = boot(options)?;
     loop {
         match engine.run_scheduler_tick() {
             Ok(true) => continue,
@@ -3944,9 +3966,6 @@ fn serve(options: RuntimeOptions) -> Result<()> {
 }
 
 impl Engine {
-    /// One pass of the scheduler, with the loop's ordering preserved exactly:
-    /// `Ok(true)` means "went round again immediately", which is what the
-    /// caller's `continue` did.
     /// One resident terminal transaction goes to history per tick.
     ///
     /// Transactions that finished before finished transactions travelled to
@@ -3955,21 +3974,34 @@ impl Engine {
     /// reads. They leave the same way a transaction finishing today does.
     fn retire_one_terminal_transaction(&self) -> Result<bool> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-        let Some(stored) = snapshot
+        // A record that cannot be archived (history unreadable, a torn write)
+        // is that record's fault: the next terminal record is still tried, and
+        // the tick goes on to supervise and freeze.
+        for stored in snapshot
             .transactions
             .iter()
-            .find(|stored| stored.value.is_terminal())
-        else {
-            return Ok(false);
-        };
-        archive_terminal_transaction(&self.options.state_store, &stored.envelope)?;
-        eprintln!(
-            "Idunn retired resident terminal transaction {} to history",
-            stored.value.transaction_id
-        );
-        Ok(true)
+            .filter(|stored| stored.value.is_terminal())
+        {
+            match archive_terminal_transaction(&self.options.state_store, &stored.envelope) {
+                Ok(()) => {
+                    eprintln!(
+                        "Idunn retired resident terminal transaction {} to history",
+                        stored.value.transaction_id
+                    );
+                    return Ok(true);
+                }
+                Err(error) => eprintln!(
+                    "Idunn could not retire terminal transaction {}: {error:#}",
+                    stored.value.transaction_id
+                ),
+            }
+        }
+        Ok(false)
     }
 
+    /// One pass of the scheduler. An unreadable control store is the tick's
+    /// fault and is returned; anything one transaction or one admitted
+    /// generation does wrong is logged against it and never stops the others.
     fn run_scheduler_tick(&self) -> Result<bool> {
         if self.retire_one_terminal_transaction()? {
             return Ok(true);
@@ -4002,43 +4034,59 @@ impl Engine {
             if snapshot.has_earlier_authority_sibling(&current.value) {
                 continue;
             }
-            if let Err(error) = self.advance_transaction(current) {
-                let latest_snapshot = ControlSnapshot::read(&self.options.state_store)?;
-                let latest = latest_snapshot
-                    .transactions
-                    .iter()
-                    .find(|stored| stored.value.transaction_id == current.value.transaction_id)
-                    .context("transaction disappeared while recording an execution error")?;
-                if latest.value.is_terminal() {
-                    progressed = true;
-                } else if latest.value.phase < DeploymentPhase::Fencing
-                    && latest.value.pre_fencing_abort.is_none()
-                {
-                    self.begin_pre_fencing_abort(latest, error)?;
-                } else if latest.value.post_fencing_abort.is_none()
-                    && self.candidate_is_permanently_stopped(&latest.value)?
-                {
-                    // Past the fence an error is resumable while the candidate
-                    // can still recover. This one cannot: its transient unit
-                    // has failed and carries Restart=no, so retrying would hold
-                    // the target forever behind a transaction that can never
-                    // finish.
-                    self.begin_post_fencing_abort(latest, error)?;
-                } else {
-                    self.record_resumable_error(latest, &error)?;
-                }
-            }
-            let after = ControlSnapshot::read(&self.options.state_store)?;
-            let live = after
-                .transactions
-                .iter()
-                .find(|stored| stored.value.transaction_id == current.value.transaction_id)
-                .context("transaction disappeared while checking scheduler progress")?;
-            if live.envelope != current.envelope {
-                progressed = true;
+            match self.resume_candidate(current) {
+                Ok(moved) => progressed |= moved,
+                Err(error) => eprintln!(
+                    "Idunn could not resume transaction {}: {error:#}",
+                    current.value.transaction_id
+                ),
             }
         }
         Ok(progressed)
+    }
+
+    /// Advance one transaction, turning its failure into the durable record
+    /// its phase calls for. Returns whether its record changed.
+    fn resume_candidate(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
+        if let Err(error) = self.advance_transaction(current) {
+            let latest_snapshot = ControlSnapshot::read(&self.options.state_store)?;
+            let latest = latest_snapshot
+                .transactions
+                .iter()
+                .find(|stored| stored.value.transaction_id == current.value.transaction_id)
+                .context("transaction disappeared while recording an execution error")?;
+            if latest.value.is_terminal() {
+                return Ok(true);
+            }
+            if latest.value.phase < DeploymentPhase::Fencing {
+                // Before the fence an abort that cannot finish a step is
+                // resumable, never a post-fence abort: that path refuses a
+                // pre-fence phase, so choosing it only wedged the tick.
+                if latest.value.pre_fencing_abort.is_none() {
+                    self.begin_pre_fencing_abort(latest, error)?;
+                } else {
+                    self.record_resumable_error(latest, &error)?;
+                }
+            } else if latest.value.post_fencing_abort.is_none()
+                && self.candidate_is_permanently_stopped(&latest.value)?
+            {
+                // Past the fence an error is resumable while the candidate
+                // can still recover. This one cannot: its transient unit
+                // has failed and carries Restart=no, so retrying would hold
+                // the target forever behind a transaction that can never
+                // finish.
+                self.begin_post_fencing_abort(latest, error)?;
+            } else {
+                self.record_resumable_error(latest, &error)?;
+            }
+        }
+        let after = ControlSnapshot::read(&self.options.state_store)?;
+        let live = after
+            .transactions
+            .iter()
+            .find(|stored| stored.value.transaction_id == current.value.transaction_id)
+            .context("transaction disappeared while checking scheduler progress")?;
+        Ok(live.envelope != current.envelope)
     }
 
     fn freeze_one_queued_command(&self) -> Result<bool> {
@@ -11459,8 +11507,57 @@ mod tests {
         Ok(())
     }
 
+    fn abort_owed(transaction: &DeploymentTransaction) -> Option<CleanupEvidence> {
+        transaction
+            .pre_fencing_abort
+            .as_ref()
+            .map(|abort| abort.topology_reconciliation)
+            .or_else(|| {
+                transaction
+                    .post_fencing_abort
+                    .as_ref()
+                    .map(|abort| abort.topology_reconciliation)
+            })
+    }
+
+    /// Put a continuity's record and its command in the control store as they
+    /// stood: `envelope` is written as given, in whatever schema it is in.
+    fn make_resident(
+        world: &EngineFixture,
+        transaction: &DeploymentTransaction,
+        envelope: CultCacheEnvelope,
+    ) -> Result<()> {
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: transaction.command_id.clone(),
+            kind: CommandKind::Continuity,
+            selector: "service".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: command.command_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: envelope.key.clone(),
+                        current: None,
+                    },
+                ],
+                &[command_envelope(&command, 100)?, envelope],
+            )?
+        );
+        Ok(())
+    }
+
     #[test]
-    fn a_pre_b1_continuity_abort_lifts_owing_its_own_activation_and_resolves_it() -> Result<()> {
+    fn a_pre_b1_continuity_abort_lifts_without_reopening_and_boot_resolves_its_residue()
+    -> Result<()> {
         write_fixture_anchor()?;
         for (name, text) in FIXTURE_PRE_B1_ABORTS {
             let envelope = fixture_envelope(text, DeploymentTransaction::TYPE)?;
@@ -11470,79 +11567,33 @@ mod tests {
             let legacy: LegacyDeploymentTransaction = rmp_serde::from_slice(&envelope.payload)?;
             assert_eq!(legacy.command_kind, CommandKind::Continuity, "{name}");
             assert!(legacy.activation.is_some(), "{name}");
-            let owed = legacy
-                .pre_fencing_abort
-                .as_ref()
-                .map(|abort| abort.topology_reconciliation)
-                .or_else(|| {
-                    legacy
-                        .post_fencing_abort
-                        .as_ref()
-                        .map(|abort| abort.topology_reconciliation)
-                })
-                .context("no abort")?;
-            assert_eq!(owed, CleanupEvidence::Skipped, "{name}");
 
             // History describes what happened, so it lifts the record as written.
             let archived = lift_legacy_transaction(&envelope)?;
-            let archived_owed = archived
-                .pre_fencing_abort
-                .as_ref()
-                .map(|abort| abort.topology_reconciliation)
-                .or_else(|| {
-                    archived
-                        .post_fencing_abort
-                        .as_ref()
-                        .map(|abort| abort.topology_reconciliation)
-                })
-                .context("no abort")?;
-            assert_eq!(archived_owed, CleanupEvidence::Skipped, "{name}");
+            assert_eq!(abort_owed(&archived), Some(CleanupEvidence::Skipped), "{name}");
 
-            // The control store lifts it owing the demotion, and validates.
+            // The control store lifts it without reopening anything.
             let lifted = read_transaction_record(&envelope)?;
-            let lifted_owed = lifted
-                .pre_fencing_abort
-                .as_ref()
-                .map(|abort| abort.topology_reconciliation)
-                .or_else(|| {
-                    lifted
-                        .post_fencing_abort
-                        .as_ref()
-                        .map(|abort| abort.topology_reconciliation)
-                })
-                .context("no abort")?;
-            assert_eq!(lifted_owed, CleanupEvidence::Pending, "{name}");
-            assert!(!lifted.is_terminal(), "{name}: a record that owes work is terminal");
-            assert_eq!(lifted.completion, None, "{name}");
+            let terminal = archived.completion.is_some();
+            if terminal {
+                assert_eq!(
+                    abort_owed(&lifted),
+                    Some(CleanupEvidence::LegacySkippedBeforeB1),
+                    "{name}"
+                );
+                assert!(lifted.is_terminal(), "{name}: the lift reopened a finished record");
+                assert_eq!(lifted.phase, archived.phase, "{name}");
+                assert_eq!(lifted.completion, archived.completion, "{name}");
+                assert!(!lifted.owns_target_authority(), "{name}");
+            } else {
+                assert_eq!(abort_owed(&lifted), Some(CleanupEvidence::Pending), "{name}");
+                assert!(!lifted.is_terminal(), "{name}");
+                assert_eq!(lifted.completion, None, "{name}");
+            }
 
-            // Boot: the store reads, and the abort resolves.
+            // Boot: the store reads.
             let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
-            let command = DeploymentCommand {
-                schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
-                command_id: lifted.command_id.clone(),
-                kind: CommandKind::Continuity,
-                selector: "service".into(),
-                requested_by: "test".into(),
-                requested_at_unix_millis: 100,
-            };
-            assert!(
-                SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
-                    &[
-                        CultCacheExpectedEnvelope {
-                            r#type: DeploymentCommand::TYPE.into(),
-                            key: command.command_id.clone(),
-                            current: None,
-                        },
-                        CultCacheExpectedEnvelope {
-                            r#type: DeploymentTransaction::TYPE.into(),
-                            key: envelope.key.clone(),
-                            current: None,
-                        },
-                    ],
-                    &[command_envelope(&command, 100)?, envelope.clone()],
-                )?,
-                "{name}"
-            );
+            make_resident(&world, &lifted, envelope.clone())?;
             assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
             let snapshot = ControlSnapshot::read(&world.state_store)?;
             assert_eq!(snapshot.transactions.len(), 1, "{name}");
@@ -11550,21 +11601,301 @@ mod tests {
             let expected = lifted.expected.clone().context("no Expected")?;
             assert_eq!(projected_under(&world, &expected)?.len(), 2, "{name}");
 
-            for _ in 0..12 {
-                let Ok(current) = resident(&world) else { break };
-                if current.value.completion.is_some() {
-                    break;
+            if terminal {
+                // A finished record owes nothing and is not touched: boot
+                // reconciliation demotes the residue by its exact activation.
+                let before = resident(&world)?.envelope;
+                let outcome = world.engine.reconcile_failed_continuity_projections()?;
+                assert_eq!(outcome.demoted, vec![lifted.transaction_id.clone()], "{name}");
+                assert_eq!(resident(&world)?.envelope, before, "{name}");
+            } else {
+                // A record in flight resolves through its own abort.
+                for _ in 0..12 {
+                    let Ok(current) = resident(&world) else { break };
+                    if current.value.completion.is_some() {
+                        break;
+                    }
+                    world.engine.advance_transaction(&current)?;
                 }
-                world.engine.advance_transaction(&current)?;
+                assert!(
+                    record_of(&world, &envelope.key)?.completion.is_some(),
+                    "{name}: the abort never resolved"
+                );
             }
-            let finished = record_of(&world, &envelope.key)?;
-            assert!(finished.completion.is_some(), "{name}: the abort never resolved");
             assert_eq!(
                 projected_under(&world, &expected)?,
                 expected_only(),
                 "{name}: the projection was not demoted to Expected-only"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn resident_terminal_pre_b1_aborts_never_claim_target_authority() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let live = seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, None)?;
+        let first = read_transaction_record(&envelope)?;
+        assert_eq!(first.target, live.target);
+        make_resident(&world, &first, envelope)?;
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+
+        // A second resident abort of the same shape for the same target,
+        // already written as the marker the migration persists.
+        let mut second = first.clone();
+        second.transaction_id = "tx-second-legacy".into();
+        second.command_id = "continuity-second-legacy".into();
+        make_resident(&world, &second, transaction_envelope(&second, 200)?)?;
+
+        // The store reads: three records, one of them live, none of the
+        // finished ones claiming the target.
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(snapshot.transactions.len(), 3);
+        let live_before = snapshot
+            .transactions
+            .iter()
+            .find(|stored| stored.value.transaction_id == live.transaction_id)
+            .context("live transaction")?
+            .envelope
+            .clone();
+
+        // Reconciliation cleans the residue once, by exact activation.
+        let expected = first.expected.clone().context("no Expected")?;
+        project_candidate(&world, &first, true)?;
+        assert_eq!(projected_under(&world, &expected)?.len(), 2);
+        let outcome = world.engine.reconcile_failed_continuity_projections()?;
+        assert_eq!(outcome.demoted.len(), 1);
+        assert_eq!(projected_under(&world, &expected)?, expected_only());
+        let after = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(
+            after
+                .transactions
+                .iter()
+                .find(|stored| stored.value.transaction_id == live.transaction_id)
+                .context("live transaction")?
+                .envelope,
+            live_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boot_never_republishes_a_withdrawn_incarnation_and_history_keeps_one_copy() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let lifted = read_transaction_record(&envelope)?;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        make_resident(&world, &lifted, envelope.clone())?;
+        // A crash between the two archive steps: history already holds it.
+        assert!(
+            SingleFileMessagePackBackingStore::new(&history_store_path(&world.state_store))
+                .insert_entry_if_absent(envelope)?
+        );
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+
+        // The incarnation was withdrawn: nothing is projected for it.
+        let expected = lifted.expected.clone().context("no Expected")?;
+        assert!(projected_under(&world, &expected)?.is_empty());
+        for _ in 0..3 {
+            world.engine.run_scheduler_tick()?;
+        }
+        assert!(
+            world
+                .engine
+                .reconcile_failed_continuity_projections()?
+                .demoted
+                .is_empty()
+        );
+        assert!(
+            projected_under(&world, &expected)?.is_empty(),
+            "a withdrawn incarnation's Expected was published again"
+        );
+
+        // One copy in history, finished, and nothing resident.
+        let history = read_history(&world.state_store)?;
+        assert_eq!(history.transactions.len(), 1);
+        assert!(history.transactions[0].is_terminal());
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn boot_runs_the_projection_reconciliation_serve_starts_from() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let incumbent = admit_incumbent(&world)?;
+        let failed = seeded_transaction(
+            &world,
+            DeploymentPhase::Warming,
+            CommandKind::Continuity,
+            Some(&incumbent),
+        )?;
+        project_candidate(&world, &failed, true)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate died"))?;
+        drive(&world, |transaction| transaction.completion.is_some())?;
+        // A pre-B1 abort's residue: the failed candidate's activation stands.
+        project_candidate(&world, &failed, true)?;
+        assert_eq!(projected_under(&world, &incumbent.expected)?.len(), 2);
+
+        let (_lock, _engine) = boot(world.engine.options.clone())?;
+        assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
+        Ok(())
+    }
+
+    /// A workload whose candidate can neither be stopped nor recover: an abort
+    /// that cannot finish its first step.
+    struct WedgedWorkload;
+
+    impl WorkloadPort for WedgedWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            StillWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            StillWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            StillWorkload.discard_prepared(plan, expected, activation)
+        }
+        fn observe(
+            &self,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+            prior: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.observe(expected, activation, prior)
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            bail!("the unit will not stop")
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn one_wedged_pre_fence_abort_does_not_stop_the_scheduler() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload))?;
+        let wedged = transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "up-nowhere".into(),
+            kind: CommandKind::Deploy,
+            selector: "nowhere".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command.command_id.clone(),
+                    current: None,
+                }],
+                &[command_envelope(&command, 100)?],
+            )?
+        );
+
+        // Every tick answers: the wedged abort records its error and waits,
+        // and the rest of the scheduler goes on to freeze the queued command.
+        for _ in 0..6 {
+            world.engine.run_scheduler_tick()?;
+        }
+        let stuck = record_of(&world, &wedged.transaction_id)?;
+        assert!(!stuck.is_terminal());
+        assert!(stuck.post_fencing_abort.is_none());
+        assert!(stuck.last_error.is_some());
+        assert!(
+            read_history_transactions(&world.state_store)
+                .iter()
+                .any(|transaction| transaction.command_id == command.command_id),
+            "the queued command was never frozen"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_transaction_that_cannot_be_archived_does_not_stop_the_scheduler() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let live = transaction_at(&world, DeploymentPhase::Warming)?;
+        odin_reports_ready(&world, &live, seeded_sequence(None) + 1)?;
+        let (finished, command) = terminal_transaction_with_command("ghostlight")?;
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: command.command_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: finished.transaction_id.clone(),
+                        current: None,
+                    },
+                ],
+                &[
+                    command_envelope(&command, 100)?,
+                    transaction_envelope(&finished, finished.updated_at_unix_millis)?,
+                ],
+            )?
+        );
+        corrupt_history(&world)?;
+        let before = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .find(|stored| stored.value.transaction_id == live.transaction_id)
+            .context("live transaction")?
+            .envelope;
+
+        // The finished record cannot be archived, and the live one still moves.
+        world.engine.run_scheduler_tick()?;
+        let after = ControlSnapshot::read(&world.state_store)?;
+        assert!(
+            after
+                .transactions
+                .iter()
+                .any(|stored| stored.value.transaction_id == finished.transaction_id)
+        );
+        assert_ne!(
+            after
+                .transactions
+                .iter()
+                .find(|stored| stored.value.transaction_id == live.transaction_id)
+                .context("live transaction")?
+                .envelope,
+            before,
+            "the live transaction was not resumed"
+        );
         Ok(())
     }
 
