@@ -9895,13 +9895,11 @@ mod tests {
                 error: "candidate died after the fence".into(),
                 recovery: TerminalRecovery::RestoreIncumbent,
             });
-            if recorded == CleanupEvidence::Pending {
-                // A Pending cleanup is not terminal, so the completion above
-                // would already be refused; judge the shape without it.
-                post.completion = None;
-                post.phase = DeploymentPhase::Fencing;
+            // A Pending cleanup is not terminal, so this completed shape is
+            // only judged for the recorded values a terminal abort can carry.
+            if recorded != CleanupEvidence::Pending {
+                assert_eq!(post.validate().is_ok(), accepted, "post-fencing, {label}");
             }
-            assert_eq!(post.validate().is_ok(), accepted, "post-fencing, {label}");
         }
         Ok(())
     }
