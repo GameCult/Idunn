@@ -7192,11 +7192,6 @@ impl Engine {
     ) -> Result<Vec<SequenceAdmittedReady>> {
         let mut providers = Vec::new();
         for stored in &snapshot.admitted {
-            // A route-proof generation holds no Odin receipt to hand a
-            // dependent; its currency is the route observation, which is B4's.
-            if stored.value.ready.class() == ReadinessClass::RouteProof {
-                continue;
-            }
             // No pre-filter on ready == latest: a provider that published again
             // after going ready is still ready. rehydrate_admitted_ready owns
             // that judgment now, and reports why when it refuses.
@@ -13905,6 +13900,94 @@ mod tests {
             odin.latest_odin_observation = None;
             odin.odin_authority = None;
             assert!(error_text(odin.validate()).contains("declares Odin"));
+            Ok(())
+        }
+
+        #[test]
+        fn a_stateless_candidate_that_finished_warming_first_still_warms() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            routed.stub.set_state("active");
+            routed.step()?;
+            assert!(matches!(
+                routed.transaction()?.warming,
+                Some(WarmingEvidence::RouteProofDirect { .. })
+            ));
+            Ok(())
+        }
+
+        #[test]
+        fn the_lease_refresh_asks_the_candidate_for_a_new_warming_presence() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let current = resident(&routed.world)?;
+            let prior = routed
+                .world
+                .engine
+                .rehydrate_warming_token(&current.value, now_millis()?, false)?;
+            let (_, evidence, token) = routed
+                .world
+                .engine
+                .fresh_warming_for_lease(&current, now_millis()?)?
+                .context("a warming candidate must refresh")?;
+            assert!(matches!(evidence, WarmingEvidence::RouteProofDirect { .. }));
+            assert_ne!(token.signed_presence_sha256(), prior.signed_presence_sha256());
+            // A candidate that went Active is not warming: nothing to bind.
+            routed.stub.set_state("active");
+            let failure = routed
+                .world
+                .engine
+                .fresh_warming_for_lease(&current, now_millis()?)
+                .map(|_| ())
+                .expect_err("an active candidate is not a warming one");
+            assert!(format!("{failure:#}").contains("not warming"), "{failure:#}");
+            routed.assert_odin_untouched()?;
+            Ok(())
+        }
+
+        #[test]
+        fn boot_reauthenticates_a_live_route_proof_transactions_evidence() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            routed.world.engine.validate_durable_authority(&snapshot)?;
+
+            // Warming evidence that does not answer the challenge it names.
+            let current = resident(&routed.world)?;
+            let mut forged = current.value.clone();
+            let Some(WarmingEvidence::RouteProofDirect { evidence }) = &mut forged.warming else {
+                bail!("no route-proof Warming evidence");
+            };
+            evidence.message_id = "candidate-another".into();
+            replace_transaction(&routed.world.state_store, &current, &forged)?;
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            let failure = routed
+                .world
+                .engine
+                .validate_durable_authority(&snapshot)
+                .expect_err("Warming evidence for another challenge");
+            assert!(format!("{failure:#}").contains("exact challenge"), "{failure:#}");
+
+            // A Ready label carried by a presence that was only warming.
+            let current = resident(&routed.world)?;
+            let CandidateAnswer::Answered { evidence, .. } = routed
+                .world
+                .engine
+                .challenge_candidate(&current.value, &["warming"], None)?
+            else {
+                bail!("the stub candidate did not answer");
+            };
+            let mut forged = current.value.clone();
+            forged.warming = Some(WarmingEvidence::RouteProofDirect {
+                evidence: evidence.clone(),
+            });
+            forged.ready = Some(ReadinessEvidence::RouteProof { evidence });
+            replace_transaction(&routed.world.state_store, &current, &forged)?;
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            let failure = routed
+                .world
+                .engine
+                .validate_durable_authority(&snapshot)
+                .expect_err("Ready carried by a warming presence");
+            assert!(format!("{failure:#}").contains("not active"), "{failure:#}");
+            routed.assert_odin_untouched()?;
             Ok(())
         }
 
