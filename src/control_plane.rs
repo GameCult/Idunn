@@ -13690,6 +13690,44 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_backoff_set_by_a_stepped_back_clock_is_due_and_a_real_one_waits() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let id = transaction_at(&world, DeploymentPhase::Warming)?.transaction_id;
+        let not_before = |world: &EngineFixture| {
+            world
+                .engine
+                .resume_backoff
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|backoff| backoff.not_before_unix_millis)
+        };
+        let set = |world: &EngineFixture, not_before_unix_millis: u64| {
+            world.engine.resume_backoff.lock().unwrap().insert(
+                id.clone(),
+                ResumeBackoff {
+                    failures: 3,
+                    not_before_unix_millis,
+                },
+            );
+        };
+
+        // Half a minute ahead is a wait the backoff can set: the step is left alone.
+        let waiting = now_millis()? + 30_000;
+        set(&world, waiting);
+        let _ = world.engine.resume_candidate(&resident(&world)?);
+        assert_eq!(not_before(&world), Some(waiting));
+
+        // A day ahead is a clock that stepped back: the step is attempted, and
+        // whatever it does, it replaces the backoff.
+        let ahead = now_millis()? + 86_400_000;
+        set(&world, ahead);
+        let _ = world.engine.resume_candidate(&resident(&world)?);
+        assert!(not_before(&world).is_none_or(|due| due < ahead));
+        Ok(())
+    }
+
+    #[test]
     fn a_persistent_fault_is_reported_once_and_again_only_after_recovery() -> Result<()> {
         let workload = Arc::new(ChangingErrorWorkload(
             std::sync::atomic::AtomicU32::new(0),

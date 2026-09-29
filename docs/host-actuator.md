@@ -82,8 +82,8 @@ running a script, and a dead `muninn serve` is seen the tick it dies.
 2. No path on yggdrasil can start, stop or observe a host workload except
    through the actuator session bound to that host's anchor.
 3. A host with no attached actuator is a failed observation, which
-   continuity counts and gives up on after three attempts, exactly like a
-   unit that will not start.
+   continuity counts and gives up on after six restarts inside one hour,
+   exactly like a unit that will not start.
 4. The actuator cannot be told to run a program the recipe did not declare;
    `allowed_programs` on the host-native runner is enforced on the host.
 
