@@ -13472,7 +13472,7 @@ mod tests {
                 )
                 .replace(
                     "private_port_end = 18009",
-                    &format!("private_port_end = {candidate_port}"),
+                    &format!("private_port_end = {}", candidate_port + 1),
                 )
                 .replace(
                     "/etc/nginx/idunn-stream-routes/service.conf",
