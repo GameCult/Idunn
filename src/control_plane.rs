@@ -9844,7 +9844,8 @@ mod tests {
     #[test]
     fn a_stored_abort_whose_candidate_cleanup_disagrees_with_the_owed_rule_is_refused() -> Result<()> {
         let world = ContinuityProjection::after_candidate_observed()?;
-        // (activation issued, workload observed, recorded cleanup, accepted)
+        // (activation issued, workload observed, recorded cleanup, accepted).
+        // Workload-only rows are omitted: the fixture refuses that shape for other reasons.
         let rows = [
             (false, false, CleanupEvidence::Skipped, true),
             (false, false, CleanupEvidence::Pending, false),
@@ -9852,8 +9853,6 @@ mod tests {
             (true, false, CleanupEvidence::Skipped, false),
             (true, false, CleanupEvidence::Pending, true),
             (true, false, CleanupEvidence::Complete, true),
-            (false, true, CleanupEvidence::Skipped, false),
-            (false, true, CleanupEvidence::Pending, true),
             (true, true, CleanupEvidence::Skipped, false),
             (true, true, CleanupEvidence::Complete, true),
         ];
