@@ -456,6 +456,35 @@ reverted (Idunn).**
 - F0 is not required. This cut could land before F0 if Self wants the drift
   closed first.
 
+**B1 status, 2026-09-29 (Self).** Landed on `idunn/route-b1` (`87fa57d` revert of `a148802`,
+`4427769`, `4a9fe87`); 177 tests pass. **Soul (Opus): do not close.** The rule held (one
+rule, one resolution, exact activation, the Expected never withdrawn, foreign activations
+refused, the revert exact). The transition failed:
+- **High, CONFIRMED:** a continuity abort persisted under the old rule (`Skipped` although
+  an activation was issued) fails the new validation (`control_plane.rs:1031-1044`).
+  `ControlSnapshot::read` fails the whole store on one record, so a resident record stops
+  Idunn from booting, for every target.
+- **Medium, CONFIRMED:** supervision's pre-restart demotion failure is only logged
+  (`:3557-3576`). A continuity failing between `prepare_activation` and
+  `publish_observed_activation` then wedges its abort on "substituted" every tick. Drift
+  left by a pre-B1 failed continuity wedges a later deploy abort the same way.
+- Low: `docs/deployment-authority.md` says the projection "never drifts".
+
+**Self's ruling for the B1 fix batch, which runs on top of F0 because F0 owns the legacy lift:**
+1. The legacy-transaction lift maps a pre-B1 continuity abort that issued an activation to
+   `Pending`. The new single resolution then demotes its own activation, which also cleans
+   the residue that record left behind.
+2. Supervision owns the Expected-only precondition. It does not mint a continuity while its
+   pre-restart demotion fails; the failure is recorded, not merely logged.
+3. A one-time boot reconciliation demotes a projected activation only when its issuing
+   transaction is a failed transaction in history (exact identity). It never adopts.
+4. Engine-layer tests for both abort paths, using Soul's EngineFixture probe shape (candidate
+   cleanup already Complete, so no systemctl runs). cargo-mutants found 6 Engine-path mutants
+   missed.
+5. Correct the doc's "never drifts".
+Before any deploy, check the live host for resident continuity abort records. That is a read
+of `control.cc`, and the operator's to authorise.
+
 **B2 — Bounded, backed-off route and unit repair (Idunn).**
 
 *Widened 2026-09-29 by Self, from Soul's S1 pass.* S1 closed the healthy-target storm, and
