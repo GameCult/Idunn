@@ -39,9 +39,9 @@ use crate::deployment_plan::{
 use crate::drivers::{
     CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
     GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
-    ProcessIdentity, RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
-    SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
-    WriteLeasePort,
+    ProcessIdentity, RouteActuationGate, RouteActuators, RouteObservation, RoutePreflightReceipt,
+    RunnerPort, SourcePort, SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation,
+    WorkloadPort, WriteLeasePort,
 };
 use crate::host_actuator::{
     HostActuatorAccess, HostActuatorHub, HostActuatorRunnerDriver, HostActuatorWorkloadDriver,
@@ -56,11 +56,26 @@ const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v3";
 const ADMITTED_GENERATION_SCHEMA_V2: &str = "idunn.admitted_generation.v2";
 /// The capability whose declaration makes a target Odin-correlated.
 const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
-/// How many times continuity will restart one admitted release before it
-/// concludes the release itself is the problem. More than one because a start
-/// can fail for a passing reason -- a port still held, a peer not yet up --
-/// and few because each attempt holds the target against any deployment.
-const CONTINUITY_RESTART_ATTEMPTS: usize = 3;
+/// How many times continuity will restart one target inside one window before
+/// it concludes the target itself is the problem. More than one because a
+/// start can fail for a passing reason -- a port still held, a peer not yet up
+/// -- and bounded because each attempt holds the target against any
+/// deployment. Counted per target, so a restart that succeeds and dies again
+/// does not start the count over.
+const CONTINUITY_RESTART_ATTEMPTS: u32 = 6;
+const CONTINUITY_RESTART_WINDOW_MILLIS: u64 = 3_600_000;
+/// The wait after the first restart; it doubles with each further attempt in
+/// the window.
+const CONTINUITY_RESTART_BACKOFF_MILLIS: u64 = 5_000;
+
+/// Route actuations (fragment write, firewall, `nginx -t`, reload,
+/// private-mount validation) one target may perform per rolling window. A
+/// healthy target performs none; a legitimate deployment performs one or two.
+const ROUTE_ACTUATION_CEILING: u32 = 12;
+const ROUTE_ACTUATION_WINDOW_MILLIS: u64 = 3_600_000;
+/// The longest wait between route challenges while proofs keep failing. The
+/// shortest is the observation max age.
+const ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS: u64 = 600_000;
 
 const DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS: u64 = 30_000;
 const DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS: u64 = 2_000;
@@ -686,7 +701,57 @@ struct ActuationWindow {
     count: u32,
 }
 
+impl ActuationWindow {
+    /// Count one actuation against the rolling window, or refuse with the time
+    /// the window next opens. The count is durable before the caller acts, so a
+    /// crash cannot hide an actuation.
+    fn charge(&mut self, now: u64) -> std::result::Result<(), u64> {
+        if self.count == 0
+            || now.saturating_sub(self.window_started_at_unix_millis)
+                >= ROUTE_ACTUATION_WINDOW_MILLIS
+        {
+            self.window_started_at_unix_millis = now;
+            self.count = 0;
+        }
+        if self.count >= ROUTE_ACTUATION_CEILING {
+            return Err(self
+                .window_started_at_unix_millis
+                .saturating_add(ROUTE_ACTUATION_WINDOW_MILLIS));
+        }
+        self.count += 1;
+        Ok(())
+    }
+}
+
 impl RouteSupervisionState {
+    /// The next challenge is not due yet.
+    fn is_waiting(&self, now: u64) -> bool {
+        self.next_challenge_at_unix_millis
+            .is_some_and(|next| now < next)
+    }
+
+    /// A failed proof, or a failed repair of the fragment it needs. Observation
+    /// state only: the route is marked degraded and the next challenge waits,
+    /// twice as long each time, from the observation max age up to a cap.
+    fn record_failed_challenge(&mut self, now: u64, maximum_age_millis: u64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let doublings = self.consecutive_failures.saturating_sub(1).min(16);
+        let wait = maximum_age_millis
+            .saturating_mul(1 << doublings)
+            .min(ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS)
+            .max(maximum_age_millis);
+        self.last_challenge_at_unix_millis = Some(now);
+        self.next_challenge_at_unix_millis = Some(now.saturating_add(wait));
+        self.degraded_since_unix_millis.get_or_insert(now);
+    }
+
+    fn record_proved_challenge(&mut self, now: u64) {
+        self.consecutive_failures = 0;
+        self.last_challenge_at_unix_millis = Some(now);
+        self.next_challenge_at_unix_millis = None;
+        self.degraded_since_unix_millis = None;
+    }
+
     /// A new incarnation starts unobserved and undegraded, but inherits the
     /// target's actuation window: a ceiling that reset on every commit would
     /// not be a ceiling.
@@ -720,6 +785,33 @@ struct ContinuityBackoff {
 }
 
 impl ContinuityBackoff {
+    /// The target has used its restarts for this window.
+    fn is_exhausted(&self, now: u64) -> bool {
+        self.window_is_open(now) && self.attempts >= CONTINUITY_RESTART_ATTEMPTS
+    }
+
+    fn is_waiting(&self, now: u64) -> bool {
+        self.next_restart_at_unix_millis.is_some_and(|at| now < at)
+    }
+
+    fn window_is_open(&self, now: u64) -> bool {
+        self.window_started_at_unix_millis
+            .is_some_and(|start| now.saturating_sub(start) < CONTINUITY_RESTART_WINDOW_MILLIS)
+    }
+
+    /// One restart scheduled: the next may not begin until twice as long has
+    /// passed as the last wait.
+    fn record_restart(&mut self, now: u64) {
+        if !self.window_is_open(now) {
+            self.window_started_at_unix_millis = Some(now);
+            self.attempts = 0;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        let wait = CONTINUITY_RESTART_BACKOFF_MILLIS
+            .saturating_mul(1 << self.attempts.saturating_sub(1).min(16));
+        self.next_restart_at_unix_millis = Some(now.saturating_add(wait));
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.attempts == 0 || self.window_started_at_unix_millis.is_some(),
@@ -1783,6 +1875,9 @@ struct RuntimeOptions {
     /// can be served; a binding that names one then fails at its first
     /// driver call, not at startup, so an Idunn without hosts is unchanged.
     host_actuator_bind: Option<SocketAddr>,
+    /// Where route drivers find nginx, systemctl, ufw and systemd-run, and
+    /// their scratch directory. Every route driver is built from this.
+    route_actuators: RouteActuators,
 }
 
 impl Default for RuntimeOptions {
@@ -1808,6 +1903,7 @@ impl Default for RuntimeOptions {
             topology_maximum_future_skew_millis: DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS,
             poll_millis: 500,
             host_actuator_bind: None,
+            route_actuators: RouteActuators::default(),
         }
     }
 }
@@ -3365,6 +3461,19 @@ struct Engine {
     host_actuators: Option<SharedHostActuatorHub>,
 }
 
+/// The route driver's door to the actuation ceiling: every group of host
+/// mutations a driver makes for `target` is counted through here.
+struct EngineRouteGate<'a> {
+    engine: &'a Engine,
+    target: &'a str,
+}
+
+impl RouteActuationGate for EngineRouteGate<'_> {
+    fn admit(&self) -> Result<()> {
+        self.engine.charge_route_actuation(self.target)
+    }
+}
+
 impl Engine {
     fn open(options: RuntimeOptions) -> Result<Self> {
         Self::open_with_systemd_workload(
@@ -4125,36 +4234,14 @@ impl Engine {
             // admitted release will not start, rescheduling it forever keeps
             // the target permanently occupied -- and a target with a live
             // transaction accepts no deployment, so the one action that could
-            // fix it is exactly the one that is locked out. Give up after a few
-            // attempts and leave the target free for a replacement.
-            //
-            // Counted against this generation id, so a successful restart --
-            // which admits a new generation -- starts the count over rather
-            // than carrying old failures forward.
-            // Failed restarts retire to history the moment they finish, so
-            // the count must read history: counting only the live set found
-            // zero every time and restarted a release that could not start
-            // forever, which is the loop the give-up exists to end.
-            let is_refused_restart = |transaction: &DeploymentTransaction| {
-                transaction.target == current.value.target
-                    && transaction.command_kind == CommandKind::Continuity
-                    && transaction.incumbent_generation_id.as_deref()
-                        == Some(current.value.generation_id.as_str())
-                    && matches!(
-                        transaction.completion,
-                        Some(TransactionCompletion::FailedBeforeFencing { .. })
-                            | Some(TransactionCompletion::FailedAfterFencing { .. })
-                    )
-            };
-            let refused_restarts = snapshot
-                .transactions
-                .iter()
-                .filter(|stored| is_refused_restart(&stored.value))
-                .count()
-                + read_history_transactions(&self.options.state_store)
-                    .iter()
-                    .filter(|transaction| is_refused_restart(transaction))
-                    .count();
+            // fix it is exactly the one that is locked out. Restarts are
+            // counted per target in a rolling window and spaced by a doubling
+            // wait; a new generation inherits the count, so a release that
+            // starts, dies and starts again is bounded the same as one that
+            // never starts. When the window is spent the target is left free
+            // for a replacement.
+            let now = now_millis()?;
+            let backoff = &current.value.continuity_backoff;
 
             if let Some(blocker) = blocker {
                 // Yielding a *deployment* to continuity is right: the incumbent
@@ -4169,7 +4256,7 @@ impl Engine {
                 // the deployment is the only thing left that can fix the
                 // target -- aborting it would close the last door.
                 if blocker.value.command_kind == CommandKind::Deploy
-                    && refused_restarts < CONTINUITY_RESTART_ATTEMPTS
+                    && !backoff.is_exhausted(now)
                     && blocker.value.phase < DeploymentPhase::Fencing
                     && blocker.value.pre_fencing_abort.is_none()
                 {
@@ -4183,11 +4270,14 @@ impl Engine {
                 }
                 continue;
             }
-            if refused_restarts >= CONTINUITY_RESTART_ATTEMPTS {
+            if backoff.is_exhausted(now) {
                 eprintln!(
-                    "Idunn stopped restarting admitted {}: its release failed to start {} times.                      The target is free for a deployment to replace it: {workload_error:#}",
-                    current.value.target, refused_restarts
+                    "Idunn stopped restarting admitted {}: {} restarts inside the window. The target is free for a deployment to replace it: {workload_error:#}",
+                    current.value.target, backoff.attempts
                 );
+                continue;
+            }
+            if backoff.is_waiting(now) {
                 continue;
             }
 
@@ -4219,7 +4309,6 @@ impl Engine {
                     current.value.target
                 );
             }
-            let now = now_millis()?;
             // An engaged lifecycle brake means no continuity transaction is
             // minted at all. A transaction that exists and waits on the brake
             // owns the target, and a target owned by a parked restart accepts
@@ -4240,6 +4329,10 @@ impl Engine {
             command.validate()?;
             let transaction =
                 DeploymentTransaction::from_continuity(&command, &current.value, now)?;
+            // The restart is counted in the same CAS that mints it, so a crash
+            // cannot schedule one the ceiling never saw.
+            let mut counted = current.value.clone();
+            counted.continuity_backoff.record_restart(now);
             ensure!(
                 SingleFileMessagePackBackingStore::new(&self.options.state_store)
                     .compare_exchange(
@@ -4254,13 +4347,19 @@ impl Engine {
                                 key: transaction.transaction_id.clone(),
                                 current: None,
                             },
+                            CultCacheExpectedEnvelope {
+                                r#type: AdmittedGeneration::TYPE.into(),
+                                key: counted.target.clone(),
+                                current: Some(current.envelope.clone()),
+                            },
                         ],
                         &[
                             command_envelope(&command, now)?,
                             transaction_envelope(&transaction, now)?,
+                            admitted_envelope(&counted, now)?,
                         ],
                     )?,
-                "continuity scheduling lost its command/transaction CAS"
+                "continuity scheduling lost its command/transaction/backoff CAS"
             );
             progressed = true;
         }
@@ -4307,9 +4406,20 @@ impl Engine {
         let route_binding = binding
             .route
             .context("routed admitted generation has no operator route binding")?;
-        let driver = NginxRouteDriver::new(route_binding);
+        let driver = self.route_driver(route_binding);
+        let gate = self.route_gate(&current.value.target);
 
         let now = now_millis()?;
+        // A route whose proofs keep failing is challenged on a widening
+        // schedule, not every tick.
+        if current
+            .value
+            .route_supervision
+            .as_ref()
+            .is_some_and(|state| state.is_waiting(now))
+        {
+            return Ok(false);
+        }
         if driver.observe_membership(&current.value.expected, &observation.membership_sha256)?
             && route_observation_is_current(
                 observation.observed_at_unix_millis,
@@ -4320,52 +4430,156 @@ impl Engine {
         {
             return Ok(false);
         }
-        // Actuates only when the fragment on disk differs from the admitted
-        // membership; an exact fragment makes this a no-op.
-        driver
-            .restore_admitted_membership(&current.value.expected, &observation.membership_sha256)?;
-        let authority = self.runtime_authority_parts(
-            &current.value.plan,
-            &current.value.expected,
-            &current.value.activation,
-        )?;
-        let refreshed = self.prove_stable_route_against(
-            &current.value.expected,
-            &current.value.activation,
-            &authority,
-            current.value.leasing.lease_sha256(),
-            &driver,
-            observation.membership_sha256.clone(),
-        )?;
-        ensure!(
-            driver.observe_membership(&current.value.expected, &refreshed.membership_sha256)?,
-            "admitted route membership changed during its continuity challenge"
-        );
-        if let (Some(lease_driver), Some(lease)) = (&lease_driver, current.value.leasing.lease()) {
+        // A failed repair or a failed proof changes observation state only:
+        // it marks the route degraded and widens the wait.
+        let challenge = (|| -> Result<RouteObservation> {
+            // Actuates only when the fragment on disk differs from the admitted
+            // membership; an exact fragment makes this a no-op.
+            driver.restore_admitted_membership(
+                &current.value.expected,
+                &observation.membership_sha256,
+                &gate,
+            )?;
+            let authority = self.runtime_authority_parts(
+                &current.value.plan,
+                &current.value.expected,
+                &current.value.activation,
+            )?;
+            let refreshed = self.prove_stable_route_against(
+                &current.value.expected,
+                &current.value.activation,
+                &authority,
+                current.value.leasing.lease_sha256(),
+                &driver,
+                observation.membership_sha256.clone(),
+            )?;
             ensure!(
-                lease_driver.observe_exact(lease)?,
-                "admitted process write lease changed during its continuity challenge"
+                driver.observe_membership(&current.value.expected, &refreshed.membership_sha256)?,
+                "admitted route membership changed during its continuity challenge"
             );
-        }
-        let mut next = current.value.clone();
-        next.routing = RoutingEvidence::Promoted {
-            observation: refreshed,
-            promoted_at_unix_millis: *promoted_at_unix_millis,
+            if let (Some(lease_driver), Some(lease)) = (&lease_driver, current.value.leasing.lease())
+            {
+                ensure!(
+                    lease_driver.observe_exact(lease)?,
+                    "admitted process write lease changed during its continuity challenge"
+                );
+            }
+            Ok(refreshed)
+        })();
+        let refreshed = match challenge {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                let maximum_age = self.options.topology_maximum_age_millis;
+                if let Err(record) = self.update_admitted_generation(&current.value, |next| {
+                    if let Some(state) = next.route_supervision.as_mut() {
+                        state.record_failed_challenge(now, maximum_age);
+                    }
+                }) {
+                    eprintln!(
+                        "Idunn could not record the failed route challenge of {}: {record:#}",
+                        current.value.target
+                    );
+                }
+                return Err(error);
+            }
         };
-        next.route_repair_started_at_unix_millis = None;
-        next.validate()?;
+        self.update_admitted_generation(&current.value, |next| {
+            next.routing = RoutingEvidence::Promoted {
+                observation: refreshed,
+                promoted_at_unix_millis: *promoted_at_unix_millis,
+            };
+            next.route_repair_started_at_unix_millis = None;
+            if let Some(state) = next.route_supervision.as_mut() {
+                state.record_proved_challenge(now);
+            }
+        })?;
+        Ok(true)
+    }
+
+    /// Revise one admitted generation from its current stored form. The
+    /// route actuation ceiling is charged to the same record, so a revision
+    /// built from an earlier read would lose the charge; every writer of the
+    /// generation's route state goes through here.
+    fn update_admitted_generation(
+        &self,
+        seen: &AdmittedGeneration,
+        change: impl FnOnce(&mut AdmittedGeneration),
+    ) -> Result<()> {
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let current = snapshot
+            .admitted_for(&seen.target)
+            .context("admitted generation left the store")?;
+        ensure!(
+            current.value.generation_id == seen.generation_id,
+            "admitted generation was replaced"
+        );
+        let mut next = current.value.clone();
+        change(&mut next);
+        let now = now_millis()?;
         ensure!(
             SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
                 &[CultCacheExpectedEnvelope {
                     r#type: AdmittedGeneration::TYPE.into(),
-                    key: current.value.target.clone(),
+                    key: next.target.clone(),
                     current: Some(current.envelope.clone()),
                 }],
                 &[admitted_envelope(&next, now)?],
             )?,
-            "admitted generation changed before route continuity receipt CAS"
+            "admitted generation changed before its route state CAS"
         );
-        Ok(true)
+        Ok(())
+    }
+
+    /// Every route driver comes from here, so the actuator paths are the
+    /// options' and nothing else's.
+    fn route_driver(&self, binding: RouteBinding) -> NginxRouteDriver {
+        NginxRouteDriver::with_actuators(binding, &self.options.route_actuators)
+    }
+
+    fn route_gate<'a>(&'a self, target: &'a str) -> EngineRouteGate<'a> {
+        EngineRouteGate {
+            engine: self,
+            target,
+        }
+    }
+
+    /// Count one route actuation against the target's rolling ceiling, in the
+    /// route supervision state of its admitted generation, before the driver
+    /// acts. A target with no routed generation has no window yet, so a first
+    /// routed deployment is not metered.
+    fn charge_route_actuation(&self, target: &str) -> Result<()> {
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let Some(current) = snapshot.admitted_for(target) else {
+            return Ok(());
+        };
+        let Some(state) = &current.value.route_supervision else {
+            return Ok(());
+        };
+        let mut next = current.value.clone();
+        let window = &mut next
+            .route_supervision
+            .as_mut()
+            .context("route supervision state vanished")?
+            .actuations;
+        let now = now_millis()?;
+        if let Err(reopens) = window.charge(now) {
+            bail!(
+                "route actuation ceiling of {ROUTE_ACTUATION_CEILING} per hour reached for {target} ({} used); the window reopens at {reopens}",
+                state.actuations.count
+            );
+        }
+        ensure!(
+            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: AdmittedGeneration::TYPE.into(),
+                    key: target.into(),
+                    current: Some(current.envelope.clone()),
+                }],
+                &[admitted_envelope(&next, now)?],
+            )?,
+            "admitted generation changed before its route actuation was counted"
+        );
+        Ok(())
     }
 
     fn refresh_admitted_topology(
@@ -4769,7 +4983,7 @@ impl Engine {
             let route_binding = binding
                 .route
                 .context("routed Expected lost route binding")?;
-            let driver = NginxRouteDriver::new(route_binding);
+            let driver = self.route_driver(route_binding);
             let receipt = driver.preflight(
                 expected,
                 &activation.runtime_instance_id,
@@ -5180,7 +5394,8 @@ impl Engine {
                 let binding = admitted.value.plan.as_ref().unwrap().parsed_inputs()?.1;
                 let route_binding = binding.route.context("routed plan has no route binding")?;
                 let preflight = required(&admitted.value.route_preflight, "route preflight")?;
-                let driver = NginxRouteDriver::new(route_binding);
+                let driver = self.route_driver(route_binding);
+                let gate = self.route_gate(&admitted.value.target);
                 ensure!(
                     preflight.candidate_runtime_instance_id == activation.runtime_instance_id,
                     "route preflight belongs to another runtime instance"
@@ -5194,6 +5409,7 @@ impl Engine {
                     &activation.runtime_instance_id,
                     preflight,
                     rollback_allowed,
+                    &gate,
                 )?;
                 let observation = match self.prove_stable_route(
                     &admitted.value,
@@ -5211,6 +5427,7 @@ impl Engine {
                             expected,
                             &activation.runtime_instance_id,
                             preflight,
+                            &gate,
                         ) {
                             Ok(()) => Err(proof_error)
                                 .context("candidate did not answer its stable route challenge"),
@@ -5298,7 +5515,7 @@ impl Engine {
                 .parsed_inputs()?
                 .1;
             let driver =
-                NginxRouteDriver::new(binding.route.context("routed plan has no route binding")?);
+                self.route_driver(binding.route.context("routed plan has no route binding")?);
             ensure!(
                 driver.observe_membership(expected, &route.membership_sha256)?,
                 "route membership changed before admission commit"
@@ -5939,7 +6156,7 @@ impl Engine {
         let binding = required(&transaction.plan, "first Odin plan")?
             .parsed_inputs()?
             .1;
-        let driver = NginxRouteDriver::new(
+        let driver = self.route_driver(
             binding
                 .route
                 .context("first Odin bootstrap has no candidate route binding")?,
@@ -6531,9 +6748,9 @@ impl Engine {
             let preflight = required(&current.value.route_preflight, "route preflight receipt")?;
             let binding = current.value.plan.as_ref().unwrap().parsed_inputs()?.1;
             let driver =
-                NginxRouteDriver::new(binding.route.context("routed plan has no route binding")?);
+                self.route_driver(binding.route.context("routed plan has no route binding")?);
             driver
-                .withdraw_candidate_membership(preflight)
+                .withdraw_candidate_membership(preflight, &self.route_gate(&current.value.target))
                 .context("restoring the route the candidate found")?;
             return self.persist_same_phase(current, |next| {
                 next.post_fencing_abort.as_mut().unwrap().route_restoration =
@@ -7299,11 +7516,12 @@ mod tests {
         state_store: PathBuf,
         odin_signer: ServiceIdentitySigner<OdinTopologyIdentity>,
         root: PathBuf,
+        stubs: Option<RouteStubs>,
     }
 
     impl EngineFixture {
         fn new() -> Result<Self> {
-            Self::build(None)
+            Self::build(None, false)
         }
 
         /// An Engine whose systemd workload port is `workload`, so the phase
@@ -7312,10 +7530,18 @@ mod tests {
         /// stateless target, and the Odin evidence is signed by the key this
         /// fixture enrolled.
         fn with_workload(workload: Arc<dyn WorkloadPort>) -> Result<Self> {
-            Self::build(Some(workload))
+            Self::build(Some(workload), false)
         }
 
-        fn build(workload: Option<Arc<dyn WorkloadPort>>) -> Result<Self> {
+        /// `with_workload`, with every route actuator program replaced by a stub
+        /// that logs its calls, so the real route driver runs against a scratch
+        /// directory instead of nginx.
+        #[cfg(unix)]
+        fn routed(workload: Arc<dyn WorkloadPort>) -> Result<Self> {
+            Self::build(Some(workload), true)
+        }
+
+        fn build(workload: Option<Arc<dyn WorkloadPort>>, with_stubs: bool) -> Result<Self> {
             let temp = TempDir::new()?;
             let root = temp.path();
             std::fs::create_dir_all(root.join("identities"))?;
@@ -7327,7 +7553,19 @@ mod tests {
             export_service_identity_trust_anchor(&odin_signer, &odin_anchor)?;
 
             let state_store = root.join("control.cc");
+            let (route_actuators, stubs) = if with_stubs {
+                #[cfg(unix)]
+                {
+                    let (actuators, stubs) = RouteStubs::new(root)?;
+                    (actuators, Some(stubs))
+                }
+                #[cfg(not(unix))]
+                bail!("route stubs are shell scripts")
+            } else {
+                (RouteActuators::default(), None)
+            };
             let options = RuntimeOptions {
+                route_actuators,
                 state_store: state_store.clone(),
                 bindings_dir: root.join("bindings"),
                 source_root: root.join("sources"),
@@ -7349,7 +7587,89 @@ mod tests {
                 engine,
                 state_store,
                 odin_signer,
+                stubs,
             })
+        }
+    }
+
+    /// Where a routed fixture's fragment lives and which local port answers as
+    /// its stable listener.
+    struct RoutedFixture {
+        config: PathBuf,
+        stable_port: u16,
+    }
+
+    /// A stable listener that accepts and hangs up: every route challenge
+    /// against it fails at once, where a closed port would be retried for
+    /// seconds first. Returns its port.
+    fn hanging_up_listener() -> Result<u16> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        Ok(port)
+    }
+
+    /// Stub nginx, systemd-run, systemctl and ufw that append each call to one
+    /// log. `reload-fails` makes `systemctl reload` exit non-zero.
+    #[cfg(unix)]
+    struct RouteStubs {
+        calls: PathBuf,
+        reload_fails: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl RouteStubs {
+        fn new(root: &Path) -> Result<(RouteActuators, Self)> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = root.join("route-stubs");
+            std::fs::create_dir_all(&dir)?;
+            let calls = dir.join("calls");
+            let reload_fails = dir.join("reload-fails");
+            let program = |name: &str, refuse: &str| -> Result<PathBuf> {
+                let path = dir.join(name);
+                std::fs::write(
+                    &path,
+                    format!(
+                        "#!/bin/sh\necho \"{name} $*\" >> '{}'\n{refuse}exit 0\n",
+                        calls.display()
+                    ),
+                )?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+                Ok(path)
+            };
+            let actuators = RouteActuators {
+                nginx: program("nginx", "")?,
+                systemd_run: program("systemd-run", "")?,
+                systemctl: program(
+                    "systemctl",
+                    &format!(
+                        "if [ \"$1\" = reload ] && [ -e '{}' ]; then exit 1; fi\n",
+                        reload_fails.display()
+                    ),
+                )?,
+                ufw: program("ufw", "")?,
+                preflight_root: root.join("route-preflight"),
+            };
+            Ok((actuators, Self { calls, reload_fails }))
+        }
+
+        fn refuse_reloads(&self) -> Result<()> {
+            std::fs::write(&self.reload_fails, b"x")?;
+            Ok(())
+        }
+
+        /// How many logged calls begin with `prefix`, e.g. `systemctl reload`.
+        fn count(&self, prefix: &str) -> usize {
+            std::fs::read_to_string(&self.calls)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .count()
         }
     }
 
@@ -8597,56 +8917,6 @@ mod tests {
     }
 
     #[test]
-    fn continuity_gives_up_on_a_release_that_will_not_start() -> Result<()> {
-        let command = DeploymentCommand {
-            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
-            command_id: "continuity-1".into(),
-            kind: CommandKind::Continuity,
-            selector: "odin".into(),
-            requested_by: "idunn-continuity".into(),
-            requested_at_unix_millis: 100,
-        };
-        let failed_restart = |generation: &str, ordinal: u32| -> Result<DeploymentTransaction> {
-            let mut transaction =
-                DeploymentTransaction::new(&command, "odin".into(), ordinal, None, 100)?;
-            transaction.incumbent_generation_id = Some(generation.into());
-            transaction.completion = Some(TransactionCompletion::FailedBeforeFencing {
-                error: "systemd unit is not running".into(),
-            });
-            Ok(transaction)
-        };
-
-        let refused = |transactions: &[DeploymentTransaction], generation: &str| -> usize {
-            transactions
-                .iter()
-                .filter(|value| {
-                    value.target == "odin"
-                        && value.command_kind == CommandKind::Continuity
-                        && value.incumbent_generation_id.as_deref() == Some(generation)
-                        && matches!(
-                            value.completion,
-                            Some(TransactionCompletion::FailedBeforeFencing { .. })
-                                | Some(TransactionCompletion::FailedAfterFencing { .. })
-                        )
-                })
-                .count()
-        };
-
-        let attempts = vec![
-            failed_restart("generation-1", 0)?,
-            failed_restart("generation-1", 1)?,
-            failed_restart("generation-1", 2)?,
-        ];
-        assert!(refused(&attempts, "generation-1") >= CONTINUITY_RESTART_ATTEMPTS);
-
-        // A restart that succeeds admits a new generation, and the count is
-        // kept against the generation id, so the next release is not condemned
-        // by the failures of the one it replaced.
-        assert_eq!(refused(&attempts, "generation-2"), 0);
-        Ok(())
-    }
-
-    #[test]
     fn activation_without_workload_still_requires_durable_candidate_cleanup() {
         assert_eq!(
             candidate_cleanup_requirement(true, false),
@@ -9517,45 +9787,108 @@ mod tests {
         world: &EngineFixture,
         phase: DeploymentPhase,
     ) -> Result<DeploymentTransaction> {
+        transaction_from(world, phase, None, None)
+    }
+
+    /// `transaction_at`, optionally routed through `route` and
+    /// restarting `incumbent`, an admitted generation already in the store.
+    fn transaction_from(
+        world: &EngineFixture,
+        phase: DeploymentPhase,
+        incumbent: Option<&AdmittedGeneration>,
+        route: Option<&RoutedFixture>,
+    ) -> Result<DeploymentTransaction> {
+        let (transaction, command) = transaction_record(world, phase, incumbent, route)?;
+        let now = now_millis()?;
+        let store = SingleFileMessagePackBackingStore::new(&world.state_store);
+        assert!(store.compare_exchange(
+            &[
+                CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command.command_id.clone(),
+                    current: None,
+                },
+                CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: transaction.transaction_id.clone(),
+                    current: None,
+                },
+            ],
+            &[
+                command_envelope(&command, command.requested_at_unix_millis)?,
+                transaction_envelope(&transaction, now)?,
+            ],
+        )?);
+        Ok(transaction)
+    }
+
+    /// The record `transaction_from` stores, unstored.
+    fn transaction_record(
+        world: &EngineFixture,
+        phase: DeploymentPhase,
+        incumbent: Option<&AdmittedGeneration>,
+        route: Option<&RoutedFixture>,
+    ) -> Result<(DeploymentTransaction, DeploymentCommand)> {
         use crate::deployment_plan::tests::{
             BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
         };
+        let unique = Uuid::new_v4().simple();
         let provider = enroll_service_identity_at::<GameCultProviderHealthIdentity>(
-            &world.root.join("identities/provider.cc"),
+            &world.root.join(format!("identities/provider-{unique}.cc")),
         )?;
-        let provider_anchor = world.root.join("identities/provider-anchor.cc");
+        let provider_anchor = world.root.join(format!("identities/provider-anchor-{unique}.cc"));
         export_service_identity_trust_anchor(&provider, &provider_anchor)?;
 
         let (binding_head, binding_tail) = BINDING
             .split_once("[route]")
             .context("binding has no route table")?;
-        let binding = format!(
-            "{binding_head}[brakes]{}",
-            binding_tail
-                .split_once("[brakes]")
-                .context("binding has no brakes table")?
-                .1
-        )
+        let brakes = binding_tail
+            .split_once("[brakes]")
+            .context("binding has no brakes table")?
+            .1;
+        let route_table = match route {
+            Some(route) => format!(
+                "[route]{}",
+                binding_tail
+                    .split_once("[brakes]")
+                    .context("binding has no brakes table")?
+                    .0
+                    .replace(
+                        "/etc/nginx/idunn-stream-routes/service.conf",
+                        &route.config.display().to_string(),
+                    )
+                    .replace(
+                        "http://127.0.0.1:17999",
+                        &format!("http://127.0.0.1:{}", route.stable_port),
+                    )
+            ),
+            None => String::new(),
+        };
+        let binding = format!("{binding_head}{route_table}[brakes]{brakes}")
         .replace(
             "/etc/gamecult/trust/service.cc",
             &provider_anchor.display().to_string(),
         )
         .replace("service-runtime-signer", &provider.entry().identity_id);
-        let recipe = RECIPE
+        let mut recipe = RECIPE
             .split("[[dependencies]]")
             .next()
             .context("recipe is empty")?
-            .replace("route_required = true", "route_required = false")
-            .replace(
-                r#"["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
-                r#"["GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
-            );
+            .to_owned();
+        if route.is_none() {
+            recipe = recipe
+                .replace("route_required = true", "route_required = false")
+                .replace(
+                    r#"["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+                    r#"["GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+                );
+        }
         let plan = compile_deployment_plan(
             recipe.as_bytes(),
             binding.as_bytes(),
             source(&recipe),
             "service-incarnation-1",
-            None,
+            route.map(|_| 18001),
             110,
             &[],
         )?;
@@ -9566,7 +9899,8 @@ mod tests {
             120,
         )?;
         let expected = release.expected_projection(&plan)?;
-        assert!(!expected.write_lease_required && expected.route.is_none());
+        assert!(!expected.write_lease_required);
+        assert_eq!(expected.route.is_some(), route.is_some());
 
         let now = now_millis()?;
         let command = DeploymentCommand {
@@ -9577,7 +9911,8 @@ mod tests {
             requested_by: "test".into(),
             requested_at_unix_millis: 100,
         };
-        let mut transaction = DeploymentTransaction::new(&command, "service".into(), 0, None, now)?;
+        let mut transaction =
+            DeploymentTransaction::new(&command, "service".into(), 0, incumbent, now)?;
         let activation = IdunnRuntimeActivationLaunch::issue(
             &expected,
             runtime_instance_id(&transaction.transaction_id)?,
@@ -9625,27 +9960,7 @@ mod tests {
         transaction.odin_publisher_sequence_cursor = 4;
         transaction.enter_phase(phase, now);
         transaction.validate()?;
-
-        let store = SingleFileMessagePackBackingStore::new(&world.state_store);
-        assert!(store.compare_exchange(
-            &[
-                CultCacheExpectedEnvelope {
-                    r#type: DeploymentCommand::TYPE.into(),
-                    key: command.command_id.clone(),
-                    current: None,
-                },
-                CultCacheExpectedEnvelope {
-                    r#type: DeploymentTransaction::TYPE.into(),
-                    key: transaction.transaction_id.clone(),
-                    current: None,
-                },
-            ],
-            &[
-                command_envelope(&command, command.requested_at_unix_millis)?,
-                transaction_envelope(&transaction, now)?,
-            ],
-        )?);
-        Ok(transaction)
+        Ok((transaction, command))
     }
 
     /// Odin's correlation for the transaction's incarnation, signed by the key
@@ -10325,6 +10640,590 @@ mod tests {
             reason: String::new(),
         };
         assert!(failed.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_actuation_window_refuses_at_the_ceiling_and_reopens_after_an_hour() {
+        let mut window = ActuationWindow::default();
+        for _ in 0..ROUTE_ACTUATION_CEILING {
+            assert_eq!(window.charge(1_000), Ok(()));
+        }
+        assert_eq!(window.count, ROUTE_ACTUATION_CEILING);
+        // Refusing counts nothing and says when the window reopens.
+        assert_eq!(
+            window.charge(1_000 + ROUTE_ACTUATION_WINDOW_MILLIS - 1),
+            Err(1_000 + ROUTE_ACTUATION_WINDOW_MILLIS)
+        );
+        assert_eq!(window.count, ROUTE_ACTUATION_CEILING);
+        // The window is rolling from its first actuation: at exactly one hour
+        // it is a fresh window.
+        assert_eq!(window.charge(1_000 + ROUTE_ACTUATION_WINDOW_MILLIS), Ok(()));
+        assert_eq!(window.count, 1);
+        assert_eq!(
+            window.window_started_at_unix_millis,
+            1_000 + ROUTE_ACTUATION_WINDOW_MILLIS
+        );
+    }
+
+    #[test]
+    fn route_challenges_wait_twice_as_long_after_each_failure_up_to_a_cap() {
+        let max_age = DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS;
+        let mut state = RouteSupervisionState::default();
+        let mut waits = Vec::new();
+        for failure in 1..=8 {
+            state.record_failed_challenge(1_000, max_age);
+            assert_eq!(state.consecutive_failures, failure);
+            assert_eq!(state.last_challenge_at_unix_millis, Some(1_000));
+            waits.push(state.next_challenge_at_unix_millis.unwrap() - 1_000);
+        }
+        // The last failure was at 1_000: the next challenge is due exactly when
+        // its wait is up.
+        let due = state.next_challenge_at_unix_millis.unwrap();
+        assert!(state.is_waiting(due - 1));
+        assert!(!state.is_waiting(due));
+        assert!(!RouteSupervisionState::default().is_waiting(0));
+        assert_eq!(
+            waits,
+            vec![
+                max_age,
+                2 * max_age,
+                4 * max_age,
+                8 * max_age,
+                16 * max_age,
+                ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS,
+                ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS,
+                ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS,
+            ]
+        );
+        // The wait never falls below the max age, even when the cap would.
+        let mut slow = RouteSupervisionState::default();
+        slow.record_failed_challenge(1_000, 2 * ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS);
+        assert_eq!(
+            slow.next_challenge_at_unix_millis,
+            Some(1_000 + 2 * ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS)
+        );
+
+        let degraded_since = state.degraded_since_unix_millis;
+        assert_eq!(degraded_since, Some(1_000));
+        state.record_failed_challenge(9_000, max_age);
+        assert_eq!(state.degraded_since_unix_millis, degraded_since);
+
+        // A proof clears the observation state and keeps the ceiling's count.
+        state.actuations.count = 3;
+        state.actuations.window_started_at_unix_millis = 500;
+        state.record_proved_challenge(20_000);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.next_challenge_at_unix_millis, None);
+        assert_eq!(state.degraded_since_unix_millis, None);
+        assert_eq!(state.last_challenge_at_unix_millis, Some(20_000));
+        assert_eq!(state.actuations.count, 3);
+    }
+
+    #[test]
+    fn continuity_restarts_double_their_wait_and_stop_at_the_window_ceiling() {
+        let mut backoff = ContinuityBackoff::default();
+        assert!(!backoff.is_exhausted(0) && !backoff.is_waiting(0));
+        let mut waits = Vec::new();
+        for attempt in 1..=CONTINUITY_RESTART_ATTEMPTS {
+            assert!(!backoff.is_exhausted(1_000));
+            backoff.record_restart(1_000);
+            assert_eq!(backoff.attempts, attempt);
+            waits.push(backoff.next_restart_at_unix_millis.unwrap() - 1_000);
+        }
+        let expected: Vec<u64> = (0..CONTINUITY_RESTART_ATTEMPTS)
+            .map(|attempt| CONTINUITY_RESTART_BACKOFF_MILLIS << attempt)
+            .collect();
+        assert_eq!(waits, expected);
+        assert!(backoff.is_exhausted(1_000));
+        assert!(backoff.is_exhausted(1_000 + CONTINUITY_RESTART_WINDOW_MILLIS - 1));
+
+        let due = backoff.next_restart_at_unix_millis.unwrap();
+        assert!(backoff.is_waiting(due - 1));
+        assert!(!backoff.is_waiting(due));
+
+        // The next window starts the count over.
+        let reopened = 1_000 + CONTINUITY_RESTART_WINDOW_MILLIS;
+        assert!(!backoff.is_exhausted(reopened));
+        backoff.record_restart(reopened);
+        assert_eq!(backoff.attempts, 1);
+        assert_eq!(backoff.window_started_at_unix_millis, Some(reopened));
+        assert!(backoff.validate().is_ok());
+    }
+
+    /// A workload whose process is gone: it launches nothing and cannot be
+    /// observed.
+    struct DeadWorkload;
+
+    impl WorkloadPort for DeadWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            StillWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            StillWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            StillWorkload.discard_prepared(plan, expected, activation)
+        }
+        fn observe(
+            &self,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+            _: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            bail!("the unit is not running")
+        }
+        fn stop(&self, observation: &WorkloadObservation) -> Result<()> {
+            StillWorkload.stop(observation)
+        }
+        fn is_permanently_stopped(&self, observation: &WorkloadObservation) -> Result<bool> {
+            StillWorkload.is_permanently_stopped(observation)
+        }
+    }
+
+    /// A routed, route-proof `Stored<AdmittedGeneration>` for target
+    /// `service`, in the store of `world`. Its route observation was made at
+    /// `observed_at`, and `route.config` holds its exact fragment when
+    /// `fragment` is set. Built from the real plan, release, Expected and
+    /// activation constructions.
+    fn routed_generation(
+        world: &EngineFixture,
+        route: &RoutedFixture,
+        fragment: bool,
+        observed_at: u64,
+    ) -> Result<Stored<AdmittedGeneration>> {
+        let (mut transaction, _) =
+            transaction_record(world, DeploymentPhase::Warming, None, Some(route))?;
+        let expected = transaction.expected.clone().context("no Expected")?;
+        let binding = transaction.plan.as_ref().unwrap().parsed_inputs()?.1;
+        let driver = world
+            .engine
+            .route_driver(binding.route.context("fixture plan has no route")?);
+        let rendered = driver.render(&expected)?;
+        if fragment {
+            std::fs::create_dir_all(route.config.parent().unwrap())?;
+            std::fs::write(&route.config, &rendered)?;
+        }
+        let runtime_instance_id = transaction
+            .activation
+            .as_ref()
+            .context("no activation")?
+            .runtime_instance_id
+            .clone();
+        transaction.phase = DeploymentPhase::Committing;
+        transaction.ready = Some(route_proof_evidence());
+        transaction.latest_odin_observation = None;
+        transaction.leasing = Some(LeasingEvidence::SkippedStateless);
+        transaction.routing = Some(RoutingEvidence::Promoted {
+            observation: RouteObservation {
+                route_id: "service".into(),
+                runtime_instance_id,
+                membership_sha256: sha256_id(&rendered),
+                signed_presence_sha256: sha256_id(b"presence"),
+                observed_at_unix_millis: observed_at,
+            },
+            promoted_at_unix_millis: observed_at,
+        });
+        let now = now_millis()?;
+        let generation = AdmittedGeneration::from_transaction(
+            &transaction,
+            world.engine.bootstrap_odin_authority.clone(),
+            None,
+            now,
+        )?;
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store)
+                .insert_entry_if_absent(admitted_envelope(&generation, now)?)?
+        );
+        stored_generation(world)
+    }
+
+    fn stored_generation(world: &EngineFixture) -> Result<Stored<AdmittedGeneration>> {
+        ControlSnapshot::read(&world.state_store)?
+            .admitted
+            .into_iter()
+            .next()
+            .context("no admitted generation")
+    }
+
+    fn route_state(world: &EngineFixture) -> Result<RouteSupervisionState> {
+        stored_generation(world)?
+            .value
+            .route_supervision
+            .context("generation carries no route supervision state")
+    }
+
+    /// Change the route supervision state the way its owner would.
+    fn revise_route_state(
+        world: &EngineFixture,
+        change: impl FnOnce(&mut RouteSupervisionState),
+    ) -> Result<()> {
+        world
+            .engine
+            .update_admitted_generation(&stored_generation(world)?.value, |next| {
+                change(next.route_supervision.as_mut().unwrap())
+            })
+    }
+
+    fn supervise(world: &EngineFixture, ticks: usize) -> Result<()> {
+        for _ in 0..ticks {
+            world.engine.supervise_one_admitted_generation()?;
+        }
+        Ok(())
+    }
+
+    fn routed_world(workload: Arc<dyn WorkloadPort>) -> Result<(EngineFixture, RoutedFixture)> {
+        let world = EngineFixture::routed(workload)?;
+        let route = RoutedFixture {
+            config: world.root.join("route/service.conf"),
+            stable_port: hanging_up_listener()?,
+        };
+        Ok((world, route))
+    }
+
+    /// Reloads per target per hour, steady: a healthy route with an exact
+    /// fragment and a current observation costs no program call and no write,
+    /// however long supervision runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_steady_route_is_never_actuated_or_rewritten() -> Result<()> {
+        let (world, route) = routed_world(Arc::new(StillWorkload))?;
+        let before = routed_generation(&world, &route, true, now_millis()?)?;
+        supervise(&world, 200)?;
+        let stubs = world.stubs.as_ref().unwrap();
+        assert!(!stubs.calls.exists(), "a steady route must run no program");
+        assert_eq!(stored_generation(&world)?.envelope, before.envelope);
+        Ok(())
+    }
+
+    /// Storm path (a). A reload that fails deletes the fragment, so the next
+    /// tick reads drift and repairs again. The first failure backs the route's
+    /// challenges off, so the repairs stop.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_reload_that_deletes_the_fragment_backs_the_route_off() -> Result<()> {
+        let (world, route) = routed_world(Arc::new(StillWorkload))?;
+        let started = now_millis()?;
+        routed_generation(&world, &route, false, started)?;
+        let stubs = world.stubs.as_ref().unwrap();
+        stubs.refuse_reloads()?;
+
+        supervise(&world, 200)?;
+
+        assert_eq!(stubs.count("systemctl reload"), 1);
+        assert!(!route.config.exists(), "the unproved fragment is removed");
+        let state = route_state(&world)?;
+        assert_eq!(state.consecutive_failures, 1);
+        assert!(state.degraded_since_unix_millis.is_some());
+        assert!(
+            state.next_challenge_at_unix_millis.unwrap()
+                >= started + DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS,
+            "the wait is at least the observation max age"
+        );
+        assert_eq!(state.actuations.count, 1);
+        Ok(())
+    }
+
+    /// Storm path (a) with the backoff out of the way: whatever asks for a
+    /// repair, the target's rolling ceiling bounds the actuations, and a new
+    /// window allows more.
+    #[cfg(unix)]
+    #[test]
+    fn route_repairs_are_bounded_by_a_per_target_rolling_ceiling() -> Result<()> {
+        let (world, route) = routed_world(Arc::new(StillWorkload))?;
+        routed_generation(&world, &route, false, now_millis()?)?;
+        let stubs = world.stubs.as_ref().unwrap();
+        stubs.refuse_reloads()?;
+        let ceiling = ROUTE_ACTUATION_CEILING as usize;
+        let repair_every_tick = |ticks: usize| -> Result<()> {
+            for _ in 0..ticks {
+                revise_route_state(&world, |state| state.next_challenge_at_unix_millis = None)?;
+                supervise(&world, 1)?;
+            }
+            Ok(())
+        };
+
+        repair_every_tick(100)?;
+        assert_eq!(stubs.count("systemctl reload"), ceiling);
+        assert_eq!(stubs.count("ufw allow"), ceiling);
+        assert_eq!(stubs.count("systemd-run"), ceiling);
+        assert_eq!(route_state(&world)?.actuations.count, ROUTE_ACTUATION_CEILING);
+
+        // The ceiling is kept in the generation, so it survives a restart of
+        // the Engine that counted it.
+        let restarted = Engine::open_with_systemd_workload(
+            world.engine.options.clone(),
+            Arc::new(StillWorkload),
+        )?;
+        revise_route_state(&world, |state| state.next_challenge_at_unix_millis = None)?;
+        restarted.supervise_one_admitted_generation()?;
+        assert_eq!(stubs.count("systemctl reload"), ceiling);
+
+        // An hour on, the window is open again.
+        revise_route_state(&world, |state| {
+            state.actuations.window_started_at_unix_millis -= ROUTE_ACTUATION_WINDOW_MILLIS + 1;
+        })?;
+        repair_every_tick(100)?;
+        assert_eq!(stubs.count("systemctl reload"), 2 * ceiling);
+        Ok(())
+    }
+
+    /// Observation observes: a route whose proof fails while its fragment is
+    /// exact performs no actuation at all, is marked degraded, and each
+    /// further failure widens the wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_proof_with_an_exact_fragment_only_degrades_the_route() -> Result<()> {
+        let (world, route) = routed_world(Arc::new(StillWorkload))?;
+        let stale = now_millis()? - 10 * DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS;
+        routed_generation(&world, &route, true, stale)?;
+        let stubs = world.stubs.as_ref().unwrap();
+
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            revise_route_state(&world, |state| state.next_challenge_at_unix_millis = None)?;
+            supervise(&world, 1)?;
+            let state = route_state(&world)?;
+            waits.push(
+                state.next_challenge_at_unix_millis.unwrap()
+                    - state.last_challenge_at_unix_millis.unwrap(),
+            );
+        }
+
+        assert!(!stubs.calls.exists(), "a failed proof must actuate nothing");
+        assert_eq!(route_state(&world)?.consecutive_failures, 4);
+        assert!(route_state(&world)?.degraded_since_unix_millis.is_some());
+        let max_age = DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS;
+        assert_eq!(waits, vec![max_age, 2 * max_age, 4 * max_age, 8 * max_age]);
+        // Waiting means waiting: no challenge is made before the wait is up.
+        let waiting = stored_generation(&world)?;
+        supervise(&world, 20)?;
+        assert_eq!(stored_generation(&world)?.envelope, waiting.envelope);
+        Ok(())
+    }
+
+    /// Storm path (b). A restart's candidate whose stable-listener proof
+    /// fails is resumed every tick, and each resume ran the whole install:
+    /// firewall, `nginx -t`, reload. The target's ceiling now bounds them.
+    #[cfg(unix)]
+    #[test]
+    fn a_candidate_whose_route_proof_fails_reloads_at_most_the_ceiling() -> Result<()> {
+        let (world, route) = routed_world(Arc::new(StillWorkload))?;
+        let incumbent = routed_generation(&world, &route, true, now_millis()?)?;
+        let seeded = transaction_from(
+            &world,
+            DeploymentPhase::Warming,
+            Some(&incumbent.value),
+            Some(&route),
+        )?;
+        odin_reports_ready(&world, &seeded, 5)?;
+        drive(&world, |transaction| {
+            transaction.phase == DeploymentPhase::Routing && transaction.route_preflight.is_some()
+        })?;
+        let stubs = world.stubs.as_ref().unwrap();
+        let before = stubs.count("systemctl reload");
+
+        for _ in 0..40 {
+            let current = resident(&world)?;
+            assert!(world.engine.advance_transaction(&current).is_err());
+        }
+
+        let reloads = stubs.count("systemctl reload") - before;
+        assert_eq!(reloads, ROUTE_ACTUATION_CEILING as usize);
+        assert_eq!(route_state(&world)?.actuations.count, ROUTE_ACTUATION_CEILING);
+        Ok(())
+    }
+
+    /// The abort of a fenced candidate withdraws its route through the same
+    /// ceiling, and a withdrawal that cannot reload is bounded too.
+    #[cfg(unix)]
+    #[test]
+    fn a_post_fence_abort_that_cannot_reload_is_bounded_by_the_same_ceiling() -> Result<()> {
+        let (world, route) = routed_world(Arc::new(StillWorkload))?;
+        let incumbent = routed_generation(&world, &route, true, now_millis()?)?;
+        let seeded = transaction_from(
+            &world,
+            DeploymentPhase::Warming,
+            Some(&incumbent.value),
+            Some(&route),
+        )?;
+        odin_reports_ready(&world, &seeded, 5)?;
+        drive(&world, |transaction| {
+            transaction.phase == DeploymentPhase::Routing && transaction.route_preflight.is_some()
+        })?;
+        let current = resident(&world)?;
+        world
+            .engine
+            .begin_post_fencing_abort(&current, anyhow!("candidate died"))?;
+        let stubs = world.stubs.as_ref().unwrap();
+        stubs.refuse_reloads()?;
+        let before = stubs.count("systemctl reload");
+
+        for _ in 0..40 {
+            let current = resident(&world)?;
+            let _ = world.engine.advance_transaction(&current);
+        }
+
+        assert_eq!(
+            stubs.count("systemctl reload") - before,
+            ROUTE_ACTUATION_CEILING as usize
+        );
+        Ok(())
+    }
+
+    /// The incumbent died while a deployment was still before its fence:
+    /// the deployment yields to the restart, unless the target has already
+    /// used its restarts, when the deployment is the only thing left that can
+    /// fix it.
+    #[cfg(unix)]
+    #[test]
+    fn a_deployment_yields_to_a_restart_only_while_the_target_has_restarts_left() -> Result<()> {
+        for exhausted in [false, true] {
+            let (world, route) = routed_world(Arc::new(DeadWorkload))?;
+            let incumbent = routed_generation(&world, &route, true, now_millis()?)?;
+            let now = now_millis()?;
+            if exhausted {
+                world
+                    .engine
+                    .update_admitted_generation(&incumbent.value, |next| {
+                        next.continuity_backoff.window_started_at_unix_millis = Some(now);
+                        next.continuity_backoff.attempts = CONTINUITY_RESTART_ATTEMPTS;
+                    })?;
+            }
+            let command = command(CommandKind::Deploy);
+            let deployment = DeploymentTransaction::new(
+                &command,
+                "service".into(),
+                0,
+                Some(&incumbent.value),
+                now,
+            )?;
+            assert!(
+                SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                    &[
+                        CultCacheExpectedEnvelope {
+                            r#type: DeploymentCommand::TYPE.into(),
+                            key: command.command_id.clone(),
+                            current: None,
+                        },
+                        CultCacheExpectedEnvelope {
+                            r#type: DeploymentTransaction::TYPE.into(),
+                            key: deployment.transaction_id.clone(),
+                            current: None,
+                        },
+                    ],
+                    &[
+                        command_envelope(&command, now)?,
+                        transaction_envelope(&deployment, now)?,
+                    ],
+                )?
+            );
+
+            supervise(&world, 1)?;
+
+            assert_eq!(
+                resident(&world)?.value.pre_fencing_abort.is_some(),
+                !exhausted,
+                "exhausted restarts: {exhausted}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Continuity restarts are counted per target: each is spaced by a
+    /// doubling wait, the window's ceiling stops them, and the next window
+    /// starts them again.
+    #[cfg(unix)]
+    #[test]
+    fn continuity_restarts_are_backed_off_and_bounded_per_target() -> Result<()> {
+        let (world, route) = routed_world(Arc::new(DeadWorkload))?;
+        routed_generation(&world, &route, true, now_millis()?)?;
+        let live = |world: &EngineFixture| -> Result<Vec<Stored<DeploymentTransaction>>> {
+            Ok(ControlSnapshot::read(&world.state_store)?.transactions)
+        };
+        // A restart that failed is archived and frees the target.
+        let fail_restart = |world: &EngineFixture| -> Result<()> {
+            for stored in live(world)? {
+                archive_terminal_transaction(&world.state_store, &stored.envelope)?;
+            }
+            Ok(())
+        };
+        let restart_now = |world: &EngineFixture| -> Result<()> {
+            world
+                .engine
+                .update_admitted_generation(&stored_generation(world)?.value, |next| {
+                    next.continuity_backoff.next_restart_at_unix_millis = None;
+                })
+        };
+
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(live(&world)?.len(), 1, "the dead workload is restarted");
+        let backoff = stored_generation(&world)?.value.continuity_backoff;
+        assert_eq!(backoff.attempts, 1);
+        assert!(backoff.next_restart_at_unix_millis.unwrap() > now_millis()?);
+
+        fail_restart(&world)?;
+        supervise(&world, 50)?;
+        assert!(live(&world)?.is_empty(), "the next restart waits out its backoff");
+
+        let mut waits = Vec::new();
+        for attempt in 2..=CONTINUITY_RESTART_ATTEMPTS {
+            restart_now(&world)?;
+            supervise(&world, 1)?;
+            assert_eq!(live(&world)?.len(), 1, "attempt {attempt} runs");
+            let backoff = stored_generation(&world)?.value.continuity_backoff;
+            assert_eq!(backoff.attempts, attempt);
+            waits.push(backoff.next_restart_at_unix_millis.unwrap() - now_millis()?);
+            fail_restart(&world)?;
+        }
+        assert!(
+            waits.windows(2).all(|pair| pair[1] > pair[0]),
+            "each wait is longer than the last: {waits:?}"
+        );
+
+        restart_now(&world)?;
+        supervise(&world, 5)?;
+        assert!(live(&world)?.is_empty(), "the window's restarts are spent");
+
+        world
+            .engine
+            .update_admitted_generation(&stored_generation(&world)?.value, |next| {
+                let backoff = &mut next.continuity_backoff;
+                backoff.window_started_at_unix_millis = backoff
+                    .window_started_at_unix_millis
+                    .map(|at| at - CONTINUITY_RESTART_WINDOW_MILLIS);
+                backoff.next_restart_at_unix_millis = None;
+            })?;
+        supervise(&world, 1)?;
+        assert_eq!(live(&world)?.len(), 1, "a new window restarts the target");
+        assert_eq!(
+            stored_generation(&world)?.value.continuity_backoff.attempts,
+            1
+        );
         Ok(())
     }
 }
