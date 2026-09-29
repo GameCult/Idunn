@@ -8829,6 +8829,10 @@ mod tests {
             ("a tab before the chunk size", "\t", ""),
             ("whitespace after the chunk size and no extension", "", " "),
             ("whitespace before the size, ahead of an extension", " ", ";x"),
+            ("a vertical tab before an extension", "", "\x0b;x"),
+            ("a carriage return before an extension", "", "\r;x"),
+            ("a bare carriage return ends the size line", "", "\r"),
+            ("a doubled carriage return ends the size line", "", "\r\r"),
         ] {
             assert_refused(
                 challenge(
