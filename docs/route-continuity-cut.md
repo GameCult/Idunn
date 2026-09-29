@@ -471,7 +471,7 @@ refused, the revert exact). The transition failed:
 - Low: `docs/deployment-authority.md` says the projection "never drifts".
 
 **Self's ruling for the B1 fix batch, which runs on top of F0 because F0 owns the legacy lift:**
-1. The legacy-transaction lift maps a pre-B1 continuity abort that issued an activation to
+1. ~~(superseded below)~~ The legacy-transaction lift maps a pre-B1 continuity abort that issued an activation to
    `Pending`. The new single resolution then demotes its own activation, which also cleans
    the residue that record left behind.
 2. Supervision owns the Expected-only precondition. It does not mint a continuity while its
@@ -484,6 +484,35 @@ refused, the revert exact). The transition failed:
 5. Correct the doc's "never drifts".
 Before any deploy, check the live host for resident continuity abort records. That is a read
 of `control.cc`, and the operator's to authorise.
+
+**B1 fix batch 1, Soul pass, 2026-09-29: do not close. Self's corrected ruling replaces item 1 above.**
+Hands implemented item 1 by reopening terminal pre-B1 records at `Starting`. Soul confirmed the
+cost:
+- If the target also holds a live transaction, or a second resident pre-B1 abort, the reopened
+  record fails `ControlSnapshot::read` and Idunn does not boot.
+- The migration has already written the record as v4, so the old binary cannot roll back.
+- The reopen is a second owner for residue that boot reconciliation already cleans.
+The defect was in Self's ruling: it set a state on a record without saying what happens to
+terminal records.
+
+**Corrected ruling:**
+- Nothing is reopened.
+- A terminal pre-B1 abort keeps its phase. Validation accepts its shape under a **typed legacy
+  marker** that only the lift sets.
+- **Boot reconciliation is the single owner of legacy residue.**
+- In-flight pre-B1 aborts may lift to `Pending` only if they cannot collide with another live
+  transaction.
+
+**Also fixed in batch 2:**
+- A failed pre-fence abort goes to `record_resumable_error`, never to
+  `begin_post_fencing_abort`. Before this, one wedged abort failed every scheduler tick for
+  every target.
+- Errors are isolated per transaction, including `archive_terminal_transaction`.
+- `serve`'s boot wiring is pinned by a test.
+
+**Moved to B2:** the continuity restart ceiling reads only `ContinuityBackoff`, never
+`history.cc`. Otherwise an unreadable history file stops crash recovery for every target.
+Deferral and backoff show in `idunn status`.
 
 **B2 — Bounded, backed-off route and unit repair (Idunn).**
 
