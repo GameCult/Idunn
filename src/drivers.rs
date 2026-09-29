@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -700,6 +700,7 @@ const ROUTE_CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(2);
 const ROUTE_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const ROUTE_SNAPSHOT_MAX_BYTES: usize = 1024 * 1024;
 const ROUTE_HTTP_MAX_HEADER_BYTES: usize = 32 * 1024;
+const ROUTE_HTTP_CHUNK_LINE_BYTES: usize = 128;
 const ROUTE_HTTP_SNAPSHOT_PATH: &str = "/cultnet/snapshot";
 
 impl RoutePreflightReceipt {
@@ -5607,6 +5608,70 @@ fn ensure_or_refuse(condition: bool, message: &'static str) -> Result<(), Challe
     }
 }
 
+/// One answer as it arrives, over either transport. A peer that stops is judged
+/// the same way on both: no byte at all is silence (a process still starting
+/// does that), and anything short of a whole answer after some bytes is a bad
+/// answer. Waiting does not finish an answer that has begun and stopped.
+struct Answer<R> {
+    source: R,
+    seen: usize,
+}
+
+impl<R: Read> Answer<R> {
+    fn new(source: R) -> Self {
+        Self { source, seen: 0 }
+    }
+
+    fn stopped(&self, what: &str) -> ChallengeFailure {
+        let error = anyhow!("stable CultNet route stopped {what}");
+        if self.seen == 0 {
+            silent(error)
+        } else {
+            refused(error)
+        }
+    }
+
+    fn read_some(&mut self, buffer: &mut [u8], what: &str) -> Result<usize, ChallengeFailure> {
+        loop {
+            match self.source.read(buffer) {
+                Ok(0) => return Err(self.stopped(what)),
+                Ok(read) => {
+                    self.seen += read;
+                    return Ok(read);
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(_) => return Err(self.stopped(what)),
+            }
+        }
+    }
+
+    fn read_all(&mut self, buffer: &mut [u8], what: &str) -> Result<(), ChallengeFailure> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            filled += self.read_some(&mut buffer[filled..], what)?;
+        }
+        Ok(())
+    }
+
+    /// One CRLF-terminated line, without its terminator.
+    fn read_line(&mut self, bound: usize, what: &str) -> Result<Vec<u8>, ChallengeFailure> {
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0_u8];
+            self.read_all(&mut byte, what)?;
+            line.push(byte[0]);
+            if line.ends_with(b"\r\n") {
+                line.truncate(line.len() - 2);
+                return Ok(line);
+            }
+            ensure_or_refuse(
+                line.len() <= bound,
+                "stable CultNet HTTP response line exceeds its bound",
+            )?;
+        }
+    }
+}
+
 fn request_tcp_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, ChallengeFailure> {
     let mut stream = connect_route_socket(target)
         .with_context(|| format!("connecting stable CultNet TCP route {target}"))
@@ -5622,21 +5687,16 @@ fn request_tcp_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, C
         .and_then(|()| stream.flush())
         .map_err(silent)?;
 
+    let mut answer = Answer::new(stream);
     let mut header = [0_u8; 4];
-    stream
-        .read_exact(&mut header)
-        .context("reading stable CultNet TCP response frame")
-        .map_err(silent)?;
+    answer.read_all(&mut header, "before its response frame header ended")?;
     let length = u32::from_be_bytes(header) as usize;
     ensure_or_refuse(
         (1..=ROUTE_SNAPSHOT_MAX_BYTES).contains(&length),
         "stable CultNet TCP response exceeds the route observation bound",
     )?;
     let mut response = vec![0_u8; length];
-    stream
-        .read_exact(&mut response)
-        .context("reading stable CultNet TCP response payload")
-        .map_err(silent)?;
+    answer.read_all(&mut response, "before its response frame ended")?;
     Ok(response)
 }
 
@@ -5660,79 +5720,124 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
         .and_then(|()| stream.flush())
         .map_err(silent)?;
 
-    let maximum = ROUTE_HTTP_MAX_HEADER_BYTES
-        .checked_add(ROUTE_SNAPSHOT_MAX_BYTES)
-        .context("route HTTP response bound overflow")
+    // The response is read by its own framing, never to end of stream: a peer
+    // that ignores `Connection: close` and keeps the socket open has still
+    // answered in full.
+    let mut answer = Answer::new(BufReader::new(stream));
+    let mut head_bytes = 0_usize;
+    let mut head_line = |answer: &mut Answer<BufReader<TcpStream>>| {
+        let line = answer.read_line(ROUTE_HTTP_MAX_HEADER_BYTES, "before its headers ended")?;
+        head_bytes += line.len() + 2;
+        ensure_or_refuse(
+            head_bytes <= ROUTE_HTTP_MAX_HEADER_BYTES,
+            "stable CultNet HTTP response headers exceed their bound",
+        )?;
+        Ok::<_, ChallengeFailure>(line)
+    };
+    let status = head_line(&mut answer)?;
+    let status = std::str::from_utf8(&status)
+        .context("stable CultNet HTTP response status is not UTF-8")
         .map_err(refused)?;
-    let mut response = Vec::new();
-    (&mut stream)
-        .take((maximum + 1) as u64)
-        .read_to_end(&mut response)
-        .context("reading stable CultNet HTTP response")
-        .map_err(silent)?;
-    if response.is_empty() {
-        return Err(silent(anyhow!(
-            "stable CultNet HTTP route closed the connection without answering"
+    if !is_http_success(status) {
+        return Err(refused(anyhow!(
+            "stable CultNet HTTP route rejected the snapshot challenge: {status}"
         )));
     }
-    parse_http_snapshot(&response, maximum).map_err(refused)
-}
 
-/// The body of an HTTP snapshot response that arrived, or why what arrived is
-/// not one.
-fn parse_http_snapshot(response: &[u8], maximum: usize) -> Result<Vec<u8>> {
-    ensure!(
-        response.len() <= maximum,
-        "stable CultNet HTTP response exceeds the route observation bound"
-    );
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
-        .context("stable CultNet HTTP response has no header boundary")?;
-    ensure!(
-        header_end <= ROUTE_HTTP_MAX_HEADER_BYTES,
-        "stable CultNet HTTP response headers exceed their bound"
-    );
-    let headers = std::str::from_utf8(&response[..header_end])
-        .context("stable CultNet HTTP response headers are not UTF-8")?;
-    let mut lines = headers.split("\r\n");
-    let status = lines
-        .next()
-        .context("stable CultNet HTTP response has no status")?;
-    ensure!(
-        matches!(status, "HTTP/1.1 200 OK" | "HTTP/1.0 200 OK"),
-        "stable CultNet HTTP route rejected the snapshot challenge: {status}"
-    );
     let mut content_length = None;
-    for line in lines.filter(|line| !line.is_empty()) {
+    let mut chunked = false;
+    loop {
+        let line = head_line(&mut answer)?;
+        if line.is_empty() {
+            break;
+        }
+        let line = std::str::from_utf8(&line)
+            .context("stable CultNet HTTP response headers are not UTF-8")
+            .map_err(refused)?;
         let (name, value) = line
             .split_once(':')
-            .context("stable CultNet HTTP response contains a malformed header")?;
+            .context("stable CultNet HTTP response contains a malformed header")
+            .map_err(refused)?;
         if name.eq_ignore_ascii_case("transfer-encoding") {
-            bail!("stable CultNet HTTP response uses unsupported transfer encoding");
+            ensure_or_refuse(
+                value.trim().eq_ignore_ascii_case("chunked"),
+                "stable CultNet HTTP response uses unsupported transfer encoding",
+            )?;
+            chunked = true;
         }
         if name.eq_ignore_ascii_case("content-length") {
-            ensure!(
+            ensure_or_refuse(
                 content_length.is_none(),
-                "stable CultNet HTTP response repeats Content-Length"
-            );
+                "stable CultNet HTTP response repeats Content-Length",
+            )?;
             content_length = Some(
                 value
                     .trim()
                     .parse::<usize>()
-                    .context("stable CultNet HTTP Content-Length is invalid")?,
+                    .context("stable CultNet HTTP Content-Length is invalid")
+                    .map_err(refused)?,
             );
         }
     }
-    let content_length =
-        content_length.context("stable CultNet HTTP response has no Content-Length")?;
-    ensure!(
-        content_length <= ROUTE_SNAPSHOT_MAX_BYTES
-            && response.len().saturating_sub(header_end) == content_length,
-        "stable CultNet HTTP response body differs from its bounded Content-Length"
-    );
-    Ok(response[header_end..].to_vec())
+
+    let body = "before its body ended";
+    match (content_length, chunked) {
+        (Some(length), false) => {
+            ensure_or_refuse(
+                length <= ROUTE_SNAPSHOT_MAX_BYTES,
+                "stable CultNet HTTP response body exceeds the route observation bound",
+            )?;
+            let mut response = vec![0_u8; length];
+            answer.read_all(&mut response, body)?;
+            Ok(response)
+        }
+        (None, true) => {
+            let mut response = Vec::new();
+            loop {
+                let size = answer.read_line(ROUTE_HTTP_CHUNK_LINE_BYTES, body)?;
+                let size = std::str::from_utf8(&size)
+                    .ok()
+                    .and_then(|size| size.split(';').next())
+                    .and_then(|size| usize::from_str_radix(size.trim(), 16).ok())
+                    .context("stable CultNet HTTP chunk size is invalid")
+                    .map_err(refused)?;
+                if size == 0 {
+                    // Trailers, if any, end at the empty line.
+                    while !answer.read_line(ROUTE_HTTP_MAX_HEADER_BYTES, body)?.is_empty() {}
+                    return Ok(response);
+                }
+                ensure_or_refuse(
+                    response.len().saturating_add(size) <= ROUTE_SNAPSHOT_MAX_BYTES,
+                    "stable CultNet HTTP response body exceeds the route observation bound",
+                )?;
+                let start = response.len();
+                response.resize(start + size, 0);
+                answer.read_all(&mut response[start..], body)?;
+                let mut end = [0_u8; 2];
+                answer.read_all(&mut end, body)?;
+                ensure_or_refuse(&end == b"\r\n", "stable CultNet HTTP chunk is not terminated")?;
+            }
+        }
+        _ => Err(refused(anyhow!(
+            "stable CultNet HTTP response has no single body framing"
+        ))),
+    }
+}
+
+/// A 2xx status line of HTTP/1.0 or HTTP/1.1.
+fn is_http_success(status: &str) -> bool {
+    let Some(rest) = status
+        .strip_prefix("HTTP/1.1 ")
+        .or_else(|| status.strip_prefix("HTTP/1.0 "))
+    else {
+        return false;
+    };
+    let code = rest.as_bytes();
+    code.len() >= 3
+        && code[0] == b'2'
+        && code[1].is_ascii_digit()
+        && code[2].is_ascii_digit()
+        && (code.len() == 3 || code[3] == b' ')
 }
 
 /// nginx reload is signal-driven: `systemctl reload` can return before its
@@ -8121,8 +8226,17 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// A peer that reads one snapshot request and writes back whatever `reply`
-    /// builds from the challenge id. Returns the port it listens on.
+    /// builds from the challenge id, then closes. Returns the port it listens on.
     fn scripted_peer(reply: impl FnOnce(&str) -> Vec<u8> + Send + 'static) -> u16 {
+        lingering_peer(reply, Duration::ZERO)
+    }
+
+    /// `scripted_peer`, except the socket stays open for `linger` after the
+    /// answer: keep-alive, ignoring `Connection: close`.
+    fn lingering_peer(
+        reply: impl FnOnce(&str) -> Vec<u8> + Send + 'static,
+        linger: Duration,
+    ) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
         let port = listener.local_addr().expect("a bound port").port();
         thread::spawn(move || {
@@ -8152,6 +8266,8 @@ mod tests {
                 }
             };
             let _ = stream.write_all(&reply(&message_id));
+            let _ = stream.flush();
+            thread::sleep(linger);
         });
         port
     }
@@ -8284,7 +8400,8 @@ mod tests {
         assert_eq!(answer.canonical_presence, [1, 2, 3]);
 
         assert_silent(tcp_challenge(framed_peer(|_| Vec::new())), "a peer that hangs up");
-        assert_silent(
+        // Some bytes and then nothing is a bad answer, not a late one.
+        assert_refused(
             tcp_challenge(framed_peer(|_| vec![0, 0, 0, 9, 1])),
             "a frame that never finishes",
         );
@@ -8333,6 +8450,197 @@ mod tests {
         }
     }
 
+
+    // ---------------------------------------------------------------------
+    // One rule for a peer that stops, on either transport: no byte at all is
+    // silence; some bytes and then nothing is a bad answer. An answer is read
+    // by its own framing, so a peer that keeps the socket open has still
+    // answered.
+    // ---------------------------------------------------------------------
+
+    fn http_chunked(body: &[u8], chunk: usize) -> Vec<u8> {
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for piece in body.chunks(chunk) {
+            response.extend_from_slice(format!("{:x};ext=1\r\n", piece.len()).as_bytes());
+            response.extend_from_slice(piece);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\nTrailer: x\r\n\r\n");
+        response
+    }
+
+    fn honest_body(message_id: &str) -> Vec<u8> {
+        let response = honest(message_id);
+        let end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("an HTTP answer");
+        response[end + 4..].to_vec()
+    }
+
+    const LINGER: Duration = Duration::from_secs(6);
+
+    #[test]
+    fn an_http_answer_is_read_by_its_framing_not_to_the_end_of_the_stream() {
+        let started = Instant::now();
+        let answer = challenge(lingering_peer(honest, LINGER), |_| {}).expect("a whole answer");
+        assert_eq!(answer.canonical_presence, [1, 2, 3]);
+        assert!(started.elapsed() < LINGER / 2, "the challenge waited on the socket");
+
+        let started = Instant::now();
+        let answer = challenge(
+            lingering_peer(|id| http_chunked(&honest_body(id), 7), LINGER),
+            |_| {},
+        )
+        .expect("a chunked answer");
+        assert_eq!(answer.canonical_presence, [1, 2, 3]);
+        assert!(started.elapsed() < LINGER / 2, "the challenge waited on the socket");
+    }
+
+    #[test]
+    fn an_http_status_that_is_not_success_is_refused_even_when_the_peer_lingers() {
+        for status in [
+            "404 Not Found",
+            "301 Moved Permanently",
+            "503 Service Unavailable",
+            "199 Odd",
+        ] {
+            // The body is the honest answer: only the status refuses it.
+            let reply = move |id: &str| {
+                let body = honest_body(id);
+                let mut reply =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n", body.len())
+                        .into_bytes();
+                reply.extend_from_slice(&body);
+                reply
+            };
+            let started = Instant::now();
+            assert_refused(challenge(lingering_peer(reply, LINGER), |_| {}), status);
+            assert!(started.elapsed() < LINGER / 2, "{status} waited on the socket");
+        }
+    }
+
+    #[test]
+    fn only_a_two_hundred_series_http_1_status_line_is_success() {
+        for status in ["HTTP/1.1 200 OK", "HTTP/1.0 200 OK", "HTTP/1.1 204", "HTTP/1.1 299 x"] {
+            assert!(is_http_success(status), "{status}");
+        }
+        for status in [
+            "",
+            "HTTP/2 200 OK",
+            "HTTP/1.1 ",
+            "HTTP/1.1 20",
+            "HTTP/1.1 2x0 OK",
+            "HTTP/1.1 20x OK",
+            "HTTP/1.1 2000 OK",
+            "HTTP/1.1 300 OK",
+            "HTTP/1.1 404 Not Found",
+            "200 OK",
+        ] {
+            assert!(!is_http_success(status), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_peer_that_sent_some_bytes_and_stopped_is_refused_on_either_transport() {
+        // No byte at all is silence, on both.
+        assert_silent(challenge(scripted_peer(|_| Vec::new()), |_| {}), "an HTTP peer with nothing to say");
+        assert_silent(tcp_challenge(framed_peer(|_| Vec::new())), "a TCP peer with nothing to say");
+
+        // Some bytes and then nothing is a bad answer, wherever it stops.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+        for (why, bytes) in [
+            ("a status line that stops", b"HTTP/1.1 2".to_vec()),
+            ("headers that stop", b"HTTP/1.1 200 OK\r\nContent-Le".to_vec()),
+            ("a body that stops", [head.as_slice(), b"abc"].concat()),
+            (
+                "a chunk that stops",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab".to_vec(),
+            ),
+            (
+                "a chunked body that never ends",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n".to_vec(),
+            ),
+        ] {
+            assert_refused(challenge(scripted_peer(move |_| bytes), |_| {}), why);
+        }
+        for (why, bytes) in [
+            ("a 3-byte banner", b"OK\n".to_vec()),
+            ("a frame header that stops", vec![0, 0]),
+            ("a frame that stops", vec![0, 0, 0, 9, 1]),
+        ] {
+            assert_refused(tcp_challenge(framed_peer(move |_| bytes)), why);
+        }
+    }
+
+    #[test]
+    fn an_http_answer_that_frames_its_body_wrongly_is_refused() {
+        for (why, reply) in [
+            (
+                "an unsupported transfer encoding",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n".to_vec(),
+            ),
+            (
+                "both framings",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n0\r\n\r\n"
+                    .to_vec(),
+            ),
+            ("no framing", b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabc".to_vec()),
+            (
+                "a repeated Content-Length",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na".to_vec(),
+            ),
+            (
+                "an invalid Content-Length",
+                b"HTTP/1.1 200 OK\r\nContent-Length: many\r\n\r\n".to_vec(),
+            ),
+            (
+                "a Content-Length over the bound",
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    ROUTE_SNAPSHOT_MAX_BYTES + 1
+                )
+                .into_bytes(),
+            ),
+            ("a malformed header", b"HTTP/1.1 200 OK\r\nno colon here\r\n\r\n".to_vec()),
+            (
+                "an invalid chunk size",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n".to_vec(),
+            ),
+            (
+                "an unterminated chunk",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naXX0\r\n\r\n".to_vec(),
+            ),
+            (
+                "chunks over the bound",
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    ROUTE_SNAPSHOT_MAX_BYTES + 1
+                )
+                .into_bytes(),
+            ),
+            (
+                "one header line over the bound",
+                [
+                    b"HTTP/1.1 200 OK\r\nX: ".to_vec(),
+                    vec![b'a'; ROUTE_HTTP_MAX_HEADER_BYTES + 1],
+                ]
+                .concat(),
+            ),
+            (
+                "headers over the bound together",
+                [
+                    b"HTTP/1.1 200 OK\r\n".to_vec(),
+                    b"X: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n".repeat(600),
+                ]
+                .concat(),
+            ),
+            ("headers that are not UTF-8", b"HTTP/1.1 200 OK\r\nX: \xff\r\n\r\n".to_vec()),
+            ("a status that is not UTF-8", b"HTTP/1.1 \xff\r\n\r\n".to_vec()),
+        ] {
+            assert_refused(challenge(scripted_peer(move |_| reply), |_| {}), why);
+        }
+    }
 
     fn assert_silent(outcome: Result<RouteSnapshotResponse, ChallengeFailure>, why: &str) {
         assert!(
