@@ -8118,6 +8118,279 @@ fn apply_identity(command: &mut Command, identity: Option<ProcessIdentity>) -> R
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------------
+    // A direct challenge fails one of two ways. Silence waits; a bad answer,
+    // or a challenge that cannot be made, is an error.
+    // ---------------------------------------------------------------------
+
+    /// A peer that reads one snapshot request and writes back whatever `reply`
+    /// builds from the challenge id. Returns the port it listens on.
+    fn scripted_peer(reply: impl FnOnce(&str) -> Vec<u8> + Send + 'static) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().expect("a bound port").port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let message_id = loop {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                if let Ok(CultNetMessage::SnapshotRequest { message_id, .. }) =
+                    decode_cultnet_message_from_slice(
+                        &request[end + 4..],
+                        CultNetWireContract::CultNetSchemaV0,
+                    )
+                {
+                    break message_id;
+                }
+            };
+            let _ = stream.write_all(&reply(&message_id));
+        });
+        port
+    }
+
+    fn http_ok(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn raw_snapshot(message_id: &str, schema: &str, key: &str, payload: Vec<u8>) -> Vec<u8> {
+        http_ok(
+            &encode_cultnet_message_to_vec(
+                &CultNetMessage::SnapshotResponseRaw {
+                    message_id: message_id.into(),
+                    documents: vec![cultnet_rs::CultNetRawDocumentRecord {
+                        schema_id: schema.into(),
+                        record_key: key.into(),
+                        stored_at: "1970-01-01T00:00:00.100Z".into(),
+                        payload_encoding: cultnet_rs::CultNetRawPayloadEncoding::Messagepack,
+                        payload,
+                        source_runtime_id: None,
+                        source_agent_id: None,
+                        source_role: None,
+                        tags: None,
+                    }],
+                },
+                CultNetWireContract::CultNetSchemaV0,
+            )
+            .expect("an encodable response"),
+        )
+    }
+
+    fn honest(message_id: &str) -> Vec<u8> {
+        raw_snapshot(
+            message_id,
+            cultnet_rs::GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
+            "service",
+            vec![1, 2, 3],
+        )
+    }
+
+    /// One candidate challenge to `port`, with the Expected adjusted by `adjust`.
+    fn challenge(
+        port: u16,
+        adjust: impl FnOnce(&mut IdunnExpectedIncarnationRecord),
+    ) -> Result<RouteSnapshotResponse, ChallengeFailure> {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let mut candidate = expected();
+        candidate.route = Some(cultnet_rs::IdunnExpectedRoute {
+            route_id: "service".into(),
+            transport: "http".into(),
+            stable_endpoint: "http://127.0.0.1:17999".into(),
+            candidate_endpoint: format!("http://127.0.0.1:{port}"),
+        });
+        adjust(&mut candidate);
+        NginxRouteDriver::new(RouteBinding {
+            driver: RouteDriver::NginxStreamTcp,
+            route_id: "service".into(),
+            stable_endpoint: "http://127.0.0.1:17999".into(),
+            private_host: "127.0.0.1".into(),
+            private_port_start: port,
+            private_port_end: port,
+            config_path: temp.path().join("service.conf"),
+            reload_unit: "nginx.service".into(),
+        })
+        .request_candidate_runtime_presence(&candidate, "candidate-probe")
+    }
+
+    fn assert_silent(outcome: Result<RouteSnapshotResponse, ChallengeFailure>, why: &str) {
+        assert!(
+            matches!(outcome, Err(ChallengeFailure::Silent(_))),
+            "{why} must read as silence: {outcome:?}"
+        );
+    }
+
+    fn assert_refused(outcome: Result<RouteSnapshotResponse, ChallengeFailure>, why: &str) {
+        assert!(
+            matches!(outcome, Err(ChallengeFailure::Refused(_))),
+            "{why} must be an error, not a wait: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_exact_answer_is_taken() {
+        let port = scripted_peer(honest);
+        let answer = challenge(port, |_| {}).expect("the exact answer");
+        assert_eq!(answer.message_id, "candidate-probe");
+        assert_eq!(answer.canonical_presence, [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_challenge_that_nothing_answers_is_silence() {
+        assert_silent(challenge(scripted_peer(|_| Vec::new()), |_| {}), "a peer that hangs up");
+        // Half a response, then the peer is gone.
+        assert_refused(
+            challenge(scripted_peer(|_| b"HTTP/1.1 200 OK\r\nContent-Le".to_vec()), |_| {}),
+            "a response that never finished its headers",
+        );
+        // Nothing listens.
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = reservation.local_addr().expect("a bound port").port();
+        drop(reservation);
+        assert_silent(challenge(port, |_| {}), "a closed port");
+    }
+
+    #[test]
+    fn a_bad_answer_is_refused_not_waited_on() {
+        assert_refused(
+            challenge(
+                scripted_peer(|_| {
+                    raw_snapshot(
+                        "candidate-another",
+                        cultnet_rs::GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
+                        "service",
+                        vec![1],
+                    )
+                }),
+                |_| {},
+            ),
+            "an answer to another challenge",
+        );
+        assert_refused(
+            challenge(
+                scripted_peer(|id| raw_snapshot(id, "some.other.schema", "service", vec![1])),
+                |_| {},
+            ),
+            "a substituted document schema",
+        );
+        assert_refused(
+            challenge(
+                scripted_peer(|id| {
+                    raw_snapshot(
+                        id,
+                        cultnet_rs::GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
+                        "another-target",
+                        vec![1],
+                    )
+                }),
+                |_| {},
+            ),
+            "a substituted record key",
+        );
+        assert_refused(
+            challenge(
+                scripted_peer(|id| {
+                    raw_snapshot(
+                        id,
+                        cultnet_rs::GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
+                        "service",
+                        vec![0; ROUTE_SNAPSHOT_MAX_BYTES + 1],
+                    )
+                }),
+                |_| {},
+            ),
+            "an oversized payload",
+        );
+        assert_refused(
+            challenge(
+                scripted_peer(|id| {
+                    http_ok(
+                        &encode_cultnet_message_to_vec(
+                            &CultNetMessage::SnapshotRequest {
+                                message_id: id.into(),
+                                schema_ids: None,
+                                record_keys: None,
+                            },
+                            CultNetWireContract::CultNetSchemaV0,
+                        )
+                        .expect("an encodable message"),
+                    )
+                }),
+                |_| {},
+            ),
+            "a response that is not a raw snapshot",
+        );
+        assert_refused(
+            challenge(
+                scripted_peer(|_| {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                }),
+                |_| {},
+            ),
+            "an HTTP error",
+        );
+        assert_refused(
+            challenge(scripted_peer(|_| http_ok(b"not a cultnet message")), |_| {}),
+            "a body that is not CultNet",
+        );
+        assert_refused(
+            challenge(scripted_peer(|_| b"HTTP/1.1 200 OK
+Content-Le".to_vec()), |_| {}),
+            "a response that never finished its headers",
+        );
+    }
+
+    #[test]
+    fn a_challenge_that_cannot_be_made_is_an_error_not_a_wait() {
+        let port = scripted_peer(honest);
+        assert_refused(
+            challenge(port, |candidate| {
+                candidate.route.as_mut().unwrap().route_id = "another-route".into();
+            }),
+            "a binding that differs from Expected",
+        );
+        assert_refused(
+            challenge(port, |candidate| {
+                candidate.route.as_mut().unwrap().transport = "smtp".into();
+            }),
+            "an unsupported transport",
+        );
+        assert_refused(
+            challenge(port, |candidate| {
+                candidate.route.as_mut().unwrap().candidate_endpoint =
+                    format!("http://candidate.example:{port}");
+            }),
+            "a host that is not an IP address",
+        );
+        assert_refused(
+            challenge(port, |candidate| {
+                candidate.route.as_mut().unwrap().candidate_endpoint =
+                    format!("http://127.0.0.1:{}", port.wrapping_add(1));
+            }),
+            "a candidate endpoint outside the route binding",
+        );
+        assert_refused(
+            challenge(port, |candidate| candidate.route = None),
+            "an Expected with no route",
+        );
+    }
+
     #[test]
     fn route_connect_retries_connection_refused_until_listener_is_ready() -> Result<()> {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;

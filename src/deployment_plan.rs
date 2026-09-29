@@ -1567,6 +1567,69 @@ nodes = ["yggdrasil"]
     }
 
     #[test]
+    fn a_plan_names_how_its_target_proves_readiness_and_agrees_with_its_expected() {
+        use crate::control_plane::UndeclaredReadiness;
+        let unrouted_binding = {
+            let (head, tail) = BINDING.split_once("[route]").unwrap();
+            format!("{head}[brakes]{}", tail.split_once("[brakes]").unwrap().1)
+        };
+        let unrouted = |recipe: &str| {
+            recipe
+                .replace("route_required = true", "route_required = false")
+                .replace(
+                    r#"["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+                    r#"["GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+                )
+        };
+        let without_odin = RECIPE.split("[[dependencies]]").next().unwrap().to_owned();
+        let provides_odin = |recipe: &str| {
+            recipe.replace("capability = \"service.runtime\"", "capability = \"odin.verse-rendezvous\"")
+        };
+        let cases: [(&str, String, &str, Option<u16>, Result<ReadinessClass, ()>); 5] = [
+            ("depends on Odin, routed", RECIPE.to_owned(), BINDING, Some(18001), Ok(ReadinessClass::OdinCorrelated)),
+            ("routed, no Odin", without_odin.clone(), BINDING, Some(18001), Ok(ReadinessClass::RouteProof)),
+            ("unrouted, no Odin", unrouted(&without_odin), &unrouted_binding, None, Err(())),
+            ("provides Odin, unrouted", provides_odin(&unrouted(&without_odin)), &unrouted_binding, None, Ok(ReadinessClass::OdinSelf)),
+            ("depends on Odin, unrouted", unrouted(RECIPE), &unrouted_binding, None, Ok(ReadinessClass::OdinCorrelated)),
+        ];
+        for (name, recipe, binding, port, outcome) in cases {
+            let providers = [ready_odin_provider("odin", "odin-yggdrasil", 1)];
+            let plan = compile_deployment_plan(
+                recipe.as_bytes(),
+                binding.as_bytes(),
+                source(&recipe),
+                "service-incarnation-1",
+                port,
+                110,
+                if recipe.contains("[[dependencies]]") { &providers } else { &[] },
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let release = SealedRelease::new(
+                &plan,
+                vec![artifact_receipt()],
+                vec![external_input_receipt()],
+                120,
+            )
+            .unwrap();
+            let expected = release.expected_projection(&plan).unwrap();
+            match outcome {
+                Ok(class) => {
+                    assert_eq!(plan.readiness_class().unwrap(), class, "{name}");
+                    assert_eq!(ReadinessClass::of(&expected), Ok(class), "{name}");
+                }
+                Err(()) => {
+                    let error = plan.readiness_class().expect_err(name);
+                    let undeclared = UndeclaredReadiness {
+                        target: "service".into(),
+                    };
+                    assert_eq!(error.downcast_ref::<UndeclaredReadiness>(), Some(&undeclared), "{name}");
+                    assert_eq!(ReadinessClass::of(&expected), Err(undeclared), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn expected_projection_is_sanitized_and_names_the_selected_graph() {
         let plan = plan();
         let release = SealedRelease::new(

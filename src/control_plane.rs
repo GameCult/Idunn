@@ -651,7 +651,9 @@ impl ReadinessClass {
         }
     }
 
-    fn of(expected: &IdunnExpectedIncarnationRecord) -> Result<Self, UndeclaredReadiness> {
+    pub(crate) fn of(
+        expected: &IdunnExpectedIncarnationRecord,
+    ) -> Result<Self, UndeclaredReadiness> {
         Self::declared(
             &expected.target,
             expected
@@ -3828,7 +3830,7 @@ struct Engine {
     idunn_signer: ServiceIdentitySigner<IdunnServiceIdentity>,
     idunn_anchor: ServiceIdentityTrustAnchor,
     bootstrap_odin_authority: AdmittedOdinAuthority,
-    source: GitSourceDriver,
+    source: Arc<dyn SourcePort>,
     docker_runner: DockerRunnerDriver,
     systemd_workload: Arc<dyn WorkloadPort>,
     host_actuators: Option<SharedHostActuatorHub>,
@@ -3873,11 +3875,11 @@ impl Engine {
         let odin_anchor = read_trust_anchor::<OdinTopologyIdentity>(&options.odin_trust_anchor)
             .context("reading bootstrap Odin topology anchor")?;
         let bootstrap_odin_authority = AdmittedOdinAuthority::from_anchor(&odin_anchor)?;
-        let source = GitSourceDriver::new(
+        let source: Arc<dyn SourcePort> = Arc::new(GitSourceDriver::new(
             &options.source_root,
             options.staging_root.join("frozen-sources"),
             options.source_identity,
-        );
+        ));
         let host_actuators = options
             .host_actuator_bind
             .map(|bind| HostActuatorHub::bind(bind).map(|hub| Arc::new(Mutex::new(hub))))
@@ -6059,14 +6061,9 @@ impl Engine {
         if current.value.routing.is_none() {
             let admitted = if ReadinessClass::of(expected)? == ReadinessClass::RouteProof {
                 // Ready is the candidate's own proof, recorded in AwaitingReady.
-                // No Odin correlation is read to admit a route.
-                ensure!(
-                    matches!(
-                        current.value.ready,
-                        Some(ReadinessEvidence::RouteProof { .. })
-                    ),
-                    "route-proof Routing without route-proof Ready evidence"
-                );
+                // Validation refuses Routing without a Ready receipt, and a
+                // receipt the other party vouched for is held before any step
+                // runs. No Odin correlation is read to admit a route.
                 current.clone()
             } else {
                 let current_lease = current
@@ -6189,13 +6186,6 @@ impl Engine {
         let ready_current = if route_proof {
             // The candidate's Ready proof is durable, and the stable route's
             // challenge below is its currency. No Odin is read to commit.
-            ensure!(
-                matches!(
-                    current.value.ready,
-                    Some(ReadinessEvidence::RouteProof { .. })
-                ),
-                "route-proof commit without route-proof Ready evidence"
-            );
             current.clone()
         } else {
             let current_lease_sha256 = current
@@ -6437,11 +6427,8 @@ impl Engine {
                 // with the narrower "no admitted Odin" test contradicted the
                 // caller and failed the refresh. What the refresh owes is
                 // freshness, and the replay check below is what provides it.
-                ensure!(
-                    ReadinessClass::of(required(&current.value.expected, "Warming Expected")?)?
-                        == ReadinessClass::OdinSelf,
-                    "direct Warming refresh is reserved for Odin"
-                );
+                // That the target is Odin was already required by the
+                // rehydration above, which authenticates the recorded answer.
                 let (evidence, present) = self.observe_first_odin_warming(&current.value)?;
                 let warming = WarmingEvidence::FirstOdinDirect { evidence };
                 let token = SequenceAdmittedWarming::from_direct_presence(
@@ -6890,11 +6877,11 @@ impl Engine {
             presence.detail == format!("route-observation:{message_id}"),
             "route proof response is not bound to the exact challenge"
         );
-        let lease_is_current = if presence.state == "warming" {
-            presence.write_lease_sha256.is_none()
-        } else {
-            presence.write_lease_sha256.as_deref() == current_write_lease_sha256
-        };
+        // A warming presence is exempt from the lease comparison: it is
+        // Idunn's own lease that a warming candidate cannot hold yet, and the
+        // authenticator above already refuses one that claims a lease.
+        let lease_is_current = presence.state == "warming"
+            || presence.write_lease_sha256.as_deref() == current_write_lease_sha256;
         ensure!(
             lease_is_current,
             "route proof runtime does not hold the exact current process write lease"
@@ -10392,7 +10379,7 @@ mod tests {
         // Providing the rendezvous is being Odin, whatever else is declared.
         expected.dependencies.clear();
         expected.route = None;
-        expected.capabilities[0].capability = ODIN_RENDEZVOUS_CAPABILITY.into();
+        provide_odin(&mut expected);
         assert_eq!(ReadinessClass::of(&expected), Ok(ReadinessClass::OdinSelf));
         Ok(())
     }
@@ -10726,6 +10713,16 @@ mod tests {
             canonical_brake_bytes,
             authorized_at_unix_millis: now,
         })
+    }
+
+    /// What makes a target Odin: it provides the rendezvous.
+    fn provide_odin(expected: &mut IdunnExpectedIncarnationRecord) {
+        expected.capabilities.push(cultnet_rs::IdunnExpectedCapability {
+            capability: ODIN_RENDEZVOUS_CAPABILITY.into(),
+            schema: "odin.verse-topology.v1".into(),
+            compatibility: "v1".into(),
+            minimum_capacity: 1,
+        });
     }
 
     /// The declaration that makes an unrouted fixture target Odin-correlated.
@@ -11278,7 +11275,7 @@ mod tests {
         // Odin is the target that provides the rendezvous, whatever it is named.
         odin.expected.target = "odin".into();
         odin.expected.dependencies.clear();
-        odin.expected.capabilities[0].capability = ODIN_RENDEZVOUS_CAPABILITY.into();
+        provide_odin(&mut odin.expected);
         odin.odin_authority = Some(AdmittedOdinAuthority::from_anchor(
             &world.odin_signer.trust_anchor()?,
         )?);
@@ -13494,6 +13491,142 @@ mod tests {
         Ok(())
     }
 
+    /// A source that resolves one fixed recipe and never freezes anything.
+    struct FixedSource {
+        recipe: String,
+    }
+
+    impl SourcePort for FixedSource {
+        fn resolve(
+            &self,
+            _binding: &OperatorBinding,
+            _resolution_id: &str,
+            _selected_at_unix_millis: u64,
+        ) -> Result<crate::drivers::ResolvedSource> {
+            Ok(crate::drivers::ResolvedSource {
+                facts: crate::deployment_plan::tests::source(&self.recipe),
+                recipe_bytes: self.recipe.clone().into_bytes(),
+            })
+        }
+
+        fn freeze(&self, _: &str, _: &CompiledDeploymentPlan) -> Result<FrozenSourceReceipt> {
+            bail!("this source freezes nothing")
+        }
+
+        fn observe_frozen(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &FrozenSourceReceipt,
+        ) -> Result<crate::drivers::FrozenSource> {
+            bail!("this source freezes nothing")
+        }
+
+        fn cleanup(&self, _: &str, _: Option<&FrozenSourceReceipt>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A Deploy transaction for an unrouted target, still Sealing, whose
+    /// source resolves `recipe`. One scheduler tick admits its plan or refuses it.
+    fn sealing_world(recipe: &str) -> Result<EngineFixture> {
+        use crate::deployment_plan::tests::BINDING;
+        let mut world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (binding_head, binding_tail) = BINDING
+            .split_once("[route]")
+            .context("binding has no route table")?;
+        let binding = format!(
+            "{binding_head}[brakes]{}",
+            binding_tail
+                .split_once("[brakes]")
+                .context("binding has no brakes table")?
+                .1
+        );
+        std::fs::create_dir_all(world.root.join("bindings"))?;
+        std::fs::write(world.root.join("bindings/service.toml"), binding)?;
+        world.engine.source = Arc::new(FixedSource {
+            recipe: recipe.to_owned(),
+        });
+        let now = now_millis()?;
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "up-service".into(),
+            kind: CommandKind::Deploy,
+            selector: "service".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        let transaction = DeploymentTransaction::new(&command, "service".into(), 0, None, now)?;
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: command.command_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: transaction.transaction_id.clone(),
+                        current: None,
+                    },
+                ],
+                &[
+                    command_envelope(&command, command.requested_at_unix_millis)?,
+                    transaction_envelope(&transaction, now)?,
+                ],
+            )?
+        );
+        Ok(world)
+    }
+
+    fn unrouted_recipe() -> String {
+        crate::deployment_plan::tests::RECIPE
+            .split("[[dependencies]]")
+            .next()
+            .expect("the recipe has a body")
+            .replace("route_required = true", "route_required = false")
+            .replace(
+                r#"["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+                r#"["GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+            )
+    }
+
+    #[test]
+    fn admission_refuses_a_recipe_that_declares_no_way_to_prove_readiness() -> Result<()> {
+        let recipe = unrouted_recipe();
+        let world = sealing_world(&recipe)?;
+        world.engine.run_scheduler_tick()?;
+        let refused = latest(&world)?;
+        assert!(refused.plan.is_none(), "the refused recipe was planned");
+        assert!(refused.frozen_source.is_none(), "the refused recipe was frozen");
+        let abort = refused
+            .pre_fencing_abort
+            .context("a recipe with no declared proof of readiness must be refused")?;
+        assert!(
+            abort.error.contains("target service declares no way to prove readiness"),
+            "{}",
+            abort.error
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admission_takes_a_recipe_that_declares_its_proof() -> Result<()> {
+        let recipe = unrouted_recipe().replace(
+            "capability = \"service.runtime\"",
+            &format!("capability = \"{ODIN_RENDEZVOUS_CAPABILITY}\""),
+        );
+        let world = sealing_world(&recipe)?;
+        world.engine.run_scheduler_tick()?;
+        let planned = latest(&world)?;
+        assert!(planned.pre_fencing_abort.is_none(), "{:?}", planned.pre_fencing_abort);
+        assert_eq!(
+            planned.plan.as_ref().map(CompiledDeploymentPlan::readiness_class).transpose()?,
+            Some(ReadinessClass::OdinSelf)
+        );
+        Ok(())
+    }
+
     // ---------------------------------------------------------------------
     // Route-proof readiness: a routed target that declares no Odin dependency
     // is admitted by Idunn's own challenges. Odin is never read.
@@ -13524,6 +13657,20 @@ mod tests {
             /// that is up but not answering. Unlike a closed port, no other
             /// test's listener can be handed the address.
             hang_up: AtomicBool,
+            /// The write lease its presence claims to hold: what a candidate
+            /// that picked up Idunn's grant reports.
+            lease: Mutex<Option<String>>,
+            reply: Mutex<Reply>,
+        }
+
+        /// How the runtime answers a well-formed challenge.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Reply {
+            Honest,
+            /// An answer to some other challenge.
+            ForeignChallengeId,
+            /// An HTTP error where the snapshot should be.
+            HttpFailure,
         }
 
         impl RuntimeStub {
@@ -13558,7 +13705,7 @@ mod tests {
                     health_contract: expected.health_contract.clone(),
                     state: (*self.state.lock().unwrap()).into(),
                     detail: format!("route-observation:{message_id}"),
-                    write_lease_sha256: None,
+                    write_lease_sha256: self.lease.lock().unwrap().clone(),
                     signer_identity_id: self.provider.entry().identity_id.clone(),
                     publisher_sequence: self.sequence.fetch_add(1, Ordering::SeqCst) + 1,
                     observed_at_unix_millis: now_millis()?,
@@ -13610,8 +13757,19 @@ mod tests {
                 else {
                     bail!("stub received something other than a snapshot request");
                 };
+                let reply = *self.reply.lock().unwrap();
+                if reply == Reply::HttpFailure {
+                    stream.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )?;
+                    return Ok(());
+                }
                 let response = cultnet_rs::CultNetMessage::SnapshotResponseRaw {
-                    message_id: message_id.clone(),
+                    message_id: if reply == Reply::ForeignChallengeId {
+                        "candidate-foreign".to_owned()
+                    } else {
+                        message_id.clone()
+                    },
                     documents: vec![cultnet_rs::CultNetRawDocumentRecord {
                         schema_id: cultnet_rs::GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into(),
                         record_key: self.expected.target.clone(),
@@ -13696,6 +13854,23 @@ mod tests {
             phase: DeploymentPhase,
             provides_odin: bool,
         ) -> Result<RoutedWorld> {
+            build_routed_world(odin, minimum_capacity, phase, provides_odin, false)
+        }
+
+        /// The same world for a target with process-writable state: its
+        /// candidate is granted a write lease and Ready must be the candidate
+        /// reporting exactly that lease.
+        fn stateful_routed_world(odin: Odin, phase: DeploymentPhase) -> Result<RoutedWorld> {
+            build_routed_world(odin, 1, phase, false, true)
+        }
+
+        fn build_routed_world(
+            odin: Odin,
+            minimum_capacity: u32,
+            phase: DeploymentPhase,
+            provides_odin: bool,
+            stateful: bool,
+        ) -> Result<RoutedWorld> {
             use crate::deployment_plan::tests::{
                 BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
             };
@@ -13730,7 +13905,30 @@ mod tests {
                     "/etc/nginx/idunn-stream-routes/service.conf",
                     &config.display().to_string().replace('\\', "/"),
                 );
-            let recipe = RECIPE
+            let (binding, recipe_source) = if stateful {
+                std::fs::create_dir_all(world.root.join("lease"))?;
+                (
+                    binding.replace(
+                        "[brakes]",
+                        &format!(
+                            "[process_write_lease]\nrecord_path = \"{}\"\n\n[brakes]",
+                            world.root.join("lease/process-write-lease.cc").display()
+                        ),
+                    ),
+                    RECIPE
+                        .replace(
+                            "writer = \"none\"\nrecovery = \"rebuildable\"\nstartup = \"open-at-start\"",
+                            "writer = \"process-bound-single-writer\"\nrecovery = \"preserve\"\nstartup = \"create-or-open-after-write-lease\"",
+                        )
+                        .replace(
+                            "required_environment = [\"GAMECULT_IDUNN_CANDIDATE_BIND\", \"GAMECULT_IDUNN_RUNTIME_BUNDLE\"]",
+                            "required_environment = [\"GAMECULT_IDUNN_CANDIDATE_BIND\", \"GAMECULT_IDUNN_PROCESS_WRITE_LEASE\", \"GAMECULT_IDUNN_RUNTIME_BUNDLE\"]",
+                        ),
+                )
+            } else {
+                (binding, RECIPE.to_owned())
+            };
+            let recipe = recipe_source
                 .split("[[dependencies]]")
                 .next()
                 .context("recipe is empty")?
@@ -13762,6 +13960,7 @@ mod tests {
             )?;
             let expected = release.expected_projection(&plan)?;
             assert!(expected.route.is_some() && expected.dependencies.is_empty());
+            assert_eq!(expected.write_lease_required, stateful);
             assert_eq!(
                 ReadinessClass::of(&expected),
                 Ok(if provides_odin {
@@ -13829,6 +14028,8 @@ mod tests {
                 stable_hits: AtomicUsize::new(0),
                 stop: AtomicBool::new(false),
                 hang_up: AtomicBool::new(false),
+                lease: Mutex::new(None),
+                reply: Mutex::new(Reply::Honest),
             });
             stub.listen(candidate_listener, true);
             stub.listen(stable_listener, false);
@@ -13859,30 +14060,20 @@ mod tests {
                 transaction.warming = Some(WarmingEvidence::RouteProofDirect { evidence });
             }
             if phase >= DeploymentPhase::Fencing {
-                let rendered = NginxRouteDriver::new(
-                    transaction
-                        .plan
-                        .as_ref()
-                        .unwrap()
-                        .parsed_inputs()?
-                        .1
-                        .route
-                        .context("no route binding")?,
-                )
-                .render(transaction.expected.as_ref().unwrap())?;
-                transaction.route_preflight = Some(crate::drivers::RoutePreflightReceipt {
-                    route_id: "service".into(),
-                    candidate_runtime_instance_id: transaction
-                        .activation
-                        .as_ref()
-                        .unwrap()
-                        .runtime_instance_id
-                        .clone(),
-                    candidate_membership_sha256: sha256_id(&rendered),
-                    incumbent_runtime_instance_id: None,
-                    incumbent_membership_sha256: None,
-                    incumbent_configuration: None,
-                });
+                transaction.route_preflight = Some(candidate_preflight(&transaction)?);
+            }
+            if stateful {
+                // The lease driver reads the Expected and the observed
+                // activation from the topology store, as Starting left them.
+                let plan = transaction.plan.as_ref().unwrap();
+                let anchor = world.engine.provider_anchor_for_plan(plan)?;
+                let topology = world.engine.topology();
+                topology.publish_expected(transaction.expected.as_ref().unwrap(), &anchor)?;
+                topology.publish_observed_activation(
+                    transaction.expected.as_ref().unwrap(),
+                    transaction.activation.as_ref().unwrap(),
+                    transaction.workload.as_ref().unwrap(),
+                )?;
             }
             transaction.enter_phase(phase, now);
             transaction.validate()?;
@@ -13944,6 +14135,38 @@ mod tests {
                 stub,
                 odin,
                 poisoned,
+            })
+        }
+
+        /// The preflight receipt of a candidate whose route was never
+        /// installed: what Warming records before Fencing, without running the
+        /// host's nginx.
+        fn candidate_preflight(
+            transaction: &DeploymentTransaction,
+        ) -> Result<crate::drivers::RoutePreflightReceipt> {
+            let rendered = NginxRouteDriver::new(
+                transaction
+                    .plan
+                    .as_ref()
+                    .unwrap()
+                    .parsed_inputs()?
+                    .1
+                    .route
+                    .context("no route binding")?,
+            )
+            .render(transaction.expected.as_ref().unwrap())?;
+            Ok(crate::drivers::RoutePreflightReceipt {
+                route_id: "service".into(),
+                candidate_runtime_instance_id: transaction
+                    .activation
+                    .as_ref()
+                    .unwrap()
+                    .runtime_instance_id
+                    .clone(),
+                candidate_membership_sha256: sha256_id(&rendered),
+                incumbent_runtime_instance_id: None,
+                incumbent_membership_sha256: None,
+                incumbent_configuration: None,
             })
         }
 
@@ -14128,11 +14351,21 @@ mod tests {
             routed.run_to_routing()?;
             routed.promote_by_hand()?;
             routed.stub.capacity.store(1, Ordering::SeqCst);
-            let failure = format!("{:#}", routed.step().expect_err("a shortfall must be refused"));
+            let failure = routed.step().expect_err("a shortfall must be refused");
+            // The shortfall is a typed value, not a sentence to search.
+            let disagrees = failure
+                .downcast_ref::<PresenceDisagrees>()
+                .with_context(|| format!("the refusal is not typed: {failure:#}"))?;
+            let shortfall = disagrees
+                .disagreements
+                .iter()
+                .find(|disagreement| disagreement.code == "expected-capability-000-capacity")
+                .context("the capacity shortfall is not named")?;
             assert!(
-                failure.contains("expected-capability-000-capacity"),
-                "{failure}"
+                shortfall.expected.as_deref().is_some_and(|text| text.ends_with("capacity>=2")),
+                "{shortfall:?}"
             );
+            assert!(shortfall.observed.is_some(), "{shortfall:?}");
             assert!(admitted(&routed).is_err());
             Ok(())
         }
@@ -14306,6 +14539,710 @@ mod tests {
                 routed.world.engine.current_odin_authority(&snapshot)?,
                 routed.world.engine.bootstrap_odin_authority
             );
+            Ok(())
+        }
+
+        impl RoutedWorld {
+            /// Boot would accept this store, and Odin was never read.
+            fn assert_boots(&self) -> Result<()> {
+                let snapshot = ControlSnapshot::read(&self.world.state_store)?;
+                self.world.engine.validate_durable_authority(&snapshot)?;
+                self.assert_odin_untouched()
+            }
+
+            /// Step until `done`, checking after every step that boot would
+            /// still accept the store.
+            fn drive_until(&self, done: impl Fn(&DeploymentTransaction) -> bool) -> Result<()> {
+                for _ in 0..20 {
+                    if done(&self.transaction()?) {
+                        return Ok(());
+                    }
+                    self.step()?;
+                    self.assert_boots()?;
+                }
+                bail!("the transaction never reached the awaited state")
+            }
+
+            fn answer_now(&self) -> Result<(RuntimePresenceEvidence, cultnet_rs::VerifiedRuntimePresence)> {
+                match self.world.engine.challenge_candidate(
+                    &self.transaction()?,
+                    &["warming", "active"],
+                    None,
+                )? {
+                    CandidateAnswer::Answered { evidence, present } => Ok((evidence, present)),
+                    CandidateAnswer::Silent(reason) => bail!("the candidate was silent: {reason}"),
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // The stateful path, end to end through the Engine.
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn a_stateful_route_proof_target_holds_its_lease_from_fencing_to_commit() -> Result<()> {
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            routed.assert_boots()?;
+
+            routed.drive_until(|t| matches!(t.leasing, Some(LeasingEvidence::Prepared { .. })))?;
+            assert_eq!(routed.transaction()?.phase, DeploymentPhase::Leasing);
+            routed.drive_until(|t| matches!(t.leasing, Some(LeasingEvidence::Granted { .. })))?;
+            routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+            let lease_sha256 = routed
+                .transaction()?
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::lease_sha256)
+                .context("no granted lease")?
+                .to_owned();
+
+            // The candidate has not picked the lease up: still warming.
+            routed.step()?;
+            assert_eq!(
+                routed.transaction()?.last_error.as_deref(),
+                Some("candidate is still warming")
+            );
+            assert!(routed.transaction()?.ready.is_none());
+            // Active without the lease Idunn granted is not Ready.
+            routed.stub.set_state("active");
+            let refusal = routed
+                .step()
+                .expect_err("an active candidate without the granted lease is refused");
+            assert!(
+                format!("{refusal:#}").contains("exact current process write lease"),
+                "{refusal:#}"
+            );
+            assert!(routed.transaction()?.ready.is_none());
+            // Active holding exactly that lease is.
+            *routed.stub.lease.lock().unwrap() = Some(lease_sha256.clone());
+            routed.step()?;
+            assert!(matches!(
+                routed.transaction()?.ready,
+                Some(ReadinessEvidence::RouteProof { .. })
+            ));
+            routed.assert_boots()?;
+
+            routed.drive_until(|t| t.phase == DeploymentPhase::Routing)?;
+            routed.promote_by_hand()?;
+            routed.assert_boots()?;
+            routed.step()?;
+
+            let generation = admitted(&routed)?;
+            generation.validate()?;
+            assert_eq!(generation.ready.voucher(), Voucher::Candidate);
+            assert!(generation.expected.write_lease_required);
+            assert_eq!(generation.leasing.lease_sha256(), Some(lease_sha256.as_str()));
+            assert!(generation.odin_authority.is_none());
+            routed.assert_boots()?;
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // Warming is one challenge, then the phase moves.
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn warming_challenges_once_and_then_advances_on_every_tick() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            routed.step()?;
+            let recorded = routed
+                .transaction()?
+                .warming
+                .context("the first step recorded no Warming evidence")?;
+            assert_eq!(routed.stub.candidate_hits.load(Ordering::SeqCst), 1);
+
+            // The route preflight needs the host's nginx; its receipt is recorded
+            // here so the phase can move on.
+            let current = resident(&routed.world)?;
+            let mut next = current.value.clone();
+            next.route_preflight = Some(candidate_preflight(&next)?);
+            replace_transaction(&routed.world.state_store, &current, &next)?;
+
+            routed.drive_until(|t| t.phase == DeploymentPhase::Fencing)?;
+            assert_eq!(
+                routed.stub.candidate_hits.load(Ordering::SeqCst),
+                1,
+                "a recorded Warming answer is never asked for again"
+            );
+            assert_eq!(routed.transaction()?.warming, Some(recorded));
+            Ok(())
+        }
+
+        #[test]
+        fn a_stateful_candidate_may_not_answer_its_warming_challenge_active() {
+            let mut expected = fixture_generation(FIXTURE_GENERATION).unwrap().1.expected;
+            expected.write_lease_required = true;
+            assert_eq!(route_proof_warming_states(&expected), ["warming"]);
+            expected.write_lease_required = false;
+            assert_eq!(route_proof_warming_states(&expected), ["warming", "active"]);
+        }
+
+        #[test]
+        fn a_stateful_candidate_that_answers_warming_active_is_refused() -> Result<()> {
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Warming)?;
+            routed.stub.set_state("active");
+            let refusal = routed
+                .step()
+                .expect_err("a stateful candidate cannot be active before it holds a lease");
+            assert!(format!("{refusal:#}").contains("not warming"), "{refusal:#}");
+            assert!(routed.transaction()?.warming.is_none());
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // What a challenged presence must prove.
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn a_presence_holds_the_write_lease_exactly_when_it_is_not_warming() -> Result<()> {
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Warming)?;
+            let authority = routed
+                .world
+                .engine
+                .runtime_authority(&routed.transaction()?)?;
+            let lease = sha256_id(b"the granted lease");
+            let other = sha256_id(b"some other lease");
+            let judge = |state: &'static str,
+                         held: Option<&str>,
+                         current: Option<&str>,
+                         states: &[&str]|
+             -> Result<()> {
+                let challenged = now_millis()?;
+                routed.stub.set_state(state);
+                *routed.stub.lease.lock().unwrap() = held.map(str::to_owned);
+                let bytes = routed.stub.answer("candidate-probe")?;
+                routed
+                    .world
+                    .engine
+                    .authenticate_challenged_presence(
+                        &authority,
+                        states,
+                        current,
+                        "candidate-probe",
+                        challenged,
+                        now_millis()?,
+                        &bytes,
+                    )
+                    .map(|_| ())
+            };
+            let either = ["warming", "active"];
+            judge("warming", None, None, &either)?;
+            judge("active", Some(&lease), Some(&lease), &either)?;
+            for (state, held, current, named) in [
+                // Warming holds nothing, whatever Idunn has granted.
+                ("warming", Some(lease.as_str()), None, "write lease"),
+                ("warming", Some(lease.as_str()), Some(lease.as_str()), "write lease"),
+                // Anything else holds exactly the current grant.
+                ("active", None, Some(lease.as_str()), "exact current process write lease"),
+                ("active", Some(lease.as_str()), None, "exact current process write lease"),
+                (
+                    "active",
+                    Some(other.as_str()),
+                    Some(lease.as_str()),
+                    "exact current process write lease",
+                ),
+            ] {
+                let error = judge(state, held, current, &either)
+                    .expect_err("a presence with the wrong lease is refused");
+                assert!(
+                    format!("{error:#}").contains(named),
+                    "{state} {held:?} {current:?}: {error:#}"
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn a_presence_minted_before_its_challenge_is_refused() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            let authority = routed
+                .world
+                .engine
+                .runtime_authority(&routed.transaction()?)?;
+            let bytes = routed.stub.answer("candidate-probe")?;
+            let minted = now_millis()?;
+            // Answered before the challenge that claims it: an old presence
+            // replayed for a new question.
+            let replay = routed
+                .world
+                .engine
+                .authenticate_challenged_presence(
+                    &authority,
+                    &["warming"],
+                    None,
+                    "candidate-probe",
+                    minted + 1_000,
+                    minted + 1_000,
+                    &bytes,
+                )
+                .expect_err("a presence minted before its challenge");
+            assert!(
+                format!("{replay:#}").contains("minted before its challenge"),
+                "{replay:#}"
+            );
+            let early = routed
+                .world
+                .engine
+                .authenticate_challenged_presence(
+                    &authority,
+                    &["warming"],
+                    None,
+                    "candidate-probe",
+                    minted + 1_000,
+                    minted,
+                    &bytes,
+                )
+                .expect_err("a receipt before its challenge");
+            assert!(format!("{early:#}").contains("predates its challenge"), "{early:#}");
+            Ok(())
+        }
+
+        #[test]
+        fn direct_warming_evidence_is_bound_to_the_bytes_it_authenticated() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            let id = routed.transaction()?.transaction_id;
+            let direct = |evidence: RuntimePresenceEvidence| WarmingEvidence::RouteProofDirect { evidence };
+
+            let (evidence, present) = routed.answer_now()?;
+            SequenceAdmittedWarming::from_direct_presence(id.clone(), direct(evidence), present)?;
+
+            // The digest is the authenticated presence's, but the bytes are not.
+            let (mut evidence, present) = routed.answer_now()?;
+            evidence.canonical_bytes.push(0);
+            let error = SequenceAdmittedWarming::from_direct_presence(id.clone(), direct(evidence), present)
+                .expect_err("bytes that are not the authenticated presence");
+            assert!(format!("{error:#}").contains("differs from its authenticated"), "{error:#}");
+
+            // The bytes are the authenticated presence's, but the digest is not.
+            let (mut evidence, present) = routed.answer_now()?;
+            evidence.canonical_sha256 = sha256_id(b"another presence");
+            let error = SequenceAdmittedWarming::from_direct_presence(id.clone(), direct(evidence), present)
+                .expect_err("a digest that is not the authenticated presence's");
+            assert!(format!("{error:#}").contains("differs from its authenticated"), "{error:#}");
+
+            // Evidence about another answer altogether.
+            let (other, _) = routed.answer_now()?;
+            let (_, present) = routed.answer_now()?;
+            SequenceAdmittedWarming::from_direct_presence(id, direct(other), present)
+                .expect_err("evidence about another answer");
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // Validation: candidate-vouched evidence belongs to route-proof targets.
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn candidate_vouched_evidence_is_refused_on_a_target_odin_reports_on() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            let (evidence, _) = routed.answer_now()?;
+            let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+            let odin_reported = transaction_at(&world, DeploymentPhase::Warming)?;
+            assert_eq!(
+                ReadinessClass::of(odin_reported.expected.as_ref().unwrap()),
+                Ok(ReadinessClass::OdinCorrelated)
+            );
+
+            let mut warming = odin_reported.clone();
+            warming.warming = Some(WarmingEvidence::RouteProofDirect {
+                evidence: evidence.clone(),
+            });
+            assert!(error_text(warming.validate()).contains("not route-proof"));
+
+            let mut ready = odin_reported.clone();
+            ready.ready = Some(ReadinessEvidence::RouteProof {
+                evidence: evidence.clone(),
+            });
+            assert!(error_text(ready.validate()).contains("not route-proof"));
+
+            // Direct Odin warming is Odin's alone, by class: a route-proof
+            // target may not claim it, and a target that provides the
+            // rendezvous may, whatever it is named.
+            let mut direct = routed.transaction()?;
+            direct.warming = Some(WarmingEvidence::FirstOdinDirect {
+                evidence: evidence.clone(),
+            });
+            assert!(error_text(direct.validate()).contains("reserved for Odin"));
+            let odin = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, true)?;
+            let mut direct = odin.transaction()?;
+            assert_eq!(direct.target, "service");
+            direct.warming = Some(WarmingEvidence::FirstOdinDirect { evidence });
+            direct.validate()?;
+            Ok(())
+        }
+
+        #[test]
+        fn a_route_proof_transaction_past_awaiting_ready_needs_the_candidates_ready_proof() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            let routing = routed.transaction()?;
+            routing.validate()?;
+            let mut bare = routing.clone();
+            bare.ready = None;
+            assert!(error_text(bare.validate()).contains("lacks Ready evidence"));
+            routed.promote_by_hand()?;
+            let mut bare = routed.transaction()?;
+            assert_eq!(bare.phase, DeploymentPhase::Committing);
+            bare.ready = None;
+            assert!(error_text(bare.validate()).contains("lacks Ready evidence"));
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // The class is the Expected's alone. Evidence collected under another
+        // class is held and reported, never stepped, never repaired.
+        // -----------------------------------------------------------------
+
+        /// Odin's Ready for the world's target, as pre-B3 code recorded it for
+        /// every routed target.
+        fn odin_receipt_for(
+            routed: &RoutedWorld,
+            transaction: &DeploymentTransaction,
+            sequence: u64,
+        ) -> Result<TopologyEvidence> {
+            let now = now_millis()?;
+            let bytes = signed_correlation(&routed.world, transaction, sequence, true)?;
+            let authenticated = routed.world.engine.authenticate_topology_bytes(
+                &ControlSnapshot::read(&routed.world.state_store)?,
+                transaction,
+                &bytes,
+                transaction
+                    .leasing
+                    .as_ref()
+                    .and_then(LeasingEvidence::lease_sha256),
+                now,
+            )?;
+            TopologyEvidence::from_authenticated(&authenticated, now)
+        }
+
+        fn stored(generation: &AdmittedGeneration) -> Stored<AdmittedGeneration> {
+            Stored {
+                value: generation.clone(),
+                envelope: CultCacheEnvelope {
+                    key: generation.target.clone(),
+                    r#type: AdmittedGeneration::TYPE.into(),
+                    payload: Vec::new(),
+                    stored_at: "1970-01-01T00:00:00.100Z".into(),
+                    schema_id: Some(ADMITTED_GENERATION_SCHEMA.into()),
+                },
+            }
+        }
+
+        #[test]
+        fn a_pre_b3_transaction_over_a_route_proof_target_is_held_and_reported_once() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+
+            // Ready as pre-B3 Idunn wrote it: an Odin receipt.
+            let current = resident(&routed.world)?;
+            let mut legacy = current.value.clone();
+            let receipt = odin_receipt_for(&routed, &legacy, 9)?;
+            legacy.latest_odin_observation = Some(receipt.clone());
+            legacy.odin_publisher_sequence_cursor = 9;
+            legacy.ready = Some(ReadinessEvidence::OdinCorrelated { evidence: receipt });
+            replace_transaction(&routed.world.state_store, &current, &legacy)?;
+
+            let disagreement = ReadinessDisagreement::WrongVoucher {
+                target: "service".into(),
+                required: ReadinessClass::RouteProof,
+                collected: Voucher::Odin,
+            };
+            assert_eq!(legacy.readiness_disagreement(), Some(disagreement.clone()));
+            // The record is readable and boot accepts it: held, not refused.
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            routed.world.engine.validate_durable_authority(&snapshot)?;
+            // Stepping it would fail, on every tick, for good.
+            assert!(routed.step().is_err());
+
+            let hits = (
+                routed.stub.candidate_hits.load(Ordering::SeqCst),
+                routed.stub.stable_hits.load(Ordering::SeqCst),
+            );
+            for _ in 0..4 {
+                assert!(!routed.world.engine.run_scheduler_tick()?);
+            }
+            let held = resident(&routed.world)?;
+            assert_eq!(held.value.phase, DeploymentPhase::Routing);
+            assert!(held.value.pre_fencing_abort.is_none());
+            assert!(held.value.post_fencing_abort.is_none());
+            assert_eq!(held.value.ready, legacy.ready, "nothing re-derived the evidence");
+            assert_eq!(
+                held.value.last_error.as_deref(),
+                Some(disagreement.to_string().as_str())
+            );
+            // Reported once: later ticks leave the record alone.
+            routed.world.engine.run_scheduler_tick()?;
+            assert_eq!(resident(&routed.world)?.envelope, held.envelope);
+            assert_eq!(
+                hits,
+                (
+                    routed.stub.candidate_hits.load(Ordering::SeqCst),
+                    routed.stub.stable_hits.load(Ordering::SeqCst)
+                ),
+                "a held transaction is asked nothing"
+            );
+            routed.assert_odin_untouched()?;
+
+            // An abort already under way is not held: it never reads the class.
+            let mut aborting = held.value.clone();
+            aborting.post_fencing_abort = Some(post_fencing_abort_intent(&aborting, "operator abort"));
+            replace_transaction(&routed.world.state_store, &held, &aborting)?;
+            let after = resident(&routed.world)?;
+            let _ = routed.world.engine.resume_candidate(&after);
+            assert_ne!(
+                resident(&routed.world)?.value.last_error.as_deref(),
+                Some(disagreement.to_string().as_str()),
+                "an abort in progress runs instead of being held"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn a_pre_b3_generation_over_a_route_proof_target_boots_and_is_reported_not_refreshed()
+        -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            let at_routing = routed.transaction()?;
+            routed.promote_by_hand()?;
+            routed.step()?;
+
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            let current = snapshot.admitted.first().context("nothing was admitted")?;
+            let receipt = odin_receipt_for(&routed, &at_routing, 9)?;
+            let mut legacy = current.value.clone();
+            legacy.ready = ReadinessEvidence::OdinCorrelated {
+                evidence: receipt.clone(),
+            };
+            legacy.latest_odin_observation = Some(receipt);
+            // Receipts that would not authenticate if they were re-proved: the
+            // authority is another key's. Held generations are not re-proved.
+            let stranger = cultnet_rs::enroll_service_identity_at::<OdinTopologyIdentity>(
+                &routed.world.root.join("identities/stranger.cc"),
+            )?;
+            legacy.odin_authority = Some(AdmittedOdinAuthority::from_anchor(&stranger.trust_anchor()?)?);
+            legacy.odin_publisher_sequence_cursor = 9;
+            assert!(
+                SingleFileMessagePackBackingStore::new(&routed.world.state_store)
+                    .compare_exchange(
+                        &[CultCacheExpectedEnvelope {
+                            r#type: AdmittedGeneration::TYPE.into(),
+                            key: legacy.target.clone(),
+                            current: Some(current.envelope.clone()),
+                        }],
+                        &[admitted_envelope(&legacy, now_millis()?)?],
+                    )?
+            );
+
+            assert_eq!(
+                legacy.readiness(),
+                Err(ReadinessDisagreement::WrongVoucher {
+                    target: "service".into(),
+                    required: ReadinessClass::RouteProof,
+                    collected: Voucher::Odin,
+                })
+            );
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            let current = snapshot.admitted.first().context("the generation is gone")?;
+            // The class chooses the path: no Odin receipt is re-proved at boot
+            // and none is refreshed, though the evidence is an Odin receipt.
+            routed.world.engine.validate_durable_authority(&snapshot)?;
+            assert!(!routed.world.engine.refresh_admitted_topology(&snapshot, current)?);
+            routed.assert_odin_untouched()?;
+
+            routed.world.engine.supervise_one_admitted_generation()?;
+            assert!(
+                routed
+                    .world
+                    .engine
+                    .fault_reports
+                    .lock()
+                    .unwrap()
+                    .contains_key("generation:service"),
+                "supervision reports the disagreement"
+            );
+            routed.assert_odin_untouched()?;
+            Ok(())
+        }
+
+        #[test]
+        fn a_stored_record_that_declares_no_way_to_prove_readiness_is_held() -> Result<()> {
+            let world = EngineFixture::new()?;
+            // Odin's store is unreadable: any read of it is an error.
+            std::fs::write(&world.engine.options.odin_correlation_store, b"odin is not a cache")?;
+
+            let (_, mut generation) = fixture_generation(FIXTURE_GENERATION)?;
+            let target = generation.expected.target.clone();
+            assert_eq!(generation.readiness(), Ok(ReadinessClass::OdinCorrelated));
+            generation.expected.dependencies.clear();
+            generation.expected.route = None;
+            let undeclared = UndeclaredReadiness { target: target.clone() };
+            assert_eq!(
+                generation.readiness(),
+                Err(ReadinessDisagreement::Undeclared(undeclared.clone()))
+            );
+            assert!(
+                !world
+                    .engine
+                    .refresh_admitted_topology(&ControlSnapshot::default(), &stored(&generation))?
+            );
+
+            // The mirror: Odin declared, but the receipt is the candidate's.
+            let (_, mut odin_class) = fixture_generation(FIXTURE_GENERATION)?;
+            odin_class.ready = route_proof_evidence();
+            assert_eq!(
+                odin_class.readiness(),
+                Err(ReadinessDisagreement::WrongVoucher {
+                    target: target.clone(),
+                    required: ReadinessClass::OdinCorrelated,
+                    collected: Voucher::Candidate,
+                })
+            );
+
+            // A transaction says the same about what it has collected.
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            let (evidence, _) = routed.answer_now()?;
+            let odin_world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+            let seeded = transaction_at(&odin_world, DeploymentPhase::Warming)?;
+            assert_eq!(seeded.readiness_disagreement(), None);
+            let mut collected = seeded.clone();
+            collected.warming = Some(WarmingEvidence::RouteProofDirect { evidence });
+            assert_eq!(
+                collected.readiness_disagreement(),
+                Some(ReadinessDisagreement::WrongVoucher {
+                    target: "service".into(),
+                    required: ReadinessClass::OdinCorrelated,
+                    collected: Voucher::Candidate,
+                })
+            );
+            let mut bare = seeded.clone();
+            bare.expected.as_mut().unwrap().dependencies.clear();
+            assert_eq!(
+                bare.readiness_disagreement(),
+                Some(ReadinessDisagreement::Undeclared(UndeclaredReadiness {
+                    target: "service".into()
+                }))
+            );
+            let mut no_expected = seeded;
+            no_expected.expected = None;
+            assert_eq!(no_expected.readiness_disagreement(), None);
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // Odin is whichever target provides the rendezvous.
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn odin_is_the_target_that_provides_the_rendezvous_not_the_target_named_odin() -> Result<()> {
+            let world = EngineFixture::new()?;
+            let (_, fixture) = fixture_generation(FIXTURE_GENERATION)?;
+
+            // A target named "odin" that merely depends on Odin is not Odin.
+            let mut named = fixture.clone();
+            named.target = "odin".into();
+            named.expected.target = "odin".into();
+            let mut snapshot = ControlSnapshot::default();
+            snapshot.admitted.push(stored(&named));
+            assert!(snapshot.admitted_odin().is_none());
+            assert_eq!(
+                world.engine.current_odin_authority(&snapshot)?,
+                world.engine.bootstrap_odin_authority
+            );
+
+            // The target that provides the rendezvous is, whatever it is called.
+            let mut provider = fixture.clone();
+            provider.target = "verse".into();
+            provider.expected.target = "verse".into();
+            provider.expected.dependencies.clear();
+            provide_odin(&mut provider.expected);
+            let authority = AdmittedOdinAuthority::from_anchor(&world.odin_signer.trust_anchor()?)?;
+            provider.odin_authority = Some(authority.clone());
+            snapshot.admitted.push(stored(&provider));
+            assert_eq!(
+                snapshot.admitted_odin().map(|found| found.value.target.as_str()),
+                Some("verse")
+            );
+            assert_eq!(
+                snapshot.admitted_odin().and_then(|found| found.value.odin_authority.clone()),
+                Some(authority)
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn a_target_that_provides_the_rendezvous_warms_as_odin_whatever_it_is_named() -> Result<()> {
+            // Nothing else has been admitted that could observe it, so Odin
+            // observes itself directly -- and only a stateful incarnation may.
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, true)?;
+            assert_eq!(routed.transaction()?.target, "service");
+            let refusal = routed
+                .step()
+                .expect_err("a stateless Odin cannot be observed directly");
+            assert!(
+                format!("{refusal:#}").contains("direct Odin warming must be a stateful incarnation"),
+                "{refusal:#}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn direct_odin_warming_is_reserved_to_odin_by_class_not_by_name() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            let mut named = routed.transaction()?;
+            named.target = "odin".into();
+            let error = routed
+                .world
+                .engine
+                .authenticate_first_odin_warming_presence(&named, "warming-probe", 1, 2, &[1])
+                .expect_err("a target named odin that is not Odin");
+            assert!(
+                format!("{error:#}").contains("reserved for a stateful Odin incarnation"),
+                "{error:#}"
+            );
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // A bad answer is an error. Only silence waits.
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn a_bad_answer_to_a_challenge_is_an_error_and_only_silence_waits() -> Result<()> {
+            for reply in [Reply::ForeignChallengeId, Reply::HttpFailure] {
+                let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+                *routed.stub.reply.lock().unwrap() = reply;
+                let error = match routed.world.engine.challenge_candidate(
+                    &routed.transaction()?,
+                    &["warming"],
+                    None,
+                ) {
+                    Err(error) => error,
+                    Ok(_) => bail!("a bad answer was taken for silence"),
+                };
+                assert!(
+                    matches!(
+                        error.downcast_ref::<ChallengeFailure>(),
+                        Some(ChallengeFailure::Refused(_))
+                    ),
+                    "{error:#}"
+                );
+                // Before the fence a candidate that answers wrongly is aborted,
+                // not waited on.
+                routed.world.engine.run_scheduler_tick()?;
+                let after = routed.transaction()?;
+                assert!(after.pre_fencing_abort.is_some(), "the bad answer aborted it");
+                assert!(after.warming.is_none());
+            }
+
+            let silent = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            silent.stub.hang_up.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                silent.world.engine.challenge_candidate(&silent.transaction()?, &["warming"], None)?,
+                CandidateAnswer::Silent(_)
+            ));
             Ok(())
         }
     }
