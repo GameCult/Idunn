@@ -1609,7 +1609,6 @@ struct AdmittedGeneration {
 struct OdinReceipts<'a> {
     ready: &'a TopologyEvidence,
     latest: &'a TopologyEvidence,
-    authority: &'a AdmittedOdinAuthority,
 }
 
 impl AdmittedGeneration {
@@ -1619,11 +1618,10 @@ impl AdmittedGeneration {
             &self.latest_odin_observation,
             &self.odin_authority,
         ) {
-            (ReadinessEvidence::OdinCorrelated { evidence }, Some(latest), Some(authority)) => {
+            (ReadinessEvidence::OdinCorrelated { evidence }, Some(latest), Some(_)) => {
                 Ok(OdinReceipts {
                     ready: evidence,
                     latest,
-                    authority,
                 })
             }
             _ => bail!("admitted generation of {} is not Odin-correlated", self.target),
@@ -2420,9 +2418,10 @@ fn command_envelope(value: &DeploymentCommand, now: u64) -> Result<CultCacheEnve
 
 /// The transaction layout of v2 and v3 records: `ready` is a bare Odin receipt,
 /// and there are no phase deadline or lease adoption slots. It exists only to
-/// decode records written before v4; `migrate_control_store_to_current_schema`
-/// rewrites every one at boot, so this struct dies once no v2 or v3 record can
-/// remain in `control.cc` or `history.cc`.
+/// decode records written before v4. `migrate_control_store_to_current_schema`
+/// rewrites every one in `control.cc` at boot, but `history.cc` is never
+/// migrated or pruned, so this struct dies only when history is pruned or
+/// migrated.
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(
     type = "idunn.deployment_transaction",
@@ -2860,20 +2859,61 @@ fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
     if !path.exists() {
         return Vec::new();
     }
-    let Ok(envelopes) = SingleFileMessagePackBackingStore::new(&path).pull_all_read_only_snapshot()
-    else {
-        return Vec::new();
+    let envelopes = match SingleFileMessagePackBackingStore::new(&path).pull_all_read_only_snapshot()
+    {
+        Ok(envelopes) => envelopes,
+        Err(error) => {
+            eprintln!(
+                "Idunn cannot read {}: {error:#}; every archived transaction is invisible \
+                 to status and to continuity backoff",
+                path.display()
+            );
+            return Vec::new();
+        }
     };
-    envelopes
+    let (transactions, undecodable) = decode_history_transactions(envelopes);
+    if !undecodable.is_empty() {
+        for (key, error) in &undecodable {
+            eprintln!("Idunn history holds an undecodable transaction {key}: {error}");
+        }
+        eprintln!(
+            "Idunn history: {} archived transaction(s) could not be decoded and are not counted \
+             by status or continuity backoff",
+            undecodable.len()
+        );
+    }
+    transactions
+}
+
+/// Decode every archived transaction. An entry that fails is returned with its
+/// key and reason instead of vanishing, so the reader can say how many records
+/// its answer is missing.
+///
+/// `LegacyDeploymentTransaction` decodes the v2 and v3 layouts. `history.cc` is
+/// never migrated or pruned, so it dies only when history is pruned or
+/// migrated, not at boot.
+fn decode_history_transactions(
+    envelopes: Vec<CultCacheEnvelope>,
+) -> (Vec<DeploymentTransaction>, Vec<(String, String)>) {
+    let mut transactions = Vec::new();
+    let mut undecodable = Vec::new();
+    for envelope in envelopes
         .into_iter()
         .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
-        .filter_map(|envelope| match envelope.schema_id.as_deref() {
+    {
+        let decoded = match envelope.schema_id.as_deref() {
             Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2 | DEPLOYMENT_TRANSACTION_SCHEMA_V3) => {
-                lift_legacy_transaction(&envelope).ok()
+                lift_legacy_transaction(&envelope)
             }
-            _ => rmp_serde::from_slice::<DeploymentTransaction>(&envelope.payload).ok(),
-        })
-        .collect()
+            _ => rmp_serde::from_slice::<DeploymentTransaction>(&envelope.payload)
+                .map_err(anyhow::Error::from),
+        };
+        match decoded {
+            Ok(transaction) => transactions.push(transaction),
+            Err(error) => undecodable.push((envelope.key, format!("{error:#}"))),
+        }
+    }
+    (transactions, undecodable)
 }
 
 /// Consumed commands, read as leniently as their transactions.
@@ -3461,10 +3501,16 @@ impl Engine {
     }
 
     fn current_odin_authority(&self, snapshot: &ControlSnapshot) -> Result<AdmittedOdinAuthority> {
-        let authority = snapshot
-            .admitted_for("odin")
-            .and_then(|stored| stored.value.odin_authority.clone())
-            .unwrap_or_else(|| self.bootstrap_odin_authority.clone());
+        // The bootstrap key stands only until Odin itself is admitted. Once it
+        // is, its own generation names the authority; an admitted Odin that
+        // carries none has no authority to name, and falling back to the
+        // bootstrap key would let a stale key vouch for the Verse.
+        let authority = match snapshot.admitted_for("odin") {
+            None => self.bootstrap_odin_authority.clone(),
+            Some(stored) => stored.value.odin_authority.clone().with_context(|| {
+                "admitted Odin generation carries no Odin authority (route-proof readiness)"
+            })?,
+        };
         authority.validate()?;
         Ok(authority)
     }
@@ -9034,7 +9080,7 @@ mod tests {
             let odin = lifted.odin_receipts()?;
             assert_eq!(odin.ready, &legacy.ready);
             assert_eq!(odin.latest, &legacy.latest_odin_observation);
-            assert_eq!(odin.authority, &legacy.odin_authority);
+            assert_eq!(lifted.odin_authority.as_ref(), Some(&legacy.odin_authority));
             assert_eq!(
                 lifted.odin_publisher_sequence_cursor,
                 legacy.odin_publisher_sequence_cursor
@@ -9292,7 +9338,11 @@ mod tests {
             next_restart_at_unix_millis: Some(8),
         };
         let committing = fixture_transaction(FIXTURE_TRANSACTIONS[4].1)?.1;
-        let authority = incumbent.odin_receipts()?.authority.clone();
+        incumbent.odin_receipts()?;
+        let authority = incumbent
+            .odin_authority
+            .clone()
+            .context("fixture generation has no Odin authority")?;
         let next = AdmittedGeneration::from_transaction(
             &committing,
             authority.clone(),
@@ -9827,6 +9877,389 @@ mod tests {
         );
         transaction.enter_phase(DeploymentPhase::Complete, base + 3_000);
         assert_eq!(transaction.phase_deadline, None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_undecodable_history_record_is_counted_and_never_dropped_silently() -> Result<()> {
+        let (finished, _) = terminal_transaction_with_command("ghostlight")?;
+        let good = transaction_envelope(&finished, finished.updated_at_unix_millis)?;
+        let mut torn = good.clone();
+        torn.key = "tx-torn".into();
+        // 0xc1 is msgpack's never-used byte: decodable by nothing.
+        torn.payload = vec![0xc1];
+        let mut foreign = good.clone();
+        foreign.key = "tx-foreign".into();
+        foreign.schema_id = Some(DEPLOYMENT_TRANSACTION_SCHEMA_V3.into());
+        foreign.payload = vec![0xc1];
+
+        let (decoded, undecodable) =
+            decode_history_transactions(vec![good, torn, foreign]);
+        assert_eq!(decoded, [finished]);
+        assert_eq!(
+            undecodable.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            ["tx-torn", "tx-foreign"]
+        );
+        assert!(undecodable.iter().all(|(_, error)| !error.is_empty()));
+        Ok(())
+    }
+
+    /// The layout `IsolationEvidence` had before c848459 turned it into an
+    /// untagged Linux/Host enum. That commit claimed old records decode
+    /// unchanged; this is the check with the old shape itself.
+    #[test]
+    fn isolation_evidence_from_before_the_host_variant_still_decodes() -> Result<()> {
+        #[derive(Serialize)]
+        struct BeforeTheHostVariant {
+            candidate_uid: u32,
+            candidate_pid_namespace_id: u64,
+            candidate_mount_namespace_id: u64,
+            incumbent_uid: Option<u32>,
+            incumbent_pid_namespace_id: Option<u64>,
+            incumbent_mount_namespace_id: Option<u64>,
+        }
+        for incumbent in [None, Some(7)] {
+            let old = BeforeTheHostVariant {
+                candidate_uid: 61_000,
+                candidate_pid_namespace_id: 4_026_531_836,
+                candidate_mount_namespace_id: 4_026_531_841,
+                incumbent_uid: incumbent,
+                incumbent_pid_namespace_id: incumbent.map(|_| 8),
+                incumbent_mount_namespace_id: incumbent.map(|_| 9),
+            };
+            for bytes in [rmp_serde::to_vec(&old)?, rmp_serde::to_vec_named(&old)?] {
+                let decoded: IsolationEvidence = rmp_serde::from_slice(&bytes)?;
+                let IsolationEvidence::Linux(linux) = decoded else {
+                    bail!("an old Linux record decoded as a host record");
+                };
+                assert_eq!(linux.candidate_uid, 61_000);
+                assert_eq!(linux.incumbent_uid, incumbent);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_admitted_odin_without_odin_authority_is_refused_not_replaced_by_the_bootstrap_key() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let empty = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(
+            world.engine.current_odin_authority(&empty)?,
+            world.engine.bootstrap_odin_authority
+        );
+
+        let (_, mut odin) = fixture_generation(FIXTURE_GENERATION)?;
+        odin.target = "odin".into();
+        odin.odin_authority = Some(AdmittedOdinAuthority::from_anchor(
+            &world.odin_signer.trust_anchor()?,
+        )?);
+        let mut with_authority = ControlSnapshot::default();
+        with_authority.admitted.push(Stored {
+            value: odin.clone(),
+            envelope: CultCacheEnvelope {
+                key: "odin".into(),
+                r#type: AdmittedGeneration::TYPE.into(),
+                payload: Vec::new(),
+                stored_at: "1970-01-01T00:00:00.100Z".into(),
+                schema_id: Some(ADMITTED_GENERATION_SCHEMA.into()),
+            },
+        });
+        assert_eq!(
+            world.engine.current_odin_authority(&with_authority)?,
+            odin.odin_authority.clone().unwrap()
+        );
+
+        odin.odin_authority = None;
+        let mut without = ControlSnapshot::default();
+        without.admitted.push(Stored {
+            value: odin.clone(),
+            envelope: CultCacheEnvelope {
+                key: "odin".into(),
+                r#type: AdmittedGeneration::TYPE.into(),
+                payload: Vec::new(),
+                stored_at: "1970-01-01T00:00:00.100Z".into(),
+                schema_id: Some(ADMITTED_GENERATION_SCHEMA.into()),
+            },
+        });
+        let error = world
+            .engine
+            .current_odin_authority(&without)
+            .expect_err("a route-proof Odin must not fall back to the bootstrap key");
+        assert!(format!("{error:#}").contains("no Odin authority"), "{error:#}");
+        Ok(())
+    }
+
+    fn error_text(result: Result<()>) -> String {
+        format!("{:#}", result.expect_err("the record must be refused"))
+    }
+
+    /// A route-proof generation from a real admission: the world's Expected
+    /// declares no Odin dependency, so route proof is its class.
+    fn route_proof_generation() -> Result<AdmittedGeneration> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let seeded = transaction_at_fencing(&world)?;
+        odin_reports_ready(&world, &seeded, 5)?;
+        drive(&world, |transaction| {
+            transaction.phase == DeploymentPhase::Committing
+        })?;
+        let mut committing = resident(&world)?.value;
+        assert_eq!(
+            ReadinessClass::of(committing.expected.as_ref().unwrap()),
+            ReadinessClass::RouteProof
+        );
+        committing.ready = Some(route_proof_evidence());
+        committing.latest_odin_observation = None;
+        let generation = AdmittedGeneration::from_transaction(
+            &committing,
+            world.engine.bootstrap_odin_authority.clone(),
+            None,
+            now_millis()?,
+        )?;
+        generation.validate()?;
+        Ok(generation)
+    }
+
+    #[test]
+    fn a_route_proof_generation_is_admitted_only_in_its_exact_shape() -> Result<()> {
+        let generation = route_proof_generation()?;
+        assert_eq!(generation.ready.class(), ReadinessClass::RouteProof);
+        assert!(generation.odin_authority.is_none());
+        assert!(generation.latest_odin_observation.is_none());
+        assert!(generation.odin_receipts().is_err());
+
+        // Route proof carries no Odin receipt and no Odin authority.
+        let mut with_receipt = generation.clone();
+        with_receipt.latest_odin_observation = Some(topology(1, 1));
+        assert!(with_receipt.validate().is_err());
+        let mut with_authority = generation.clone();
+        with_authority.odin_authority = Some(AdmittedOdinAuthority {
+            signer_identity_id: "odin-signer".into(),
+            signer_public_key: vec![1; 32],
+        });
+        assert!(with_authority.validate().is_err());
+
+        // Its readiness evidence is checked by shape.
+        let ReadinessEvidence::RouteProof { evidence } = &generation.ready else {
+            bail!("not route proof");
+        };
+        let mut tampered = generation.clone();
+        tampered.ready = ReadinessEvidence::RouteProof {
+            evidence: RuntimePresenceEvidence {
+                canonical_sha256: sha256_id(b"another"),
+                ..evidence.clone()
+            },
+        };
+        assert!(error_text(tampered.validate()).contains("runtime presence evidence"));
+        let mut untimed = generation.clone();
+        untimed.ready = ReadinessEvidence::RouteProof {
+            evidence: RuntimePresenceEvidence {
+                admitted_at_unix_millis: evidence.challenged_at_unix_millis - 1,
+                ..evidence.clone()
+            },
+        };
+        assert!(error_text(untimed.validate()).contains("timeline"));
+        Ok(())
+    }
+
+    #[test]
+    fn odin_correlated_readiness_evidence_is_checked_by_shape() -> Result<()> {
+        let (_, generation) = fixture_generation(FIXTURE_GENERATION)?;
+        generation.validate()?;
+        let ReadinessEvidence::OdinCorrelated { evidence } = &generation.ready else {
+            bail!("fixture is not Odin-correlated");
+        };
+        for broken in [
+            TopologyEvidence {
+                canonical_sha256: sha256_id(b"another"),
+                ..evidence.clone()
+            },
+            TopologyEvidence {
+                publisher_sequence: 0,
+                ..evidence.clone()
+            },
+            TopologyEvidence {
+                admitted_at_unix_millis: 0,
+                ..evidence.clone()
+            },
+        ] {
+            let mut tampered = generation.clone();
+            tampered.ready = ReadinessEvidence::OdinCorrelated { evidence: broken };
+            assert!(tampered.validate().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lease_adoption_evidence_is_checked_by_shape_on_the_transaction() -> Result<()> {
+        let (_, transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[2].1)?;
+        let adoption = LeaseAdoptionEvidence {
+            write_lease_sha256: sha256_id(b"lease"),
+            signed_presence_sha256: sha256_id(b"presence"),
+            source: AdoptionSource::Direct,
+            observed_at_unix_millis: 100,
+        };
+        let refused = |change: fn(&mut LeaseAdoptionEvidence)| {
+            let mut adopting = transaction.clone();
+            let mut evidence = adoption.clone();
+            change(&mut evidence);
+            adopting.lease_adoption = Some(evidence);
+            error_text(adopting.validate())
+        };
+        assert!(refused(|evidence| evidence.write_lease_sha256.clear())
+            .contains("adopted lease digest"));
+        assert!(refused(|evidence| evidence.signed_presence_sha256 = "no spaces allowed".into())
+            .contains("presence digest"));
+        assert!(refused(|evidence| evidence.observed_at_unix_millis = 0)
+            .contains("no observation time"));
+        // Well-formed but naming no granted lease: the record is refused for
+        // that reason and no other.
+        assert!(refused(|_| {}).contains("does not name the granted lease"));
+        Ok(())
+    }
+
+    #[test]
+    fn route_supervision_and_continuity_backoff_are_checked_on_the_generation() -> Result<()> {
+        let (_, generation) = fixture_generation(FIXTURE_GENERATION)?;
+        generation.validate()?;
+        let supervised = |change: fn(&mut RouteSupervisionState)| {
+            let mut tampered = generation.clone();
+            change(tampered.route_supervision.as_mut().unwrap());
+            error_text(tampered.validate())
+        };
+        assert!(supervised(|state| state.degraded_since_unix_millis = Some(0))
+            .contains("no start time"));
+        assert!(supervised(|state| state.actuations.count = 1)
+            .contains("count but no start"));
+        let mut degraded = generation.clone();
+        let state = degraded.route_supervision.as_mut().unwrap();
+        state.degraded_since_unix_millis = Some(5);
+        state.actuations = ActuationWindow {
+            window_started_at_unix_millis: 5,
+            count: 2,
+        };
+        degraded.validate()?;
+
+        let mut backoff = generation.clone();
+        backoff.continuity_backoff.attempts = 2;
+        assert!(error_text(backoff.validate()).contains("attempts but no window"));
+        backoff.continuity_backoff.window_started_at_unix_millis = Some(5);
+        backoff.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn max_odin_sequence_counts_admitted_generations_by_target_and_signer() -> Result<()> {
+        let (_, mut generation) = fixture_generation(FIXTURE_GENERATION)?;
+        let authority = generation.odin_authority.clone().context("no authority")?;
+        generation.odin_publisher_sequence_cursor = 88;
+        let target = generation.target.clone();
+        let snapshot = ControlSnapshot {
+            commands: Vec::new(),
+            transactions: Vec::new(),
+            admitted: vec![Stored {
+                envelope: CultCacheEnvelope {
+                    key: target.clone(),
+                    r#type: AdmittedGeneration::TYPE.into(),
+                    payload: Vec::new(),
+                    stored_at: "1970-01-01T00:00:00.100Z".into(),
+                    schema_id: Some(ADMITTED_GENERATION_SCHEMA.into()),
+                },
+                value: generation,
+            }],
+        };
+        assert_eq!(snapshot.max_odin_sequence(&target, &authority.signer_identity_id), 88);
+        assert_eq!(snapshot.max_odin_sequence(&target, "another-signer"), 0);
+        assert_eq!(
+            snapshot.max_odin_sequence("another-target", &authority.signer_identity_id),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_holding_a_lifted_legacy_generation_reads_and_keeps_its_key_honest() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = temp.path().join("control.cc");
+        let envelope = fixture_envelope(FIXTURE_GENERATION, AdmittedGeneration::TYPE)?;
+        let backing = SingleFileMessagePackBackingStore::new(&store);
+        backing.insert_entry_if_absent(envelope.clone())?;
+
+        let snapshot = ControlSnapshot::read(&store)?;
+        assert_eq!(snapshot.admitted.len(), 1);
+        let lifted = &snapshot.admitted[0].value;
+        assert_eq!(lifted.target, envelope.key);
+        assert_eq!(lifted.ready.class(), ReadinessClass::OdinCorrelated);
+        assert!(snapshot.admitted_for(&envelope.key).is_some());
+
+        // The lifted record is held to the same key rule as a current one.
+        let other = temp.path().join("misfiled.cc");
+        let mut misfiled = envelope;
+        misfiled.key = "not-its-target".into();
+        SingleFileMessagePackBackingStore::new(&other).insert_entry_if_absent(misfiled)?;
+        assert!(error_text(ControlSnapshot::read(&other).map(|_| ()))
+            .contains("admitted generation key is not its target"));
+        Ok(())
+    }
+
+    /// Replace Odin's one correlation for the incarnation with a newer one.
+    fn odin_republishes(
+        world: &EngineFixture,
+        transaction: &DeploymentTransaction,
+        sequence: u64,
+    ) -> Result<()> {
+        let path = &world.engine.options.odin_correlation_store;
+        let store = SingleFileMessagePackBackingStore::new(path);
+        let existing = store.pull_all_read_only_snapshot()?;
+        assert!(store.delete_batch_if_unchanged(&existing)?);
+        odin_reports_ready(world, transaction, sequence)
+    }
+
+    fn ready_sequence(transaction: &DeploymentTransaction) -> Option<u64> {
+        transaction
+            .ready
+            .as_ref()
+            .and_then(ReadinessEvidence::odin)
+            .map(|evidence| evidence.publisher_sequence)
+    }
+
+    #[test]
+    fn a_newer_odin_reading_refreshes_the_receipt_before_awaiting_ready_or_routing_advance()
+    -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let seeded = transaction_at_fencing(&world)?;
+        odin_reports_ready(&world, &seeded, 5)?;
+
+        // AwaitingReady: the receipt is written, then confirmed, then the
+        // phase advances only on a receipt equal to the latest reading.
+        drive(&world, |transaction| {
+            transaction.phase == DeploymentPhase::AwaitingReady
+                && ready_sequence(transaction) == Some(5)
+        })?;
+        odin_republishes(&world, &seeded, 6)?;
+        world.engine.advance_transaction(&resident(&world)?)?; // admits 6
+        let admitted = resident(&world)?.value;
+        assert_eq!(admitted.phase, DeploymentPhase::AwaitingReady);
+        assert_eq!(admitted.latest_odin_observation.as_ref().unwrap().publisher_sequence, 6);
+        assert_eq!(ready_sequence(&admitted), Some(5));
+        world.engine.advance_transaction(&resident(&world)?)?; // refreshes Ready to 6
+        let refreshed = resident(&world)?.value;
+        assert_eq!(refreshed.phase, DeploymentPhase::AwaitingReady);
+        assert_eq!(ready_sequence(&refreshed), Some(6));
+        world.engine.advance_transaction(&resident(&world)?)?;
+        assert_eq!(resident(&world)?.value.phase, DeploymentPhase::Routing);
+
+        // Routing: route admission demands a receipt equal to the latest
+        // reading, so a newer one is adopted before anything is routed.
+        odin_republishes(&world, &seeded, 7)?;
+        world.engine.advance_transaction(&resident(&world)?)?; // admits 7
+        assert_eq!(ready_sequence(&resident(&world)?.value), Some(6));
+        world.engine.advance_transaction(&resident(&world)?)?; // refreshes Ready to 7
+        let routing = resident(&world)?.value;
+        assert_eq!(routing.phase, DeploymentPhase::Routing);
+        assert_eq!(ready_sequence(&routing), Some(7));
+        assert!(routing.routing.is_none());
+        world.engine.advance_transaction(&resident(&world)?)?;
+        assert!(resident(&world)?.value.routing.is_some());
         Ok(())
     }
 

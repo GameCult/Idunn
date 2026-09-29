@@ -467,6 +467,9 @@ pub fn select_dependencies(
 /// overrides any of them; the resolved values are frozen into the plan.
 pub const DEFAULT_FENCING_DEADLINE_SECONDS: u32 = 120;
 pub const DEFAULT_LEASING_DEADLINE_SECONDS: u32 = 120;
+// Unsafe for streampixels-service (startup = "create-or-open-after-write-lease"):
+// its Postgres migrations run inside AwaitingReady. B5 requires an explicit
+// binding value for stateful targets instead of this default.
 pub const DEFAULT_AWAITING_READY_DEADLINE_SECONDS: u32 = 300;
 pub const DEFAULT_ROUTING_DEADLINE_SECONDS: u32 = 120;
 pub const DEFAULT_COMMITTING_DEADLINE_SECONDS: u32 = 120;
