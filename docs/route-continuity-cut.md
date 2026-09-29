@@ -83,6 +83,22 @@ Nothing is fenced, so the incumbent is untouched.
 - `cargo mutants --in-diff`: 24 caught, 0 missed.
 - A narrow Soul pass gates the install.
 
+**Ship log, 2026-09-29 (host clock).**
+- B3 merged at `d32395a` and installed on Yggdrasil at 18:36 UTC, with sha `854aa351`. It migrated 5 control
+  records. The store backup is `/root/idunn-store-backup-20260929T183604Z-pre-route-b3`.
+- Nginx reloads fell from 82 per 10 minutes to 0. Odin continuity timeouts fell from 92 in 6 hours to 0.
+- **Raven's actuator (built 2026-09-11) could not decode the new plan types.** A rebuild then found that the
+  Windows `idunn-host` has not compiled since S1: `FROZEN_SOURCE_SYMLINK_TARGET_LIMIT` was defined for unix
+  only. That is fixed at `d3db582`.
+  - The new actuator (sha `f36bf1fc`) is swapped in on Raven. The old one is kept as
+    `idunn-host.exe.prev-20260929T190006Z`.
+  - Follow-up: nothing builds the Windows actuator in verification.
+- raven-muninn was admitted at 19:02 by Odin correlation, replacing the held generation.
+- **The streampixels-service deploy failed before fencing.** The S1 `bulk_fetch_objects` asks for bare blob
+  ids with `git fetch --stdin`. In a `blob:none` clone, the connectivity check then fails with "bad revision
+  <blob>". The fix, with a test, is in Hands on `fix/bulk-blob-fetch`: a promisor-style fetch with
+  `--filter=blob:none` and `fetch.negotiationAlgorithm=noop`.
+
 **Ruling, 2026-09-30 (operator): the dead-hold report is stored on the generation.**
 - Add an optional `last_error` to `AdmittedGeneration` (new key 21), and make `status` render admitted
   generations.
