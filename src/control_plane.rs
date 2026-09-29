@@ -262,20 +262,36 @@ impl RuntimePresenceEvidence {
 enum WarmingEvidence {
     OdinTopology { evidence: TopologyEvidence },
     FirstOdinDirect { evidence: RuntimePresenceEvidence },
+    /// A route-proof target's candidate answered Idunn's challenge itself.
+    RouteProofDirect { evidence: RuntimePresenceEvidence },
 }
 
 impl WarmingEvidence {
     fn validate_shape(&self) -> Result<()> {
         match self {
             Self::OdinTopology { evidence } => evidence.validate_shape(),
-            Self::FirstOdinDirect { evidence } => evidence.validate_shape(),
+            Self::FirstOdinDirect { evidence } | Self::RouteProofDirect { evidence } => {
+                evidence.validate_shape()
+            }
         }
     }
 
     fn canonical_sha256(&self) -> &str {
         match self {
             Self::OdinTopology { evidence } => &evidence.canonical_sha256,
-            Self::FirstOdinDirect { evidence } => &evidence.canonical_sha256,
+            Self::FirstOdinDirect { evidence } | Self::RouteProofDirect { evidence } => {
+                &evidence.canonical_sha256
+            }
+        }
+    }
+
+    /// The presence Idunn challenged for itself, when no Odin carried it.
+    fn direct(&self) -> Option<&RuntimePresenceEvidence> {
+        match self {
+            Self::OdinTopology { .. } => None,
+            Self::FirstOdinDirect { evidence } | Self::RouteProofDirect { evidence } => {
+                Some(evidence)
+            }
         }
     }
 }
@@ -315,21 +331,24 @@ impl SequenceAdmittedWarming {
         })
     }
 
-    fn from_first_odin_presence(
+    fn from_direct_presence(
         transaction_id: String,
-        evidence: RuntimePresenceEvidence,
+        warming: WarmingEvidence,
         present: cultnet_rs::VerifiedRuntimePresence,
     ) -> Result<Self> {
+        let evidence = warming
+            .direct()
+            .context("direct Warming evidence is an Odin topology receipt")?;
         ensure!(
             present.canonical_bytes() == evidence.canonical_bytes
                 && present.signed_presence_sha256() == evidence.canonical_sha256,
-            "direct first-Odin Warming evidence differs from its authenticated presence"
+            "direct Warming evidence differs from its authenticated presence"
         );
         let runtime_instance_id = present.record().runtime_instance_id.clone();
         Ok(Self {
             transaction_id,
             signed_presence_sha256: evidence.canonical_sha256.clone(),
-            evidence: WarmingEvidence::FirstOdinDirect { evidence },
+            evidence: warming,
             runtime_instance_id,
         })
     }
@@ -526,24 +545,58 @@ impl RoutingEvidence {
     }
 }
 
+/// The states a route-proof candidate may answer its Warming challenge in. A
+/// stateful one is warming until it holds a lease it cannot hold yet, and the
+/// lease binds that warming presence. A stateless one may have finished
+/// warming before the first challenge landed.
+fn route_proof_warming_states(expected: &IdunnExpectedIncarnationRecord) -> &'static [&'static str] {
+    if expected.write_lease_required {
+        &["warming"]
+    } else {
+        &["warming", "active"]
+    }
+}
+
+/// What a direct challenge to a candidate endpoint produced.
+enum CandidateAnswer {
+    /// No answer: the reason it is still being waited on.
+    Silent(String),
+    Answered {
+        evidence: RuntimePresenceEvidence,
+        present: cultnet_rs::VerifiedRuntimePresence,
+    },
+}
+
 /// Which kind of proof admits a target as Ready. Derived from the target's
 /// Expected, never stored: Expected is digest-bound, so the class cannot drift
 /// from the incarnation it describes. A target that declares a
 /// `shared-infrastructure odin.verse-rendezvous` dependency advertises into the
-/// Verse and is Odin-correlated; one that declares none is route-proof.
+/// Verse and is Odin-correlated; a routed one that declares none is
+/// route-proof. Odin itself provides the rendezvous capability rather than
+/// depending on it. It collects the same receipts an Odin-correlated target
+/// does, and its admitted generation is what names the Odin authority, so it
+/// is never route-proof. A target with no route has no endpoint to challenge,
+/// so only Odin can report on it and it stays Odin-correlated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadinessClass {
+    OdinSelf,
     OdinCorrelated,
     RouteProof,
 }
 
 impl ReadinessClass {
     fn of(expected: &IdunnExpectedIncarnationRecord) -> Self {
+        let provides_odin = expected
+            .capabilities
+            .iter()
+            .any(|capability| capability.capability == ODIN_RENDEZVOUS_CAPABILITY);
         let declares_odin = expected.dependencies.iter().any(|dependency| {
             dependency.kind == "shared-infrastructure"
                 && dependency.capability == ODIN_RENDEZVOUS_CAPABILITY
         });
-        if declares_odin {
+        if provides_odin {
+            Self::OdinSelf
+        } else if declares_odin || expected.route.is_none() {
             Self::OdinCorrelated
         } else {
             Self::RouteProof
@@ -1334,6 +1387,12 @@ impl DeploymentTransaction {
                     self.target == "odin",
                     "direct Warming evidence is reserved for Odin observing itself"
                 ),
+                WarmingEvidence::RouteProofDirect { .. } => ensure!(
+                    self.expected.as_ref().is_none_or(|expected| {
+                        ReadinessClass::of(expected) == ReadinessClass::RouteProof
+                    }),
+                    "direct route-proof Warming evidence for a target Odin observes"
+                ),
             }
         }
         if let Some(leasing) = &self.leasing {
@@ -1786,7 +1845,7 @@ impl AdmittedGeneration {
 
     fn from_transaction(
         transaction: &DeploymentTransaction,
-        odin_authority: AdmittedOdinAuthority,
+        odin_authority: Option<AdmittedOdinAuthority>,
         incumbent: Option<&AdmittedGeneration>,
         now: u64,
     ) -> Result<Self> {
@@ -1795,15 +1854,15 @@ impl AdmittedGeneration {
             "only Committing can create an admitted generation"
         );
         let ready = required(&transaction.ready, "Ready receipt")?.clone();
-        let (latest_odin_observation, odin_authority) = match ready.class() {
-            ReadinessClass::OdinCorrelated => (
+        let (latest_odin_observation, odin_authority) = match &ready {
+            ReadinessEvidence::OdinCorrelated { .. } => (
                 Some(
                     required(&transaction.latest_odin_observation, "latest Odin receipt")?
                         .clone(),
                 ),
-                Some(odin_authority),
+                Some(required(&odin_authority, "Odin authority")?.clone()),
             ),
-            ReadinessClass::RouteProof => (None, None),
+            ReadinessEvidence::RouteProof { .. } => (None, None),
         };
         let routing = required(&transaction.routing, "route disposition")?.clone();
         let route_supervision = matches!(&routing, RoutingEvidence::Promoted { .. }).then(|| {
@@ -3890,7 +3949,28 @@ impl Engine {
                             &evidence.canonical_bytes,
                         )?;
                     }
+                    WarmingEvidence::RouteProofDirect { evidence } => {
+                        self.reauthenticate_route_proof(
+                            transaction,
+                            evidence,
+                            route_proof_warming_states(required(
+                                &transaction.expected,
+                                "Warming Expected projection",
+                            )?),
+                            None,
+                            evidence.admitted_at_unix_millis,
+                        )?;
+                    }
                 }
+            }
+            if let Some(ReadinessEvidence::RouteProof { evidence }) = &transaction.ready {
+                self.reauthenticate_route_proof(
+                    transaction,
+                    evidence,
+                    &["active"],
+                    lease,
+                    evidence.admitted_at_unix_millis,
+                )?;
             }
             if let Some(evidence) = transaction.ready.as_ref().and_then(ReadinessEvidence::odin) {
                 let authenticated = self.authenticate_topology_bytes(
@@ -5253,6 +5333,30 @@ impl Engine {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let incumbent_lease_sha256 =
             self.incumbent_lease_sha256_for_warming(&snapshot, &current.value)?;
+        if current.value.warming.is_none() && ReadinessClass::of(expected) == ReadinessClass::RouteProof {
+            // A route-proof target's warming is Idunn's own challenge to the
+            // candidate endpoint. No Odin is read: the target declared no
+            // reason to be aware of one.
+            return match self.challenge_candidate(
+                &current.value,
+                route_proof_warming_states(expected),
+                None,
+            )? {
+                CandidateAnswer::Silent(reason) => self.record_gate_wait(current, &reason),
+                CandidateAnswer::Answered { evidence, present } => {
+                    let warming = WarmingEvidence::RouteProofDirect { evidence };
+                    let _token = SequenceAdmittedWarming::from_direct_presence(
+                        current.value.transaction_id.clone(),
+                        warming.clone(),
+                        present,
+                    )?;
+                    self.persist_same_phase(current, |next| {
+                        next.warming = Some(warming);
+                        Ok(())
+                    })
+                }
+            };
+        }
         if current.value.warming.is_none() {
             // Odin's warming is observed directly when nothing else can observe
             // it. That is the first bootstrap, and it is also every continuity
@@ -5287,13 +5391,14 @@ impl Engine {
                     "direct Odin warming must be a stateful incarnation"
                 );
                 let (evidence, present) = self.observe_first_odin_warming(&current.value)?;
-                let _token = SequenceAdmittedWarming::from_first_odin_presence(
+                let warming = WarmingEvidence::FirstOdinDirect { evidence };
+                let _token = SequenceAdmittedWarming::from_direct_presence(
                     current.value.transaction_id.clone(),
-                    evidence.clone(),
+                    warming.clone(),
                     present,
                 )?;
                 return self.persist_same_phase(current, |next| {
-                    next.warming = Some(WarmingEvidence::FirstOdinDirect { evidence });
+                    next.warming = Some(warming);
                     Ok(())
                 });
             }
@@ -5680,6 +5785,34 @@ impl Engine {
                 "candidate process write lease is no longer exact"
             );
         }
+        if ReadinessClass::of(expected) == ReadinessClass::RouteProof {
+            // Ready is the candidate answering Idunn's own challenge Active,
+            // holding the exact lease Idunn granted. Once recorded it is
+            // history; the stable route's challenge is what keeps proving it.
+            if matches!(
+                current.value.ready,
+                Some(ReadinessEvidence::RouteProof { .. })
+            ) {
+                return self.transition(current, DeploymentPhase::Routing);
+            }
+            let lease = current
+                .value
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::lease_sha256);
+            return match self.challenge_candidate(&current.value, &["warming", "active"], lease)? {
+                CandidateAnswer::Silent(reason) => self.record_gate_wait(current, &reason),
+                CandidateAnswer::Answered { present, .. } if present.record().state == "warming" => {
+                    self.record_gate_wait(current, "candidate is still warming")
+                }
+                CandidateAnswer::Answered { evidence, .. } => {
+                    self.persist_same_phase(current, |next| {
+                        next.ready = Some(ReadinessEvidence::RouteProof { evidence });
+                        Ok(())
+                    })
+                }
+            };
+        }
         {
             let current_lease = current
                 .value
@@ -5725,39 +5858,55 @@ impl Engine {
         let activation = required(&current.value.activation, "activation")?;
         self.observe_candidate_before_waiting(&current.value)?;
         if current.value.routing.is_none() {
-            let current_lease = current
-                .value
-                .leasing
-                .as_ref()
-                .and_then(LeasingEvidence::lease_sha256);
-            let Some((admitted, authenticated)) =
-                self.admit_latest_topology(current, current_lease)?
-            else {
-                return Ok(());
+            let admitted = if ReadinessClass::of(expected) == ReadinessClass::RouteProof {
+                // Ready is the candidate's own proof, recorded in AwaitingReady.
+                // No Odin correlation is read to admit a route.
+                ensure!(
+                    matches!(
+                        current.value.ready,
+                        Some(ReadinessEvidence::RouteProof { .. })
+                    ),
+                    "route-proof Routing without route-proof Ready evidence"
+                );
+                current.clone()
+            } else {
+                let current_lease = current
+                    .value
+                    .leasing
+                    .as_ref()
+                    .and_then(LeasingEvidence::lease_sha256);
+                let Some((admitted, authenticated)) =
+                    self.admit_latest_topology(current, current_lease)?
+                else {
+                    return Ok(());
+                };
+                if admitted.envelope != current.envelope {
+                    return Ok(());
+                }
+                ensure!(
+                    is_semantic_ready(&authenticated),
+                    "latest Odin observation is not Ready at route admission"
+                );
+                let latest = required(
+                    &admitted.value.latest_odin_observation,
+                    "current route-admission topology evidence",
+                )?;
+                if admitted.value.ready.as_ref().and_then(ReadinessEvidence::odin)
+                    != Some(latest)
+                {
+                    let latest = latest.clone();
+                    return self.persist_same_phase(&admitted, |next| {
+                        next.ready = Some(ReadinessEvidence::OdinCorrelated { evidence: latest });
+                        Ok(())
+                    });
+                }
+                let ready = self.rehydrate_ready_token(&admitted.value, now_millis()?, true)?;
+                ensure!(
+                    ready.transaction_id() == admitted.value.transaction_id,
+                    "Ready token belongs to another transaction"
+                );
+                admitted
             };
-            if admitted.envelope != current.envelope {
-                return Ok(());
-            }
-            ensure!(
-                is_semantic_ready(&authenticated),
-                "latest Odin observation is not Ready at route admission"
-            );
-            let latest = required(
-                &admitted.value.latest_odin_observation,
-                "current route-admission topology evidence",
-            )?;
-            if admitted.value.ready.as_ref().and_then(ReadinessEvidence::odin) != Some(latest) {
-                let latest = latest.clone();
-                return self.persist_same_phase(&admitted, |next| {
-                    next.ready = Some(ReadinessEvidence::OdinCorrelated { evidence: latest });
-                    Ok(())
-                });
-            }
-            let ready = self.rehydrate_ready_token(&admitted.value, now_millis()?, true)?;
-            ensure!(
-                ready.transaction_id() == admitted.value.transaction_id,
-                "Ready token belongs to another transaction"
-            );
             validate_live_providers_for_deploy(admitted.value.command_kind, || {
                 self.validate_selected_providers_current(required(
                     &admitted.value.plan,
@@ -5834,32 +5983,50 @@ impl Engine {
 
     fn advance_committing(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
         self.observe_candidate_before_waiting(&current.value)?;
-        let current_lease_sha256 = current
-            .value
-            .leasing
-            .as_ref()
-            .and_then(LeasingEvidence::lease_sha256)
-            .map(str::to_owned);
-        let Some((ready_current, authenticated)) =
-            self.admit_latest_topology(current, current_lease_sha256.as_deref())?
-        else {
-            return Ok(());
+        let route_proof = ReadinessClass::of(required(
+            &current.value.expected,
+            "Expected projection",
+        )?) == ReadinessClass::RouteProof;
+        let ready_current = if route_proof {
+            // The candidate's Ready proof is durable, and the stable route's
+            // challenge below is its currency. No Odin is read to commit.
+            ensure!(
+                matches!(
+                    current.value.ready,
+                    Some(ReadinessEvidence::RouteProof { .. })
+                ),
+                "route-proof commit without route-proof Ready evidence"
+            );
+            current.clone()
+        } else {
+            let current_lease_sha256 = current
+                .value
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::lease_sha256)
+                .map(str::to_owned);
+            let Some((ready_current, authenticated)) =
+                self.admit_latest_topology(current, current_lease_sha256.as_deref())?
+            else {
+                return Ok(());
+            };
+            if ready_current.envelope != current.envelope {
+                return Ok(());
+            }
+            ensure!(
+                is_semantic_ready(&authenticated),
+                "latest Odin observation is not Ready at admission commit"
+            );
+            // Not require_current: the Ready receipt is durable evidence, so
+            // authenticating it against `now` asks a stored record to be live and
+            // refuses it once it ages past the 30s observation window. Route
+            // admission (:3906) refreshes the receipt to the latest observation and
+            // can therefore demand currency; by Committing the receipt is history.
+            // Currency here is answered by the latest observation, authenticated
+            // and checked for semantic readiness immediately above.
+            self.rehydrate_ready_token(&ready_current.value, now_millis()?, false)?;
+            ready_current
         };
-        if ready_current.envelope != current.envelope {
-            return Ok(());
-        }
-        ensure!(
-            is_semantic_ready(&authenticated),
-            "latest Odin observation is not Ready at admission commit"
-        );
-        // Not require_current: the Ready receipt is durable evidence, so
-        // authenticating it against `now` asks a stored record to be live and
-        // refuses it once it ages past the 30s observation window. Route
-        // admission (:3906) refreshes the receipt to the latest observation and
-        // can therefore demand currency; by Committing the receipt is history.
-        // Currency here is answered by the latest observation, authenticated
-        // and checked for semantic readiness immediately above.
-        self.rehydrate_ready_token(&ready_current.value, now_millis()?, false)?;
         validate_live_providers_for_deploy(ready_current.value.command_kind, || {
             self.validate_selected_providers_current(required(
                 &ready_current.value.plan,
@@ -5909,26 +6076,31 @@ impl Engine {
             self.ensure_transaction_write_lease_current(&ready_current.value, now_millis()?)?;
         }
 
-        let current_lease_sha256 = ready_current
-            .value
-            .leasing
-            .as_ref()
-            .and_then(LeasingEvidence::lease_sha256)
-            .map(str::to_owned);
-        let Some((commit_current, authenticated)) =
-            self.admit_latest_topology(&ready_current, current_lease_sha256.as_deref())?
-        else {
-            return Ok(());
+        let commit_current = if route_proof {
+            ready_current
+        } else {
+            let current_lease_sha256 = ready_current
+                .value
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::lease_sha256)
+                .map(str::to_owned);
+            let Some((commit_current, authenticated)) =
+                self.admit_latest_topology(&ready_current, current_lease_sha256.as_deref())?
+            else {
+                return Ok(());
+            };
+            if commit_current.envelope != ready_current.envelope {
+                return Ok(());
+            }
+            ensure!(
+                is_semantic_ready(&authenticated),
+                "latest Odin observation is not Ready after the final admission challenge"
+            );
+            self.rehydrate_ready_token(&commit_current.value, now_millis()?, false)?;
+            commit_current
         };
-        if commit_current.envelope != ready_current.envelope {
-            return Ok(());
-        }
-        ensure!(
-            is_semantic_ready(&authenticated),
-            "latest Odin observation is not Ready after the final admission challenge"
-        );
         let now = now_millis()?;
-        self.rehydrate_ready_token(&commit_current.value, now, false)?;
         validate_live_providers_for_deploy(commit_current.value.command_kind, || {
             self.validate_selected_providers_current(required(
                 &commit_current.value.plan,
@@ -5945,7 +6117,9 @@ impl Engine {
 
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let incumbent = self.exact_incumbent(&snapshot, &commit_current.value)?;
-        let odin_authority = self.current_odin_authority(&snapshot)?;
+        let odin_authority = (!route_proof)
+            .then(|| self.current_odin_authority(&snapshot))
+            .transpose()?;
         let generation = AdmittedGeneration::from_transaction(
             &commit_current.value,
             odin_authority,
@@ -6069,20 +6243,38 @@ impl Engine {
                     "direct Warming refresh is reserved for Odin"
                 );
                 let (evidence, present) = self.observe_first_odin_warming(&current.value)?;
-                let token = SequenceAdmittedWarming::from_first_odin_presence(
+                let warming = WarmingEvidence::FirstOdinDirect { evidence };
+                let token = SequenceAdmittedWarming::from_direct_presence(
                     current.value.transaction_id.clone(),
-                    evidence.clone(),
+                    warming.clone(),
                     present,
                 )?;
                 ensure!(
                     token.signed_presence_sha256() != prior.signed_presence_sha256(),
                     "first Odin replayed its pre-fence Warming presence"
                 );
-                Ok(Some((
-                    current.clone(),
-                    WarmingEvidence::FirstOdinDirect { evidence },
-                    token,
-                )))
+                Ok(Some((current.clone(), warming, token)))
+            }
+            WarmingEvidence::RouteProofDirect { .. } => {
+                // A stateful route-proof candidate is warming until it holds
+                // the lease this refresh is about to bind, so the fresh
+                // presence must be warming again, and must be a new one.
+                let CandidateAnswer::Answered { evidence, present } =
+                    self.challenge_candidate(&current.value, &["warming"], None)?
+                else {
+                    return Ok(None);
+                };
+                let warming = WarmingEvidence::RouteProofDirect { evidence };
+                let token = SequenceAdmittedWarming::from_direct_presence(
+                    current.value.transaction_id.clone(),
+                    warming.clone(),
+                    present,
+                )?;
+                ensure!(
+                    token.signed_presence_sha256() != prior.signed_presence_sha256(),
+                    "route-proof candidate replayed its pre-fence Warming presence"
+                );
+                Ok(Some((current.clone(), warming, token)))
             }
             WarmingEvidence::OdinTopology {
                 evidence: prior_evidence,
@@ -6421,6 +6613,7 @@ impl Engine {
         )
     }
 
+    /// The stable route's proof: a challenged presence that is Active.
     fn authenticate_routed_presence(
         &self,
         authority: &cultnet_rs::VerifiedRuntimeAuthority,
@@ -6430,9 +6623,41 @@ impl Engine {
         received_at_unix_millis: u64,
         canonical_presence: &[u8],
     ) -> Result<(String, u64)> {
+        let present = self.authenticate_challenged_presence(
+            authority,
+            &["active"],
+            current_write_lease_sha256,
+            message_id,
+            challenged_at_unix_millis,
+            received_at_unix_millis,
+            canonical_presence,
+        )?;
+        Ok((
+            present.signed_presence_sha256().to_owned(),
+            received_at_unix_millis,
+        ))
+    }
+
+    /// A presence Idunn challenged for itself, from the stable endpoint or the
+    /// candidate's: signed by the provider and the launch's activation key,
+    /// bound to current authority, minted after the challenge, answering that
+    /// exact challenge, in one of `states`. A warming presence holds no write
+    /// lease; a presence in any other state holds exactly the current one.
+    /// Every disagreement with authority is named, so a capacity below the
+    /// Expected minimum reads as that and not as a generic refusal.
+    fn authenticate_challenged_presence(
+        &self,
+        authority: &cultnet_rs::VerifiedRuntimeAuthority,
+        states: &[&str],
+        current_write_lease_sha256: Option<&str>,
+        message_id: &str,
+        challenged_at_unix_millis: u64,
+        received_at_unix_millis: u64,
+        canonical_presence: &[u8],
+    ) -> Result<cultnet_rs::VerifiedRuntimePresence> {
         ensure!(
             received_at_unix_millis >= challenged_at_unix_millis,
-            "route observation predates its challenge"
+            "route proof predates its challenge"
         );
         let authenticated = authenticate_runtime_presence_claim(
             canonical_presence,
@@ -6443,31 +6668,49 @@ impl Engine {
                 maximum_future_skew_millis: self.options.topology_maximum_future_skew_millis,
             },
         )?;
-        let signed_presence_sha256 = authenticated.signed_presence_sha256().to_owned();
         let correlation = correlate_runtime_presence_claim(authenticated, authority)?;
-        ensure!(
-            correlation.disagreements().is_empty(),
-            "stable route answered with a runtime that disagrees with current authority"
-        );
+        if !correlation.disagreements().is_empty() {
+            let named = correlation
+                .disagreements()
+                .iter()
+                .map(|disagreement| {
+                    format!(
+                        "{} (expected {}, observed {})",
+                        disagreement.code,
+                        disagreement.expected.as_deref().unwrap_or("none"),
+                        disagreement.observed.as_deref().unwrap_or("none"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("route proof answered with a runtime that disagrees with current authority: {named}");
+        }
         let present = correlation.into_undisputed_present()?;
         let presence = present.record();
         ensure!(
             presence.observed_at_unix_millis >= challenged_at_unix_millis,
-            "stable route returned a presence minted before the route challenge"
+            "route proof returned a presence minted before its challenge"
         );
         ensure!(
-            presence.state == "active",
-            "stable route runtime is not Active"
+            states.contains(&presence.state.as_str()),
+            "route proof runtime is {}, not {}",
+            presence.state,
+            states.join(" or ")
         );
         ensure!(
             presence.detail == format!("route-observation:{message_id}"),
-            "stable route response is not bound to the exact challenge"
+            "route proof response is not bound to the exact challenge"
         );
+        let lease_is_current = if presence.state == "warming" {
+            presence.write_lease_sha256.is_none()
+        } else {
+            presence.write_lease_sha256.as_deref() == current_write_lease_sha256
+        };
         ensure!(
-            presence.write_lease_sha256.as_deref() == current_write_lease_sha256,
-            "stable route runtime does not hold the exact current process write lease"
+            lease_is_current,
+            "route proof runtime does not hold the exact current process write lease"
         );
-        Ok((signed_presence_sha256, received_at_unix_millis))
+        Ok(present)
     }
 
     fn authenticate_first_odin_warming_presence(
@@ -6800,13 +7043,108 @@ impl Engine {
                     },
                     &evidence.canonical_bytes,
                 )?;
-                SequenceAdmittedWarming::from_first_odin_presence(
+                SequenceAdmittedWarming::from_direct_presence(
                     transaction.transaction_id.clone(),
-                    evidence,
+                    WarmingEvidence::FirstOdinDirect { evidence },
+                    present,
+                )
+            }
+            WarmingEvidence::RouteProofDirect { evidence } => {
+                let present = self.reauthenticate_route_proof(
+                    transaction,
+                    &evidence,
+                    route_proof_warming_states(required(
+                        &transaction.expected,
+                        "Warming Expected projection",
+                    )?),
+                    None,
+                    if require_current {
+                        now
+                    } else {
+                        evidence.admitted_at_unix_millis
+                    },
+                )?;
+                SequenceAdmittedWarming::from_direct_presence(
+                    transaction.transaction_id.clone(),
+                    WarmingEvidence::RouteProofDirect { evidence },
                     present,
                 )
             }
         }
+    }
+
+    /// A route-proof presence Idunn recorded, authenticated again as of `at`.
+    fn reauthenticate_route_proof(
+        &self,
+        transaction: &DeploymentTransaction,
+        evidence: &RuntimePresenceEvidence,
+        states: &[&str],
+        current_write_lease_sha256: Option<&str>,
+        at_unix_millis: u64,
+    ) -> Result<cultnet_rs::VerifiedRuntimePresence> {
+        let authority = self.runtime_authority(transaction)?;
+        self.authenticate_challenged_presence(
+            &authority,
+            states,
+            current_write_lease_sha256,
+            &evidence.message_id,
+            evidence.challenged_at_unix_millis,
+            at_unix_millis,
+            &evidence.canonical_bytes,
+        )
+    }
+
+    /// One direct challenge to a route-proof target's candidate endpoint.
+    /// Failing to reach or hear the candidate is only silence: a process that
+    /// is still starting does not answer, and that is waiting, not a fault.
+    /// What does answer is authenticated, and a bad answer is an error.
+    fn challenge_candidate(
+        &self,
+        transaction: &DeploymentTransaction,
+        states: &[&str],
+        current_write_lease_sha256: Option<&str>,
+    ) -> Result<CandidateAnswer> {
+        let expected = required(&transaction.expected, "candidate Expected")?;
+        let binding = required(&transaction.plan, "candidate plan")?
+            .parsed_inputs()?
+            .1;
+        let driver = NginxRouteDriver::new(
+            binding
+                .route
+                .context("route-proof candidate has no route binding")?,
+        );
+        let message_id = format!("candidate-{}", Uuid::new_v4().simple());
+        let challenged_at_unix_millis = now_millis()?;
+        let response = match driver.request_candidate_runtime_presence(expected, &message_id) {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(CandidateAnswer::Silent(format!(
+                    "candidate endpoint did not answer its challenge: {error:#}"
+                )));
+            }
+        };
+        ensure!(
+            response.message_id == message_id,
+            "candidate transport substituted its challenge identity"
+        );
+        let admitted_at_unix_millis = now_millis()?;
+        let authority = self.runtime_authority(transaction)?;
+        let present = self.authenticate_challenged_presence(
+            &authority,
+            states,
+            current_write_lease_sha256,
+            &message_id,
+            challenged_at_unix_millis,
+            admitted_at_unix_millis,
+            &response.canonical_presence,
+        )?;
+        let evidence = RuntimePresenceEvidence::from_present(
+            &present,
+            message_id,
+            challenged_at_unix_millis,
+            admitted_at_unix_millis,
+        )?;
+        Ok(CandidateAnswer::Answered { evidence, present })
     }
 
     fn rehydrate_ready_token(
@@ -6854,6 +7192,11 @@ impl Engine {
     ) -> Result<Vec<SequenceAdmittedReady>> {
         let mut providers = Vec::new();
         for stored in &snapshot.admitted {
+            // A route-proof generation holds no Odin receipt to hand a
+            // dependent; its currency is the route observation, which is B4's.
+            if stored.value.ready.class() == ReadinessClass::RouteProof {
+                continue;
+            }
             // No pre-filter on ready == latest: a provider that published again
             // after going ready is still ready. rehydrate_admitted_ready owns
             // that judgment now, and reports why when it refuses.
