@@ -22,3 +22,23 @@ the plan is the `deployment_plan` test recipe. No byte comes from a live store.
 
 `control_plane.rs` decodes these through `LegacyDeploymentTransaction` and
 `LegacyAdmittedGeneration`. The fixtures die with those structs.
+
+## Pre-B1 continuity aborts
+
+The `transaction-*-abort*` files and `provider-anchor` were printed by a second
+throwaway test over `9001b58`. It built a continuity transaction that issued an
+activation (the recipe and binding of the `deployment_plan` tests, a provider
+identity enrolled fresh, the trust-anchor path in the binding fixed at
+`/tmp/idunn-b1-legacy/provider-anchor.cc`) and gave it the aborts the base code
+writes: the pre-fence abort literal of `begin_pre_fencing_abort`, and the base
+`post_fencing_abort_intent`. In each, the transaction issued an activation and
+its abort records `topology_reconciliation = Skipped`, because the base rule
+owed a continuity no projection cleanup. The workload and Odin evidence are
+borrowed from `transaction-fencing`.
+
+| File | What it is |
+|---|---|
+| `transaction-pre-fence-abort` | Warming continuity, pre-fencing abort in flight |
+| `transaction-pre-fence-abort-terminal` | the same abort finished: Complete, `FailedBeforeFencing` |
+| `transaction-post-fence-abort` | Fencing continuity, post-fencing abort in flight |
+| `provider-anchor` | one line: the provider trust-anchor file bytes, hex. A test writes it to the fixed path so the Engine can read the plan's anchor |

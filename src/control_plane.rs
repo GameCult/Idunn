@@ -62,6 +62,10 @@ const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
 /// and few because each attempt holds the target against any deployment.
 const CONTINUITY_RESTART_ATTEMPTS: usize = 3;
 
+/// How long continuity waits after it could not prepare a restart (the
+/// projection would not demote) before trying again.
+const CONTINUITY_DEFERRAL_MILLIS: u64 = 30_000;
+
 const DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS: u64 = 30_000;
 const DEFAULT_TOPOLOGY_MAXIMUM_FUTURE_SKEW_MILLIS: u64 = 2_000;
 
@@ -741,18 +745,148 @@ enum TransactionCompletion {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum CleanupEvidence {
-    Pending,
-    Skipped,
-    Complete,
+use cleanup_evidence::CleanupEvidence;
+
+/// Where the legacy marker lives, so that only the lift can make one.
+///
+/// `LegacyLift` has a private field: outside this module no expression can
+/// construct it, so no other code can write `CleanupEvidence::Legacy(..)`.
+/// Decoding a stored record is the one other way in, and it stays here too.
+/// `transaction_envelope` refuses a record carrying the marker; the schema
+/// migration, which persists what the lift produced, writes through
+/// `migrate_transaction_record`, and a fault note on an existing record through
+/// `last_error_envelope`; both are defined here beside the only constructor,
+/// and the encoder they share is private to this module.
+mod cleanup_evidence {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct LegacyLift(());
+
+    const LEGACY_MARKER: &str = "legacy-skipped-before-b1";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum CleanupEvidence {
+        Pending,
+        Skipped,
+        Complete,
+        /// Set only by the legacy lift, on a terminal continuity abort written
+        /// before the single resolution rule: it issued an activation and
+        /// recorded `Skipped`. Boot reconciliation, not the record, owes that
+        /// residue's demotion. The marker is what lets validation accept the
+        /// old shape without reopening a finished transaction.
+        Legacy(LegacyLift),
+    }
+
+    impl CleanupEvidence {
+        pub(super) fn is_complete(self) -> bool {
+            !matches!(self, Self::Pending)
+        }
+
+        pub(super) fn is_legacy_marker(self) -> bool {
+            matches!(self, Self::Legacy(_))
+        }
+    }
+
+    impl Serialize for CleanupEvidence {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(match self {
+                Self::Pending => "pending",
+                Self::Skipped => "skipped",
+                Self::Complete => "complete",
+                Self::Legacy(_) => LEGACY_MARKER,
+            })
+        }
+    }
+
+    impl<'de> Deserialize<'de> for CleanupEvidence {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let text = String::deserialize(deserializer)?;
+            match text.as_str() {
+                "pending" => Ok(Self::Pending),
+                "skipped" => Ok(Self::Skipped),
+                "complete" => Ok(Self::Complete),
+                LEGACY_MARKER => Ok(Self::Legacy(LegacyLift(()))),
+                other => Err(serde::de::Error::unknown_variant(
+                    other,
+                    &["pending", "skipped", "complete", LEGACY_MARKER],
+                )),
+            }
+        }
+    }
+
+    impl DeploymentTransaction {
+        pub(super) fn carries_legacy_marker(&self) -> bool {
+            self.pre_fencing_abort
+                .as_ref()
+                .map(|abort| abort.topology_reconciliation)
+                .into_iter()
+                .chain(
+                    self.post_fencing_abort
+                        .as_ref()
+                        .map(|abort| abort.topology_reconciliation),
+                )
+                .any(CleanupEvidence::is_legacy_marker)
+        }
+    }
+
+    /// The schema migration's one entry point: read a stored v2, v3 or v4
+    /// transaction (lifting older ones) and return its key and current-shape
+    /// envelope. The record may carry the marker the lift just set.
+    pub(super) fn migrate_transaction_record(
+        envelope: &CultCacheEnvelope,
+    ) -> Result<(String, CultCacheEnvelope)> {
+        let value = read_transaction_record(envelope)?;
+        let next = encode_transaction(&value, value.updated_at_unix_millis)?;
+        Ok((value.transaction_id, next))
+    }
+
+    /// The envelope for an existing record with only its `last_error` set. The
+    /// record may already carry the marker; this cannot add one.
+    pub(super) fn last_error_envelope(
+        value: &DeploymentTransaction,
+        detail: &str,
+    ) -> Result<CultCacheEnvelope> {
+        let mut next = value.clone();
+        next.last_error = Some(detail.to_string());
+        encode_transaction(&next, next.updated_at_unix_millis)
+    }
+
+/// A continuity abort written before the single resolution rule recorded no
+/// projection cleanup although its transaction had issued an activation, and
+/// so left that activation standing.
+///
+/// Nothing is reopened. A record already terminal keeps its terminal phase and
+/// completion and is marked the legacy marker, the one shape validation
+/// accepts for a terminal abort that owes nothing yet issued an activation;
+/// boot reconciliation, the single owner of that residue, demotes it by exact
+/// activation. A record still in flight lifts to `Pending`: it already holds
+/// its target's authority (a live record claims it before and after the lift),
+/// so the lift adds no claimant, and its own abort demotes the activation.
+/// Only the control store's read applies this: history describes what happened
+/// and is lifted unchanged.
+pub(super) fn owe_legacy_continuity_projection(transaction: &mut DeploymentTransaction) {
+    if transaction.command_kind != CommandKind::Continuity || transaction.activation.is_none() {
+        return;
+    }
+    let terminal = transaction.completion.is_some();
+    if let Some(abort) = transaction.pre_fencing_abort.as_mut()
+        && abort.topology_reconciliation == CleanupEvidence::Skipped
+    {
+        abort.topology_reconciliation = if terminal {
+            CleanupEvidence::Legacy(LegacyLift(()))
+        } else {
+            CleanupEvidence::Pending
+        };
+    }
+    if let Some(abort) = transaction.post_fencing_abort.as_mut()
+        && abort.topology_reconciliation == CleanupEvidence::Skipped
+        && !terminal
+    {
+        abort.topology_reconciliation = CleanupEvidence::Pending;
+    }
 }
 
-impl CleanupEvidence {
-    fn is_complete(self) -> bool {
-        matches!(self, Self::Skipped | Self::Complete)
-    }
 }
 
 /// Rollback of a transaction that has already fenced the incumbent.
@@ -1029,6 +1163,22 @@ impl DeploymentTransaction {
         Ok(transaction)
     }
 
+    /// Whether an abort owes the projection a reconciliation. A deployment
+    /// published its own Expected key. A continuity shares the admitted key,
+    /// whose Expected is never withdrawn, so it owes only the demotion of the
+    /// activation it issued.
+    fn abort_topology_reconciliation(&self) -> CleanupEvidence {
+        let owes = match self.command_kind {
+            CommandKind::Deploy => self.expected_publication_sha256.is_some(),
+            CommandKind::Continuity => self.activation.is_some(),
+        };
+        if owes {
+            CleanupEvidence::Pending
+        } else {
+            CleanupEvidence::Skipped
+        }
+    }
+
     fn rejected(command: &DeploymentCommand, error: anyhow::Error, now: u64) -> Result<Self> {
         let mut transaction = Self::new(command, command.selector.clone(), 0, None, now)?;
         let detail = truncate(&format!("{error:#}"), 2048);
@@ -1274,15 +1424,21 @@ impl DeploymentTransaction {
                 ),
                 "abort candidate cleanup differs from its prepared activation"
             );
-            let topology_cleanup_required = self.command_kind == CommandKind::Deploy
-                && self.expected_publication_sha256.is_some();
             ensure!(
                 matches!(
-                    (topology_cleanup_required, abort.topology_reconciliation),
-                    (true, CleanupEvidence::Pending | CleanupEvidence::Complete)
-                        | (false, CleanupEvidence::Skipped)
-                ),
-                "abort topology cleanup differs from published deployment Expected"
+                    (
+                        self.abort_topology_reconciliation(),
+                        abort.topology_reconciliation
+                    ),
+                    (
+                        CleanupEvidence::Pending,
+                        CleanupEvidence::Pending | CleanupEvidence::Complete
+                    ) | (CleanupEvidence::Skipped, CleanupEvidence::Skipped)
+                ) || (self.command_kind == CommandKind::Continuity
+                    && self.phase == DeploymentPhase::Complete
+                    && self.completion.is_some()
+                    && abort.topology_reconciliation.is_legacy_marker()),
+                "abort topology cleanup differs from what the transaction projected"
             );
             ensure!(
                 matches!(
@@ -2674,7 +2830,8 @@ fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTra
             Ok(value)
         }
         _ => {
-            let value = lift_legacy_transaction(envelope)?;
+            let mut value = lift_legacy_transaction(envelope)?;
+            cleanup_evidence::owe_legacy_continuity_projection(&mut value);
             value.validate()?;
             Ok(value)
         }
@@ -2735,9 +2892,8 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
     let mut migrated = 0;
     for envelope in stale {
         let (record_type, key, mut next) = if envelope.r#type == DeploymentTransaction::TYPE {
-            let value = read_transaction_record(&envelope)?;
-            let next = transaction_envelope(&value, value.updated_at_unix_millis)?;
-            (DeploymentTransaction::TYPE, value.transaction_id, next)
+            let (key, next) = cleanup_evidence::migrate_transaction_record(&envelope)?;
+            (DeploymentTransaction::TYPE, key, next)
         } else {
             let value = read_generation_record(&envelope)?;
             let next = admitted_envelope(&value, value.admitted_at_unix_millis)?;
@@ -2761,6 +2917,14 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
 }
 
 fn transaction_envelope(value: &DeploymentTransaction, now: u64) -> Result<CultCacheEnvelope> {
+    ensure!(
+        !value.carries_legacy_marker(),
+        "only the legacy lift may produce a legacy-marked record; it cannot be written as a new one"
+    );
+    encode_transaction(value, now)
+}
+
+fn encode_transaction(value: &DeploymentTransaction, now: u64) -> Result<CultCacheEnvelope> {
     value.validate()?;
     typed_envelope(
         &value.transaction_id,
@@ -2848,41 +3012,114 @@ fn archive_terminal_transaction(state_store: &Path, envelope: &CultCacheEnvelope
     Ok(())
 }
 
-/// Finished transactions, read leniently and for display only.
-///
-/// `control.cc` keeps the byte-exact canonical check because its records still
-/// gate decisions. History describes what already happened, so an unreadable
-/// entry here is skipped rather than allowed to refuse the read -- that
-/// asymmetry is the whole reason the two files are separate.
-fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
+/// What `history.cc` yielded: the transactions it decoded and the entries it
+/// could not, each with its key and reason.
+struct HistoryRead {
+    transactions: Vec<DeploymentTransaction>,
+    undecodable: Vec<(String, String)>,
+}
+
+impl HistoryRead {
+    /// What is missing from `transactions`, or `None` when nothing is.
+    fn report(&self) -> Option<String> {
+        if self.undecodable.is_empty() {
+            return None;
+        }
+        let keys = self
+            .undecodable
+            .iter()
+            .map(|(key, error)| format!("{key} ({error})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!(
+            "Idunn history: {} archived transaction(s) could not be decoded and are not counted \
+             by status or continuity backoff: {keys}",
+            self.undecodable.len()
+        ))
+    }
+}
+
+/// Finished transactions. `control.cc` keeps the byte-exact canonical check
+/// because its records still gate decisions. History describes what already
+/// happened, so an undecodable entry is reported and skipped rather than
+/// allowed to refuse the read -- that asymmetry is the whole reason the two
+/// files are separate. A file that cannot be read at all is an error: the
+/// caller decides whether an empty answer is safe.
+fn read_history(state_store: &Path) -> Result<HistoryRead> {
     let path = history_store_path(state_store);
     if !path.exists() {
-        return Vec::new();
+        return Ok(HistoryRead {
+            transactions: Vec::new(),
+            undecodable: Vec::new(),
+        });
     }
-    let envelopes = match SingleFileMessagePackBackingStore::new(&path).pull_all_read_only_snapshot()
-    {
-        Ok(envelopes) => envelopes,
-        Err(error) => {
-            eprintln!(
-                "Idunn cannot read {}: {error:#}; every archived transaction is invisible \
-                 to status and to continuity backoff",
-                path.display()
-            );
-            return Vec::new();
-        }
-    };
+    let envelopes = SingleFileMessagePackBackingStore::new(&path)
+        .pull_all_read_only_snapshot()
+        .with_context(|| format!("Idunn cannot read {}", path.display()))?;
     let (transactions, undecodable) = decode_history_transactions(envelopes);
-    if !undecodable.is_empty() {
-        for (key, error) in &undecodable {
-            eprintln!("Idunn history holds an undecodable transaction {key}: {error}");
+    Ok(HistoryRead {
+        transactions,
+        undecodable,
+    })
+}
+
+/// History for display only (status). An unreadable file shows as empty and
+/// says so; decisions use `Engine::history_for_decision`, which does not.
+fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
+    match read_history(state_store) {
+        Ok(history) => {
+            if let Some(report) = history.report() {
+                eprintln!("{report}");
+            }
+            history.transactions
         }
-        eprintln!(
-            "Idunn history: {} archived transaction(s) could not be decoded and are not counted \
-             by status or continuity backoff",
-            undecodable.len()
-        );
+        Err(error) => {
+            eprintln!("{error:#}; every archived transaction is invisible to status");
+            Vec::new()
+        }
     }
-    transactions
+}
+
+/// How long to wait after `failures` consecutive failures: one poll interval
+/// after the first, doubling each time, never past the ceiling.
+fn backoff_wait(poll_millis: u64, failures: u32) -> u64 {
+    poll_millis
+        .saturating_mul(1u64 << failures.min(20))
+        .min(RESUME_BACKOFF_CEILING_MILLIS)
+}
+
+/// Whether an attempt due at `not_before` must still wait at `now`.
+fn is_waiting(now: u64, not_before: u64) -> bool {
+    now < not_before
+}
+
+/// Whether a transaction moved between two reads. An error note (`last_error`)
+/// and its timestamp are commentary on a stuck step, not a step.
+fn state_advanced(before: &DeploymentTransaction, after: &DeploymentTransaction) -> bool {
+    let mut after = after.clone();
+    after.last_error.clone_from(&before.last_error);
+    after.updated_at_unix_millis = before.updated_at_unix_millis;
+    &after != before
+}
+
+/// Says a fault once while it lasts. A scheduler tick that hits the same
+/// unreadable file every half second must not print it every half second.
+#[derive(Default)]
+struct ReportOnce {
+    last: Mutex<Option<String>>,
+}
+
+impl ReportOnce {
+    /// The text to print now: `report` when it differs from the last one
+    /// offered, nothing while the same fault stands or once it has cleared.
+    fn offer(&self, report: Option<String>) -> Option<String> {
+        let mut last = self.last.lock().expect("report mutex");
+        if *last == report {
+            return None;
+        }
+        last.clone_from(&report);
+        report
+    }
 }
 
 /// Decode every archived transaction. An entry that fails is returned with its
@@ -3363,7 +3600,25 @@ struct Engine {
     docker_runner: DockerRunnerDriver,
     systemd_workload: Arc<dyn WorkloadPort>,
     host_actuators: Option<SharedHostActuatorHub>,
+    history_report: ReportOnce,
+    /// One `ReportOnce` per faulting record, so one wedged transaction says
+    /// its fault once and never drowns another's.
+    fault_reports: Mutex<BTreeMap<String, ReportOnce>>,
+    /// Retry pacing for a transaction whose step keeps failing, by
+    /// transaction id: consecutive failures and the earliest next attempt.
+    /// Process-local on purpose: a restart retries at once, and no schema
+    /// carries a clock that only pacing reads.
+    resume_backoff: Mutex<BTreeMap<String, ResumeBackoff>>,
 }
+
+#[derive(Clone, Copy)]
+struct ResumeBackoff {
+    failures: u32,
+    not_before_unix_millis: u64,
+}
+
+/// Longest wait between attempts at a failing transaction step.
+const RESUME_BACKOFF_CEILING_MILLIS: u64 = 60_000;
 
 impl Engine {
     fn open(options: RuntimeOptions) -> Result<Self> {
@@ -3417,6 +3672,9 @@ impl Engine {
             docker_runner: DockerRunnerDriver::default(),
             systemd_workload,
             host_actuators,
+            history_report: ReportOnce::default(),
+            fault_reports: Mutex::default(),
+            resume_backoff: Mutex::default(),
         })
     }
 
@@ -3491,6 +3749,27 @@ impl Engine {
                 access: self.host_access()?,
             }),
         })
+    }
+
+    /// History for a decision that would be wrong on an empty answer: the
+    /// continuity restart ceiling and the check that a command is consumed.
+    /// `None` means `history.cc` cannot be read, so the decision is not made;
+    /// a history that merely has no entries is `Some`. The fault is printed
+    /// once while it lasts, not on every tick.
+    fn history_for_decision(&self) -> Option<Vec<DeploymentTransaction>> {
+        let (report, transactions) = match read_history(&self.options.state_store) {
+            Ok(history) => (history.report(), Some(history.transactions)),
+            Err(error) => (
+                Some(format!(
+                    "{error:#}; continuity and command retirement stop until it is readable"
+                )),
+                None,
+            ),
+        };
+        if let Some(text) = self.history_report.offer(report) {
+            eprintln!("{text}");
+        }
+        transactions
     }
 
     fn topology(&self) -> CultCacheTopologyDriver {
@@ -3665,7 +3944,106 @@ impl Engine {
     }
 }
 
-fn serve(options: RuntimeOptions) -> Result<()> {
+/// What the boot reconciliation of failed continuity projections found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProjectionReconciliation {
+    /// Failed continuity transactions whose exact activation was demoted.
+    demoted: Vec<String>,
+    /// Targets whose projection names an activation that neither the admitted
+    /// generation, a live transaction, nor a failed issuer accounts for. They
+    /// are reported and left alone.
+    unexplained: Vec<String>,
+}
+
+impl Engine {
+    /// Once at boot: demote the activation a failed continuity left standing,
+    /// where the projection still names exactly the activation that failed
+    /// transaction issued. A continuity abort before the single resolution
+    /// rule left such residue (and the lift owes the same demotion to any
+    /// abort still resident). The issuer is identified by exact activation,
+    /// from history and from resident terminal records not yet retired to it.
+    ///
+    /// Nothing is adopted: an activation with no failed issuer is never
+    /// demoted or kept on anyone's behalf, only reported.
+    fn reconcile_failed_continuity_projections(&self) -> Result<ProjectionReconciliation> {
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let mut outcome = ProjectionReconciliation::default();
+        // Resident issuers need no history; only the history issuers wait on it.
+        let history = self.history_for_decision();
+        if history.is_none() {
+            eprintln!(
+                "Idunn cannot read history at boot: failed continuities archived there are not \
+                 reconciled, resident ones still are"
+            );
+        }
+        let topology = self.topology();
+        let issuers = history
+            .iter()
+            .flatten()
+            .chain(snapshot.transactions.iter().map(|stored| &stored.value))
+            .filter(|transaction| {
+                transaction.command_kind == CommandKind::Continuity
+                    && matches!(
+                        transaction.completion,
+                        Some(TransactionCompletion::FailedBeforeFencing { .. })
+                            | Some(TransactionCompletion::FailedAfterFencing { .. })
+                    )
+            });
+        for issuer in issuers {
+            let (Some(expected), Some(activation), Some(plan)) =
+                (&issuer.expected, &issuer.activation, &issuer.plan)
+            else {
+                continue;
+            };
+            let demoted = (|| -> Result<bool> {
+                if topology.projected_activation(expected)?.as_ref() != Some(activation) {
+                    return Ok(false);
+                }
+                let provider_anchor = self.provider_anchor_for_plan(plan)?;
+                topology.demote_to_expected_only(expected, &provider_anchor, activation, None)?;
+                Ok(true)
+            })();
+            match demoted {
+                Ok(true) => outcome.demoted.push(issuer.transaction_id.clone()),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "Idunn could not reconcile the projection of failed continuity {}: {error:#}",
+                    issuer.transaction_id
+                ),
+            }
+        }
+        for generation in &snapshot.admitted {
+            let projected = match topology.projected_activation(&generation.value.expected) {
+                Ok(projected) => projected,
+                Err(error) => {
+                    eprintln!(
+                        "Idunn cannot read the projected activation of {}: {error:#}",
+                        generation.value.target
+                    );
+                    continue;
+                }
+            };
+            let Some(projected) = projected else {
+                continue;
+            };
+            let accounted = projected == generation.value.activation
+                || snapshot.transactions.iter().any(|stored| {
+                    stored.value.target == generation.value.target
+                        && !stored.value.is_terminal()
+                        && stored.value.activation.as_ref() == Some(&projected)
+                });
+            if !accounted {
+                outcome.unexplained.push(generation.value.target.clone());
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+/// Everything the daemon does once, before its loop: lock, migrate, validate,
+/// reconcile the projection. The lock is returned so the caller holds it for as
+/// long as the engine runs.
+fn boot(options: RuntimeOptions) -> Result<(ProcessLock, Engine)> {
     for path in [
         &options.state_store,
         &options.topology_store,
@@ -3680,7 +4058,7 @@ fn serve(options: RuntimeOptions) -> Result<()> {
         fs::create_dir_all(directory)
             .with_context(|| format!("creating Idunn directory {}", directory.display()))?;
     }
-    let _lock = ProcessLock::acquire(&options.state_store)?;
+    let lock = ProcessLock::acquire(&options.state_store)?;
     let migrated = migrate_control_store_to_current_schema(&options.state_store)
         .context("migrating Idunn control records to the current schema")?;
     if migrated > 0 {
@@ -3691,7 +4069,25 @@ fn serve(options: RuntimeOptions) -> Result<()> {
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
     let engine = Engine::open(options)?;
     engine.validate_durable_authority(&ControlSnapshot::read(&engine.options.state_store)?)?;
+    match engine.reconcile_failed_continuity_projections() {
+        Ok(outcome) => {
+            for transaction_id in &outcome.demoted {
+                println!("demoted the activation failed continuity {transaction_id} left projected");
+            }
+            for target in &outcome.unexplained {
+                eprintln!(
+                    "Idunn found an activation projected for {target} that no admitted generation, \
+                     live transaction or failed continuity accounts for; left as it is"
+                );
+            }
+        }
+        Err(error) => eprintln!("Idunn boot projection reconciliation failed: {error:#}"),
+    }
+    Ok((lock, engine))
+}
 
+fn serve(options: RuntimeOptions) -> Result<()> {
+    let (_lock, engine) = boot(options)?;
     loop {
         match engine.run_scheduler_tick() {
             Ok(true) => continue,
@@ -3710,9 +4106,6 @@ fn serve(options: RuntimeOptions) -> Result<()> {
 }
 
 impl Engine {
-    /// One pass of the scheduler, with the loop's ordering preserved exactly:
-    /// `Ok(true)` means "went round again immediately", which is what the
-    /// caller's `continue` did.
     /// One resident terminal transaction goes to history per tick.
     ///
     /// Transactions that finished before finished transactions travelled to
@@ -3721,28 +4114,104 @@ impl Engine {
     /// reads. They leave the same way a transaction finishing today does.
     fn retire_one_terminal_transaction(&self) -> Result<bool> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-        let Some(stored) = snapshot
+        // A record that cannot be archived (history unreadable, a torn write)
+        // is that record's fault: the next terminal record is still tried, and
+        // the tick goes on to supervise and freeze.
+        for stored in snapshot
             .transactions
             .iter()
-            .find(|stored| stored.value.is_terminal())
-        else {
-            return Ok(false);
-        };
-        archive_terminal_transaction(&self.options.state_store, &stored.envelope)?;
-        eprintln!(
-            "Idunn retired resident terminal transaction {} to history",
-            stored.value.transaction_id
-        );
-        Ok(true)
+            .filter(|stored| stored.value.is_terminal())
+        {
+            match archive_terminal_transaction(&self.options.state_store, &stored.envelope) {
+                Ok(()) => {
+                    eprintln!(
+                        "Idunn retired resident terminal transaction {} to history",
+                        stored.value.transaction_id
+                    );
+                    return Ok(true);
+                }
+                Err(error) => self.note_fault(
+                    "could not retire terminal transaction",
+                    &stored.value.transaction_id,
+                    &error,
+                ),
+            }
+        }
+        Ok(false)
     }
 
+    /// One pass of the scheduler. An unreadable control store is the tick's
+    /// fault and is returned; anything one transaction or one admitted
+    /// generation does wrong is logged against it and never stops the others.
     fn run_scheduler_tick(&self) -> Result<bool> {
         if self.retire_one_terminal_transaction()? {
             return Ok(true);
         }
         let transaction_progress = self.resume_one_transaction()?;
         let continuity_progress = self.supervise_one_admitted_generation()?;
-        Ok(!transaction_progress && !continuity_progress && self.freeze_one_queued_command()?)
+        // Freezing is not gated on the others' progress: a queued command
+        // whose target is free must not wait behind an unrelated target's
+        // wedge. `freeze_command` already refuses a busy target, so this is
+        // still at most one freeze per tick and never a second claimant.
+        let froze = self.freeze_one_queued_command()?;
+        Ok(transaction_progress || continuity_progress || froze)
+    }
+
+    /// Say a per-record fault once while it lasts and leave it in the
+    /// record's `last_error`, which status renders. Recording is best effort:
+    /// a store too broken to take the note is already in stderr.
+    fn note_fault(&self, what: &str, transaction_id: &str, error: &anyhow::Error) {
+        let detail = truncate(&format!("{error:#}"), 2048);
+        let offered = {
+            let mut reports = self.fault_reports.lock().expect("fault report mutex");
+            reports
+                .entry(transaction_id.to_string())
+                .or_default()
+                .offer(Some(detail.clone()))
+        };
+        let recorded = self.record_last_error(transaction_id, &detail);
+        if offered.is_some() {
+            eprintln!("Idunn {what} {transaction_id}: {detail}");
+            if let Err(error) = recorded {
+                eprintln!("Idunn could not leave that in the record of {transaction_id}: {error:#}");
+            }
+        }
+    }
+
+    fn clear_fault(&self, transaction_id: &str) {
+        self.fault_reports
+            .lock()
+            .expect("fault report mutex")
+            .remove(transaction_id);
+    }
+
+    /// Write `detail` as the record's `last_error`, touching nothing else and
+    /// not archiving: a terminal record whose archive is the fault stays put.
+    fn record_last_error(&self, transaction_id: &str, detail: &str) -> Result<()> {
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let Some(stored) = snapshot
+            .transactions
+            .iter()
+            .find(|stored| stored.value.transaction_id == transaction_id)
+        else {
+            return Ok(());
+        };
+        if stored.value.last_error.as_deref() == Some(detail) {
+            return Ok(());
+        }
+        let envelope = cleanup_evidence::last_error_envelope(&stored.value, detail)?;
+        ensure!(
+            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: transaction_id.to_string(),
+                    current: Some(stored.envelope.clone()),
+                }],
+                &[envelope],
+            )?,
+            "transaction changed before its fault note"
+        );
+        Ok(())
     }
 
     /// Startup and every later loop use the same order: unfinished ownership
@@ -3768,43 +4237,111 @@ impl Engine {
             if snapshot.has_earlier_authority_sibling(&current.value) {
                 continue;
             }
-            if let Err(error) = self.advance_transaction(current) {
-                let latest_snapshot = ControlSnapshot::read(&self.options.state_store)?;
-                let latest = latest_snapshot
-                    .transactions
-                    .iter()
-                    .find(|stored| stored.value.transaction_id == current.value.transaction_id)
-                    .context("transaction disappeared while recording an execution error")?;
-                if latest.value.is_terminal() {
-                    progressed = true;
-                } else if latest.value.phase < DeploymentPhase::Fencing
-                    && latest.value.pre_fencing_abort.is_none()
-                {
-                    self.begin_pre_fencing_abort(latest, error)?;
-                } else if latest.value.post_fencing_abort.is_none()
-                    && self.candidate_is_permanently_stopped(&latest.value)?
-                {
-                    // Past the fence an error is resumable while the candidate
-                    // can still recover. This one cannot: its transient unit
-                    // has failed and carries Restart=no, so retrying would hold
-                    // the target forever behind a transaction that can never
-                    // finish.
-                    self.begin_post_fencing_abort(latest, error)?;
-                } else {
-                    self.record_resumable_error(latest, &error)?;
+            match self.resume_candidate(current) {
+                Ok(moved) => progressed |= moved,
+                Err(error) => {
+                    self.note_fault(
+                        "could not resume transaction",
+                        &current.value.transaction_id,
+                        &error,
+                    );
                 }
-            }
-            let after = ControlSnapshot::read(&self.options.state_store)?;
-            let live = after
-                .transactions
-                .iter()
-                .find(|stored| stored.value.transaction_id == current.value.transaction_id)
-                .context("transaction disappeared while checking scheduler progress")?;
-            if live.envelope != current.envelope {
-                progressed = true;
             }
         }
         Ok(progressed)
+    }
+
+    /// Advance one transaction, turning its failure into the durable record
+    /// its phase calls for. Returns whether its record changed.
+    ///
+    /// "Moved" means the transaction's state advanced: a phase change, a
+    /// completion, or a durable abort step. Rewriting `last_error` to say the
+    /// same step failed again in new words is not movement, or a wedged
+    /// transaction would report progress every tick.
+    fn resume_candidate(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
+        let id = current.value.transaction_id.as_str();
+        if self
+            .resume_backoff
+            .lock()
+            .expect("resume backoff mutex")
+            .get(id)
+            .is_some_and(|backoff| {
+                now_millis().is_ok_and(|now| is_waiting(now, backoff.not_before_unix_millis))
+            })
+        {
+            return Ok(false);
+        }
+        let advanced = self.advance_transaction(current);
+        if advanced.is_ok() {
+            // The step ran and succeeded: the fault, if any, has recovered, so
+            // a later failure is news. A skipped or failed attempt clears nothing.
+            self.resume_backoff
+                .lock()
+                .expect("resume backoff mutex")
+                .remove(id);
+            self.clear_fault(id);
+        }
+        if let Err(error) = advanced {
+            let latest_snapshot = ControlSnapshot::read(&self.options.state_store)?;
+            let latest = latest_snapshot
+                .transactions
+                .iter()
+                .find(|stored| stored.value.transaction_id == current.value.transaction_id)
+                .context("transaction disappeared while recording an execution error")?;
+            if latest.value.is_terminal() {
+                self.resume_backoff
+                    .lock()
+                    .expect("resume backoff mutex")
+                    .remove(id);
+                return Ok(true);
+            }
+            self.back_off(id)?;
+            if latest.value.phase < DeploymentPhase::Fencing {
+                // Before the fence an abort that cannot finish a step is
+                // resumable, never a post-fence abort: that path refuses a
+                // pre-fence phase, so choosing it only wedged the tick.
+                if latest.value.pre_fencing_abort.is_none() {
+                    self.begin_pre_fencing_abort(latest, error)?;
+                } else {
+                    self.record_resumable_error(latest, &error)?;
+                }
+            } else if latest.value.post_fencing_abort.is_none()
+                && self.candidate_is_permanently_stopped(&latest.value)?
+            {
+                // Past the fence an error is resumable while the candidate
+                // can still recover. This one cannot: its transient unit
+                // has failed and carries Restart=no, so retrying would hold
+                // the target forever behind a transaction that can never
+                // finish.
+                self.begin_post_fencing_abort(latest, error)?;
+            } else {
+                self.record_resumable_error(latest, &error)?;
+            }
+        }
+        let after = ControlSnapshot::read(&self.options.state_store)?;
+        let live = after
+            .transactions
+            .iter()
+            .find(|stored| stored.value.transaction_id == current.value.transaction_id)
+            .context("transaction disappeared while checking scheduler progress")?;
+        Ok(state_advanced(&current.value, &live.value))
+    }
+
+    /// Wait twice as long after each consecutive failure of a transaction's
+    /// step, from one poll interval up to a ceiling.
+    fn back_off(&self, transaction_id: &str) -> Result<()> {
+        let now = now_millis()?;
+        let mut all = self.resume_backoff.lock().expect("resume backoff mutex");
+        let failures = all.get(transaction_id).map_or(0, |backoff| backoff.failures);
+        let wait = backoff_wait(self.options.poll_millis, failures);
+        all.insert(
+            transaction_id.to_string(),
+            ResumeBackoff {
+                failures: failures.saturating_add(1),
+                not_before_unix_millis: now.saturating_add(wait),
+            },
+        );
+        Ok(())
     }
 
     fn freeze_one_queued_command(&self) -> Result<bool> {
@@ -3829,7 +4366,12 @@ impl Engine {
         // whose transactions were retired to history before commands travelled
         // with them are still resident; they are not queued, they are
         // history that never moved. Retire them here and never freeze them.
-        let historical_commands = read_history_transactions(&self.options.state_store)
+        // With history unreadable, whether a command was consumed is unknown:
+        // freezing it again could run a finished deployment twice.
+        let Some(history) = self.history_for_decision() else {
+            return Ok(false);
+        };
+        let historical_commands = history
             .into_iter()
             .map(|transaction| transaction.command_id)
             .collect::<BTreeSet<_>>();
@@ -4146,12 +4688,17 @@ impl Engine {
                             | Some(TransactionCompletion::FailedAfterFencing { .. })
                     )
             };
+            // An unreadable history counts as zero refusals only by lying:
+            // the ceiling would never trip. Without it, nothing is actuated.
+            let Some(history) = self.history_for_decision() else {
+                continue;
+            };
             let refused_restarts = snapshot
                 .transactions
                 .iter()
                 .filter(|stored| is_refused_restart(&stored.value))
                 .count()
-                + read_history_transactions(&self.options.state_store)
+                + history
                     .iter()
                     .filter(|transaction| is_refused_restart(transaction))
                     .count();
@@ -4199,6 +4746,17 @@ impl Engine {
             // Demote to Expected-only, the same shape an aborted deployment
             // leaves, and let the restart publish its own activation once it is
             // observed.
+            let now = now_millis()?;
+            // A restart whose projection could not be prepared is deferred in
+            // the generation's own backoff, not retried every tick.
+            if current
+                .value
+                .continuity_backoff
+                .next_restart_at_unix_millis
+                .is_some_and(|not_before| now < not_before)
+            {
+                continue;
+            }
             let demotion = (|| -> Result<()> {
                 let topology = self.topology();
                 let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
@@ -4213,13 +4771,21 @@ impl Engine {
                 )?;
                 Ok(())
             })();
+            // Expected-only is the precondition of a restart: a continuity
+            // minted over a projection that still names an activation would
+            // fail between preparing and publishing its own, and its abort
+            // could not resolve. So a failed demotion mints nothing. The
+            // failure is written to the generation, and the next attempt is
+            // not before the deferral ends.
             if let Err(error) = demotion {
                 eprintln!(
-                    "Idunn preserved admitted {} after refusing to demote its projection: {error:#}",
+                    "Idunn deferred continuity for admitted {} after refusing to demote its projection: {error:#}",
                     current.value.target
                 );
+                self.defer_continuity_restart(current, now)?;
+                progressed = true;
+                continue;
             }
-            let now = now_millis()?;
             // An engaged lifecycle brake means no continuity transaction is
             // minted at all. A transaction that exists and waits on the brake
             // owns the target, and a target owned by a parked restart accepts
@@ -4265,6 +4831,29 @@ impl Engine {
             progressed = true;
         }
         Ok(progressed)
+    }
+
+    /// Record that continuity may not restart this generation before
+    /// `now + CONTINUITY_DEFERRAL_MILLIS`. The generation's `ContinuityBackoff`
+    /// owns "not before": only its `next_restart_at_unix_millis` is written,
+    /// so the attempts and window that count real restarts are untouched.
+    fn defer_continuity_restart(&self, current: &Stored<AdmittedGeneration>, now: u64) -> Result<()> {
+        let mut next = current.value.clone();
+        next.continuity_backoff.next_restart_at_unix_millis =
+            Some(now + CONTINUITY_DEFERRAL_MILLIS);
+        next.validate()?;
+        ensure!(
+            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: AdmittedGeneration::TYPE.into(),
+                    key: current.value.target.clone(),
+                    current: Some(current.envelope.clone()),
+                }],
+                &[admitted_envelope(&next, now)?],
+            )?,
+            "admitted generation changed before continuity deferral CAS"
+        );
+        Ok(())
     }
 
     fn supervise_admitted_route(&self, current: &Stored<AdmittedGeneration>) -> Result<bool> {
@@ -6465,13 +7054,7 @@ impl Engine {
                 current.value.activation.is_some(),
                 current.value.workload.is_some(),
             ),
-            topology_reconciliation: if current.value.command_kind == CommandKind::Deploy
-                && current.value.expected_publication_sha256.is_some()
-            {
-                CleanupEvidence::Pending
-            } else {
-                CleanupEvidence::Skipped
-            },
+            topology_reconciliation: current.value.abort_topology_reconciliation(),
             source_cleanup: if current.value.command_kind == CommandKind::Deploy {
                 CleanupEvidence::Pending
             } else {
@@ -6593,32 +7176,34 @@ impl Engine {
             });
         }
         if abort.topology_reconciliation == CleanupEvidence::Pending {
-            let expected = required(&current.value.expected, "failed Expected projection")?;
             let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-            // The failed candidate's records go, under its own key. Fencing
-            // stopped the incumbent and revoked its lease, so the incumbent is
-            // demoted to Expected-only under its key, which is what lets
-            // continuity bring it back; deployment does not restart it here.
+            // The failed candidate's projection is resolved first. For a
+            // deployment, fencing also stopped the incumbent and revoked its
+            // lease, so the incumbent is demoted to Expected-only under its
+            // key with its own exact activation, which is what lets
+            // continuity bring it back. A continuity candidate is the
+            // incumbent's key: it has nothing further to demote.
             let topology = self.topology();
             let failed_provider_anchor = self.provider_anchor_for_plan(required(
                 &current.value.plan,
                 "failed transaction plan",
             )?)?;
-            topology
-                .withdraw_incarnation(
-                    expected,
-                    &failed_provider_anchor,
-                    current.value.activation.as_ref(),
-                    None,
-                )
-                .context("withdrawing the failed candidate projection")?;
-            if let Some(incumbent) = self.exact_incumbent(&snapshot, &current.value)? {
+            reconcile_failed_candidate_projection(
+                &topology,
+                &current.value,
+                &failed_provider_anchor,
+            )?;
+            if let Some(incumbent) = self
+                .exact_incumbent(&snapshot, &current.value)?
+                .filter(|_| current.value.command_kind == CommandKind::Deploy)
+            {
                 let admitted_provider_anchor =
                     self.provider_anchor_for_plan(&incumbent.value.plan)?;
-                let expected_sha256 = topology.demote_current_activation_to_expected_only(
+                let expected_sha256 = topology.demote_to_expected_only(
                     &incumbent.value.expected,
                     &admitted_provider_anchor,
-                    &self.idunn_anchor,
+                    &incumbent.value.activation,
+                    incumbent.value.leasing.lease(),
                 )?;
                 ensure!(
                     expected_sha256 == incumbent.value.expected.canonical_sha256()?,
@@ -6687,22 +7272,17 @@ impl Engine {
             });
         }
         if abort.topology_reconciliation == CleanupEvidence::Pending {
-            let expected = required(&current.value.expected, "failed Expected projection")?;
-            // Before fencing the incumbent was never touched: it is still
-            // running under its own key with its activation and lease. Only the
-            // failed candidate's records are withdrawn. The incumbent's
-            // projection is not demoted -- doing so would tell a live process
-            // it has no activation.
+            // Before fencing a deployment never touched its incumbent: it is
+            // still running under its own key with its activation and lease,
+            // so only the candidate's records are withdrawn. A continuity
+            // candidate shares the admitted key and demotes what it issued.
             let plan = required(&current.value.plan, "failed transaction plan")?;
             let provider_anchor = self.provider_anchor_for_plan(plan)?;
-            self.topology()
-                .withdraw_incarnation(
-                    expected,
-                    &provider_anchor,
-                    current.value.activation.as_ref(),
-                    None,
-                )
-                .context("withdrawing exact failed Expected projection")?;
+            reconcile_failed_candidate_projection(
+                &self.topology(),
+                &current.value,
+                &provider_anchor,
+            )?;
             return self.persist_same_phase(current, |next| {
                 next.pre_fencing_abort
                     .as_mut()
@@ -6828,6 +7408,37 @@ fn provider_warming_advanced(
         && candidate_signed_presence_sha256 != prior_signed_presence_sha256
 }
 
+/// Resolve the projection a failed candidate left. A deployment candidate owns
+/// its own incarnation key and withdraws it whole. A continuity candidate
+/// shares the admitted key: the admitted Expected is never withdrawn, and the
+/// only thing demoted is the activation this transaction issued, exactly.
+fn reconcile_failed_candidate_projection(
+    topology: &CultCacheTopologyDriver,
+    transaction: &DeploymentTransaction,
+    provider_anchor: &ServiceIdentityTrustAnchor,
+) -> Result<()> {
+    let expected = required(&transaction.expected, "failed Expected projection")?;
+    match transaction.command_kind {
+        CommandKind::Deploy => topology
+            .withdraw_incarnation(
+                expected,
+                provider_anchor,
+                transaction.activation.as_ref(),
+                None,
+            )
+            .context("withdrawing the failed candidate projection"),
+        CommandKind::Continuity => topology
+            .demote_to_expected_only(
+                expected,
+                provider_anchor,
+                required(&transaction.activation, "failed continuity activation")?,
+                None,
+            )
+            .map(drop)
+            .context("demoting the failed continuity activation"),
+    }
+}
+
 fn may_rollback_route_after_failed_proof(fencing: &FencingEvidence) -> bool {
     matches!(fencing, FencingEvidence::SkippedStateless)
 }
@@ -6867,13 +7478,7 @@ fn post_fencing_abort_intent(
             transaction.activation.is_some(),
             transaction.workload.is_some(),
         ),
-        topology_reconciliation: if transaction.command_kind == CommandKind::Deploy
-            && transaction.expected_publication_sha256.is_some()
-        {
-            CleanupEvidence::Pending
-        } else {
-            CleanupEvidence::Skipped
-        },
+        topology_reconciliation: transaction.abort_topology_reconciliation(),
         source_cleanup: if transaction.command_kind == CommandKind::Deploy {
             CleanupEvidence::Pending
         } else {
@@ -7184,7 +7789,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::drivers::SystemdWorkloadObservation;
+    use crate::drivers::{SystemdWorkloadObservation, incarnation_key};
 
     /// Fixed clock for the signing fixture; correlations must land inside
     /// DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS of it to authenticate.
@@ -9506,25 +10111,107 @@ mod tests {
         }
     }
 
-    /// A Continuity transaction for an unrouted, stateless target, sitting at
-    /// `phase` (Warming or later) with every earlier phase's evidence in place. The plan, sealed
-    /// release, Expected, activation and Warming evidence are the real
-    /// constructions; only the workload and isolation observations are
-    /// borrowed from a recorded transaction. Continuity is chosen because a
-    /// Deploy would need a frozen source and a signed brake record, which no
-    /// phase past Fencing reads.
+    /// A Continuity transaction for an unrouted, stateless target with no
+    /// incumbent: the shape most Engine tests need.
     fn transaction_at(
         world: &EngineFixture,
         phase: DeploymentPhase,
     ) -> Result<DeploymentTransaction> {
+        seeded_transaction(world, phase, CommandKind::Continuity, None)
+    }
+
+    /// The Odin publisher sequence a transaction seeded over `incumbent`
+    /// warms at; its Ready is the next one. Above anything an earlier
+    /// generation of the world admitted.
+    fn seeded_sequence(incumbent: Option<&AdmittedGeneration>) -> u64 {
+        if incumbent.is_some() { 14 } else { 4 }
+    }
+
+    /// A released deployment brake receipt, signed by an operator identity
+    /// enrolled in the world: what a Deploy's `deployment_authorization` holds.
+    fn deployment_authorization(
+        world: &EngineFixture,
+        expected: &IdunnExpectedIncarnationRecord,
+        transaction_id: &str,
+        now: u64,
+    ) -> Result<DeploymentAuthorization> {
+        use cultnet_rs::{
+            IDUNN_DEPLOYMENT_BRAKE_AUTHORITY, IDUNN_DEPLOYMENT_BRAKE_ID,
+            IDUNN_DEPLOYMENT_BRAKE_SCOPE, IDUNN_DEPLOYMENT_RELEASE_PURPOSE,
+            IdunnDeploymentBrakeReleasePurpose, enroll_service_identity_at,
+        };
+        let signer = enroll_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(
+            &world.root.join("identities/brake-operator.cc"),
+        )?;
+        export_service_identity_trust_anchor(&signer, &world.root.join("brake-anchor.cc"))?;
+        let mut record = IdunnDeploymentBrakeRecord {
+            schema_version: IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into(),
+            brake_id: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
+            authority: IDUNN_DEPLOYMENT_BRAKE_AUTHORITY.into(),
+            runtime_id: expected.runtime_id.clone(),
+            status: "released".into(),
+            scope: IDUNN_DEPLOYMENT_BRAKE_SCOPE.into(),
+            reason: "test rollout".into(),
+            observed_at_unix_millis: now,
+            expires_at_unix_millis: Some(now + 600_000),
+            authorization_id: Some("authorization-test".into()),
+            authorization_purpose: Some(IDUNN_DEPLOYMENT_RELEASE_PURPOSE.into()),
+            authorized_release_id: Some(expected.sealed_release_id.clone()),
+            authorized_deployment_id: Some(transaction_id.to_owned()),
+            authorized_by: Some(signer.trust_anchor()?.identity_id),
+            authorization_issued_at_unix_millis: Some(now),
+            authorization_expires_at_unix_millis: Some(now + 600_000),
+            signature_algorithm: Some("ed25519".into()),
+            signature: None,
+            private_state_exposed: false,
+            updated_by: "operator/test".into(),
+        };
+        record.signature = Some(
+            signer
+                .sign::<IdunnDeploymentBrakeReleasePurpose>(&rmp_serde::to_vec(&record)?)
+                .signature,
+        );
+        record.validate()?;
+        let canonical_brake_bytes = rmp_serde::to_vec(&record)?;
+        Ok(DeploymentAuthorization {
+            authorization_id: "authorization-test".into(),
+            brake_sha256: sha256_id(&canonical_brake_bytes),
+            canonical_brake_bytes,
+            authorized_at_unix_millis: now,
+        })
+    }
+
+    /// A transaction for an unrouted, stateless target, sitting at `phase`
+    /// (Warming or later) with every earlier phase's evidence in place. The
+    /// plan, sealed release, Expected, activation and Warming evidence are the
+    /// real constructions; only the workload and isolation observations are
+    /// borrowed from a recorded transaction.
+    ///
+    /// `incumbent` is an admitted generation already in the world's store. A
+    /// Continuity over it restarts that generation's own release, so it shares
+    /// the incumbent's Expected key. A Deploy over it builds a second
+    /// incarnation. A Deploy carries what phases past Fencing never read but
+    /// validation requires: a three-field frozen-source receipt and a
+    /// well-formed release receipt from the brake.
+    fn seeded_transaction(
+        world: &EngineFixture,
+        phase: DeploymentPhase,
+        kind: CommandKind,
+        incumbent: Option<&AdmittedGeneration>,
+    ) -> Result<DeploymentTransaction> {
         use crate::deployment_plan::tests::{
             BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
         };
-        let provider = enroll_service_identity_at::<GameCultProviderHealthIdentity>(
-            &world.root.join("identities/provider.cc"),
-        )?;
+        let provider_path = world.root.join("identities/provider.cc");
         let provider_anchor = world.root.join("identities/provider-anchor.cc");
-        export_service_identity_trust_anchor(&provider, &provider_anchor)?;
+        let provider = if provider_path.exists() {
+            open_service_identity_at::<GameCultProviderHealthIdentity>(&provider_path)?
+        } else {
+            let provider =
+                enroll_service_identity_at::<GameCultProviderHealthIdentity>(&provider_path)?;
+            export_service_identity_trust_anchor(&provider, &provider_anchor)?;
+            provider
+        };
 
         let (binding_head, binding_tail) = BINDING
             .split_once("[route]")
@@ -9550,34 +10237,60 @@ mod tests {
                 r#"["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
                 r#"["GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
             );
-        let plan = compile_deployment_plan(
-            recipe.as_bytes(),
-            binding.as_bytes(),
-            source(&recipe),
-            "service-incarnation-1",
-            None,
-            110,
-            &[],
-        )?;
-        let release = SealedRelease::new(
-            &plan,
-            vec![artifact_receipt()],
-            vec![external_input_receipt()],
-            120,
-        )?;
+        let (plan, release) = match (kind, incumbent) {
+            (CommandKind::Continuity, Some(incumbent)) => (
+                incumbent.plan.clone(),
+                incumbent.sealed_release.clone(),
+            ),
+            _ => {
+                let incarnation = if incumbent.is_some() {
+                    "service-incarnation-2"
+                } else {
+                    "service-incarnation-1"
+                };
+                let plan = compile_deployment_plan(
+                    recipe.as_bytes(),
+                    binding.as_bytes(),
+                    source(&recipe),
+                    incarnation,
+                    None,
+                    110,
+                    &[],
+                )?;
+                let release = SealedRelease::new(
+                    &plan,
+                    vec![artifact_receipt()],
+                    vec![external_input_receipt()],
+                    120,
+                )?;
+                (plan, release)
+            }
+        };
         let expected = release.expected_projection(&plan)?;
         assert!(!expected.write_lease_required && expected.route.is_none());
 
         let now = now_millis()?;
         let command = DeploymentCommand {
             schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
-            command_id: "continuity-service".into(),
-            kind: CommandKind::Continuity,
+            command_id: format!(
+                "{}-service{}",
+                match kind {
+                    CommandKind::Deploy => "up",
+                    CommandKind::Continuity => "continuity",
+                },
+                if incumbent.is_some() { "-again" } else { "" }
+            ),
+            kind,
             selector: "service".into(),
             requested_by: "test".into(),
             requested_at_unix_millis: 100,
         };
-        let mut transaction = DeploymentTransaction::new(&command, "service".into(), 0, None, now)?;
+        let mut transaction = match (kind, incumbent) {
+            (CommandKind::Continuity, Some(incumbent)) => {
+                DeploymentTransaction::from_continuity(&command, incumbent, now)?
+            }
+            _ => DeploymentTransaction::new(&command, "service".into(), 0, incumbent, now)?,
+        };
         let activation = IdunnRuntimeActivationLaunch::issue(
             &expected,
             runtime_instance_id(&transaction.transaction_id)?,
@@ -9590,12 +10303,30 @@ mod tests {
             .1
             .workload
             .context("recorded transaction has no workload")?;
-        transaction.lifecycle_authorized_at_unix_millis = Some(now);
+        match kind {
+            CommandKind::Continuity => {
+                transaction.lifecycle_authorized_at_unix_millis = Some(now);
+            }
+            CommandKind::Deploy => {
+                transaction.frozen_source = Some(FrozenSourceReceipt {
+                    transaction_id: transaction.transaction_id.clone(),
+                    plan_id: plan.plan_id.clone(),
+                    snapshot_sha256: sha256_id(b"frozen source snapshot"),
+                });
+                transaction.deployment_authorization = Some(deployment_authorization(
+                    world,
+                    &expected,
+                    &transaction.transaction_id,
+                    now,
+                )?);
+            }
+        }
         transaction.expected_publication_sha256 = Some(expected.canonical_sha256()?);
         transaction.activation_publication_sha256 = Some(activation.canonical_sha256()?);
         match &mut workload {
             WorkloadObservation::Systemd(observed) => {
                 observed.runtime_instance_id = activation.runtime_instance_id.clone();
+                observed.executable_sha256 = expected.artifact_sha256.clone();
             }
             WorkloadObservation::Host(_) => bail!("recorded workload is not a systemd unit"),
         }
@@ -9611,7 +10342,8 @@ mod tests {
         transaction.workload = Some(workload);
         transaction.plan = Some(plan);
         // Odin's first word about the candidate, before it was Ready.
-        let warming = signed_correlation(world, &transaction, 4, false)?;
+        let sequence = seeded_sequence(incumbent);
+        let warming = signed_correlation(world, &transaction, sequence, false)?;
         let authenticated = world.engine.authenticate_topology_bytes(
             &ControlSnapshot::read(&world.state_store)?,
             &transaction,
@@ -9622,7 +10354,7 @@ mod tests {
         transaction.warming = Some(WarmingEvidence::OdinTopology {
             evidence: TopologyEvidence::from_authenticated(&authenticated, now)?,
         });
-        transaction.odin_publisher_sequence_cursor = 4;
+        transaction.odin_publisher_sequence_cursor = sequence;
         transaction.enter_phase(phase, now);
         transaction.validate()?;
 
@@ -10325,6 +11057,1869 @@ mod tests {
             reason: String::new(),
         };
         assert!(failed.validate().is_err());
+        Ok(())
+    }
+    /// The persisted projection a continuity restart leaves behind, read at
+    /// the file the daemon writes.
+    struct ContinuityProjection {
+        _temp: TempDir,
+        topology: CultCacheTopologyDriver,
+        provider_anchor: ServiceIdentityTrustAnchor,
+        expected: IdunnExpectedIncarnationRecord,
+        admitted_activation: IdunnRuntimeActivationRecord,
+        candidate_activation: IdunnRuntimeActivationRecord,
+    }
+
+    impl ContinuityProjection {
+        /// The production sequence: the admitted incarnation dies and is
+        /// demoted to Expected-only, then the continuity candidate publishes
+        /// its own activation under the same key once it is observed.
+        fn after_candidate_observed() -> Result<Self> {
+            let temp = TempDir::new()?;
+            let root = temp.path();
+            let idunn = enroll_service_identity_at::<IdunnServiceIdentity>(&root.join("idunn.cc"))?;
+            let provider = enroll_service_identity_at::<GameCultProviderHealthIdentity>(
+                &root.join("provider.cc"),
+            )?;
+            let provider_anchor = provider.trust_anchor()?;
+            let mut expected = TopologyFixture::new("ghostlight")?.expected;
+            expected.expected_signer_identity_id = provider.entry().identity_id.clone();
+            expected.artifact_sha256 = sha256_id(&[1]);
+            expected.validate()?;
+            let topology = CultCacheTopologyDriver {
+                projection_store: root.join("topology.cc"),
+                correlation_store: root.join("correlation.cc"),
+            };
+            let admitted = workload(1, 40, 50);
+            let candidate = workload(2, 41, 51);
+            let issue = |observation: &WorkloadObservation| -> Result<_> {
+                Ok(IdunnRuntimeActivationLaunch::issue(
+                    &expected,
+                    observation.runtime_instance_id().to_owned(),
+                    NOW,
+                    &idunn,
+                )?
+                .activation()
+                .clone())
+            };
+            let admitted_activation = issue(&admitted)?;
+            let candidate_activation = issue(&candidate)?;
+            assert_ne!(admitted_activation, candidate_activation);
+
+            topology.publish_expected(&expected, &provider_anchor)?;
+            topology.publish_observed_activation(&expected, &admitted_activation, &admitted)?;
+            topology.demote_to_expected_only(
+                &expected,
+                &provider_anchor,
+                &admitted_activation,
+                None,
+            )?;
+            topology.publish_expected(&expected, &provider_anchor)?;
+            topology.publish_observed_activation(&expected, &candidate_activation, &candidate)?;
+            Ok(Self {
+                _temp: temp,
+                topology,
+                provider_anchor,
+                expected,
+                admitted_activation,
+                candidate_activation,
+            })
+        }
+
+        fn continuity_transaction(&self) -> Result<DeploymentTransaction> {
+            let mut transaction = DeploymentTransaction::new(
+                &command(CommandKind::Continuity),
+                "ghostlight".into(),
+                0,
+                None,
+                100,
+            )?;
+            transaction.expected = Some(self.expected.clone());
+            transaction.activation = Some(self.candidate_activation.clone());
+            Ok(transaction)
+        }
+
+        /// Types of the records projected under the shared incarnation key.
+        fn projected_types(&self) -> Result<Vec<String>> {
+            let key = incarnation_key(&self.expected)?;
+            Ok(
+                SingleFileMessagePackBackingStore::new(&self.topology.projection_store)
+                    .pull_all_read_only_snapshot()?
+                    .into_iter()
+                    .filter(|entry| entry.key == key)
+                    .map(|entry| entry.r#type)
+                    .collect(),
+            )
+        }
+    }
+
+    #[test]
+    fn a_failed_continuity_demotes_its_own_activation_and_keeps_the_expected() -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        assert!(
+            world
+                .projected_types()?
+                .contains(&IdunnRuntimeActivationRecord::TYPE.to_owned())
+        );
+        let transaction = world.continuity_transaction()?;
+        assert_eq!(
+            transaction.abort_topology_reconciliation(),
+            CleanupEvidence::Pending
+        );
+        assert_eq!(
+            post_fencing_abort_intent(&transaction, "candidate died").topology_reconciliation,
+            CleanupEvidence::Pending
+        );
+
+        reconcile_failed_candidate_projection(
+            &world.topology,
+            &transaction,
+            &world.provider_anchor,
+        )?;
+
+        assert_eq!(
+            world.projected_types()?,
+            vec![IdunnExpectedIncarnationRecord::TYPE.to_owned()],
+            "the shared key must keep its Expected and nothing else"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_continuity_that_issued_no_activation_owes_no_projection_change() -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        let mut transaction = world.continuity_transaction()?;
+        transaction.activation = None;
+        assert_eq!(
+            transaction.abort_topology_reconciliation(),
+            CleanupEvidence::Skipped
+        );
+        assert_eq!(
+            post_fencing_abort_intent(&transaction, "candidate never started")
+                .topology_reconciliation,
+            CleanupEvidence::Skipped
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deploy_fencing_after_a_failed_continuity_resolves_with_the_admitted_activation()
+    -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        reconcile_failed_candidate_projection(
+            &world.topology,
+            &world.continuity_transaction()?,
+            &world.provider_anchor,
+        )?;
+        let settled = std::fs::read(&world.topology.projection_store)?;
+
+        // The deploy's post-fence rollback demotes the admitted generation's
+        // exact activation. The failed continuity left nothing standing, so it
+        // resolves instead of refusing as substituted.
+        world.topology.demote_to_expected_only(
+            &world.expected,
+            &world.provider_anchor,
+            &world.admitted_activation,
+            None,
+        )?;
+        assert_eq!(std::fs::read(&world.topology.projection_store)?, settled);
+        Ok(())
+    }
+
+    #[test]
+    fn no_path_adopts_an_activation_the_transaction_did_not_issue() -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        let before = std::fs::read(&world.topology.projection_store)?;
+
+        // The candidate's activation is still projected. The admitted
+        // generation's exact activation is not what stands there, so its
+        // demotion refuses rather than taking the newer one.
+        assert!(
+            world
+                .topology
+                .demote_to_expected_only(
+                    &world.expected,
+                    &world.provider_anchor,
+                    &world.admitted_activation,
+                    None,
+                )
+                .is_err()
+        );
+
+        // Nor may a continuity transaction demote an activation it did not
+        // issue.
+        let mut foreign = world.continuity_transaction()?;
+        foreign.activation = Some(world.admitted_activation.clone());
+        assert!(
+            reconcile_failed_candidate_projection(
+                &world.topology,
+                &foreign,
+                &world.provider_anchor
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&world.topology.projection_store)?, before);
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // B1 fix batch: the transition, the precondition, the boot reconciliation,
+    // history that fails closed, and the abort paths through the Engine.
+    // ---------------------------------------------------------------------
+
+    /// A workload port whose process can be killed: observing it succeeds
+    /// until `kill`, then fails the way a dead unit does. Everything else is
+    /// `StillWorkload`'s.
+    struct SwitchWorkload {
+        alive: std::sync::atomic::AtomicBool,
+    }
+
+    impl SwitchWorkload {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                alive: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+
+        fn kill(&self) {
+            self.alive
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl WorkloadPort for SwitchWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            StillWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            StillWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn observe(
+            &self,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+            prior: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            ensure!(
+                self.alive.load(std::sync::atomic::Ordering::SeqCst),
+                "the workload is gone"
+            );
+            Ok(prior.clone())
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            Ok(())
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// Admit a generation for "service" through the real phase machine and
+    /// retire its transaction, leaving the world with an incumbent.
+    fn admit_incumbent(world: &EngineFixture) -> Result<AdmittedGeneration> {
+        let seeded = transaction_at(world, DeploymentPhase::Fencing)?;
+        odin_reports_ready(world, &seeded, seeded_sequence(None) + 1)?;
+        drive(world, |transaction| {
+            transaction.phase == DeploymentPhase::Complete
+        })?;
+        assert!(world.engine.retire_one_terminal_transaction()?);
+        Ok(ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("commit wrote no admitted generation")?
+            .value
+            .clone())
+    }
+
+    /// Change the incumbent in the store, compare-and-swap.
+    fn edit_incumbent(
+        world: &EngineFixture,
+        edit: impl FnOnce(&mut AdmittedGeneration),
+    ) -> Result<AdmittedGeneration> {
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        let stored = snapshot
+            .admitted_for("service")
+            .context("no admitted generation")?;
+        let mut next = stored.value.clone();
+        edit(&mut next);
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: AdmittedGeneration::TYPE.into(),
+                    key: "service".into(),
+                    current: Some(stored.envelope.clone()),
+                }],
+                &[admitted_envelope(&next, now_millis()?)?],
+            )?
+        );
+        Ok(next)
+    }
+
+    fn incumbent_envelope(world: &EngineFixture) -> Result<CultCacheEnvelope> {
+        Ok(ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("no admitted generation")?
+            .envelope
+            .clone())
+    }
+
+    /// Publish what a transaction's candidate projects: its Expected and,
+    /// when asked, its observed activation.
+    fn project_candidate(
+        world: &EngineFixture,
+        transaction: &DeploymentTransaction,
+        with_activation: bool,
+    ) -> Result<()> {
+        let expected = transaction.expected.as_ref().context("no Expected")?;
+        let anchor = world
+            .engine
+            .provider_anchor_for_plan(transaction.plan.as_ref().context("no plan")?)?;
+        let topology = world.engine.topology();
+        topology.publish_expected(expected, &anchor)?;
+        if with_activation {
+            // The observation must name the release the Expected declares;
+            // the borrowed workload is patched to.
+            let mut workload = transaction.workload.clone().context("no workload")?;
+            if let WorkloadObservation::Systemd(observed) = &mut workload {
+                observed.executable_sha256 = expected.artifact_sha256.clone();
+            }
+            topology.publish_observed_activation(
+                expected,
+                transaction.activation.as_ref().context("no activation")?,
+                &workload,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Publish what an admitted generation projects while it runs.
+    fn project_admitted(world: &EngineFixture, generation: &AdmittedGeneration) -> Result<()> {
+        let anchor = world.engine.provider_anchor_for_plan(&generation.plan)?;
+        let topology = world.engine.topology();
+        topology.publish_expected(&generation.expected, &anchor)?;
+        topology.publish_observed_activation(
+            &generation.expected,
+            &generation.activation,
+            &generation.workload,
+        )?;
+        Ok(())
+    }
+
+    /// The types of the records projected under one incarnation key, sorted.
+    fn projected_under(
+        world: &EngineFixture,
+        expected: &IdunnExpectedIncarnationRecord,
+    ) -> Result<Vec<String>> {
+        let path = &world.engine.options.topology_store;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let key = incarnation_key(expected)?;
+        let mut types = SingleFileMessagePackBackingStore::new(path)
+            .pull_all_read_only_snapshot()?
+            .into_iter()
+            .filter(|entry| entry.key == key)
+            .map(|entry| entry.r#type)
+            .collect::<Vec<_>>();
+        types.sort();
+        Ok(types)
+    }
+
+    /// One transaction by id, wherever it now lives. A failed transaction is
+    /// archived the moment it finishes, so it is in history, not resident.
+    fn record_of(world: &EngineFixture, transaction_id: &str) -> Result<DeploymentTransaction> {
+        if let Some(stored) = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .find(|stored| stored.value.transaction_id == transaction_id)
+        {
+            return Ok(stored.value);
+        }
+        read_history_transactions(&world.state_store)
+            .into_iter()
+            .find(|transaction| transaction.transaction_id == transaction_id)
+            .context("the transaction is in neither the live set nor history")
+    }
+
+    fn expected_only() -> Vec<String> {
+        vec![IdunnExpectedIncarnationRecord::TYPE.to_owned()]
+    }
+
+    // ---- the Engine's abort paths, Deploy and incumbent ----
+
+    #[test]
+    fn a_deploy_that_fences_commits_and_retires_the_incumbent_it_replaced() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        admit_incumbent(&world)?;
+        let backoff = ContinuityBackoff {
+            window_started_at_unix_millis: Some(1_000),
+            attempts: 2,
+            next_restart_at_unix_millis: Some(9_000),
+        };
+        let incumbent = edit_incumbent(&world, |generation| {
+            generation.continuity_backoff = backoff.clone();
+        })?;
+
+        let candidate = seeded_transaction(
+            &world,
+            DeploymentPhase::Fencing,
+            CommandKind::Deploy,
+            Some(&incumbent),
+        )?;
+        odin_reports_ready(&world, &candidate, seeded_sequence(Some(&incumbent)) + 1)?;
+        drive(&world, |transaction| {
+            transaction.phase == DeploymentPhase::Complete
+        })?;
+
+        let admitted = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("the deploy admitted nothing")?
+            .value
+            .clone();
+        assert_eq!(admitted.transaction_id, candidate.transaction_id);
+        assert_ne!(admitted.generation_id, incumbent.generation_id);
+        // The restart ceiling belongs to the target: a commit must not reset it.
+        assert_eq!(admitted.continuity_backoff, backoff);
+        assert_eq!(admitted.route_supervision, incumbent.route_supervision);
+
+        // The commit did not stop the incumbent: it is retired after.
+        let committed = record_of(&world, &candidate.transaction_id)?;
+        let cleanup = committed.post_commit_cleanup.clone().context("no cleanup")?;
+        assert_eq!(
+            cleanup.incumbent,
+            IncumbentCleanupEvidence::Pending {
+                generation_id: incumbent.generation_id.clone(),
+                workload: incumbent.workload.clone(),
+            }
+        );
+        assert_eq!(cleanup.source, SourceCleanupEvidence::Pending);
+        let frozen = world
+            .engine
+            .options
+            .staging_root
+            .join("frozen-sources")
+            .join(&candidate.transaction_id);
+        std::fs::create_dir_all(&frozen)?;
+        std::fs::write(frozen.join("tree"), b"frozen")?;
+
+        drive(&world, |transaction| transaction.is_terminal())?;
+        let retired = record_of(&world, &candidate.transaction_id)?
+            .post_commit_cleanup
+            .context("no cleanup")?;
+        assert_eq!(
+            retired.incumbent,
+            IncumbentCleanupEvidence::Complete {
+                generation_id: incumbent.generation_id
+            }
+        );
+        assert_eq!(retired.source, SourceCleanupEvidence::Complete);
+        assert!(!frozen.exists(), "the frozen source outlived its deploy");
+        Ok(())
+    }
+
+    #[test]
+    fn a_deploy_post_fence_abort_cleans_up_and_restores_its_incumbent_exactly() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let incumbent = admit_incumbent(&world)?;
+        project_admitted(&world, &incumbent)?;
+        let candidate = seeded_transaction(
+            &world,
+            DeploymentPhase::Fencing,
+            CommandKind::Deploy,
+            Some(&incumbent),
+        )?;
+        project_candidate(&world, &candidate, true)?;
+        let candidate_expected = candidate.expected.clone().context("no Expected")?;
+        assert_eq!(
+            projected_under(&world, &candidate_expected)?.len(),
+            2,
+            "the candidate did not project"
+        );
+        let frozen = world
+            .engine
+            .options
+            .staging_root
+            .join("frozen-sources")
+            .join(&candidate.transaction_id);
+        std::fs::create_dir_all(&frozen)?;
+        std::fs::write(frozen.join("tree"), b"frozen")?;
+        let before = incumbent_envelope(&world)?;
+
+        world
+            .engine
+            .begin_post_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        assert!(resident(&world)?.value.post_fencing_abort.is_some());
+        drive(&world, |transaction| transaction.completion.is_some())?;
+
+        let finished = record_of(&world, &candidate.transaction_id)?;
+        assert!(matches!(
+            finished.completion,
+            Some(TransactionCompletion::FailedAfterFencing {
+                recovery: TerminalRecovery::RestoreIncumbent,
+                ..
+            })
+        ));
+        let abort = finished.post_fencing_abort.context("no abort evidence")?;
+        assert_eq!(abort.topology_reconciliation, CleanupEvidence::Complete);
+        assert_eq!(abort.source_cleanup, CleanupEvidence::Complete);
+        assert!(!frozen.exists(), "the abandoned source was not cleaned");
+        assert!(
+            projected_under(&world, &candidate_expected)?.is_empty(),
+            "the abandoned candidate is still projected"
+        );
+        // Fencing stopped the incumbent: it stands as Expected-only, with the
+        // exact activation it ran under withdrawn, ready for continuity.
+        assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
+        assert_eq!(incumbent_envelope(&world)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_deploy_pre_fence_abort_cleans_up_and_leaves_its_incumbent_running() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let incumbent = admit_incumbent(&world)?;
+        project_admitted(&world, &incumbent)?;
+        let candidate = seeded_transaction(
+            &world,
+            DeploymentPhase::Warming,
+            CommandKind::Deploy,
+            Some(&incumbent),
+        )?;
+        project_candidate(&world, &candidate, true)?;
+        let candidate_expected = candidate.expected.clone().context("no Expected")?;
+        let frozen = world
+            .engine
+            .options
+            .staging_root
+            .join("frozen-sources")
+            .join(&candidate.transaction_id);
+        std::fs::create_dir_all(&frozen)?;
+        std::fs::write(frozen.join("tree"), b"frozen")?;
+        let before = incumbent_envelope(&world)?;
+
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let intent = resident(&world)?.value.pre_fencing_abort.context("no intent")?;
+        assert_eq!(intent.topology_reconciliation, CleanupEvidence::Pending);
+        assert_eq!(intent.source_cleanup, CleanupEvidence::Pending);
+        drive(&world, |transaction| transaction.completion.is_some())?;
+
+        let finished = record_of(&world, &candidate.transaction_id)?;
+        assert!(matches!(
+            finished.completion,
+            Some(TransactionCompletion::FailedBeforeFencing { .. })
+        ));
+        assert!(finished.is_terminal());
+        assert!(!frozen.exists(), "the abandoned source was not cleaned");
+        assert!(projected_under(&world, &candidate_expected)?.is_empty());
+        // Before fencing a deployment never touched its incumbent.
+        assert_eq!(
+            projected_under(&world, &incumbent.expected)?,
+            {
+                let mut types = vec![
+                    IdunnExpectedIncarnationRecord::TYPE.to_owned(),
+                    IdunnRuntimeActivationRecord::TYPE.to_owned(),
+                ];
+                types.sort();
+                types
+            }
+        );
+        assert_eq!(incumbent_envelope(&world)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_continuity_abort_over_its_incumbent_demotes_only_the_activation_it_issued() -> Result<()> {
+        for post_fence in [false, true] {
+            let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+            let incumbent = admit_incumbent(&world)?;
+            let candidate = seeded_transaction(
+                &world,
+                if post_fence {
+                    DeploymentPhase::Fencing
+                } else {
+                    DeploymentPhase::Warming
+                },
+                CommandKind::Continuity,
+                Some(&incumbent),
+            )?;
+            // The candidate shares the incumbent's key: same Expected, its own
+            // activation.
+            assert_eq!(candidate.expected.as_ref(), Some(&incumbent.expected));
+            assert_ne!(candidate.activation.as_ref(), Some(&incumbent.activation));
+            project_candidate(&world, &candidate, true)?;
+            let before = incumbent_envelope(&world)?;
+
+            let stored = resident(&world)?;
+            if post_fence {
+                world
+                    .engine
+                    .begin_post_fencing_abort(&stored, anyhow!("candidate died"))?;
+                assert_eq!(
+                    resident(&world)?
+                        .value
+                        .post_fencing_abort
+                        .context("no intent")?
+                        .topology_reconciliation,
+                    CleanupEvidence::Pending
+                );
+            } else {
+                world
+                    .engine
+                    .begin_pre_fencing_abort(&stored, anyhow!("candidate died"))?;
+                assert_eq!(
+                    resident(&world)?
+                        .value
+                        .pre_fencing_abort
+                        .context("no intent")?
+                        .topology_reconciliation,
+                    CleanupEvidence::Pending
+                );
+            }
+            drive(&world, |transaction| transaction.completion.is_some())?;
+
+            assert_eq!(
+                projected_under(&world, &incumbent.expected)?,
+                expected_only(),
+                "post_fence={post_fence}: the shared key must keep its Expected and nothing else"
+            );
+            let finished = record_of(&world, &candidate.transaction_id)?;
+            assert!(finished.is_terminal());
+            assert!(matches!(
+                finished.completion,
+                Some(
+                    TransactionCompletion::FailedBeforeFencing { .. }
+                        | TransactionCompletion::FailedAfterFencing { .. }
+                )
+            ));
+            assert_eq!(incumbent_envelope(&world)?, before);
+        }
+        Ok(())
+    }
+
+    // ---- fix 1: the legacy lift owns the transition ----
+
+    const FIXTURE_PRE_B1_ABORTS: [(&str, &str); 3] = [
+        (
+            "pre-fence abort in flight",
+            include_str!("../tests/fixtures/idunn-control-legacy/transaction-pre-fence-abort.hex"),
+        ),
+        (
+            "pre-fence abort already terminal",
+            include_str!(
+                "../tests/fixtures/idunn-control-legacy/transaction-pre-fence-abort-terminal.hex"
+            ),
+        ),
+        (
+            "post-fence abort in flight",
+            include_str!("../tests/fixtures/idunn-control-legacy/transaction-post-fence-abort.hex"),
+        ),
+    ];
+    const FIXTURE_PROVIDER_ANCHOR: &str =
+        include_str!("../tests/fixtures/idunn-control-legacy/provider-anchor.hex");
+    /// Where the fixtures' plan binding names the provider trust anchor.
+    const FIXTURE_ANCHOR_PATH: &str = "/tmp/idunn-b1-legacy/provider-anchor.cc";
+
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        let hex = text.trim();
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex fixture"))
+            .collect()
+    }
+
+    fn write_fixture_anchor() -> Result<()> {
+        let path = Path::new(FIXTURE_ANCHOR_PATH);
+        std::fs::create_dir_all(path.parent().context("anchor path has no parent")?)?;
+        std::fs::write(path, hex_bytes(FIXTURE_PROVIDER_ANCHOR))?;
+        Ok(())
+    }
+
+    fn abort_owed(transaction: &DeploymentTransaction) -> Option<CleanupEvidence> {
+        transaction
+            .pre_fencing_abort
+            .as_ref()
+            .map(|abort| abort.topology_reconciliation)
+            .or_else(|| {
+                transaction
+                    .post_fencing_abort
+                    .as_ref()
+                    .map(|abort| abort.topology_reconciliation)
+            })
+    }
+
+    /// Put a continuity's record and its command in the control store as they
+    /// stood: `envelope` is written as given, in whatever schema it is in.
+    fn make_resident(
+        world: &EngineFixture,
+        transaction: &DeploymentTransaction,
+        envelope: CultCacheEnvelope,
+    ) -> Result<()> {
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: transaction.command_id.clone(),
+            kind: CommandKind::Continuity,
+            selector: "service".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: command.command_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: envelope.key.clone(),
+                        current: None,
+                    },
+                ],
+                &[command_envelope(&command, 100)?, envelope],
+            )?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pre_b1_continuity_abort_lifts_without_reopening_and_boot_resolves_its_residue()
+    -> Result<()> {
+        write_fixture_anchor()?;
+        for (name, text) in FIXTURE_PRE_B1_ABORTS {
+            let envelope = fixture_envelope(text, DeploymentTransaction::TYPE)?;
+
+            // The record is what the old rule wrote: an activation was issued
+            // and the abort says it owes the projection nothing.
+            let legacy: LegacyDeploymentTransaction = rmp_serde::from_slice(&envelope.payload)?;
+            assert_eq!(legacy.command_kind, CommandKind::Continuity, "{name}");
+            assert!(legacy.activation.is_some(), "{name}");
+
+            // History describes what happened, so it lifts the record as written.
+            let archived = lift_legacy_transaction(&envelope)?;
+            assert_eq!(abort_owed(&archived), Some(CleanupEvidence::Skipped), "{name}");
+
+            // The control store lifts it without reopening anything.
+            let lifted = read_transaction_record(&envelope)?;
+            let terminal = archived.completion.is_some();
+            if terminal {
+                assert!(
+                    abort_owed(&lifted).is_some_and(CleanupEvidence::is_legacy_marker),
+                    "{name}"
+                );
+                assert!(lifted.is_terminal(), "{name}: the lift reopened a finished record");
+                assert_eq!(lifted.phase, archived.phase, "{name}");
+                assert_eq!(lifted.completion, archived.completion, "{name}");
+                assert!(!lifted.owns_target_authority(), "{name}");
+            } else {
+                assert_eq!(abort_owed(&lifted), Some(CleanupEvidence::Pending), "{name}");
+                assert!(!lifted.is_terminal(), "{name}");
+                assert_eq!(lifted.completion, None, "{name}");
+            }
+
+            // Boot: the store reads.
+            let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+            make_resident(&world, &lifted, envelope.clone())?;
+            assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+            let snapshot = ControlSnapshot::read(&world.state_store)?;
+            assert_eq!(snapshot.transactions.len(), 1, "{name}");
+            project_candidate(&world, &lifted, true)?;
+            let expected = lifted.expected.clone().context("no Expected")?;
+            assert_eq!(projected_under(&world, &expected)?.len(), 2, "{name}");
+
+            if terminal {
+                // A finished record owes nothing and is not touched: boot
+                // reconciliation demotes the residue by its exact activation.
+                let before = resident(&world)?.envelope;
+                let outcome = world.engine.reconcile_failed_continuity_projections()?;
+                assert_eq!(outcome.demoted, vec![lifted.transaction_id.clone()], "{name}");
+                assert_eq!(resident(&world)?.envelope, before, "{name}");
+            } else {
+                // A record in flight resolves through its own abort.
+                for _ in 0..12 {
+                    let Ok(current) = resident(&world) else { break };
+                    if current.value.completion.is_some() {
+                        break;
+                    }
+                    world.engine.advance_transaction(&current)?;
+                }
+                assert!(
+                    record_of(&world, &envelope.key)?.completion.is_some(),
+                    "{name}: the abort never resolved"
+                );
+            }
+            assert_eq!(
+                projected_under(&world, &expected)?,
+                expected_only(),
+                "{name}: the projection was not demoted to Expected-only"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resident_terminal_pre_b1_aborts_never_claim_target_authority() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let live = seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, None)?;
+        let first = read_transaction_record(&envelope)?;
+        assert_eq!(first.target, live.target);
+        make_resident(&world, &first, envelope)?;
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+
+        // A second resident abort of the same shape for the same target,
+        // already written as the marker the migration persists.
+        let mut second = first.clone();
+        second.transaction_id = "tx-second-legacy".into();
+        second.command_id = "continuity-second-legacy".into();
+        make_resident(
+            &world,
+            &second,
+            cleanup_evidence::last_error_envelope(&second, "second")?,
+        )?;
+
+        // The store reads: three records, one of them live, none of the
+        // finished ones claiming the target.
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(snapshot.transactions.len(), 3);
+        let live_before = snapshot
+            .transactions
+            .iter()
+            .find(|stored| stored.value.transaction_id == live.transaction_id)
+            .context("live transaction")?
+            .envelope
+            .clone();
+
+        // Reconciliation cleans the residue once, by exact activation.
+        let expected = first.expected.clone().context("no Expected")?;
+        project_candidate(&world, &first, true)?;
+        assert_eq!(projected_under(&world, &expected)?.len(), 2);
+        let outcome = world.engine.reconcile_failed_continuity_projections()?;
+        assert_eq!(outcome.demoted.len(), 1);
+        assert_eq!(projected_under(&world, &expected)?, expected_only());
+        let after = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(
+            after
+                .transactions
+                .iter()
+                .find(|stored| stored.value.transaction_id == live.transaction_id)
+                .context("live transaction")?
+                .envelope,
+            live_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boot_never_republishes_a_withdrawn_incarnation_and_history_keeps_one_copy() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let lifted = read_transaction_record(&envelope)?;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        make_resident(&world, &lifted, envelope.clone())?;
+        // A crash between the two archive steps: history already holds it.
+        assert!(
+            SingleFileMessagePackBackingStore::new(&history_store_path(&world.state_store))
+                .insert_entry_if_absent(envelope)?
+        );
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+
+        // The incarnation was withdrawn: nothing is projected for it.
+        let expected = lifted.expected.clone().context("no Expected")?;
+        assert!(projected_under(&world, &expected)?.is_empty());
+        for _ in 0..3 {
+            world.engine.run_scheduler_tick()?;
+        }
+        assert!(
+            world
+                .engine
+                .reconcile_failed_continuity_projections()?
+                .demoted
+                .is_empty()
+        );
+        assert!(
+            projected_under(&world, &expected)?.is_empty(),
+            "a withdrawn incarnation's Expected was published again"
+        );
+
+        // One copy in history, finished, and nothing resident.
+        let history = read_history(&world.state_store)?;
+        assert_eq!(history.transactions.len(), 1);
+        assert!(history.transactions[0].is_terminal());
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn boot_runs_the_projection_reconciliation_serve_starts_from() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let incumbent = admit_incumbent(&world)?;
+        let failed = seeded_transaction(
+            &world,
+            DeploymentPhase::Warming,
+            CommandKind::Continuity,
+            Some(&incumbent),
+        )?;
+        project_candidate(&world, &failed, true)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate died"))?;
+        drive(&world, |transaction| transaction.completion.is_some())?;
+        // A pre-B1 abort's residue: the failed candidate's activation stands.
+        project_candidate(&world, &failed, true)?;
+        assert_eq!(projected_under(&world, &incumbent.expected)?.len(), 2);
+
+        let (_lock, _engine) = boot(world.engine.options.clone())?;
+        assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
+        Ok(())
+    }
+
+    /// A workload whose candidate can neither be stopped nor recover: an abort
+    /// that cannot finish its first step.
+    struct WedgedWorkload;
+
+    impl WorkloadPort for WedgedWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            StillWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            StillWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            StillWorkload.discard_prepared(plan, expected, activation)
+        }
+        fn observe(
+            &self,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+            prior: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.observe(expected, activation, prior)
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            bail!("the unit will not stop")
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn one_wedged_pre_fence_abort_does_not_stop_the_scheduler() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload))?;
+        let wedged = transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "up-nowhere".into(),
+            kind: CommandKind::Deploy,
+            selector: "nowhere".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command.command_id.clone(),
+                    current: None,
+                }],
+                &[command_envelope(&command, 100)?],
+            )?
+        );
+
+        // Recording the error is not progress, and neither is repeating it.
+        assert!(!world.engine.resume_one_transaction()?);
+        assert!(!world.engine.resume_one_transaction()?);
+        // Every tick answers: the wedged abort records its error and waits,
+        // and the rest of the scheduler goes on to freeze the queued command.
+        write_service_binding(&world)?;
+        for _ in 0..6 {
+            world.engine.run_scheduler_tick()?;
+        }
+        let stuck = record_of(&world, &wedged.transaction_id)?;
+        assert!(!stuck.is_terminal());
+        assert!(stuck.post_fencing_abort.is_none());
+        assert!(stuck.last_error.is_some());
+        assert!(
+            read_history_transactions(&world.state_store)
+                .iter()
+                .any(|transaction| transaction.command_id == command.command_id),
+            "the queued command was never frozen"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_wedged_post_fence_abort_only_waits() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload))?;
+        let dead = transaction_at(&world, DeploymentPhase::Fencing)?;
+        world
+            .engine
+            .begin_post_fencing_abort(&resident(&world)?, anyhow!("candidate died"))?;
+
+        // The abort cannot stop the unit. The abort is already durable, so
+        // that is a resumable error, and the tick answers every time.
+        for _ in 0..3 {
+            world.engine.run_scheduler_tick()?;
+        }
+        let stuck = record_of(&world, &dead.transaction_id)?;
+        assert!(!stuck.is_terminal());
+        assert!(stuck.last_error.is_some());
+        Ok(())
+    }
+
+    /// A wedged abort whose `stop()` error carries a changing counter, as
+    /// systemctl output with a PID or timestamp would.
+    struct ChangingErrorWorkload(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicBool);
+
+    impl WorkloadPort for ChangingErrorWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            WedgedWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            WedgedWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            WedgedWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            WedgedWorkload.discard_prepared(plan, expected, activation)
+        }
+        fn observe(
+            &self,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+            prior: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            WedgedWorkload.observe(expected, activation, prior)
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+            bail!("the unit will not stop (main pid {n})")
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn queue_deploy_for_nowhere(world: &EngineFixture) -> Result<DeploymentCommand> {
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "up-nowhere".into(),
+            kind: CommandKind::Deploy,
+            selector: "nowhere".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command.command_id.clone(),
+                    current: None,
+                }],
+                &[command_envelope(&command, 100)?],
+            )?
+        );
+        Ok(command)
+    }
+
+    #[test]
+    fn a_wedge_whose_error_text_changes_every_tick_does_not_starve_other_targets() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(ChangingErrorWorkload(
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicBool::new(false),
+        )))?;
+        transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let command = queue_deploy_for_nowhere(&world)?;
+        write_service_binding(&world)?;
+        for _ in 0..20 {
+            world.engine.run_scheduler_tick()?;
+        }
+        assert!(
+            read_history_transactions(&world.state_store)
+                .iter()
+                .any(|transaction| transaction.command_id == command.command_id),
+            "the queued command was starved by another target's wedge"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rewriting_last_error_is_not_progress() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let before = transaction_at(&world, DeploymentPhase::Warming)?;
+        let mut noted = before.clone();
+        noted.last_error = Some("the unit will not stop (main pid 7)".into());
+        noted.updated_at_unix_millis += 1;
+        assert!(!state_advanced(&before, &noted));
+        let mut moved = noted.clone();
+        moved.phase = DeploymentPhase::AwaitingReady;
+        assert!(state_advanced(&before, &moved));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failing_step_is_retried_after_a_backoff_not_every_tick() -> Result<()> {
+        let workload = Arc::new(ChangingErrorWorkload(
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let world = EngineFixture::with_workload(workload.clone())?;
+        transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        for _ in 0..10 {
+            world.engine.run_scheduler_tick()?;
+        }
+        assert_eq!(
+            workload.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wedged step was retried inside its backoff"
+        );
+        Ok(())
+    }
+
+    /// A candidate that fails to advance and is dead for good.
+    struct DeadCandidateWorkload;
+
+    impl WorkloadPort for DeadCandidateWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            StillWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            StillWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            StillWorkload.discard_prepared(plan, expected, activation)
+        }
+        fn observe(
+            &self,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+            _: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            bail!("the candidate is gone")
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            Ok(())
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn a_permanently_dead_candidate_past_the_fence_begins_its_post_fence_abort() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(DeadCandidateWorkload))?;
+        let dead = transaction_at(&world, DeploymentPhase::Fencing)?;
+        assert!(record_of(&world, &dead.transaction_id)?.post_fencing_abort.is_none());
+        for _ in 0..8 {
+            world.engine.resume_one_transaction()?;
+        }
+        assert!(
+            record_of(&world, &dead.transaction_id)?
+                .post_fencing_abort
+                .is_some(),
+            "a dead candidate past the fence was retried instead of aborted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_resume_fault_is_reported_once_and_left_in_the_record() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let live = transaction_at(&world, DeploymentPhase::Warming)?;
+        let error = anyhow!("store hiccup 1");
+        world
+            .engine
+            .note_fault("could not resume transaction", &live.transaction_id, &error);
+        assert_eq!(
+            record_of(&world, &live.transaction_id)?.last_error.as_deref(),
+            Some("store hiccup 1")
+        );
+        let reports = world.engine.fault_reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[&live.transaction_id].offer(Some("store hiccup 1".into())).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_record_cannot_carry_the_legacy_marker() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let lifted = read_transaction_record(&envelope)?;
+        assert!(lifted.carries_legacy_marker());
+        let error = error_text(transaction_envelope(&lifted, 1).map(|_| ()));
+        assert!(error.contains("legacy lift"), "{error}");
+        // The migration's own path still writes it, and it reads back.
+        let (_, migrated) = cleanup_evidence::migrate_transaction_record(&envelope)?;
+        assert!(read_transaction_record(&migrated)?.carries_legacy_marker());
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_history_does_not_skip_resident_residue_at_boot() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let first = read_transaction_record(&envelope)?;
+        make_resident(&world, &first, envelope)?;
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+        let expected = first.expected.clone().context("no Expected")?;
+        project_candidate(&world, &first, true)?;
+        assert_eq!(projected_under(&world, &expected)?.len(), 2);
+        corrupt_history(&world)?;
+        let outcome = world.engine.reconcile_failed_continuity_projections()?;
+        assert_eq!(outcome.demoted.len(), 1);
+        assert_eq!(projected_under(&world, &expected)?, expected_only());
+        Ok(())
+    }
+
+    #[test]
+    fn backoff_doubles_caps_and_waits_exactly() {
+        assert_eq!(backoff_wait(500, 0), 500);
+        assert_eq!(backoff_wait(500, 1), 1000);
+        assert_eq!(backoff_wait(500, 2), 2000);
+        assert_eq!(backoff_wait(500, 3), 4000);
+        assert_eq!(backoff_wait(500, 30), RESUME_BACKOFF_CEILING_MILLIS);
+        assert_eq!(backoff_wait(u64::MAX, 5), RESUME_BACKOFF_CEILING_MILLIS);
+        assert!(is_waiting(9, 10));
+        assert!(!is_waiting(10, 10));
+        assert!(!is_waiting(11, 10));
+    }
+
+    #[test]
+    fn a_persistent_fault_is_reported_once_and_again_only_after_recovery() -> Result<()> {
+        let workload = Arc::new(ChangingErrorWorkload(
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let wedged = transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let id = wedged.transaction_id;
+        let expire = || {
+            world.engine.resume_backoff.lock().unwrap().clear();
+        };
+        let reported = || world.engine.fault_reports.lock().unwrap().contains_key(&id);
+        // A fault already reported for this transaction (an Err from the
+        // resume itself); a handled, still-failing step must not re-arm it.
+        world
+            .engine
+            .note_fault("could not resume transaction", &id, &anyhow!("store hiccup"));
+        assert!(reported());
+        world.engine.resume_one_transaction()?;
+        assert!(reported(), "a failing handled step re-armed the report");
+        // Skipped inside the backoff: the fault is still the same fault.
+        world.engine.resume_one_transaction()?;
+        assert!(reported(), "a backoff skip re-armed the report");
+        // Still failing after the backoff expires: still the same fault.
+        expire();
+        world.engine.resume_one_transaction()?;
+        assert!(reported());
+        // A real recovery clears it.
+        workload.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        expire();
+        world.engine.resume_one_transaction()?;
+        assert!(!reported(), "a step that ran and succeeded left the fault armed");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unretirable_legacy_marked_record_shows_its_fault_in_the_record() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let first = read_transaction_record(&envelope)?;
+        make_resident(&world, &first, envelope)?;
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+        assert!(record_of(&world, &first.transaction_id)?.carries_legacy_marker());
+        corrupt_history(&world)?;
+        assert!(!world.engine.retire_one_terminal_transaction()?);
+        let noted = record_of(&world, &first.transaction_id)?;
+        assert!(
+            noted.last_error.is_some() && noted.last_error != first.last_error,
+            "the retire fault never reached the record"
+        );
+        assert!(noted.carries_legacy_marker());
+        Ok(())
+    }
+
+    #[test]
+    fn a_tick_that_only_freezes_or_only_advances_reports_progress() -> Result<()> {
+        // Only a freeze.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        queue_deploy_for_nowhere(&world)?;
+        write_service_binding(&world)?;
+        assert!(world.engine.run_scheduler_tick()?, "a freeze-only tick reported no progress");
+
+        // Only a phase advance.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        transaction_at(&world, DeploymentPhase::Fencing)?;
+        assert!(world.engine.resume_one_transaction()?, "a real advance reported none");
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        transaction_at(&world, DeploymentPhase::Fencing)?;
+        assert!(world.engine.run_scheduler_tick()?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_transaction_that_cannot_be_archived_does_not_stop_the_scheduler() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let live = transaction_at(&world, DeploymentPhase::Warming)?;
+        odin_reports_ready(&world, &live, seeded_sequence(None) + 1)?;
+        let (finished, command) = terminal_transaction_with_command("ghostlight")?;
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: command.command_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: finished.transaction_id.clone(),
+                        current: None,
+                    },
+                ],
+                &[
+                    command_envelope(&command, 100)?,
+                    transaction_envelope(&finished, finished.updated_at_unix_millis)?,
+                ],
+            )?
+        );
+        corrupt_history(&world)?;
+        let before = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .find(|stored| stored.value.transaction_id == live.transaction_id)
+            .context("live transaction")?
+            .envelope;
+
+        // The finished record cannot be archived, and the live one still moves.
+        world.engine.run_scheduler_tick()?;
+        let after = ControlSnapshot::read(&world.state_store)?;
+        assert!(
+            after
+                .transactions
+                .iter()
+                .any(|stored| stored.value.transaction_id == finished.transaction_id)
+        );
+        assert_ne!(
+            after
+                .transactions
+                .iter()
+                .find(|stored| stored.value.transaction_id == live.transaction_id)
+                .context("live transaction")?
+                .envelope,
+            before,
+            "the live transaction was not resumed"
+        );
+        Ok(())
+    }
+
+    // ---- fix 2: supervision owns the Expected-only precondition ----
+
+    #[test]
+    fn continuity_mints_no_restart_over_a_projection_it_cannot_demote() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        assert_eq!(incumbent.continuity_backoff, ContinuityBackoff::default());
+
+        // The projection names an activation that is not the incumbent's.
+        let anchor = world.engine.provider_anchor_for_plan(&incumbent.plan)?;
+        let topology = world.engine.topology();
+        topology.publish_expected(&incumbent.expected, &anchor)?;
+        let stranger = seeded_transaction(
+            &world,
+            DeploymentPhase::Warming,
+            CommandKind::Continuity,
+            Some(&incumbent),
+        )?;
+        topology.publish_observed_activation(
+            &incumbent.expected,
+            stranger.activation.as_ref().context("no activation")?,
+            stranger.workload.as_ref().context("no workload")?,
+        )?;
+        // Remove the seeded stranger transaction: only the projection matters.
+        let seeded = resident(&world)?;
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).delete_batch_if_unchanged(
+                &[
+                    seeded.envelope.clone(),
+                    ControlSnapshot::read(&world.state_store)?
+                        .commands
+                        .into_iter()
+                        .find(|stored| stored.value.command_id == seeded.value.command_id)
+                        .context("seeded command")?
+                        .envelope,
+                ]
+            )?
+        );
+        workload.kill();
+
+        let before = now_millis()?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        assert!(
+            snapshot.transactions.is_empty(),
+            "continuity minted a restart over a projection it could not demote"
+        );
+        let deferred = snapshot
+            .admitted_for("service")
+            .context("no generation")?
+            .value
+            .continuity_backoff
+            .next_restart_at_unix_millis
+            .context("the failed demotion was not recorded")?;
+        let after = now_millis()?;
+        assert!(
+            (before + CONTINUITY_DEFERRAL_MILLIS..=after + CONTINUITY_DEFERRAL_MILLIS)
+                .contains(&deferred)
+        );
+
+        // Deferred: the next tick neither retries nor writes.
+        let envelope = incumbent_envelope(&world)?;
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(incumbent_envelope(&world)?, envelope);
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
+
+        // The projection is repaired and the deferral has run out: the restart
+        // proceeds, from an Expected-only projection.
+        topology.withdraw_stale_incarnation(&incumbent.expected, &anchor)?;
+        project_admitted(&world, &incumbent)?;
+        edit_incumbent(&world, |generation| {
+            generation.continuity_backoff.next_restart_at_unix_millis = Some(1);
+        })?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(snapshot.transactions.len(), 1);
+        assert_eq!(snapshot.transactions[0].value.command_kind, CommandKind::Continuity);
+        assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
+        Ok(())
+    }
+
+    // ---- fix 3: one-time boot reconciliation, by exact issuer ----
+
+    #[test]
+    fn boot_demotes_the_activation_a_failed_continuity_left_and_only_that() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let incumbent = admit_incumbent(&world)?;
+        let failed = seeded_transaction(
+            &world,
+            DeploymentPhase::Warming,
+            CommandKind::Continuity,
+            Some(&incumbent),
+        )?;
+        project_candidate(&world, &failed, true)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate died"))?;
+        drive(&world, |transaction| transaction.completion.is_some())?;
+        // A failed transaction is archived the moment it finishes.
+        let aborted = record_of(&world, &failed.transaction_id)?;
+        assert!(aborted.is_terminal());
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
+        assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
+
+        // Drift a pre-B1 abort left: the failed candidate's activation stands.
+        project_candidate(&world, &failed, true)?;
+        assert_eq!(projected_under(&world, &incumbent.expected)?.len(), 2);
+
+        let outcome = world.engine.reconcile_failed_continuity_projections()?;
+        assert_eq!(
+            outcome,
+            ProjectionReconciliation {
+                demoted: vec![failed.transaction_id.clone()],
+                unexplained: Vec::new(),
+            }
+        );
+        assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
+
+        // Once: nothing is left to demote.
+        assert_eq!(
+            world.engine.reconcile_failed_continuity_projections()?,
+            ProjectionReconciliation::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boot_never_adopts_an_activation_no_failed_transaction_issued() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let incumbent = admit_incumbent(&world)?;
+
+        // The incumbent's own activation is accounted for.
+        project_admitted(&world, &incumbent)?;
+        assert_eq!(
+            world.engine.reconcile_failed_continuity_projections()?,
+            ProjectionReconciliation::default()
+        );
+
+        // Some other activation, issued by nothing in history, is reported and
+        // left exactly as it is.
+        let stranger = seeded_transaction(
+            &world,
+            DeploymentPhase::Warming,
+            CommandKind::Continuity,
+            Some(&incumbent),
+        )?;
+        let anchor = world.engine.provider_anchor_for_plan(&incumbent.plan)?;
+        let topology = world.engine.topology();
+        topology.withdraw_stale_incarnation(&incumbent.expected, &anchor)?;
+        project_candidate(&world, &stranger, true)?;
+        // A live transaction accounts for its own activation...
+        assert_eq!(
+            world.engine.reconcile_failed_continuity_projections()?,
+            ProjectionReconciliation::default()
+        );
+        // ...and for nobody else's.
+        topology.withdraw_stale_incarnation(&incumbent.expected, &anchor)?;
+        let mut other = stranger.clone();
+        let other_activation = IdunnRuntimeActivationLaunch::issue(
+            &incumbent.expected,
+            runtime_instance_id("tx-someone-else")?,
+            now_millis()?,
+            &world.engine.idunn_signer,
+        )?
+        .activation()
+        .clone();
+        if let Some(WorkloadObservation::Systemd(observed)) = other.workload.as_mut() {
+            observed.runtime_instance_id = other_activation.runtime_instance_id.clone();
+        }
+        other.activation = Some(other_activation);
+        project_candidate(&world, &other, true)?;
+        assert_eq!(
+            world.engine.reconcile_failed_continuity_projections()?.unexplained,
+            vec!["service".to_owned()]
+        );
+        topology.withdraw_stale_incarnation(&incumbent.expected, &anchor)?;
+        project_candidate(&world, &stranger, true)?;
+        // ...and once it is gone, nothing does.
+        let seeded = resident(&world)?;
+        let command = ControlSnapshot::read(&world.state_store)?
+            .commands
+            .into_iter()
+            .find(|stored| stored.value.command_id == seeded.value.command_id)
+            .context("seeded command")?;
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store)
+                .delete_batch_if_unchanged(&[seeded.envelope.clone(), command.envelope])?
+        );
+        let projection = std::fs::read(&world.engine.options.topology_store)?;
+        let outcome = world.engine.reconcile_failed_continuity_projections()?;
+        assert_eq!(
+            outcome,
+            ProjectionReconciliation {
+                demoted: Vec::new(),
+                unexplained: vec!["service".into()],
+            }
+        );
+        assert_eq!(std::fs::read(&world.engine.options.topology_store)?, projection);
+        Ok(())
+    }
+
+    // ---- fix 4: history that cannot be read stops actuation ----
+
+    /// An operator binding for the target "service", so the command queue can
+    /// resolve selectors.
+    fn write_service_binding(world: &EngineFixture) -> Result<()> {
+        use crate::deployment_plan::tests::BINDING;
+        let (head, tail) = BINDING
+            .split_once("[route]")
+            .context("binding has no route table")?;
+        let binding = format!(
+            "{head}[brakes]{}",
+            tail.split_once("[brakes]")
+                .context("binding has no brakes table")?
+                .1
+        );
+        std::fs::create_dir_all(&world.engine.options.bindings_dir)?;
+        std::fs::write(world.engine.options.bindings_dir.join("service.toml"), binding)?;
+        Ok(())
+    }
+
+    fn corrupt_history(world: &EngineFixture) -> Result<()> {
+        std::fs::write(history_store_path(&world.state_store), b"\xc1\xc1 torn")?;
+        Ok(())
+    }
+
+    #[test]
+    fn history_that_cannot_be_read_is_an_error_and_missing_history_is_empty() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let history = read_history(&world.state_store)?;
+        assert!(history.transactions.is_empty() && history.report().is_none());
+
+        corrupt_history(&world)?;
+        let error = read_history(&world.state_store).err().context("torn history read")?;
+        assert!(format!("{error:#}").contains("history"), "{error:#}");
+        assert!(world.engine.history_for_decision().is_none());
+        // The display path still answers, with nothing.
+        assert!(read_history_transactions(&world.state_store).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn undecodable_history_names_what_it_is_missing() -> Result<()> {
+        let (finished, _) = terminal_transaction_with_command("ghostlight")?;
+        let good = transaction_envelope(&finished, finished.updated_at_unix_millis)?;
+        let mut torn = good.clone();
+        torn.key = "tx-torn".into();
+        torn.payload = vec![0xc1];
+        let (transactions, undecodable) = decode_history_transactions(vec![good, torn]);
+        let history = HistoryRead {
+            transactions,
+            undecodable,
+        };
+        let report = history.report().context("nothing reported")?;
+        assert!(report.contains("1 archived transaction"), "{report}");
+        assert!(report.contains("tx-torn"), "{report}");
+
+        let complete = HistoryRead {
+            transactions: history.transactions,
+            undecodable: Vec::new(),
+        };
+        assert_eq!(complete.report(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_fault_is_said_once_while_it_lasts() {
+        let once = ReportOnce::default();
+        assert_eq!(once.offer(None), None);
+        assert_eq!(once.offer(Some("torn".into())), Some("torn".into()));
+        assert_eq!(once.offer(Some("torn".into())), None);
+        assert_eq!(once.offer(Some("torn".into())), None);
+        assert_eq!(once.offer(Some("worse".into())), Some("worse".into()));
+        assert_eq!(once.offer(None), None);
+        assert_eq!(once.offer(Some("worse".into())), Some("worse".into()));
+    }
+
+    #[test]
+    fn unreadable_history_stops_continuity_instead_of_counting_no_failures() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        workload.kill();
+        corrupt_history(&world)?;
+        let envelope = incumbent_envelope(&world)?;
+
+        // A dead workload would be restarted at once, with the ceiling counting
+        // zero refusals. With history unreadable nothing is actuated.
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
+        assert_eq!(incumbent_envelope(&world)?, envelope);
+
+        // Readable again, the same tick restarts it.
+        std::fs::remove_file(history_store_path(&world.state_store))?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(ControlSnapshot::read(&world.state_store)?.transactions.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_history_stops_command_retirement_and_freezing() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "up-nowhere".into(),
+            kind: CommandKind::Deploy,
+            selector: "nowhere".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentCommand::TYPE.into(),
+                    key: command.command_id.clone(),
+                    current: None,
+                }],
+                &[command_envelope(&command, 100)?],
+            )?
+        );
+        write_service_binding(&world)?;
+        corrupt_history(&world)?;
+
+        // Whether the command was consumed is unknown, so it is not acted on.
+        assert!(!world.engine.freeze_one_queued_command()?);
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
+
+        // Readable, it is acted on: the unknown selector is refused.
+        std::fs::remove_file(history_store_path(&world.state_store))?;
+        assert!(world.engine.freeze_one_queued_command()?);
+        assert_eq!(ControlSnapshot::read(&world.state_store)?.transactions.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn the_legacy_lift_owes_only_a_continuity_that_issued_an_activation() -> Result<()> {
+        let envelope = fixture_envelope(
+            FIXTURE_PRE_B1_ABORTS[0].1,
+            DeploymentTransaction::TYPE,
+        )?;
+        let written = lift_legacy_transaction(&envelope)?;
+        let owed = |transaction: &DeploymentTransaction| {
+            transaction
+                .pre_fencing_abort
+                .as_ref()
+                .map(|abort| abort.topology_reconciliation)
+        };
+        assert_eq!(owed(&written), Some(CleanupEvidence::Skipped));
+
+        let mut lifted = written.clone();
+        cleanup_evidence::owe_legacy_continuity_projection(&mut lifted);
+        assert_eq!(owed(&lifted), Some(CleanupEvidence::Pending));
+
+        // A deployment published its own key and recorded what it owed.
+        let mut deploy = written.clone();
+        deploy.command_kind = CommandKind::Deploy;
+        cleanup_evidence::owe_legacy_continuity_projection(&mut deploy);
+        assert_eq!(owed(&deploy), Some(CleanupEvidence::Skipped));
+
+        // A continuity that issued nothing owes nothing.
+        let mut unissued = written;
+        unissued.activation = None;
+        cleanup_evidence::owe_legacy_continuity_projection(&mut unissued);
+        assert_eq!(owed(&unissued), Some(CleanupEvidence::Skipped));
+        Ok(())
+    }
+
+    #[test]
+    fn continuity_stops_after_three_refused_restarts_counted_from_history() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        for round in 0..CONTINUITY_RESTART_ATTEMPTS {
+            let failed = seeded_transaction(
+                &world,
+                DeploymentPhase::Warming,
+                CommandKind::Continuity,
+                Some(&incumbent),
+            )?;
+            world
+                .engine
+                .begin_pre_fencing_abort(&resident(&world)?, anyhow!("refused {round}"))?;
+            drive(&world, |transaction| transaction.completion.is_some())?;
+            assert!(record_of(&world, &failed.transaction_id)?.is_terminal());
+        }
+        workload.kill();
+        // Three refusals are in history and none is live: the ceiling holds.
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
         Ok(())
     }
 }
