@@ -16798,11 +16798,17 @@ mod tests {
             // The refusal is an error of its own phase, before the fence: the
             // deployment fails now, and its error carries the reopen time.
             let id = routed.transaction()?.transaction_id;
-            for _ in 0..6 {
-                routed.world.engine.resume_one_transaction()?;
+            routed.world.engine.resume_one_transaction()?;
+            let abort = routed
+                .transaction()?
+                .pre_fencing_abort
+                .context("the refusal did not abort the deployment")?;
+            assert!(abort.error.contains(&format!("reopens at unix ms {reopens_at}")), "{}", abort.error);
+            for _ in 0..8 {
                 if record_of(&routed.world, &id)?.completion.is_some() {
                     break;
                 }
+                routed.step()?;
             }
             let Some(TransactionCompletion::FailedBeforeFencing { error }) =
                 record_of(&routed.world, &id)?.completion
