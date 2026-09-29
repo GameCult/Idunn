@@ -8979,7 +8979,7 @@ mod tests {
             key,
             r#type: record_type.into(),
             payload,
-            stored_at: rfc3339_millis(1_700_000_100_000)?,
+            stored_at: rfc3339_millis(1_700_000_123_456)?,
             schema_id: Some(schema.into()),
         })
     }
