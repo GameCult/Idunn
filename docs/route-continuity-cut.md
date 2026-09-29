@@ -193,7 +193,7 @@ it for merge.
 - B2 also does not compile on top of B3, and after a one-line fix two tests fail, because the fixture target
   is now route-proof.
 
-The rework runs after B3 merges and is rebased onto it.
+The rework is a fresh branch from `583b2a7`, not a rebase of `1786ddf`. Its map is under B2 in section 4.
 
 **Rulings, 2026-09-30.**
 - **The ceiling never refuses a rollback.** Restoring the admitted or incumbent route is survival, not
@@ -202,6 +202,27 @@ The rework runs after B3 merges and is rebased onto it.
 - **First routed deployments are metered now.** The actuation window lives on the target, not on the
   admitted generation, so a target with no admitted generation is charged too. That schema change is folded
   into the store-version bump that F1 needs: a v4 generation, with a typed lift from v3.
+
+**Rulings, 2026-09-30 (operator, on the B2 rework map).**
+- **Q-B2-1 (a):** the continuity restart log moves into `TargetSupervision`; the restart ceiling reads the
+  target's own log; the carry compensator is deleted.
+- **Q-B2-2: fail at once.** A deploy refused by the route/actuation ceiling before the fence fails immediately,
+  with the reopen time in the error.
+- **Q-R1 (a):** the route declaration is the challenge declaration. Every routed target answers the
+  stable-route challenge regardless of readiness class. R1 checks it before the fence; H1 gives Heimdall a
+  responder. Operator note: the question's first framing was confusing; the cause is that Heimdall has no
+  responder, not its class.
+- **Q-B4: Idunn's own proof.** Routed providers by current route proof and not degraded; unrouted providers by
+  admission plus a live workload observation. One clause is **held open**: "a current Odin non-Ready word
+  still excludes a provider" is not ruled, pending the Odin-lifecycle authority audit (a separate Imagination
+  pass). Operator: "the last few rulings on Odin are making my authority sense tingle, it feels like Odin is
+  doing lifecycle work when that's very much Idunn's wheelhouse." B4 is blocked on that audit.
+
+**Cut status, 2026-09-30.**
+- **Ready for Hands:** B2 (rework map in section 4); D1 (after B2); R1 (after B2).
+- **In progress** on `hands/idunn-w1-t1-t2`: W1, T1, T2.
+- **Blocked:** B4, on the Odin-lifecycle authority audit; H1 (Heimdall repo), on CultLib C1.
+
 
 Heads read for this map:
 
@@ -571,6 +592,97 @@ it. This is a CultLib foundation merge, so the operator should rule on it.
 
 Depends on it: C1 and the StreamPixels gitlink in C2.
 
+**Q-B2-1. Does the continuity restart log move into `TargetSupervision` too?**
+
+**RULED (a) by the operator, 2026-09-30.**
+
+Options:
+- (a) Move it. `ContinuityBackoff`'s own doc (`:907-908`) already says it "belongs to the target, not the
+  generation". On the generation it survives only through the copy in `from_transaction` (`:2074-2076`).
+  Moving it deletes that carry and key 20. The mint CAS pins the target record instead of racing the
+  generation, which is the F3 shape. One record holds both of a target's meters.
+- (b) Keep it on the generation, reshaped to the sliding log in place. The route meter still needs
+  `TargetSupervision` for first deploys, so the meters split across two records and the carry stays.
+
+Outcome: the continuity restart log lives in `TargetSupervision`; the restart ceiling reads the target's own
+log; the carry compensator in `from_transaction` is deleted.
+
+Depends on it: B2 (see the B2 rework map in section 4).
+
+**Q-B2-2. When the route ceiling refuses a first or forward deploy before the fence, does `idunn up` fail or
+wait?**
+
+**RULED: fail at once, by the operator, 2026-09-30.**
+
+Options:
+- (a) Fail. The deploy is aborted pre-fence with "route actuation ceiling reached for <target>; reopens at
+  <time>", and the command reports failed. The target is free at once.
+- (b) Wait. A gate wait until `reopens_at`. The transaction owns the target for up to an hour, and nothing ends
+  that wait before B5's deadlines.
+
+Outcome: a deploy refused by the route/actuation ceiling before the fence fails immediately, with the reopen
+time in the error.
+
+Depends on it: B2.
+
+**Q-R1. Does a routed target answer the stable-route challenge whatever its readiness class?**
+
+**RULED (a) by the operator, 2026-09-30.** The question's first framing was confusing. The cause is that
+Heimdall has *no responder*, not its readiness class.
+
+Mechanism (read at `583b2a7`): readiness class decides Warming, Ready and whether Routing reads Odin. It never
+decides whether the stable route is challenged. Routing installs and then requires `prove_stable_route` for
+every target with `expected.route` (`:6147-6190`), Commit proves it again (`:6272-6290`), and supervision
+challenges every routed admitted generation (`:5171-5270`). Heimdall's recipe (`d5acc94`) declares
+`odin.verse-rendezvous` (Odin-correlated) and is routed, but never answers a route challenge. Heimdall is
+stateful, so a failed proof leaves the candidate route installed for fail-closed retry (`:6171-6175`), which
+past the fence is resumable forever (F17) until B5. Its first `idunn up` would hold the target with its lease
+granted, and the failure would surface at the most expensive point.
+
+Options:
+- (a) Yes. The route declaration is the challenge declaration. That is today's rule, made legible and checked
+  before the fence (cut R1). Heimdall gains a responder in owning-repo cut **H1**, the same shape as
+  StreamPixels C2: bump `vendor/CultLib` to at least C1 (`30ee8b9`), answer `POST /cultnet/snapshot` through
+  the signer's `answerRouteObservation`, and make `reportHealth` its single health owner. Idunn gains no
+  schema change, and every routed provider keeps a signed route proof, which Q2(b)/B4 currency needs.
+- (b) No, the class decides. An Odin-correlated routed target is admitted by membership only. That needs a new
+  `RoutingEvidence` variant (a transaction and generation schema bump), class branches at Routing, Commit
+  and supervision, and loses the proof that the admitted process answers through the stable listener. It also
+  applies to streampixels-service, whose provider currency would then come from Odin, which is the C2 run 2
+  failure made permanent and contradicts Q2(b).
+
+Outcome: every routed target answers the stable-route challenge regardless of readiness class. R1 checks it
+before the fence. H1 (Heimdall repo, needs CultLib C1) gives Heimdall a responder.
+
+Depends on it: R1, H1, and Heimdall's first deploy.
+
+**Q-B4. For an admitted, running provider, what makes it current enough to satisfy a dependent's deploy?**
+
+**RULED in part by the operator, 2026-09-30: Idunn's own proof. One clause is held open.**
+
+Options:
+- (a) A live readiness proof from the provider's readiness authority. Odin-correlated providers need a current
+  Ready correlation from Odin, so with Odin down or confused no dependent deploy is possible and C2 run 2
+  fails by design.
+- (b) Idunn's own current observation, whatever the class.
+- (c) Admission plus workload alive, for every provider, with no current readiness evidence.
+
+Ruled, from (b):
+- A **routed** provider is current by Idunn's route proof, and not degraded (B2's Q5(a) state). This is Q2(b)
+  as ruled, confirmed to override class.
+- An **unrouted** provider is current by its admission plus a live workload observation of the admitted
+  incarnation.
+- Capabilities come from the signed presence in the route proof (routed) or the admitted Ready receipt
+  (unrouted).
+
+**Held open, NOT ruled:** the recommendation's clause that "a current Odin non-Ready word still excludes a
+provider" (a stale one would not). The operator: "the last few rulings on Odin are making my authority sense
+tingle, it feels like Odin is doing lifecycle work when that's very much Idunn's wheelhouse." That clause stays
+open pending the Odin-lifecycle authority audit, a separate Imagination pass. Until it is ruled, B4 carries
+no Odin-veto rule either way.
+
+Depends on it: B4, which is now **blocked on the Odin-lifecycle authority audit**, not on Q-B4.
+
 ---
 
 ## 4. Draft cut list
@@ -702,11 +814,11 @@ terminal records.
 - Errors are isolated per transaction, including `archive_terminal_transaction`.
 - `serve`'s boot wiring is pinned by a test.
 
-**Moved to B2:** the continuity restart ceiling reads only `ContinuityBackoff`, never
-`history.cc`. Otherwise an unreadable history file stops crash recovery for every target.
-Deferral and backoff show in `idunn status`.
+**Moved to B2:** the continuity restart ceiling reads only the target's restart log in
+`TargetSupervision`, never `history.cc`. Otherwise an unreadable history file stops crash recovery for every
+target. Deferral and backoff show in `idunn status`.
 
-**B2 — Bounded, backed-off route and unit repair (Idunn).**
+**B2 — Bounded, backed-off route and unit repair (Idunn). READY FOR HANDS; rework map below.**
 
 *Widened 2026-09-29 by Self, from Soul's S1 pass.* S1 closed the healthy-target storm, and
 Soul found two storm paths S1 does not claim. Both are B2's:
@@ -730,16 +842,559 @@ and `preflight_root` on `RuntimeOptions`, defaulting to today's paths and used a
 marks the route degraded (Q5 a). Today nothing is written and the next tick re-challenges
 with no backoff.
 
-- Challenges back off exponentially per target on consecutive failures, with a
-  floor at max age and a cap.
-- Route actuations (write, reload, ufw) go through a per-target rolling
-  ceiling kept in route supervision state, so the ceiling survives restarts.
-- Continuity restarts go through a per-target backoff and ceiling that is not
-  reset by a new generation (F9).
-- Proof failure changes observation state only (Q5a).
-- Verification: a timeline probe on Yggdrasil counts reloads per hour per
-  target in both steady and failing states. It must show zero reloads when
-  steady and no more than the ceiling when failing.
+**Rework map, 2026-09-30 (Imagination pass, Opus).** Every `file:line` in this block is against Idunn
+`583b2a7` (the code under main `94c7691`, installed on Yggdrasil). The salvage source is
+`origin/idunn/route-b2` (`97f1ad2`, +1243/-200; merged with B1 at `1786ddf`). The rework is a fresh
+branch from `583b2a7`, not a rebase of `1786ddf`. Rulings Q-B2-1 (a) and Q-B2-2 (fail at once) are in
+section 3.
+
+#### B2 rework, A. What B3 superseded, and what survives from `97f1ad2`
+
+**Delete; do not port. B3 or this rework owns each of these now:**
+
+- `routed_generation`, `hanging_up_listener`, `RoutedFixture`, `routed_transaction`,
+  `store_seeded`, the `seeded_record` split, `route_proof_evidence()` hand evidence, and
+  `DeadWorkload`.
+  - B3's `RoutedWorld` (`control_plane.rs:14255-14660`) already builds a real route-proof
+    admission, with a `RuntimeStub` at both endpoints and a `hang_up` switch (`:14068`).
+  - `SwitchWorkload::kill` (`:11932-11945`) is the dead workload.
+  - These are why B2 "does not compile on B3, and two tests fail because the fixture target is
+    route-proof".
+- `Engine::update_admitted_generation`, the re-read-then-CAS helper. It existed because B2
+  charged the ceiling to the generation, so every other writer had to re-read to avoid losing
+  the charge. The meter moves off the generation (section B), so writers CAS on the envelope
+  they read. Tests use the existing `edit_incumbent` (`:12065`).
+- `ActuationWindow::charge`: a fixed window anchored at the first charge. That is Soul's F4.
+- The first-deploy exemption in `charge_route_actuation` (`let Some(current) = admitted_for
+  else return Ok(())`). The 2026-09-30 ruling removes it.
+- `ContinuityBackoff.deferral_reason` added as a v3 field. That is Soul's F1. The reason moves
+  to the new record (section B).
+
+**Port, reshaped as sections B-E say:**
+
+- In `drivers.rs`:
+  - `RouteActuators` and its `Default`;
+  - `NginxRouteDriver::with_actuators`, with `new` delegating to it;
+  - the gate trait threaded through every mutating method;
+  - the `Unmetered` test gate;
+  - `a_refusing_gate_stops_every_route_actuation_before_it_starts`, split in two (section E).
+- In `control_plane.rs`:
+  - `RuntimeOptions.route_actuators`;
+  - `Engine::route_driver`, used at every construction site;
+  - `EngineRouteGate`;
+  - the `RouteStubs` fixture and `EngineFixture::routed`;
+  - `RouteSupervisionState::{is_waiting, record_failed_challenge, record_proved_challenge}`;
+  - the `supervise_admitted_route` restructure, where a failed repair or proof records state;
+  - `render_supervision` plus the status loop;
+  - the continuity ceiling replacing the history count;
+  - the restart counted in the minting CAS;
+  - the tests `continuity_restarts_are_backed_off_and_bounded_per_target`,
+    `status_renders_…`, `a_deployment_yields_to_a_restart_only_while_the_target_has_restarts_left`,
+    and the storm tests, rebuilt on `RoutedWorld`.
+- Constants, kept from B2 because Soul did not dispute them:
+  - `CONTINUITY_RESTART_ATTEMPTS = 6` per `CONTINUITY_RESTART_WINDOW_MILLIS = 3_600_000`;
+  - `CONTINUITY_RESTART_BACKOFF_MILLIS = 5_000`, doubling;
+  - `ROUTE_ACTUATION_CEILING = 12` per `ROUTE_ACTUATION_WINDOW_MILLIS = 3_600_000`;
+  - `ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS = 600_000`.
+
+#### B2 rework, B. Owner map (ownership changes)
+
+**Route actuation rate.**
+- **Owner:** `Engine::charge_route_actuation(target, RouteActuation)`, over a new per-target record,
+  `TargetSupervision.route_actuations`.
+- **Inputs:** the target's record from a fresh control snapshot (absent means empty), `now`, and
+  the kind: `Forward` or `Survival`.
+- **Output:** `Ok(())`, or the typed `RouteActuationRefused { target, used, reopens_at }`.
+  - Only `Forward` can be refused.
+  - `Survival` is always recorded and always admitted (ruling: never refuse a rollback).
+- **Demoted:**
+  - `RouteSupervisionState.actuations` is dead, deleted in v4.
+  - `RouteSupervisionState::for_new_incarnation` (`:885-893`) is dead. A new incarnation's
+    route state is `default()`.
+- **Forbidden writers:**
+  - the driver, which only asks;
+  - `AdmittedGeneration::from_transaction`, which no longer carries a meter;
+  - the commit CAS.
+- **Shared paths:**
+  - Every `NginxRouteDriver` is built by `Engine::route_driver`. The seven `::new` sites are
+    `:5211`, `:5701`, `:6151`, `:6280`, `:6985`, `:7323` and `:7652`.
+  - Every mutating driver method takes `&dyn RouteActuationGate`, so none can be called
+    without the meter. The compiler enforces it.
+
+**Continuity restart pacing** (Q-B2-1 ruled (a)).
+- **Owner:** the mint in `supervise_one_admitted_generation`, over
+  `TargetSupervision.continuity_restarts` and `continuity_deferred_until`.
+- **Forbidden writers and inputs:**
+  - `history.cc`: the `history_for_decision` call at `:5003` goes;
+  - the generation id: the count is no longer per generation;
+  - `from_transaction`'s backoff carry at `:2074-2076`.
+- **Demoted:** `AdmittedGeneration.continuity_backoff` (key 20) is dead, deleted in v4.
+
+**Route challenge pacing** stays per incarnation, on the generation.
+- **Owner:** `supervise_admitted_route`, over `RouteSupervisionState` without `actuations`.
+- `route_repair_started_at_unix_millis` (key 18) is dead, deleted in v4.
+  - Its last readers are the validate block at `:2139-2145` and the unrouted guard at
+    `:5173-5176`.
+  - Its last writer is the clear at `:5263`.
+
+**One generation write per supervision iteration** (structural fix for F3). Any write to a
+target's generation or to its `TargetSupervision` ends that target's iteration:
+`progressed = true; continue`.
+- `refresh_admitted_topology` already follows this rule (`:4827-4835`).
+- The route challenge is the violator. Today a failure propagates as `Err` after B2's state
+  write, and the restart path then CASes a stale envelope.
+
+**New persistent type, `TargetSupervision`** (`idunn.target_supervision`, schema v1, in
+`control.cc`, keyed by target).
+- **Owner:** the meter primitives above.
+- **Live consumers:**
+  - the route gate (every install, preflight, rollback, withdraw and repair);
+  - the continuity mint;
+  - `status`.
+- **Invariant:** a target's meters outlive every generation and exist before the first one.
+- **Why no existing owner can serve:**
+  - The generation does not exist for a first deploy (the ruling).
+  - The transaction dies with each attempt.
+  - Brakes are operator-signed and are not Idunn's to write.
+- **What it replaces:** two carry compensators, `for_new_incarnation` and the backoff copy in
+  `from_transaction`, plus a history scan.
+
+#### B2 rework, C. Per file
+
+The branch is fresh from `583b2a7`.
+
+**Deletes first.**
+
+`control_plane.rs`:
+- `:63`: `CONTINUITY_RESTART_ATTEMPTS: usize = 3`. It is replaced by the constants in section A.
+- `:876-893`: `ActuationWindow` and `for_new_incarnation`.
+- `:906-926`: `ContinuityBackoff`. Q-B2-1 (a) moves it into `TargetSupervision`.
+- `:1986-1988`: key 18.
+- `:1992-1993`: key 20.
+- `:2043-2047` and `:2074-2076`: the carries.
+- `:2139-2145`: the key-18 validation.
+- `:4974-5020`: the history-counted `is_refused_restart` and the `history_for_decision` read.
+- `:5062-5071`: the deferral check on the generation.
+- `:5173-5176`: the key-18 guard. Keep the `SkippedUnrouted` half.
+- `:5263`: the key-18 clear.
+
+Tests:
+- `:9755-9801`, `continuity_gives_up_on_a_release_that_will_not_start`. It tests a copy of the
+  production closure, so it proves nothing.
+- `:10564`, `:11528-11542`: the F0 assertions on `ActuationWindow` and `attempts`. Rewrite them
+  against `TargetSupervision::validate`.
+- `:14622-14645`, `RoutedWorld::promote_by_hand`, and its 9 callers (`:14651`, `:14691`,
+  `:14722`, `:14767`, `:14927`, `:14949`, `:15041`, `:15299`, `:15433`). They become
+  `routed.step()`: the stub actuators let Routing run for real, so route-proof Routing gets
+  tested for the first time.
+
+**Schema: generation v4, one bump.**
+- `ADMITTED_GENERATION_SCHEMA` (`:55`) becomes `"idunn.admitted_generation.v4"`. The macro at
+  `:1939` changes to match.
+- `:56`: add `ADMITTED_GENERATION_SCHEMA_V3`.
+- The v4 layout:
+  - keys 0-17 are unchanged;
+  - 18 is a gap;
+  - 19 is `Option<RouteSupervisionState>` without `actuations`;
+  - 20 is a gap;
+  - **21 is `last_error: Option<String>`**, the dead-hold ruling's field. It is written by D1,
+    and B2 carries the slot so D1 needs no second bump.
+- The cultcache derive encodes slots positionally, so a gap is a nil and any added slot changes
+  the array. That is why F1's unbumped field broke the canonical re-encode (`decode_record`,
+  `:2811-2821`), and why every change here rides one bump.
+- **`LegacyAdmittedGenerationV3`**: move today's `AdmittedGeneration` (`:1936-1995`),
+  `RouteSupervisionState` and `ActuationWindow`, and `ContinuityBackoff` verbatim under
+  `Legacy*` names beside `LegacyAdmittedGeneration` (`:2967-3049`).
+  - Its `into_current()` drops key 18, `actuations`, `window_started_at`, `attempts` and
+    `next_restart_at`.
+  - It **refuses** a v3 record whose `actuations.count != 0` or `attempts != 0`.
+  - Why that is lossless (read): no released binary ever wrote those fields. On `583b2a7` the
+    only non-test writes are the carry at `:890`, which carries a default, and the ≤30 s
+    deferral `next_restart_at` at `:5154`. B2 was never installed.
+  - So the lift creates no `TargetSupervision`. Every target starts with an absent record, and
+    the refusal makes any future contradiction loud instead of silently dropped.
+- The v2 lift (`:3016-3048`) targets v4 directly: the same body without the retired fields.
+  Keep it; section H explains why this is not a question.
+- `read_generation_record` (`:3102-3121`): add a v3 arm.
+- The migration filter at `:3147-3148` adds `ADMITTED_GENERATION_SCHEMA_V3`.
+
+**New record, `TargetSupervision`**, beside `AdmittedGeneration`:
+
+```rust
+struct TargetSupervision {           // idunn.target_supervision / .v1, key = target
+    #[cultcache(key = 0)] schema_version: String,
+    #[cultcache(key = 1)] target: String,
+    /// Newest ≤ ROUTE_ACTUATION_CEILING actuation times, ascending.
+    #[cultcache(key = 2)] route_actuations: Vec<u64>,
+    /// Newest ≤ CONTINUITY_RESTART_ATTEMPTS restart times, ascending.   (Q-B2-1 (a))
+    #[cultcache(key = 3)] continuity_restarts: Vec<u64>,
+    #[cultcache(key = 4)] continuity_deferred_until: Option<u64>,
+    #[cultcache(key = 5)] continuity_deferral_reason: Option<String>,
+}
+```
+
+The record threads through several places:
+- `ControlSnapshot` (`:2564-2568`) gains `targets: Vec<Stored<TargetSupervision>>`.
+- The `read` match at `:2580-2610` gains its arm. Without it, the match's "foreign document"
+  bail at `:2609` refuses the store.
+- `validate_relations` checks unique targets.
+- `target_supervision_envelope` goes beside `admitted_envelope` (`:3198`).
+
+**Meters.** A sliding log, not a window (fixes F4):
+- `charge(log, now, window, limit, kind)`:
+  1. Clamp any entry greater than `now` to `now` (fixes F5; see below).
+  2. Count the entries within `window`.
+  3. For `Forward`, if the count is at least `limit`, refuse with
+     `reopens_at = log[len - limit] + window`.
+  4. Otherwise push `now` and keep only the newest `limit` entries.
+- Keeping the newest `limit` entries is exact for "at most `limit` Forward in any `window`",
+  even after Survival pushes past the limit.
+- The restart log uses the same primitive. The next restart is due at
+  `last + BACKOFF << (n - 1)`, where `n` is the number of entries in the window.
+
+**Clock steps.** Fixes F5, and collapses one helper.
+- `is_waiting(now, not_before)` (`:3351-3353`) becomes `is_waiting(now, not_before,
+  longest_wait) = now < not_before && not_before - now <= longest_wait`.
+  - A due time further ahead than any wait this owner can set means the clock stepped back,
+    so the attempt is due.
+- Callers:
+  - resume backoff at `:4537`, with `RESUME_BACKOFF_CEILING_MILLIS`;
+  - the route challenge, with `ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS.max(max_age)`;
+  - the restart wait, with `BACKOFF << (ATTEMPTS - 1)`;
+  - the deferral, with `CONTINUITY_DEFERRAL_MILLIS`.
+- The log clamp bounds a backwards step to one window, never the length of the step.
+
+**`drivers.rs`.**
+- Port `RouteActuators` from `97f1ad2` at `:5049-5068`.
+- The trait becomes `RouteActuationGate::admit(&self, kind: RouteActuation) -> Result<()>`,
+  with `pub enum RouteActuation { Forward, Survival }`.
+- Gate the methods:
+
+| Method | Kind |
+|---|---|
+| `preflight` (`:5293`), before `validate_candidate_in_private_mount` at `:5315` | **Forward** (F7) |
+| `install` (`:5338`), before the write at `:5360` | **Forward** |
+| `restore` (`:5268`) and `fail_after_rollback` (`:5279`) | **Survival** |
+| `withdraw_candidate_membership` (`:5409`) | **Survival** |
+| `rollback` (`:5555`) | **Survival** |
+| `restore_admitted_membership` (`:5420`), after the exact-bytes return at `:5430` | **Survival** |
+
+- `install`'s own rollback, through `fail_after_rollback`, therefore charges a Survival even
+  when it follows a Forward.
+
+**`control_plane.rs` Engine.**
+- `RuntimeOptions` (`:2160`, `:2202`): add `route_actuators`.
+- Add `route_driver` and `route_gate` as in `97f1ad2`.
+- `charge_route_actuation`:
+  - reads a fresh snapshot;
+  - CASes the target's record, with `current: None` when absent (the first deploy);
+  - is typed as described above.
+- **A refused Forward is an error of its phase.**
+  - Warming's preflight (`:5690-5711`) comes before the fence, so the refusal becomes a pre-fence abort
+    (`:4587-4593`) whose error names `reopens_at` (Q-B2-2 ruled: fail at once).
+  - Routing's install comes after the fence, so it stays resumable. The resume backoff spaces
+    it, and no actuation runs.
+  - Until B5 lands, a post-fence candidate whose install keeps being refused waits for the
+    window. That wait is bounded by the window, and it runs no programs.
+
+**`supervise_one_admitted_generation` (`:4787-5145`)**, in order:
+
+1. Hold (`:4960-4973`, unchanged).
+2. Blocker yield (`:5025-5043`): `refused_restarts < ATTEMPTS` becomes
+   `!restarts_exhausted(now)`.
+3. Exhausted: `eprintln` once through a `ReportOnce` keyed `continuity:<target>`, then
+   continue.
+4. Waiting or deferred: continue.
+5. Demotion (`:5072-5098`). On failure, write `continuity_deferred_until` and the reason to
+   `TargetSupervision`, then `progressed = true; continue`.
+6. Lifecycle brake (`:5105`, unchanged).
+7. Mint. The CAS at `:5114-5142` gains the `TargetSupervision` expected envelope, `None` when
+   absent, and its next value with `now` charged to the restart log and the deferral cleared.
+
+A brake-parked target spends no attempt.
+
+**`supervise_admitted_route` (`:5171-5270`).**
+- At the top: if `route_supervision.is_waiting(now, cap)`, return `Ok(false)`.
+- Port B2's challenge closure: the Survival-gated restore, prove, and re-observe.
+- On `Err`:
+  - write `record_failed_challenge` to the generation, CAS on `current.envelope`;
+  - print once through a `ReportOnce` keyed `route:<target>`;
+  - return `Ok(true)`. This is the F3 fix.
+- On `Ok`: write the receipt and `record_proved_challenge`, return `Ok(true)`.
+- If the Survival repair itself charged `TargetSupervision`, that is a second record, not the
+  generation, so the generation CAS still holds. The iteration ends either way.
+
+**`status` (`:3668-3756`).**
+- After the command loop, print one block per target: the union of admitted generations and
+  `TargetSupervision` records.
+- Port `render_supervision`, reading the restart and route logs from the target record:
+  - `route actuations N/12 in window, reopens-at …`;
+  - `continuity restarts N/6 … next-restart-at … deferred: <reason>`.
+- A metered target with no generation prints its meters alone. That is the first-deploy case.
+
+#### B2 rework, D. B2 verification
+
+Each ruling or finding is pinned by a test that fails under its own mutation. All tests are
+Engine-level on `RoutedWorld` with `RouteStubs`, `#[cfg(unix)]`, except where marked unit.
+
+| Ruling / finding | Test | Mutation it must kill |
+|---|---|---|
+| Ruling: never refuse a rollback | `a_full_ledger_still_restores_the_admitted_and_incumbent_route`. The ledger holds 12 entries inside the window. (i) A post-fence abort's withdraw runs `systemctl reload` once and pushes an entry. (ii) Supervision repairs a drifted admitted fragment the same way. (iii) A Routing proof failure's `rollback` does too. | Survival treated like Forward (refused), which drops the reload; Survival not recorded, which drops the entry |
+| Ruling: always counted | the same test, asserting the ledger's newest entry is `now` after each Survival | skipping the push for Survival |
+| Ruling: first deploys metered | `a_first_routed_deploy_is_metered_and_refused_at_the_ceiling`. `RoutedWorld` seeds with no incumbent (`:14352`). (i) `run_to_routing` then one step creates `TargetSupervision` with 1 entry. (ii) A world whose record is pre-filled to 12: install fails with `RouteActuationRefused`, and the stub log has no `ufw`, `nginx` or `systemctl`. | the B2 early return "no admitted generation means unmetered" |
+| F7 | `a_refused_preflight_starts_no_private_mount_unit`, a full ledger: the Warming preflight runs no `systemd-run` and the transaction pre-fence aborts with the reopen time | preflight's gate call deleted |
+| F4 rolling | unit, `the_actuation_log_slides`: 12 charges at t, t+1…t+11. At t+window only one slot reopens (the 13th charge succeeds, the 14th is refused until t+1+window). | fixed window anchored at the first charge |
+| F5 | unit, `a_clock_stepped_back_stalls_nothing_past_one_window`: log entries and due times at T, with `now = T − 1 day`. The Forward reopen is ≤ now + window; the route challenge, restart and resume waits read as due. | the clamp removed; the `longest_wait` guard removed |
+| F3 | `a_failed_challenge_and_a_dead_unit_in_one_tick_do_not_lose_a_cas`. A drifted fragment, a `hang_up` stub and a killed `SwitchWorkload`. Tick 1 returns `Ok` and records the failure; tick 2 mints the restart. | a route failure returns `Err`, or falls through without `continue`: the mint CAS loses and the tick errors |
+| F6 | `a_proved_challenge_clears_the_degradation`: `hang_up` on, one tick (degraded, failures 1); `hang_up` off, wait made due, one tick (failures 0, next None, degraded None) | `record_proved_challenge` call deleted |
+| F1 | `a_v3_generation_lifts_to_v4_once_and_reencodes_canonically`, over **new golden fixtures** `generation-v3-odin.hex` and `generation-v3-route-proof.hex`, cut with the `583b2a7` encoder (add them to the fixture README). The migration counts 1, then 0. After it, `decode_record` accepts the bytes, and the decisions are equal apart from the retired fields. A v3 fixture edited to `attempts = 2` is refused. | the v3 schema dropped from the migration filter; the refusal removed |
+| Restart ceiling reads no history | rename `unreadable_history_stops_continuity…` (`:13516`) as B2 did: a corrupt history still restarts, and the target's own log exhausts it | re-adding `history_for_decision` |
+| Backoff and window | port `continuity_restarts_are_backed_off_and_bounded_per_target` on `SwitchWorkload` | halving the wait; resetting the log on a new generation |
+| Storm (a) | port `a_failing_reload_that_deletes_the_fragment_backs_the_route_off`: 200 ticks give one reload | the `is_waiting` gate deleted |
+| Storm (b) | port `a_candidate_whose_route_proof_fails_reloads_at_most_the_ceiling`: Forward installs are capped at 12 | the install gate deleted |
+| Driver gates | split B2's refusing-gate test in two: Forward refused runs no program; Survival under a gate that "refuses" Forward still runs | a gate call moved after the write |
+
+- Run `cargo mutants --in-diff` on the cut. The target is 0 missed in the meters, the
+  migration and the supervision edits.
+- `a_failing_step_is_retried_after_a_backoff_not_every_tick` is flaky under a full parallel run
+  on the base too. Soul should not charge it to this cut.
+- The live timeline probe, read-only, before and after install:
+  - `journalctl -u nginx --since -1h | grep -c 'Reloaded nginx'` stays at the C2 baseline of
+    about 0 per hour while steady;
+  - `idunn status` shows every routed target with `route actuations 0/12` and a healthy route.
+
+#### B2 rework, E. Live-deploy relevance (read from migration code, not from the store)
+
+**What is live now (ship log plus code).**
+- `control.cc` generations are v3: F0's lift (`:3131-3181`) ran at the B3 install and migrated
+  5 records.
+- Transactions are v4.
+- `history.cc` holds v3 and v4 transactions and is never migrated (`:3388-3391`).
+- B2 changes no transaction schema.
+
+**What the B2 install does.**
+- At boot, the migration rewrites every v3 generation as v4, each by CAS against its exact
+  envelope. That is the same machinery F0 used.
+- It writes no `TargetSupervision`: the lift is lossless for the reasons in section C.
+- The first route actuation after install, a deploy or a repair, creates each target's record.
+
+**It is irreversible.**
+- The pre-B2 binary refuses a v4 generation (`:3120`).
+- It also refuses a `TargetSupervision` envelope: `ControlSnapshot::read` bails "foreign
+  document" at `:2609`.
+- Binary rollback therefore means restoring the backup.
+- Ship steps: back up `control.cc` and `history.cc`, install, then check that `idunn status`
+  renders every target.
+
+**A lift refusal fails boot for every target.** It cannot happen from any released binary. If it
+does, the backup plus the pre-B2 binary is the recovery, and the error names the record.
+
+**Raven.**
+- `idunn-host` decodes plans, not generations, so B2 needs no actuator rebuild.
+- W1 is still the check that the actuator builds at the sha that ships.
+
+#### B2 rework, F. Subtraction estimate (B2)
+
+Production code in `control_plane.rs` and `drivers.rs`:
+- **Removed:**
+  - about 45 lines of history ceiling;
+  - about 40 lines of `ActuationWindow`, carry and backoff;
+  - about 20 lines of key-18 and key-20 plumbing.
+- **Added:**
+  - about 90 lines for `TargetSupervision`, its snapshot arm and its validation;
+  - about 60 lines for the meter primitive and the clock guard;
+  - about 60 lines for the v3 legacy layout, mostly moved rather than written;
+  - about 60 lines for the gate plumbing and `RouteActuators`;
+  - about 50 lines for status.
+- **Net production:** about +250.
+
+Tests:
+- **Removed:** about 46 lines of the tautology test and about 24 lines of `promote_by_hand`.
+- **Net tests:** about +350. The 9 hand promotions become real Routing steps.
+
+Compared with `97f1ad2`, which was +1243/-200, about 600 of B2's lines are not ported.
+
+Structural delta:
+- One record type added.
+- Two carry compensators and one history dependency deleted.
+- Two generation keys retired.
+- No targets, crates or dependencies.
+- The build and test matrix is unchanged, apart from W1's check.
+
+**Not asked, decided.** The v2 generation lift stays, retargeted to v4. Its only consumer is a
+restore of `/root/idunn-store-backup-…-pre-route-b3`, and deleting it would force rewriting
+about 10 tests built on `FIXTURE_GENERATION` for a saving of about 80 lines. Retire the v2 and v3
+generation layouts together in one later cut, once the operator retires the pre-B3 and pre-B2
+backups.
+
+
+**D1 — The dead-hold report lives on the generation (Idunn; operator ruling, 2026-09-30). READY FOR HANDS, after B2** (B2 carries key 21 and `render_supervision`).
+
+**Owner:** `Engine::report_generation_hold(current, detail)`. It is the only writer of
+`AdmittedGeneration.last_error`.
+- It writes only when the text differs.
+- It prints once through the existing `ReportOnce` map (`:3865`), keyed by target.
+- It ends the iteration, per the rule in section B.
+
+**Writers today, by site.**
+- `note_fault("holds admitted generation", "generation:<t>")` at `:4793-4799` hands a
+  generation key to `record_last_error` (`:4472-4495`). That function looks it up among
+  *transactions*, finds nothing, and so the report is stderr only. It also never clears.
+- The dead-hold note at `:4965-4969` behaves the same way.
+- **Both go.** They are replaced by `report_generation_hold`, with the readiness disagreement,
+  or with "is not running; declare readiness in its recipe and redeploy" when dead.
+
+**Clearing** (the ruling: replaced, or hold released).
+- Replacement clears by construction. `from_transaction` sets `None`, so it needs no code.
+- Release: at the hold check, `readiness().is_ok() && last_error.is_some()` writes `None`, calls
+  `clear_fault`, and continues.
+  - This covers an Idunn upgrade that reclassifies a generation.
+  - `last_error` has no other writer: the continuity deferral reason lives in
+    `TargetSupervision`, and route failures live in `RouteSupervisionState`.
+
+**Status.** `render_supervision` prints `  held: <last_error>`.
+
+**Tests.**
+- Extend `a_held_generation_that_dies_mints_no_continuity_and_leaves_its_target_free`
+  (`:13842`). It currently reads the in-memory `fault_reports` at `:13858-13859`; it must read
+  `last_error` from the stored generation instead: first the held text, then, after
+  `SwitchWorkload::kill`, the dead text.
+- Add `a_released_hold_clears_its_report`: seed `last_error` on a generation whose readiness is
+  OK; one tick clears it, and a second tick writes nothing, with the envelope unchanged.
+- Mutations it must kill:
+  - dropping the clear;
+  - writing on every tick;
+  - routing back to `record_last_error`.
+
+**Size.** About +40 production lines and about +60 test lines. It deletes the two
+`generation:`-keyed `note_fault` calls.
+
+**Live.** No schema change. On install, the first tick writes `last_error` on any held generation
+(none per the 2026-09-30 decode, now that raven-muninn is admitted).
+
+**T1 — Pin the candidate-cleanup rule by removing its free arguments (Idunn; Soul follow-up on B3). IN PROGRESS on `hands/idunn-w1-t1-t2`.**
+
+**The defect.**
+- `pre_fencing_abort_intent` (`:7991-8005`) and `post_fencing_abort_intent` (`:8007-8039`)
+  each call `candidate_cleanup_requirement(activation.is_some(), workload.is_some())`
+  (`:8041-8050`).
+- The unit test (`:9806-9820`) never covers `(false, true)`, and no test drives either intent
+  with exactly one of the two set.
+- So swapping or constant-folding either argument at either call site survives.
+
+**The cut.**
+- Delete the helper.
+- Add `DeploymentTransaction::candidate_cleanup_owed(&self) -> CleanupEvidence`, used by both
+  intents.
+- Rewrite the unit test as a four-row table over the method.
+- Add one test that both intents take the method's answer for `(Some, None)` and `(None, Some)`.
+
+**Mutations it must kill:**
+- `||` becoming `&&`;
+- either operand becoming `false`;
+- either intent hardcoding `Skipped`.
+
+**Size.** About −10 production lines and about +8 test lines. Not live-relevant.
+
+**T2 — The chunk-size line is exactly RFC 9112 (Idunn; Soul follow-up on B3). IN PROGRESS on `hands/idunn-w1-t1-t2`.**
+
+**Probe** (Yggdrasil, throwaway commit `ce98e9b` on `583b2a7`): the HTTP reader accepts `" 3"`,
+`"3 "`, `"3 ;x"` and `"3"` alike. The cause is `size.trim_matches([' ', '\t'])` in
+`drivers.rs:5816-5821`.
+
+**What RFC 9112 7.1 allows.** `chunk-size [ chunk-ext ] CRLF`, where
+`chunk-ext = *( BWS ";" … )`. So whitespace is allowed only before a `;`, and never before the
+digits.
+
+**The cut.**
+- Split at the first `;`.
+- Trim trailing SP and HTAB only when an extension follows.
+- Never trim leading whitespace.
+- `parse_digits` (`:5846-5851`) stays the digit authority.
+
+**Tests.** Add rows to `an_http_answer_that_frames_its_body_wrongly_is_refused` (`:8611`):
+`" 3"` and `"3 "` are refused. Add to
+`a_chunked_answer_must_end_its_trailers_and_terminate_each_chunk` (`:8799`) that `"3 ;x"` and
+`"3\t;x"` are taken.
+
+**Mutations it must kill:**
+- trim both ends, which lets `" 3"` pass;
+- no trim, which refuses `"3 ;x"`.
+
+**Size.** About +4 production lines and about +8 test lines. It is live-relevant only as
+stricter parsing of StreamPixels and Odin answers. Node's `http` emits bare hex, so there is no
+expected behaviour change.
+
+**Note.** Neither T1's nor T2's text is recorded in the map at `94c7691`. Both were taken from
+the brief, and the defects were confirmed from code and the probe.
+
+**W1 — Every verification checks the Windows actuator compiles (Idunn map and the eureka stopgap image). IN PROGRESS on `hands/idunn-w1-t1-t2`.**
+
+**Probe** (Yggdrasil, rust image):
+- `rustup target add x86_64-pc-windows-gnu; cargo check --locked --target
+  x86_64-pc-windows-gnu --bin idunn-host`.
+- At `d32395a` (B3 merge, before the fix) it **fails** with four `E0425` errors, "cannot find
+  value `FROZEN_SOURCE_SYMLINK_TARGET_LIMIT`" (`drivers.rs:1461-1477`). That is exactly the
+  Raven break.
+- At `583b2a7` it **passes** in 26 s. No mingw linker is needed, because `check` does not link,
+  and no dependency compiles C for the target.
+
+**The cut.** No Idunn code changes.
+1. `~/.claude/skills/eureka/tools/stopgap/rust.Dockerfile` gains
+   `RUN rustup target add x86_64-pc-windows-gnu`, so no job downloads `rust-std`. Rename the
+   file over itself; the image is re-tagged by the file's hash.
+2. The map's "Build and verification path" makes the check a required step for every Idunn
+   cut, beside `cargo test`.
+   - It must not use `-D warnings`: the Windows target currently emits 9 warnings (unused
+     cfg-split code).
+3. When the Idunn verify recipe exists (verify campaign), the same step moves into it, and
+   this stopgap line dies with `ygg-verify.sh`.
+4. **The release build stays a documented step, not a verification.**
+   - `gamecult-ops/runbooks/idunn-host-raven.md:23` already names Starfire for
+     `cargo build --release --bin idunn-host`. Add: "at the exact Idunn sha being installed on
+     Yggdrasil; record the exe sha256 in the ship log".
+   - That is Windows-only work. It fits the load budget: one job, no burners.
+
+**Honesty limit.**
+- W1 catches compile rot, the class that broke Raven.
+- It does not catch link failures or runtime behaviour on Windows. Q-V5 rules out a Windows
+  verify host.
+- It does not catch version skew, where an old actuator cannot decode new plan types. That was
+  the other half of the Raven incident. Only the runbook's "rebuild at the installed sha" step
+  covers it. A version handshake at hub attach would be the structural fix; it is noted and not
+  mapped here.
+
+**Size.** One Dockerfile line and one map line. It adds no targets.
+
+**R1 — A routed target proves it answers the route challenge before its fence (Idunn; Q-R1 ruled (a)). READY FOR HANDS, after B2. Must land before Heimdall's first deploy.**
+
+- **Owner:** Warming's last step, the transition to Fencing (`:5742`).
+- **Inputs:**
+  - the candidate endpoint;
+  - `ReadinessClass::of(expected)`;
+  - `warming`: `RouteProofDirect` and `FirstOdinDirect` are already a direct answer.
+- **Rule.** If `expected.route.is_some()` and `warming` is `OdinTopology`, then
+  `challenge_candidate(&current.value, &["warming", "active"], None)` (`:7313`) must answer
+  before `transition(Fencing)`:
+  - `Silent` becomes `record_gate_wait`, since the candidate may still be binding;
+  - `Refused` becomes `Err`, which resume turns into a **pre-fence abort** (`:4587-4593`) with
+    "routed target <t> does not answer the stable-route challenge; a routed recipe must serve
+    CultNet snapshot challenges";
+  - an `Answered` result is not persisted. It is not readiness, and passing Warming is the
+    record.
+- **Deletes:** none. This is a check moved earlier, not a second authority. The post-fence
+  proofs at Routing and Commit stay the route's admission.
+- **Size:** about +20 production lines, no schema change.
+- **Tests** (Engine, B3 `RoutedWorld` with `provides_odin = false` and an Odin-correlated
+  recipe):
+  1. The stub's `reply` answers 404: the transaction pre-fence aborts from Warming, no lease is
+     granted, and nothing is fenced.
+  2. `hang_up` on: a gate wait, not an abort. Then `hang_up` off: it reaches Fencing.
+  3. An honest stub reaches Fencing exactly as today.
+  - Mutations it must kill: the class guard widened to `RouteProof` only (test 1 then reaches
+    Fencing); `Silent` treated as `Refused` (test 2 aborts).
+- **Live:** nothing changes for ghostlight or streampixels-service, which answer today. Heimdall
+  (not admitted) now fails in Warming instead of wedging post-fence.
 
 **B3 — Route-proof readiness (Idunn).** For a route-proof target:
 - Warming is a direct candidate-endpoint challenge. This generalizes the
@@ -754,13 +1409,67 @@ with no backoff.
   decisions.
 
 **B4 — Provider currency from Idunn's own observation; `9f00e7a` reverted
-(Idunn).**
+(Idunn). BLOCKED on the Odin-lifecycle authority audit.**
 - Per Q2(b), `validate_selected_providers_current` and plan compile read the
   provider's current route observation within max age, and read capabilities
   from its signed presence.
 - Unrouted providers use their Q1 class evidence, authenticated now.
 - Revert the admission-time authentication.
 - `ManagedReady` carries a class-tagged evidence digest.
+
+**B4 status, 2026-09-30: BLOCKED on the Odin-lifecycle authority audit** (a separate Imagination pass), not on
+Q-B4. Q-B4 is ruled in part (section 3): routed providers are current by Idunn's route proof and not
+degraded; unrouted providers by admission plus a live workload observation. The clause "a current Odin
+non-Ready word still excludes a provider" is held open. B4 also takes B2's degraded state as input.
+
+**C2 run 2 failure mechanism (Eyes, 2026-09-30)**
+
+The code was read at `583b2a7`. The Idunn journal on Yggdrasil was read read-only; no state store
+was read.
+
+**Journal evidence.**
+- 21:15:18: "excluded non-current provider streampixels-service: admitted provider's latest
+  receipt is not Ready at its admission time".
+- 20:44 and 21:15: "…streampixels-web: admitted generation of streampixels-web is not
+  Odin-correlated".
+- ghostlight and raven-muninn are excluded with the "latest … not Ready" text on every compile
+  since 19:45, with Odin up.
+
+**The path.**
+1. Plan compile (`advance_sealing`, `:5375-5385`) builds its provider list only from
+   `current_ready_provider_tokens` (`:7398-7415`), which calls `rehydrate_admitted_ready`
+   (`:7417-7470`).
+2. `rehydrate_admitted_ready`:
+   - requires Odin receipts (`odin_receipts()`, `:7422`). A route-proof provider fails here with
+     `:2019`, so **no route-proof target can be a provider today**;
+   - requires the admitted `latest_odin_observation` to be semantically Ready (`:7453-7456`).
+3. `refresh_admitted_topology` writes *every* fresh authenticated correlation as `latest`, Ready
+   or not (`:5320-5325`). Only a Ready one also moves `ready`.
+   - So one non-Ready word from Odin removes the provider until Odin says Ready again.
+   - Such a word can come from the provider's presence ageing out in Odin, including through
+     Odin's own faults, for example its 64-slot RUDP session table.
+   - With Odin stopped, that last word is frozen.
+4. `managed_ready_provider_refs` (`deployment_plan.rs:264-316`) takes capabilities from Odin's
+   record. `select_dependencies` then bails "no expected provider satisfies
+   streampixels.service.api http.v1 v1" (`deployment_plan.rs:447-455`).
+5. The same rehydration gates currency again at Starting, Routing and Committing, through
+   `validate_selected_providers_current` (`:7472-7534`). So a deploy that compiled can still
+   fail later on Odin's word.
+
+**This is the unlanded B4.** Q2 was ruled (b): "Idunn's own current route observation of the
+admitted provider … Unrouted providers fall back to their Q1 class evidence".
+- streampixels-service is routed, so under B4 its currency is Idunn's route proof. C2 run 2
+  would admit.
+- "Both runs must admit" is therefore **blocked on B4**, not wrong.
+
+**One B4 brief item found here: challenge cadence against max age.**
+- S1 challenges a healthy route only once its observation is older than
+  `topology_maximum_age_millis` (30 s) (`:5213-5221`).
+- So a healthy route's observation ranges from 0 to about 30.5 s old.
+- A B4 check of "within max age", repeated at compile, Starting, Routing and twice at Commit,
+  would sometimes refuse a healthy provider.
+- B4 must define currency as "the route is not degraded, and the last proof is within 2 × max
+  age", or challenge on demand. That is a brief decision, not an operator one.
 
 **B5 — Every post-fencing phase ends (Idunn).**
 - A deadline resolver runs before `advance_transaction`.
@@ -836,6 +1545,8 @@ after C1, S3, B3).**
   2. Both runs must admit.
   3. Both must show zero steady-state reloads over one hour.
   4. Both must show repeated successful signed challenges.
+   Run 2 (Odin stopped) is blocked on B4. The failure on 2026-09-29 21:15 is the unlanded B4,
+   not a C2 defect.
 - Public cutover is out of scope and resumes afterwards through the ordinary
   path.
 
@@ -850,6 +1561,8 @@ after C1, S3, B3).**
   commands on Yggdrasil, taken before and after each deploy.
 - Each Idunn cut names its focused tests. The whole suite runs once per cut on
   Yggdrasil, not per edit.
+- Every Idunn cut also runs `cargo check --locked --target x86_64-pc-windows-gnu --bin idunn-host` (W1),
+  without `-D warnings`.
 
 ### Ops follow-ups, out of scope
 
