@@ -15141,8 +15141,8 @@ mod tests {
             use crate::deployment_plan::tests::{
                 BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
             };
-            let workload = SwitchWorkload::new();
-            let world = EngineFixture::with_workload(workload.clone())?;
+            let switch = SwitchWorkload::new();
+            let world = EngineFixture::with_workload(switch.clone())?;
             let candidate_listener = TcpListener::bind("127.0.0.1:0")?;
             let stable_listener = TcpListener::bind("127.0.0.1:0")?;
             let candidate_port = candidate_listener.local_addr()?.port();
@@ -15400,7 +15400,7 @@ mod tests {
             };
             Ok(RoutedWorld {
                 world,
-                workload,
+                workload: switch,
                 stub,
                 odin,
                 poisoned,
