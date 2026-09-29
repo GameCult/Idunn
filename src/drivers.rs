@@ -68,6 +68,9 @@ struct GitTreeEntry {
 /// finally closed it.
 #[cfg(unix)]
 const FROZEN_SOURCE_SYMLINK_TARGET_LIMIT: usize = libc::PATH_MAX as usize;
+/// Windows' long-path limit, in UTF-16 units; the same bound on a symlink blob's size.
+#[cfg(not(unix))]
+const FROZEN_SOURCE_SYMLINK_TARGET_LIMIT: usize = 32_767;
 
 /// F2/F3 layer (b): the only way `materialize_tree_raw` is allowed to obtain
 /// a directory to write into. `path` must already be a directory this
