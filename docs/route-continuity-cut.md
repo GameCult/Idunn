@@ -36,6 +36,30 @@ because it has no route. `raven-muninn` and Heimdall both publish to Odin, so th
 The rejected alternative let Odin's availability gate Muninn's crash recovery through an undeclared,
 inferred dependency.
 
+**B2 status, 2026-09-30 (Self).** Hands pushed `idunn/route-b2` at `1786ddf`. The Opus Soul pass rejected
+it for merge.
+- **F1 (critical):** `ContinuityBackoff.deferral_reason` was added without a schema bump. B2 fails the
+  canonical re-encode of every three-field v3 generation that F0, B1 or B3 wrote, so Idunn cannot read its
+  own store.
+- **F2:** the ceiling refuses a rollback, which leaves an unproven candidate on the stable route.
+- **F3:** a failed challenge writes, and continuity's CAS then loses against a stale envelope.
+- **F4:** neither window rolls; both are anchored at the first charge.
+- **F5:** a clock stepped backwards stalls everything for the length of the step.
+- **F6:** `record_proved_challenge` is unpinned.
+- **F7:** the mount preflight is not gated.
+- B2 also does not compile on top of B3, and after a one-line fix two tests fail, because the fixture target
+  is now route-proof.
+
+The rework runs after B3 merges and is rebased onto it.
+
+**Rulings, 2026-09-30.**
+- **The ceiling never refuses a rollback.** Restoring the admitted or incumbent route is survival, not
+  deployment. It is always allowed and always counted. Only installs and other forward changes can be
+  refused. A rollback that keeps failing is spaced by backoff, never refused.
+- **First routed deployments are metered now.** The actuation window lives on the target, not on the
+  admitted generation, so a target with no admitted generation is charged too. That schema change is folded
+  into the store-version bump that F1 needs: a v4 generation, with a typed lift from v3.
+
 Heads read for this map:
 
 | Repo | Ref | Notes |
