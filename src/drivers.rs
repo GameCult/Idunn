@@ -10554,6 +10554,24 @@ Content-Le".to_vec()), |_| {}),
             bulk_fetches, 1,
             "expected exactly one bulk --stdin fetch; invocations:\n{log_text}"
         );
+        // Git's own lazy fetch for a promisor remote sends exactly these; a
+        // hosted origin (GitHub) omits an explicitly wanted blob, and Git's
+        // connectivity check then fails, without them. A file:// origin
+        // delivers the blob either way, so only the arguments can pin this.
+        let bulk_line = log_text
+            .lines()
+            .find(|line| line.contains("fetch") && line.contains("--stdin"))
+            .unwrap_or_default();
+        for required in [
+            "fetch.negotiationAlgorithm=noop",
+            "--recurse-submodules=no",
+            "--filter=blob:none",
+        ] {
+            assert!(
+                bulk_line.contains(required),
+                "bulk fetch lacks {required}: {bulk_line}"
+            );
+        }
         Ok(())
     }
 
