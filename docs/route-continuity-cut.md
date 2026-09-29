@@ -55,6 +55,24 @@ transactions of routed targets with no Odin declaration (operator approved, 2026
   target, so the declaring redeploy can never freeze. The fix is in Hands.
 - F5, bad answers read as Silent over HTTP keep-alive and TCP, is in the same batch.
 
+**B3 fix batch (`86ee21d..e8b4487`), Soul pass 3, 2026-09-30: merge with follow-ups.** Nothing here hurts a
+live host on install. 294 passed, 2 ignored. `cargo mutants --in-diff`: 53 caught, 0 missed.
+- **F1 holds.** There is one continuity mint site, and the hold check comes before it. A declaring redeploy
+  replaces a dead held incumbent end to end.
+- **F5 holds.** Zero bytes is Silent. Any byte then a stall or stop is Refused. Non-2xx responses and
+  non-chunked Transfer-Encoding are Refused.
+- **Follow-ups, in Hands on the same branch:**
+  - the P1b test never reaches the yield branch (mutant M7 survives);
+  - the chunked trailer loop is unbounded;
+  - `+N` lengths and whitespace before the colon are accepted;
+  - exact 1 MiB and one-byte-then-stop are unpinned;
+  - the `Silent` doc is stale;
+  - the dead-hold report goes to stderr only and never clears.
+
+**Ruling, 2026-09-30 (operator): cancel accepts a held pre-fence Deploy.** Idunn still never aborts a held
+record on its own. An operator can discard a held Deploy that has not reached the fence with `idunn cancel`.
+Nothing is fenced, so the incumbent is untouched.
+
 **Odin diagnosis (Eyes, read-only, 2026-09-30).**
 - The 109 Odin route timeouts are self-inflicted. Live Idunn (`8ae00a1`, pre-S1) reloads nginx inside
   `restore_admitted_membership` before every Odin challenge. The reload moves the reuseport UDP flow, so
