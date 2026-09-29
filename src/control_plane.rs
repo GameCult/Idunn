@@ -49,9 +49,13 @@ use crate::host_actuator::{
 };
 
 const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
-const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v3";
+const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v4";
+const DEPLOYMENT_TRANSACTION_SCHEMA_V3: &str = "idunn.deployment_transaction.v3";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V2: &str = "idunn.deployment_transaction.v2";
-const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v2";
+const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v3";
+const ADMITTED_GENERATION_SCHEMA_V2: &str = "idunn.admitted_generation.v2";
+/// The capability whose declaration makes a target Odin-correlated.
+const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
 /// How many times continuity will restart one admitted release before it
 /// concludes the release itself is the problem. More than one because a start
 /// can fail for a passing reason -- a port still held, a peer not yet up --
@@ -518,12 +522,223 @@ impl RoutingEvidence {
     }
 }
 
+/// Which kind of proof admits a target as Ready. Derived from the target's
+/// Expected, never stored: Expected is digest-bound, so the class cannot drift
+/// from the incarnation it describes. A target that declares a
+/// `shared-infrastructure odin.verse-rendezvous` dependency advertises into the
+/// Verse and is Odin-correlated; one that declares none is route-proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadinessClass {
+    OdinCorrelated,
+    RouteProof,
+}
+
+impl ReadinessClass {
+    fn of(expected: &IdunnExpectedIncarnationRecord) -> Self {
+        let declares_odin = expected.dependencies.iter().any(|dependency| {
+            dependency.kind == "shared-infrastructure"
+                && dependency.capability == ODIN_RENDEZVOUS_CAPABILITY
+        });
+        if declares_odin {
+            Self::OdinCorrelated
+        } else {
+            Self::RouteProof
+        }
+    }
+}
+
+/// The receipt that admitted a candidate as Ready, tagged by the class of proof
+/// that produced it. The tag records what was collected; the class a target
+/// must collect is `ReadinessClass::of(expected)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "class", rename_all = "kebab-case", deny_unknown_fields)]
+enum ReadinessEvidence {
+    OdinCorrelated { evidence: TopologyEvidence },
+    RouteProof { evidence: RuntimePresenceEvidence },
+}
+
+impl ReadinessEvidence {
+    fn class(&self) -> ReadinessClass {
+        match self {
+            Self::OdinCorrelated { .. } => ReadinessClass::OdinCorrelated,
+            Self::RouteProof { .. } => ReadinessClass::RouteProof,
+        }
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        match self {
+            Self::OdinCorrelated { evidence } => evidence.validate_shape(),
+            Self::RouteProof { evidence } => evidence.validate_shape(),
+        }
+    }
+
+    fn odin(&self) -> Option<&TopologyEvidence> {
+        match self {
+            Self::OdinCorrelated { evidence } => Some(evidence),
+            Self::RouteProof { .. } => None,
+        }
+    }
+}
+
+/// Signed evidence that the candidate process picked up the lease Idunn
+/// granted: its presence carries `write_lease_sha256` equal to the grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseAdoptionEvidence {
+    write_lease_sha256: String,
+    signed_presence_sha256: String,
+    source: AdoptionSource,
+    observed_at_unix_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AdoptionSource {
+    Direct,
+    OdinTopology,
+}
+
+impl LeaseAdoptionEvidence {
+    /// Whether this evidence is about exactly the lease that was granted.
+    fn names(&self, leasing: &LeasingEvidence) -> bool {
+        leasing.lease_sha256() == Some(self.write_lease_sha256.as_str())
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        require_id(&self.write_lease_sha256, "adopted lease digest")?;
+        require_id(&self.signed_presence_sha256, "lease adoption presence digest")?;
+        ensure!(
+            self.observed_at_unix_millis > 0,
+            "lease adoption has no observation time"
+        );
+        Ok(())
+    }
+}
+
+/// When the transaction entered its current post-fencing phase and when that
+/// phase must end. Durations come from the plan's frozen `PhaseDeadlines`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhaseDeadline {
+    phase: DeploymentPhase,
+    entered_at_unix_millis: u64,
+    deadline_at_unix_millis: u64,
+}
+
+impl PhaseDeadline {
+    /// `None` for a phase that has no deadline (pre-fencing and Complete).
+    fn entering(
+        phase: DeploymentPhase,
+        plan: &CompiledDeploymentPlan,
+        now: u64,
+    ) -> Option<Self> {
+        let deadlines = plan.phase_deadlines();
+        let seconds = match phase {
+            DeploymentPhase::Fencing => deadlines.fencing_seconds,
+            DeploymentPhase::Leasing => deadlines.leasing_seconds,
+            DeploymentPhase::AwaitingReady => deadlines.awaiting_ready_seconds,
+            DeploymentPhase::Routing => deadlines.routing_seconds,
+            DeploymentPhase::Committing => deadlines.committing_seconds,
+            _ => return None,
+        };
+        Some(Self {
+            phase,
+            entered_at_unix_millis: now,
+            deadline_at_unix_millis: now.saturating_add(u64::from(seconds) * 1000),
+        })
+    }
+}
+
+/// How a post-fencing failure recovers. `RestoreIncumbent` is what a
+/// post-fencing abort has always done and is the default for records that
+/// predate the field.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+enum TerminalRecovery {
+    RestartAdmitted,
+    #[default]
+    RestoreIncumbent,
+    OperatorRequired {
+        reason: String,
+    },
+}
+
+/// Route supervision's durable memory for one admitted routed target. Carried
+/// across commits except for the per-incarnation parts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteSupervisionState {
+    last_challenge_at_unix_millis: Option<u64>,
+    consecutive_failures: u32,
+    next_challenge_at_unix_millis: Option<u64>,
+    /// Set while route proof keeps failing. Marks the route degraded so
+    /// dependents stop selecting it; it never authorizes a restart.
+    degraded_since_unix_millis: Option<u64>,
+    actuations: ActuationWindow,
+}
+
+/// Route actuations (write, reload, firewall) inside a rolling window, so a
+/// per-target ceiling survives an Idunn restart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActuationWindow {
+    window_started_at_unix_millis: u64,
+    count: u32,
+}
+
+impl RouteSupervisionState {
+    /// A new incarnation starts unobserved and undegraded, but inherits the
+    /// target's actuation window: a ceiling that reset on every commit would
+    /// not be a ceiling.
+    fn for_new_incarnation(incumbent: Option<&Self>) -> Self {
+        Self {
+            actuations: incumbent.map(|state| state.actuations).unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(since) = self.degraded_since_unix_millis {
+            ensure!(since > 0, "route degradation has no start time");
+        }
+        ensure!(
+            self.actuations.count == 0 || self.actuations.window_started_at_unix_millis > 0,
+            "route actuation window has a count but no start"
+        );
+        Ok(())
+    }
+}
+
+/// Continuity restarts of one target inside a rolling window. Belongs to the
+/// target, not the generation: a restart that succeeds must not reset it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinuityBackoff {
+    window_started_at_unix_millis: Option<u64>,
+    attempts: u32,
+    next_restart_at_unix_millis: Option<u64>,
+}
+
+impl ContinuityBackoff {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.attempts == 0 || self.window_started_at_unix_millis.is_some(),
+            "continuity backoff has attempts but no window"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
 enum TransactionCompletion {
     Admitted { generation_id: String },
     FailedBeforeFencing { error: String },
-    FailedAfterFencing { error: String },
+    FailedAfterFencing {
+        error: String,
+        #[serde(default)]
+        recovery: TerminalRecovery,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,7 +857,7 @@ impl PostCommitCleanup {
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(
     type = "idunn.deployment_transaction",
-    schema = "idunn.deployment_transaction.v2"
+    schema = "idunn.deployment_transaction.v4"
 )]
 struct DeploymentTransaction {
     #[cultcache(key = 0)]
@@ -700,7 +915,7 @@ struct DeploymentTransaction {
     #[cultcache(key = 26)]
     leasing: Option<LeasingEvidence>,
     #[cultcache(key = 27)]
-    ready: Option<TopologyEvidence>,
+    ready: Option<ReadinessEvidence>,
     #[cultcache(key = 28)]
     routing: Option<RoutingEvidence>,
     #[cultcache(key = 29)]
@@ -719,6 +934,11 @@ struct DeploymentTransaction {
     // control store and crashloops.
     #[cultcache(key = 34, default)]
     post_fencing_abort: Option<PostFencingAbort>,
+    /// Set by `transition` on entry to each post-fencing phase.
+    #[cultcache(key = 35)]
+    phase_deadline: Option<PhaseDeadline>,
+    #[cultcache(key = 36)]
+    lease_adoption: Option<LeaseAdoptionEvidence>,
 }
 
 impl DeploymentTransaction {
@@ -775,6 +995,8 @@ impl DeploymentTransaction {
             pre_fencing_abort: None,
             post_fencing_abort: None,
             post_commit_cleanup: None,
+            phase_deadline: None,
+            lease_adoption: None,
         };
         transaction.validate()?;
         Ok(transaction)
@@ -921,7 +1143,8 @@ impl DeploymentTransaction {
             self.workload.is_none() || self.activation.is_some(),
             "workload observation exists without its prepared activation"
         );
-        for evidence in [&self.latest_odin_observation, &self.ready]
+        let ready_odin = self.ready.as_ref().and_then(ReadinessEvidence::odin);
+        for evidence in [self.latest_odin_observation.as_ref(), ready_odin]
             .into_iter()
             .flatten()
         {
@@ -930,6 +1153,15 @@ impl DeploymentTransaction {
                 evidence.publisher_sequence <= self.odin_publisher_sequence_cursor,
                 "topology evidence exceeds the transaction replay cursor"
             );
+        }
+        if let Some(ready) = &self.ready {
+            ready.validate_shape()?;
+            if let (ReadinessClass::RouteProof, Some(expected)) = (ready.class(), &self.expected) {
+                ensure!(
+                    ReadinessClass::of(expected) == ReadinessClass::RouteProof,
+                    "route-proof Ready evidence for a target that declares Odin"
+                );
+            }
         }
         if let Some(warming) = &self.warming {
             warming.validate_shape()?;
@@ -992,6 +1224,26 @@ impl DeploymentTransaction {
         }
         if let Some(error) = &self.last_error {
             require_detail(error, "transaction error")?;
+        }
+        if let Some(deadline) = &self.phase_deadline {
+            ensure!(
+                deadline.phase == self.phase
+                    && (DeploymentPhase::Fencing..=DeploymentPhase::Committing)
+                        .contains(&deadline.phase)
+                    && deadline.entered_at_unix_millis > 0
+                    && deadline.entered_at_unix_millis <= self.updated_at_unix_millis
+                    && deadline.deadline_at_unix_millis > deadline.entered_at_unix_millis,
+                "phase deadline does not describe the current post-fencing phase"
+            );
+        }
+        if let Some(adoption) = &self.lease_adoption {
+            adoption.validate_shape()?;
+            ensure!(
+                self.leasing
+                    .as_ref()
+                    .is_some_and(|leasing| adoption.names(leasing)),
+                "lease adoption does not name the granted lease"
+            );
         }
         if let Some(authorization) = &self.deployment_authorization {
             authorization.validate_shape()?;
@@ -1069,11 +1321,14 @@ impl DeploymentTransaction {
                 &self.post_fencing_abort,
                 "terminal post-fence abort evidence",
             )?;
-            let TransactionCompletion::FailedAfterFencing { error } =
+            let TransactionCompletion::FailedAfterFencing { error, recovery } =
                 self.completion.as_ref().unwrap()
             else {
                 unreachable!()
             };
+            if let TerminalRecovery::OperatorRequired { reason } = recovery {
+                require_detail(reason, "operator-required recovery reason")?;
+            }
             ensure!(
                 abort.is_complete() && abort.error == *error,
                 "terminal failure lacks complete matching abort evidence"
@@ -1290,7 +1545,7 @@ impl AdmittedOdinAuthority {
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(
     type = "idunn.admitted_generation",
-    schema = "idunn.admitted_generation.v2"
+    schema = "idunn.admitted_generation.v3"
 )]
 struct AdmittedGeneration {
     #[cultcache(key = 0)]
@@ -1319,30 +1574,84 @@ struct AdmittedGeneration {
     workload: WorkloadObservation,
     #[cultcache(key = 12)]
     leasing: LeasingEvidence,
+    /// The receipt that admitted this incarnation, tagged by proof class.
     #[cultcache(key = 13)]
-    ready: TopologyEvidence,
+    ready: ReadinessEvidence,
+    /// Present exactly when `ready` is Odin-correlated.
     #[cultcache(key = 14)]
-    latest_odin_observation: TopologyEvidence,
+    latest_odin_observation: Option<TopologyEvidence>,
     #[cultcache(key = 15)]
     routing: RoutingEvidence,
+    /// Present exactly when `ready` is Odin-correlated.
     #[cultcache(key = 16)]
-    odin_authority: AdmittedOdinAuthority,
+    odin_authority: Option<AdmittedOdinAuthority>,
+    /// Meaningful only for an Odin-correlated generation.
     #[cultcache(key = 17)]
     odin_publisher_sequence_cursor: u64,
+    /// Still readable, decides nothing new: route supervision state replaces it.
     #[cultcache(key = 18)]
     route_repair_started_at_unix_millis: Option<u64>,
+    /// Present exactly when `routing` is Promoted.
+    #[cultcache(key = 19)]
+    route_supervision: Option<RouteSupervisionState>,
+    #[cultcache(key = 20)]
+    continuity_backoff: ContinuityBackoff,
+}
+
+/// The Odin-side receipts of an Odin-correlated generation. Decisions that
+/// consume Odin evidence read it through here, so a route-proof generation
+/// cannot be mistaken for one.
+struct OdinReceipts<'a> {
+    ready: &'a TopologyEvidence,
+    latest: &'a TopologyEvidence,
+    authority: &'a AdmittedOdinAuthority,
 }
 
 impl AdmittedGeneration {
+    fn odin_receipts(&self) -> Result<OdinReceipts<'_>> {
+        match (
+            &self.ready,
+            &self.latest_odin_observation,
+            &self.odin_authority,
+        ) {
+            (ReadinessEvidence::OdinCorrelated { evidence }, Some(latest), Some(authority)) => {
+                Ok(OdinReceipts {
+                    ready: evidence,
+                    latest,
+                    authority,
+                })
+            }
+            _ => bail!("admitted generation of {} is not Odin-correlated", self.target),
+        }
+    }
+
     fn from_transaction(
         transaction: &DeploymentTransaction,
         odin_authority: AdmittedOdinAuthority,
+        incumbent: Option<&AdmittedGeneration>,
         now: u64,
     ) -> Result<Self> {
         ensure!(
             transaction.phase == DeploymentPhase::Committing,
             "only Committing can create an admitted generation"
         );
+        let ready = required(&transaction.ready, "Ready receipt")?.clone();
+        let (latest_odin_observation, odin_authority) = match ready.class() {
+            ReadinessClass::OdinCorrelated => (
+                Some(
+                    required(&transaction.latest_odin_observation, "latest Odin receipt")?
+                        .clone(),
+                ),
+                Some(odin_authority),
+            ),
+            ReadinessClass::RouteProof => (None, None),
+        };
+        let routing = required(&transaction.routing, "route disposition")?.clone();
+        let route_supervision = matches!(&routing, RoutingEvidence::Promoted { .. }).then(|| {
+            RouteSupervisionState::for_new_incarnation(
+                incumbent.and_then(|value| value.route_supervision.as_ref()),
+            )
+        });
         let generation = Self {
             schema_version: ADMITTED_GENERATION_SCHEMA.into(),
             target: transaction.target.clone(),
@@ -1358,16 +1667,16 @@ impl AdmittedGeneration {
             activation: required(&transaction.activation, "activation")?.clone(),
             workload: required(&transaction.workload, "workload")?.clone(),
             leasing: required(&transaction.leasing, "lease disposition")?.clone(),
-            ready: required(&transaction.ready, "Ready receipt")?.clone(),
-            latest_odin_observation: required(
-                &transaction.latest_odin_observation,
-                "latest Odin receipt",
-            )?
-            .clone(),
-            routing: required(&transaction.routing, "route disposition")?.clone(),
+            ready,
+            latest_odin_observation,
+            routing,
             odin_authority,
             odin_publisher_sequence_cursor: transaction.odin_publisher_sequence_cursor,
             route_repair_started_at_unix_millis: None,
+            route_supervision,
+            continuity_backoff: incumbent
+                .map(|value| value.continuity_backoff.clone())
+                .unwrap_or_default(),
         };
         generation.validate()?;
         Ok(generation)
@@ -1388,18 +1697,33 @@ impl AdmittedGeneration {
         self.expected.validate()?;
         self.activation.validate()?;
         self.ready.validate_shape()?;
-        self.latest_odin_observation.validate_shape()?;
-        self.odin_authority.validate()?;
+        match (
+            &self.ready,
+            &self.latest_odin_observation,
+            &self.odin_authority,
+        ) {
+            (ReadinessEvidence::OdinCorrelated { evidence }, Some(latest), Some(authority)) => {
+                latest.validate_shape()?;
+                authority.validate()?;
+                ensure!(
+                    evidence.publisher_sequence <= self.odin_publisher_sequence_cursor
+                        && latest.publisher_sequence == self.odin_publisher_sequence_cursor,
+                    "admitted generation evidence does not describe one incarnation"
+                );
+            }
+            (ReadinessEvidence::RouteProof { .. }, None, None) => ensure!(
+                ReadinessClass::of(&self.expected) == ReadinessClass::RouteProof,
+                "route-proof Ready evidence for a target that declares Odin"
+            ),
+            _ => bail!("admitted readiness evidence and Odin receipts disagree"),
+        }
         ensure!(
             self.target == self.expected.target
                 && self.expected.plan_id == self.plan.plan_id
                 && self.expected.sealed_release_id == self.sealed_release.sealed_release_id
                 && self.activation.expected_projection_sha256
                     == self.expected.canonical_sha256()?
-                && self.activation.runtime_instance_id == self.workload.runtime_instance_id()
-                && self.ready.publisher_sequence <= self.odin_publisher_sequence_cursor
-                && self.latest_odin_observation.publisher_sequence
-                    == self.odin_publisher_sequence_cursor,
+                && self.activation.runtime_instance_id == self.workload.runtime_instance_id(),
             "admitted generation evidence does not describe one incarnation"
         );
         ensure!(
@@ -1424,6 +1748,15 @@ impl AdmittedGeneration {
                 "only a promoted routed generation can own route repair intent"
             );
         }
+        ensure!(
+            self.route_supervision.is_some()
+                == matches!(&self.routing, RoutingEvidence::Promoted { .. }),
+            "route supervision state exists exactly for a promoted route"
+        );
+        if let Some(state) = &self.route_supervision {
+            state.validate()?;
+        }
+        self.continuity_backoff.validate()?;
         Ok(())
     }
 }
@@ -1859,12 +2192,7 @@ impl ControlSnapshot {
                     snapshot.transactions.push(Stored { envelope, value });
                 }
                 AdmittedGeneration::TYPE => {
-                    ensure!(
-                        envelope.schema_id.as_deref() == Some(ADMITTED_GENERATION_SCHEMA),
-                        "Idunn control store contains an unsupported admitted generation"
-                    );
-                    let value: AdmittedGeneration = decode_record(&envelope)?;
-                    value.validate()?;
+                    let value = read_generation_record(&envelope)?;
                     ensure!(
                         envelope.key == value.target,
                         "admitted generation key is not its target"
@@ -2049,7 +2377,11 @@ impl ControlSnapshot {
             .iter()
             .filter(|stored| {
                 stored.value.target == target
-                    && stored.value.odin_authority.signer_identity_id == signer_identity_id
+                    && stored
+                        .value
+                        .odin_authority
+                        .as_ref()
+                        .is_some_and(|authority| authority.signer_identity_id == signer_identity_id)
             })
             .map(|stored| stored.value.odin_publisher_sequence_cursor)
             .max()
@@ -2081,20 +2413,255 @@ fn command_envelope(value: &DeploymentCommand, now: u64) -> Result<CultCacheEnve
     )
 }
 
-/// Read one stored transaction, lifting a v2 record to the current shape.
+/// The transaction layout of v2 and v3 records: `ready` is a bare Odin receipt,
+/// and there are no phase deadline or lease adoption slots. It exists only to
+/// decode records written before v4; `migrate_control_store_to_current_schema`
+/// rewrites every one at boot, so this struct dies once no v2 or v3 record can
+/// remain in `control.cc` or `history.cc`.
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(
+    type = "idunn.deployment_transaction",
+    schema = "idunn.deployment_transaction.v3"
+)]
+struct LegacyDeploymentTransaction {
+    #[cultcache(key = 0)]
+    schema_version: String,
+    #[cultcache(key = 1)]
+    transaction_id: String,
+    #[cultcache(key = 2)]
+    command_id: String,
+    #[cultcache(key = 3)]
+    command_kind: CommandKind,
+    #[cultcache(key = 4)]
+    target: String,
+    #[cultcache(key = 5)]
+    ordinal: u32,
+    #[cultcache(key = 6)]
+    phase: DeploymentPhase,
+    #[cultcache(key = 7)]
+    created_at_unix_millis: u64,
+    #[cultcache(key = 8)]
+    updated_at_unix_millis: u64,
+    #[cultcache(key = 9)]
+    incumbent_generation_id: Option<String>,
+    #[cultcache(key = 10)]
+    plan: Option<CompiledDeploymentPlan>,
+    #[cultcache(key = 11)]
+    frozen_source: Option<FrozenSourceReceipt>,
+    #[cultcache(key = 12)]
+    sealed_release: Option<SealedRelease>,
+    #[cultcache(key = 13)]
+    installed_release: Option<InstalledReleaseObservation>,
+    #[cultcache(key = 14)]
+    expected: Option<IdunnExpectedIncarnationRecord>,
+    #[cultcache(key = 15)]
+    expected_publication_sha256: Option<String>,
+    #[cultcache(key = 16)]
+    deployment_authorization: Option<DeploymentAuthorization>,
+    #[cultcache(key = 17)]
+    lifecycle_authorized_at_unix_millis: Option<u64>,
+    #[cultcache(key = 18)]
+    activation: Option<IdunnRuntimeActivationRecord>,
+    #[cultcache(key = 19)]
+    workload: Option<WorkloadObservation>,
+    #[cultcache(key = 20)]
+    activation_publication_sha256: Option<String>,
+    #[cultcache(key = 21)]
+    latest_odin_observation: Option<TopologyEvidence>,
+    #[cultcache(key = 22)]
+    warming: Option<WarmingEvidence>,
+    #[cultcache(key = 23)]
+    route_preflight: Option<RoutePreflightReceipt>,
+    #[cultcache(key = 24)]
+    isolation: Option<IsolationEvidence>,
+    #[cultcache(key = 25)]
+    fencing: Option<FencingEvidence>,
+    #[cultcache(key = 26)]
+    leasing: Option<LeasingEvidence>,
+    #[cultcache(key = 27)]
+    ready: Option<TopologyEvidence>,
+    #[cultcache(key = 28)]
+    routing: Option<RoutingEvidence>,
+    #[cultcache(key = 29)]
+    odin_publisher_sequence_cursor: u64,
+    #[cultcache(key = 30)]
+    last_error: Option<String>,
+    #[cultcache(key = 31)]
+    completion: Option<TransactionCompletion>,
+    #[cultcache(key = 32)]
+    pre_fencing_abort: Option<PreFencingAbort>,
+    #[cultcache(key = 33)]
+    post_commit_cleanup: Option<PostCommitCleanup>,
+    // A v2 record has no key 34: it predates post-fencing aborts.
+    #[cultcache(key = 34, default)]
+    post_fencing_abort: Option<PostFencingAbort>,
+}
+
+impl LegacyDeploymentTransaction {
+    /// Every legacy Ready receipt is an Odin receipt: no route-proof class
+    /// existed. The new slots start empty, which is what an older transaction
+    /// had.
+    fn into_current(self) -> DeploymentTransaction {
+        DeploymentTransaction {
+            schema_version: DEPLOYMENT_TRANSACTION_SCHEMA.into(),
+            transaction_id: self.transaction_id,
+            command_id: self.command_id,
+            command_kind: self.command_kind,
+            target: self.target,
+            ordinal: self.ordinal,
+            phase: self.phase,
+            created_at_unix_millis: self.created_at_unix_millis,
+            updated_at_unix_millis: self.updated_at_unix_millis,
+            incumbent_generation_id: self.incumbent_generation_id,
+            plan: self.plan,
+            frozen_source: self.frozen_source,
+            sealed_release: self.sealed_release,
+            installed_release: self.installed_release,
+            expected: self.expected,
+            expected_publication_sha256: self.expected_publication_sha256,
+            deployment_authorization: self.deployment_authorization,
+            lifecycle_authorized_at_unix_millis: self.lifecycle_authorized_at_unix_millis,
+            activation: self.activation,
+            workload: self.workload,
+            activation_publication_sha256: self.activation_publication_sha256,
+            latest_odin_observation: self.latest_odin_observation,
+            warming: self.warming,
+            route_preflight: self.route_preflight,
+            isolation: self.isolation,
+            fencing: self.fencing,
+            leasing: self.leasing,
+            ready: self
+                .ready
+                .map(|evidence| ReadinessEvidence::OdinCorrelated { evidence }),
+            routing: self.routing,
+            odin_publisher_sequence_cursor: self.odin_publisher_sequence_cursor,
+            last_error: self.last_error,
+            completion: self.completion,
+            pre_fencing_abort: self.pre_fencing_abort,
+            post_commit_cleanup: self.post_commit_cleanup,
+            post_fencing_abort: self.post_fencing_abort,
+            phase_deadline: None,
+            lease_adoption: None,
+        }
+    }
+}
+
+/// The v2 admitted-generation layout. Same lifetime rule as
+/// `LegacyDeploymentTransaction`.
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(
+    type = "idunn.admitted_generation",
+    schema = "idunn.admitted_generation.v2"
+)]
+struct LegacyAdmittedGeneration {
+    #[cultcache(key = 0)]
+    schema_version: String,
+    #[cultcache(key = 1)]
+    target: String,
+    #[cultcache(key = 2)]
+    generation_id: String,
+    #[cultcache(key = 3)]
+    command_id: String,
+    #[cultcache(key = 4)]
+    transaction_id: String,
+    #[cultcache(key = 5)]
+    admitted_at_unix_millis: u64,
+    #[cultcache(key = 6)]
+    plan: CompiledDeploymentPlan,
+    #[cultcache(key = 7)]
+    sealed_release: SealedRelease,
+    #[cultcache(key = 8)]
+    installed_release: InstalledReleaseObservation,
+    #[cultcache(key = 9)]
+    expected: IdunnExpectedIncarnationRecord,
+    #[cultcache(key = 10)]
+    activation: IdunnRuntimeActivationRecord,
+    #[cultcache(key = 11)]
+    workload: WorkloadObservation,
+    #[cultcache(key = 12)]
+    leasing: LeasingEvidence,
+    #[cultcache(key = 13)]
+    ready: TopologyEvidence,
+    #[cultcache(key = 14)]
+    latest_odin_observation: TopologyEvidence,
+    #[cultcache(key = 15)]
+    routing: RoutingEvidence,
+    #[cultcache(key = 16)]
+    odin_authority: AdmittedOdinAuthority,
+    #[cultcache(key = 17)]
+    odin_publisher_sequence_cursor: u64,
+    #[cultcache(key = 18)]
+    route_repair_started_at_unix_millis: Option<u64>,
+}
+
+impl LegacyAdmittedGeneration {
+    /// Every v2 generation was admitted on Odin receipts, so it migrates as
+    /// Odin-correlated with those receipts unchanged. Route supervision state
+    /// starts empty for a promoted route; backoff starts empty.
+    fn into_current(self) -> AdmittedGeneration {
+        let route_supervision = matches!(&self.routing, RoutingEvidence::Promoted { .. })
+            .then(RouteSupervisionState::default);
+        AdmittedGeneration {
+            schema_version: ADMITTED_GENERATION_SCHEMA.into(),
+            target: self.target,
+            generation_id: self.generation_id,
+            command_id: self.command_id,
+            transaction_id: self.transaction_id,
+            admitted_at_unix_millis: self.admitted_at_unix_millis,
+            plan: self.plan,
+            sealed_release: self.sealed_release,
+            installed_release: self.installed_release,
+            expected: self.expected,
+            activation: self.activation,
+            workload: self.workload,
+            leasing: self.leasing,
+            ready: ReadinessEvidence::OdinCorrelated {
+                evidence: self.ready,
+            },
+            latest_odin_observation: Some(self.latest_odin_observation),
+            routing: self.routing,
+            odin_authority: Some(self.odin_authority),
+            odin_publisher_sequence_cursor: self.odin_publisher_sequence_cursor,
+            route_repair_started_at_unix_millis: self.route_repair_started_at_unix_millis,
+            route_supervision,
+            continuity_backoff: ContinuityBackoff::default(),
+        }
+    }
+}
+
+/// Decode a v2 or v3 transaction and lift it to the current shape, without
+/// validating it. History reads stop here; the control store validates.
+fn lift_legacy_transaction(envelope: &CultCacheEnvelope) -> Result<DeploymentTransaction> {
+    let schema = match envelope.schema_id.as_deref() {
+        Some(schema @ (DEPLOYMENT_TRANSACTION_SCHEMA_V2 | DEPLOYMENT_TRANSACTION_SCHEMA_V3)) => {
+            schema
+        }
+        _ => bail!("Idunn control store contains an unsupported transaction"),
+    };
+    let value: LegacyDeploymentTransaction = rmp_serde::from_slice(&envelope.payload)
+        .with_context(|| format!("decoding a {schema} deployment transaction"))?;
+    ensure!(
+        value.schema_version == schema,
+        "stored transaction schema differs from its envelope"
+    );
+    ensure!(
+        schema != DEPLOYMENT_TRANSACTION_SCHEMA_V2 || value.post_fencing_abort.is_none(),
+        "a v2 transaction cannot carry post-fencing abort evidence"
+    );
+    Ok(value.into_current())
+}
+
+/// Read one stored transaction, lifting a v2 or v3 record to the current shape.
 ///
 /// The control store refuses noncanonical bytes: a record must re-encode to
 /// exactly what is stored. That check is what makes tampering visible, and it
-/// also means adding a field is a schema change -- every transaction written
-/// before `post_fencing_abort` existed re-encodes with one extra key and would
-/// be read as tampered.
+/// also means adding a field is a schema change: an older record re-encodes
+/// with extra keys and would be read as tampered.
 ///
-/// So a v2 record is decoded by key, which tolerates the absent key, and lifted
-/// with no post-fencing abort, because a transaction written before the field
-/// existed cannot have had one. Byte-exactness cannot apply across a version
-/// boundary -- the bytes are a different schema by definition -- so the lift
-/// leans on the full semantic `validate()` instead, and everything downstream
-/// sees only the current shape.
+/// So an older record is decoded by its own layout and lifted. Byte-exactness
+/// cannot apply across a version boundary -- the bytes are a different schema
+/// by definition -- so the lift leans on the full semantic `validate()`
+/// instead, and everything downstream sees only the current shape.
 fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTransaction> {
     match envelope.schema_id.as_deref() {
         Some(DEPLOYMENT_TRANSACTION_SCHEMA) => {
@@ -2102,33 +2669,46 @@ fn read_transaction_record(envelope: &CultCacheEnvelope) -> Result<DeploymentTra
             value.validate()?;
             Ok(value)
         }
-        Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2) => {
-            let mut value: DeploymentTransaction = rmp_serde::from_slice(&envelope.payload)
-                .context("decoding a v2 deployment transaction")?;
-            ensure!(
-                value.schema_version == DEPLOYMENT_TRANSACTION_SCHEMA_V2,
-                "stored transaction schema differs from its envelope"
-            );
-            ensure!(
-                value.post_fencing_abort.is_none(),
-                "a v2 transaction cannot carry post-fencing abort evidence"
-            );
-            value.schema_version = DEPLOYMENT_TRANSACTION_SCHEMA.into();
+        _ => {
+            let value = lift_legacy_transaction(envelope)?;
             value.validate()?;
             Ok(value)
         }
-        _ => bail!("Idunn control store contains an unsupported transaction"),
     }
 }
 
-/// Rewrite every v2 transaction as v3, once, before the engine runs.
+/// Read one stored admitted generation, lifting a v2 record to the current
+/// shape by the same rule as `read_transaction_record`.
+fn read_generation_record(envelope: &CultCacheEnvelope) -> Result<AdmittedGeneration> {
+    match envelope.schema_id.as_deref() {
+        Some(ADMITTED_GENERATION_SCHEMA) => {
+            let value: AdmittedGeneration = decode_record(envelope)?;
+            value.validate()?;
+            Ok(value)
+        }
+        Some(ADMITTED_GENERATION_SCHEMA_V2) => {
+            let legacy: LegacyAdmittedGeneration = rmp_serde::from_slice(&envelope.payload)
+                .context("decoding a v2 admitted generation")?;
+            ensure!(
+                legacy.schema_version == ADMITTED_GENERATION_SCHEMA_V2,
+                "stored generation schema differs from its envelope"
+            );
+            let value = legacy.into_current();
+            value.validate()?;
+            Ok(value)
+        }
+        _ => bail!("Idunn control store contains an unsupported admitted generation"),
+    }
+}
+
+/// Rewrite every v2 and v3 record as current, once, before the engine runs.
 ///
-/// The read path lifts v2 records on its own, so this is convergence rather
-/// than correctness: without it the store keeps records in two shapes for as
-/// long as the oldest terminal transaction survives retention. Each rewrite is
-/// a compare-exchange against the exact stored envelope, so a record that
-/// changed underneath is left alone rather than clobbered.
-fn migrate_transactions_to_current_schema(store_path: &Path) -> Result<usize> {
+/// The read path lifts older records on its own, so this is convergence rather
+/// than correctness: without it the store keeps records in several shapes for
+/// as long as the oldest one survives. Each rewrite is a compare-exchange
+/// against the exact stored envelope, so a record that changed underneath is
+/// left alone rather than clobbered.
+fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
     if !store_path.exists() {
         return Ok(0);
     }
@@ -2138,24 +2718,38 @@ fn migrate_transactions_to_current_schema(store_path: &Path) -> Result<usize> {
         .context("reading Idunn control snapshot for migration")?
         .into_iter()
         .filter(|envelope| {
-            envelope.r#type == DeploymentTransaction::TYPE
-                && envelope.schema_id.as_deref() == Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2)
+            let schema = envelope.schema_id.as_deref();
+            (envelope.r#type == DeploymentTransaction::TYPE
+                && matches!(
+                    schema,
+                    Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2 | DEPLOYMENT_TRANSACTION_SCHEMA_V3)
+                ))
+                || (envelope.r#type == AdmittedGeneration::TYPE
+                    && schema == Some(ADMITTED_GENERATION_SCHEMA_V2))
         })
         .collect::<Vec<_>>();
     let mut migrated = 0;
     for envelope in stale {
-        let value = read_transaction_record(&envelope)?;
-        let next = transaction_envelope(&value, value.updated_at_unix_millis)?;
+        let (record_type, key, mut next) = if envelope.r#type == DeploymentTransaction::TYPE {
+            let value = read_transaction_record(&envelope)?;
+            let next = transaction_envelope(&value, value.updated_at_unix_millis)?;
+            (DeploymentTransaction::TYPE, value.transaction_id, next)
+        } else {
+            let value = read_generation_record(&envelope)?;
+            let next = admitted_envelope(&value, value.admitted_at_unix_millis)?;
+            (AdmittedGeneration::TYPE, value.target, next)
+        };
+        next.stored_at = envelope.stored_at.clone();
         ensure!(
             store.compare_exchange(
                 &[CultCacheExpectedEnvelope {
-                    r#type: DeploymentTransaction::TYPE.into(),
-                    key: value.transaction_id.clone(),
+                    r#type: record_type.into(),
+                    key,
                     current: Some(envelope.clone()),
                 }],
                 &[next],
             )?,
-            "deployment transaction changed during schema migration"
+            "control record changed during schema migration"
         );
         migrated += 1;
     }
@@ -2268,8 +2862,11 @@ fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
     envelopes
         .into_iter()
         .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
-        .filter_map(|envelope| {
-            rmp_serde::from_slice::<DeploymentTransaction>(&envelope.payload).ok()
+        .filter_map(|envelope| match envelope.schema_id.as_deref() {
+            Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2 | DEPLOYMENT_TRANSACTION_SCHEMA_V3) => {
+                lift_legacy_transaction(&envelope).ok()
+            }
+            _ => rmp_serde::from_slice::<DeploymentTransaction>(&envelope.payload).ok(),
         })
         .collect()
 }
@@ -2509,7 +3106,7 @@ fn submit(
                     .iter()
                     .find_map(|transaction| match &transaction.completion {
                         Some(TransactionCompletion::FailedBeforeFencing { error })
-                        | Some(TransactionCompletion::FailedAfterFencing { error }) => {
+                        | Some(TransactionCompletion::FailedAfterFencing { error, .. }) => {
                             Some(error.as_str())
                         }
                         _ => None,
@@ -2635,7 +3232,7 @@ fn derived_command_status(transactions: &[&DeploymentTransaction]) -> (&'static 
         .iter()
         .find_map(|transaction| match &transaction.completion {
             Some(TransactionCompletion::FailedBeforeFencing { error })
-            | Some(TransactionCompletion::FailedAfterFencing { error }) => Some(error.clone()),
+            | Some(TransactionCompletion::FailedAfterFencing { error, .. }) => Some(error.clone()),
             _ => None,
         })
     {
@@ -2849,7 +3446,7 @@ impl Engine {
     fn current_odin_authority(&self, snapshot: &ControlSnapshot) -> Result<AdmittedOdinAuthority> {
         let authority = snapshot
             .admitted_for("odin")
-            .map(|stored| stored.value.odin_authority.clone())
+            .and_then(|stored| stored.value.odin_authority.clone())
             .unwrap_or_else(|| self.bootstrap_odin_authority.clone());
         authority.validate()?;
         Ok(authority)
@@ -2953,7 +3550,7 @@ impl Engine {
                     }
                 }
             }
-            if let Some(evidence) = &transaction.ready {
+            if let Some(evidence) = transaction.ready.as_ref().and_then(ReadinessEvidence::odin) {
                 let authenticated = self.authenticate_topology_bytes(
                     snapshot,
                     transaction,
@@ -2971,29 +3568,31 @@ impl Engine {
         let odin_authority = self.current_odin_authority(snapshot)?;
         for stored in &snapshot.admitted {
             let generation = &stored.value;
+            if generation.ready.class() == ReadinessClass::RouteProof {
+                continue;
+            }
+            let odin = generation.odin_receipts()?;
             let authority = self.runtime_authority_parts(
                 &generation.plan,
                 &generation.expected,
                 &generation.activation,
             )?;
             let latest = authenticate_odin_runtime_topology_correlation(
-                &generation.latest_odin_observation.canonical_bytes,
+                &odin.latest.canonical_bytes,
                 &authority,
                 generation.leasing.lease_sha256(),
                 &odin_authority.signer_public_key,
-                self.trusted_topology_context(
-                    generation.latest_odin_observation.admitted_at_unix_millis,
-                ),
+                self.trusted_topology_context(odin.latest.admitted_at_unix_millis),
             )?;
-            validate_authenticated_evidence(&generation.latest_odin_observation, &latest)?;
+            validate_authenticated_evidence(odin.latest, &latest)?;
             let ready = authenticate_odin_runtime_topology_correlation(
-                &generation.ready.canonical_bytes,
+                &odin.ready.canonical_bytes,
                 &authority,
                 generation.leasing.lease_sha256(),
                 &odin_authority.signer_public_key,
-                self.trusted_topology_context(generation.ready.admitted_at_unix_millis),
+                self.trusted_topology_context(odin.ready.admitted_at_unix_millis),
             )?;
-            validate_authenticated_evidence(&generation.ready, &ready)?;
+            validate_authenticated_evidence(odin.ready, &ready)?;
             ensure!(
                 is_semantic_ready(&ready),
                 "admitted generation Ready label is not exact semantic Ready"
@@ -3019,10 +3618,12 @@ fn serve(options: RuntimeOptions) -> Result<()> {
             .with_context(|| format!("creating Idunn directory {}", directory.display()))?;
     }
     let _lock = ProcessLock::acquire(&options.state_store)?;
-    let migrated = migrate_transactions_to_current_schema(&options.state_store)
-        .context("migrating Idunn transactions to the current schema")?;
+    let migrated = migrate_control_store_to_current_schema(&options.state_store)
+        .context("migrating Idunn control records to the current schema")?;
     if migrated > 0 {
-        println!("migrated {migrated} transaction(s) to {DEPLOYMENT_TRANSACTION_SCHEMA}");
+        println!(
+            "migrated {migrated} control record(s) to {DEPLOYMENT_TRANSACTION_SCHEMA} / {ADMITTED_GENERATION_SCHEMA}"
+        );
     }
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
     let engine = Engine::open(options)?;
@@ -3728,6 +4329,10 @@ impl Engine {
         snapshot: &ControlSnapshot,
         current: &Stored<AdmittedGeneration>,
     ) -> Result<bool> {
+        if current.value.ready.class() == ReadinessClass::RouteProof {
+            return Ok(false);
+        }
+        let odin = current.value.odin_receipts()?;
         let Some(received) = self.topology().receive(
             &current.value.target,
             &current.value.expected.canonical_sha256()?,
@@ -3761,17 +4366,17 @@ impl Engine {
         };
         let evidence = TopologyEvidence::from_authenticated(&authenticated, now)?;
         if !sequence_requires_admission(
-            Some(&current.value.latest_odin_observation),
+            Some(odin.latest),
             snapshot.max_odin_sequence(&current.value.target, &evidence.signer_identity_id),
             &evidence,
         )? {
             return Ok(false);
         }
         let mut next = current.value.clone();
-        next.latest_odin_observation = evidence.clone();
+        next.latest_odin_observation = Some(evidence.clone());
         next.odin_publisher_sequence_cursor = evidence.publisher_sequence;
         if is_semantic_ready(&authenticated) {
-            next.ready = evidence;
+            next.ready = ReadinessEvidence::OdinCorrelated { evidence };
         }
         next.validate()?;
         ensure!(
@@ -4463,7 +5068,7 @@ impl Engine {
                 &admitted.value.latest_odin_observation,
                 "sequence-admitted Ready evidence",
             )?;
-            if current.value.ready.as_ref() == Some(latest) {
+            if current.value.ready.as_ref().and_then(ReadinessEvidence::odin) == Some(latest) {
                 ensure!(semantic_ready, "stored Ready receipt changed meaning");
             } else if semantic_ready {
                 let evidence = latest.clone();
@@ -4474,7 +5079,7 @@ impl Engine {
                     authenticated,
                 };
                 return self.persist_same_phase(&admitted, |next| {
-                    next.ready = Some(evidence);
+                    next.ready = Some(ReadinessEvidence::OdinCorrelated { evidence });
                     Ok(())
                 });
             } else {
@@ -4510,10 +5115,10 @@ impl Engine {
                 &admitted.value.latest_odin_observation,
                 "current route-admission topology evidence",
             )?;
-            if admitted.value.ready.as_ref() != Some(latest) {
+            if admitted.value.ready.as_ref().and_then(ReadinessEvidence::odin) != Some(latest) {
                 let latest = latest.clone();
                 return self.persist_same_phase(&admitted, |next| {
-                    next.ready = Some(latest);
+                    next.ready = Some(ReadinessEvidence::OdinCorrelated { evidence: latest });
                     Ok(())
                 });
             }
@@ -4710,8 +5315,12 @@ impl Engine {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let incumbent = self.exact_incumbent(&snapshot, &commit_current.value)?;
         let odin_authority = self.current_odin_authority(&snapshot)?;
-        let generation =
-            AdmittedGeneration::from_transaction(&commit_current.value, odin_authority, now)?;
+        let generation = AdmittedGeneration::from_transaction(
+            &commit_current.value,
+            odin_authority,
+            incumbent.map(|stored| &stored.value),
+            now,
+        )?;
         let post_commit_cleanup = PostCommitCleanup {
             incumbent: match incumbent {
                 Some(incumbent)
@@ -5576,7 +6185,10 @@ impl Engine {
         now: u64,
         require_current: bool,
     ) -> Result<SequenceAdmittedReady> {
-        let evidence = required(&transaction.ready, "durable Ready evidence")?.clone();
+        let evidence = required(&transaction.ready, "durable Ready evidence")?
+            .odin()
+            .context("durable Ready evidence is not an Odin receipt")?
+            .clone();
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let current_lease = transaction
             .leasing
@@ -5631,6 +6243,7 @@ impl Engine {
         snapshot: &ControlSnapshot,
         generation: &AdmittedGeneration,
     ) -> Result<SequenceAdmittedReady> {
+        let odin = generation.odin_receipts()?;
         let authority = self.runtime_authority_parts(
             &generation.plan,
             &generation.expected,
@@ -5639,13 +6252,13 @@ impl Engine {
         let odin_authority = self.current_odin_authority(snapshot)?;
         let current_lease = generation.leasing.lease_sha256();
         let authenticated = authenticate_odin_runtime_topology_correlation(
-            &generation.ready.canonical_bytes,
+            &odin.ready.canonical_bytes,
             &authority,
             current_lease,
             &odin_authority.signer_public_key,
-            self.trusted_topology_context(generation.ready.admitted_at_unix_millis),
+            self.trusted_topology_context(odin.ready.admitted_at_unix_millis),
         )?;
-        validate_authenticated_evidence(&generation.ready, &authenticated)?;
+        validate_authenticated_evidence(odin.ready, &authenticated)?;
         ensure!(
             is_semantic_ready(&authenticated),
             "admitted provider's Ready receipt is not Ready at its admission time"
@@ -5660,27 +6273,20 @@ impl Engine {
         // Odin. Both receipts are historical proofs; current workload health
         // is owned by continuity and route observation, not receipt age.
         let authenticated_latest = authenticate_odin_runtime_topology_correlation(
-            &generation.latest_odin_observation.canonical_bytes,
+            &odin.latest.canonical_bytes,
             &authority,
             current_lease,
             &odin_authority.signer_public_key,
-            self.trusted_topology_context(
-                generation
-                    .latest_odin_observation
-                    .admitted_at_unix_millis,
-            ),
+            self.trusted_topology_context(odin.latest.admitted_at_unix_millis),
         )?;
-        validate_authenticated_evidence(
-            &generation.latest_odin_observation,
-            &authenticated_latest,
-        )?;
+        validate_authenticated_evidence(odin.latest, &authenticated_latest)?;
         ensure!(
             is_semantic_ready(&authenticated_latest),
             "admitted provider's latest receipt is not Ready at its admission time"
         );
         Ok(SequenceAdmittedReady {
             transaction_id: generation.transaction_id.clone(),
-            evidence: generation.ready.clone(),
+            evidence: odin.ready.clone(),
             expected: generation.expected.clone(),
             authenticated,
         })
@@ -5781,6 +6387,10 @@ impl Engine {
         let mut next = current.value.clone();
         next.phase = next_phase;
         next.updated_at_unix_millis = now_millis()?;
+        next.phase_deadline = next
+            .plan
+            .as_ref()
+            .and_then(|plan| PhaseDeadline::entering(next_phase, plan, next.updated_at_unix_millis));
         next.last_error = None;
         replace_transaction(&self.options.state_store, current, &next)
     }
@@ -6010,6 +6620,7 @@ impl Engine {
         next.last_error = Some(abort.error.clone());
         next.completion = Some(TransactionCompletion::FailedAfterFencing {
             error: abort.error.clone(),
+            recovery: TerminalRecovery::RestoreIncumbent,
         });
         replace_transaction(&self.options.state_store, current, &next)
     }
@@ -6598,7 +7209,10 @@ mod tests {
             if value.completion.is_some() {
                 continue;
             }
-            let (Some(ready), Some(latest)) = (&value.ready, &value.latest_odin_observation) else {
+            let (Some(ready), Some(latest)) = (
+                value.ready.as_ref().and_then(ReadinessEvidence::odin),
+                &value.latest_odin_observation,
+            ) else {
                 continue;
             };
             println!(
@@ -7454,6 +8068,7 @@ mod tests {
                 value
                     .ready
                     .as_ref()
+                    .and_then(ReadinessEvidence::odin)
                     .map(|evidence| evidence.publisher_sequence),
                 value
                     .latest_odin_observation
@@ -7465,15 +8080,21 @@ mod tests {
         for stored in &snapshot.admitted {
             let value = &stored.value;
             println!(
-                "ADMITTED target={} generation={} tx={} admitted_at={} ready_seq={} ready_admitted_at={} latest_seq={} latest_admitted_at={} instance={} {}",
+                "ADMITTED target={} generation={} tx={} admitted_at={} ready_seq={:?} ready_admitted_at={:?} latest_seq={:?} latest_admitted_at={:?} instance={} {}",
                 value.target,
                 value.generation_id,
                 value.transaction_id,
                 value.admitted_at_unix_millis,
-                value.ready.publisher_sequence,
-                value.ready.admitted_at_unix_millis,
-                value.latest_odin_observation.publisher_sequence,
-                value.latest_odin_observation.admitted_at_unix_millis,
+                value.ready.odin().map(|evidence| evidence.publisher_sequence),
+                value.ready.odin().map(|evidence| evidence.admitted_at_unix_millis),
+                value
+                    .latest_odin_observation
+                    .as_ref()
+                    .map(|evidence| evidence.publisher_sequence),
+                value
+                    .latest_odin_observation
+                    .as_ref()
+                    .map(|evidence| evidence.admitted_at_unix_millis),
                 value.activation.runtime_instance_id,
                 value.workload.describe(),
             );
@@ -7787,6 +8408,7 @@ mod tests {
         abandoned.transactions[1].value.completion =
             Some(TransactionCompletion::FailedAfterFencing {
                 error: "candidate died after the fence".into(),
+                recovery: TerminalRecovery::RestoreIncumbent,
             });
         assert_eq!(abandoned.max_odin_sequence("odin", "odin-signer"), 0);
         Ok(())
@@ -7880,6 +8502,7 @@ mod tests {
         transaction.last_error = Some("candidate died after the fence".into());
         transaction.completion = Some(TransactionCompletion::FailedAfterFencing {
             error: "candidate died after the fence".into(),
+            recovery: TerminalRecovery::RestoreIncumbent,
         });
         // The evidence exists so that a target is released only once the
         // candidate's route, lease, process and projection are actually gone.
@@ -7895,6 +8518,7 @@ mod tests {
         // The recorded error and the completion must name the same failure.
         transaction.completion = Some(TransactionCompletion::FailedAfterFencing {
             error: "a different story".into(),
+            recovery: TerminalRecovery::RestoreIncumbent,
         });
         assert!(transaction.validate().is_err());
         Ok(())
@@ -8293,5 +8917,533 @@ mod tests {
                 gid: 1002
             })
         );
+    }
+
+    // ---- v2/v3 control records lifted to the v3 generation / v4 transaction ----
+    //
+    // The bytes under tests/fixtures/idunn-control-legacy were written by the
+    // encoder at Idunn 9001b58 (see the README there). Nothing below encodes a
+    // legacy record: the legacy layout is decoded from those bytes, and the
+    // lifted record is compared with what the decoded legacy record says.
+
+    const FIXTURE_GENERATION: &str =
+        include_str!("../tests/fixtures/idunn-control-legacy/generation-with-receipts.hex");
+    const FIXTURE_GENERATION_REPAIRING: &str = include_str!(
+        "../tests/fixtures/idunn-control-legacy/generation-route-repair-started.hex"
+    );
+    const FIXTURE_TRANSACTIONS: [(&str, &str); 6] = [
+        (
+            "fencing",
+            include_str!("../tests/fixtures/idunn-control-legacy/transaction-fencing.hex"),
+        ),
+        (
+            "leasing",
+            include_str!("../tests/fixtures/idunn-control-legacy/transaction-leasing.hex"),
+        ),
+        (
+            "awaiting-ready",
+            include_str!("../tests/fixtures/idunn-control-legacy/transaction-awaiting-ready.hex"),
+        ),
+        (
+            "routing",
+            include_str!("../tests/fixtures/idunn-control-legacy/transaction-routing.hex"),
+        ),
+        (
+            "committing",
+            include_str!("../tests/fixtures/idunn-control-legacy/transaction-committing.hex"),
+        ),
+        (
+            "failed-after-fencing",
+            include_str!(
+                "../tests/fixtures/idunn-control-legacy/transaction-failed-after-fencing.hex"
+            ),
+        ),
+    ];
+    const FIXTURE_TRANSACTION_V2: &str =
+        include_str!("../tests/fixtures/idunn-control-legacy/transaction-committing-v2.hex");
+
+    fn fixture_envelope(text: &str, record_type: &str) -> Result<CultCacheEnvelope> {
+        let mut lines = text.lines();
+        let schema = lines.next().context("fixture has no schema line")?;
+        let hex = lines.next().context("fixture has no payload line")?.trim();
+        let payload = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let key = if record_type == AdmittedGeneration::TYPE {
+            rmp_serde::from_slice::<LegacyAdmittedGeneration>(&payload)?.target
+        } else {
+            rmp_serde::from_slice::<LegacyDeploymentTransaction>(&payload)?.transaction_id
+        };
+        Ok(CultCacheEnvelope {
+            key,
+            r#type: record_type.into(),
+            payload,
+            stored_at: rfc3339_millis(1_700_000_100_000)?,
+            schema_id: Some(schema.into()),
+        })
+    }
+
+    fn fixture_generation(text: &str) -> Result<(LegacyAdmittedGeneration, AdmittedGeneration)> {
+        let envelope = fixture_envelope(text, AdmittedGeneration::TYPE)?;
+        let legacy = rmp_serde::from_slice(&envelope.payload)?;
+        Ok((legacy, read_generation_record(&envelope)?))
+    }
+
+    fn fixture_transaction(
+        text: &str,
+    ) -> Result<(LegacyDeploymentTransaction, DeploymentTransaction)> {
+        let envelope = fixture_envelope(text, DeploymentTransaction::TYPE)?;
+        let legacy = rmp_serde::from_slice(&envelope.payload)?;
+        Ok((legacy, read_transaction_record(&envelope)?))
+    }
+
+    #[test]
+    fn a_v2_generation_lifts_to_the_decisions_it_encoded() -> Result<()> {
+        for text in [FIXTURE_GENERATION, FIXTURE_GENERATION_REPAIRING] {
+            let (legacy, lifted) = fixture_generation(text)?;
+            // Every receipt the old decisions read is the same receipt, now
+            // tagged Odin-correlated.
+            let odin = lifted.odin_receipts()?;
+            assert_eq!(odin.ready, &legacy.ready);
+            assert_eq!(odin.latest, &legacy.latest_odin_observation);
+            assert_eq!(odin.authority, &legacy.odin_authority);
+            assert_eq!(
+                lifted.odin_publisher_sequence_cursor,
+                legacy.odin_publisher_sequence_cursor
+            );
+            assert_eq!(lifted.ready.class(), ReadinessClass::OdinCorrelated);
+            // The repair intent still decides whatever it decided.
+            assert_eq!(
+                lifted.route_repair_started_at_unix_millis,
+                legacy.route_repair_started_at_unix_millis
+            );
+            assert_eq!(lifted.routing, legacy.routing);
+            assert_eq!(lifted.leasing, legacy.leasing);
+            assert_eq!(lifted.plan, legacy.plan);
+            assert_eq!(lifted.expected, legacy.expected);
+            assert_eq!(lifted.activation, legacy.activation);
+            assert_eq!(lifted.workload, legacy.workload);
+            assert_eq!(lifted.generation_id, legacy.generation_id);
+            // The new state starts empty and the plan is still a v2 plan.
+            assert_eq!(lifted.route_supervision, Some(RouteSupervisionState::default()));
+            assert_eq!(lifted.continuity_backoff, ContinuityBackoff::default());
+            assert_eq!(lifted.plan.schema, crate::deployment_plan::COMPILED_DEPLOYMENT_PLAN_SCHEMA_V2);
+            assert_eq!(
+                lifted.plan.phase_deadlines(),
+                crate::deployment_plan::PhaseDeadlines::IDUNN_DEFAULTS
+            );
+        }
+        let (_, repairing) = fixture_generation(FIXTURE_GENERATION_REPAIRING)?;
+        assert!(repairing.route_repair_started_at_unix_millis.is_some());
+        let (_, plain) = fixture_generation(FIXTURE_GENERATION)?;
+        assert!(plain.route_repair_started_at_unix_millis.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn v2_and_v3_transactions_lift_to_the_decisions_they_encoded() -> Result<()> {
+        let mut phases = Vec::new();
+        for (name, text) in FIXTURE_TRANSACTIONS {
+            let (legacy, lifted) = fixture_transaction(text)?;
+            phases.push((name, lifted.phase));
+            assert_eq!(lifted.schema_version, DEPLOYMENT_TRANSACTION_SCHEMA);
+            assert_eq!(lifted.phase, legacy.phase);
+            assert_eq!(lifted.completion, legacy.completion);
+            assert_eq!(lifted.plan, legacy.plan);
+            assert_eq!(lifted.expected, legacy.expected);
+            assert_eq!(lifted.leasing, legacy.leasing);
+            assert_eq!(lifted.fencing, legacy.fencing);
+            assert_eq!(lifted.routing, legacy.routing);
+            assert_eq!(lifted.warming, legacy.warming);
+            assert_eq!(lifted.latest_odin_observation, legacy.latest_odin_observation);
+            assert_eq!(
+                lifted.odin_publisher_sequence_cursor,
+                legacy.odin_publisher_sequence_cursor
+            );
+            assert_eq!(
+                lifted.ready.as_ref().and_then(ReadinessEvidence::odin),
+                legacy.ready.as_ref()
+            );
+            assert_eq!(lifted.phase_deadline, None);
+            assert_eq!(lifted.lease_adoption, None);
+            assert_eq!(lifted.owns_target_authority(), legacy.phase != DeploymentPhase::Complete);
+        }
+        assert_eq!(
+            phases.iter().map(|(_, phase)| *phase).collect::<Vec<_>>(),
+            [
+                DeploymentPhase::Fencing,
+                DeploymentPhase::Leasing,
+                DeploymentPhase::AwaitingReady,
+                DeploymentPhase::Routing,
+                DeploymentPhase::Committing,
+                DeploymentPhase::Complete,
+            ]
+        );
+
+        // The genuine v2 layout lifts to the same record as the v3 one.
+        let (_, from_v2) = fixture_transaction(FIXTURE_TRANSACTION_V2)?;
+        let (_, from_v3) = fixture_transaction(FIXTURE_TRANSACTIONS[4].1)?;
+        assert_eq!(from_v2, from_v3);
+
+        // A terminal failure predating recovery names the recovery it always did.
+        let (_, failed) = fixture_transaction(FIXTURE_TRANSACTIONS[5].1)?;
+        assert!(matches!(
+            failed.completion,
+            Some(TransactionCompletion::FailedAfterFencing {
+                recovery: TerminalRecovery::RestoreIncumbent,
+                ..
+            })
+        ));
+        assert!(failed.is_terminal());
+        Ok(())
+    }
+
+    #[test]
+    fn the_boot_migration_rewrites_every_legacy_record_once() -> Result<()> {
+        // The fixtures were cut from one build, so their records share keys
+        // and each migrates in a store of its own.
+        let mut fixtures = vec![
+            fixture_envelope(FIXTURE_GENERATION, AdmittedGeneration::TYPE)?,
+            fixture_envelope(FIXTURE_GENERATION_REPAIRING, AdmittedGeneration::TYPE)?,
+            fixture_envelope(FIXTURE_TRANSACTION_V2, DeploymentTransaction::TYPE)?,
+        ];
+        for (_, text) in FIXTURE_TRANSACTIONS {
+            fixtures.push(fixture_envelope(text, DeploymentTransaction::TYPE)?);
+        }
+        for envelope in fixtures {
+            let temporary = tempfile::tempdir()?;
+            let path = temporary.path().join("control.cc");
+            let store = SingleFileMessagePackBackingStore::new(&path);
+            assert!(store.compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: envelope.r#type.clone(),
+                    key: envelope.key.clone(),
+                    current: None,
+                }],
+                std::slice::from_ref(&envelope),
+            )?);
+            let debug_of = |envelope: &CultCacheEnvelope| -> Result<String> {
+                Ok(if envelope.r#type == AdmittedGeneration::TYPE {
+                    format!("{:?}", read_generation_record(envelope)?)
+                } else {
+                    format!("{:?}", read_transaction_record(envelope)?)
+                })
+            };
+            let before = debug_of(&envelope)?;
+
+            assert_eq!(migrate_control_store_to_current_schema(&path)?, 1);
+            assert_eq!(migrate_control_store_to_current_schema(&path)?, 0);
+
+            let after = store.pull_all_read_only_snapshot()?;
+            assert_eq!(after.len(), 1);
+            let expected_schema = if envelope.r#type == AdmittedGeneration::TYPE {
+                ADMITTED_GENERATION_SCHEMA
+            } else {
+                DEPLOYMENT_TRANSACTION_SCHEMA
+            };
+            assert_eq!(after[0].schema_id.as_deref(), Some(expected_schema));
+            assert_eq!(after[0].stored_at, envelope.stored_at);
+            // The rewritten record is canonical and means what the legacy one meant.
+            assert_eq!(debug_of(&after[0])?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn history_still_reads_legacy_transactions() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let state_store = temporary.path().join("control.cc");
+        let envelope = fixture_envelope(FIXTURE_TRANSACTIONS[5].1, DeploymentTransaction::TYPE)?;
+        SingleFileMessagePackBackingStore::new(&history_store_path(&state_store))
+            .compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: envelope.key.clone(),
+                    current: None,
+                }],
+                std::slice::from_ref(&envelope),
+            )?;
+        let archived = read_history_transactions(&state_store);
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].transaction_id, envelope.key);
+        assert_eq!(archived[0].schema_version, DEPLOYMENT_TRANSACTION_SCHEMA);
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_class_follows_the_expected_odin_dependency() -> Result<()> {
+        let (_, generation) = fixture_generation(FIXTURE_GENERATION)?;
+        let mut expected = generation.expected.clone();
+        assert!(expected.dependencies.iter().any(|dependency| {
+            dependency.kind == "shared-infrastructure"
+                && dependency.capability == ODIN_RENDEZVOUS_CAPABILITY
+        }));
+        assert_eq!(ReadinessClass::of(&expected), ReadinessClass::OdinCorrelated);
+        for dependency in &mut expected.dependencies {
+            // Same capability, other kind: only the shared-infrastructure
+            // declaration makes a target Odin-correlated.
+            dependency.kind = "required".into();
+        }
+        assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
+        expected.dependencies.clear();
+        assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
+        Ok(())
+    }
+
+    fn route_proof_evidence() -> ReadinessEvidence {
+        let canonical_bytes = vec![7, 7, 7];
+        ReadinessEvidence::RouteProof {
+            evidence: RuntimePresenceEvidence {
+                canonical_sha256: sha256_id(&canonical_bytes),
+                canonical_bytes,
+                message_id: "challenge-1".into(),
+                challenged_at_unix_millis: 10,
+                admitted_at_unix_millis: 11,
+            },
+        }
+    }
+
+    #[test]
+    fn route_proof_readiness_is_refused_for_a_target_that_declares_odin() -> Result<()> {
+        let (_, generation) = fixture_generation(FIXTURE_GENERATION)?;
+        let mut proof = generation.clone();
+        proof.ready = route_proof_evidence();
+        proof.latest_odin_observation = None;
+        proof.odin_authority = None;
+        // The fixture's Expected declares Odin, so route proof is not its class.
+        assert!(proof.validate().is_err());
+
+        // Mixed shapes are refused whatever the class.
+        let mut mixed = generation.clone();
+        mixed.latest_odin_observation = None;
+        assert!(mixed.validate().is_err());
+        let mut mixed = generation;
+        mixed.odin_authority = None;
+        assert!(mixed.validate().is_err());
+
+        let mut transaction = fixture_transaction(FIXTURE_TRANSACTIONS[3].1)?.1;
+        transaction.validate()?;
+        transaction.ready = Some(route_proof_evidence());
+        assert!(transaction.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn route_supervision_state_exists_exactly_for_a_promoted_route() -> Result<()> {
+        let (_, generation) = fixture_generation(FIXTURE_GENERATION)?;
+        let mut missing = generation.clone();
+        missing.route_supervision = None;
+        assert!(missing.validate().is_err());
+
+        let mut unrouted = generation;
+        unrouted.route_supervision = None;
+        unrouted.routing = RoutingEvidence::SkippedUnrouted;
+        // Unrouted while Expected still names a route: refused for that reason
+        // too, so the test above pins the supervision rule on its own.
+        assert!(unrouted.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_generation_inherits_actuation_and_backoff_but_not_observation() -> Result<()> {
+        let (_, mut incumbent) = fixture_generation(FIXTURE_GENERATION)?;
+        let mut state = RouteSupervisionState {
+            last_challenge_at_unix_millis: Some(5),
+            consecutive_failures: 4,
+            next_challenge_at_unix_millis: Some(9),
+            degraded_since_unix_millis: Some(6),
+            actuations: ActuationWindow {
+                window_started_at_unix_millis: 3,
+                count: 2,
+            },
+        };
+        incumbent.route_supervision = Some(state.clone());
+        incumbent.continuity_backoff = ContinuityBackoff {
+            window_started_at_unix_millis: Some(1),
+            attempts: 2,
+            next_restart_at_unix_millis: Some(8),
+        };
+        let committing = fixture_transaction(FIXTURE_TRANSACTIONS[4].1)?.1;
+        let authority = incumbent.odin_receipts()?.authority.clone();
+        let next = AdmittedGeneration::from_transaction(
+            &committing,
+            authority.clone(),
+            Some(&incumbent),
+            1_700_000_200_000,
+        )?;
+        state = RouteSupervisionState {
+            actuations: state.actuations,
+            ..RouteSupervisionState::default()
+        };
+        assert_eq!(next.route_supervision, Some(state));
+        assert_eq!(next.continuity_backoff, incumbent.continuity_backoff);
+
+        let first = AdmittedGeneration::from_transaction(
+            &committing,
+            authority,
+            None,
+            1_700_000_200_000,
+        )?;
+        assert_eq!(first.route_supervision, Some(RouteSupervisionState::default()));
+        assert_eq!(first.continuity_backoff, ContinuityBackoff::default());
+        Ok(())
+    }
+
+    #[test]
+    fn phase_deadlines_follow_the_plan_and_only_cover_post_fencing_phases() -> Result<()> {
+        let (_, generation) = fixture_generation(FIXTURE_GENERATION)?;
+        let plan = &generation.plan;
+        let defaults = plan.phase_deadlines();
+        for (phase, seconds) in [
+            (DeploymentPhase::Fencing, defaults.fencing_seconds),
+            (DeploymentPhase::Leasing, defaults.leasing_seconds),
+            (DeploymentPhase::AwaitingReady, defaults.awaiting_ready_seconds),
+            (DeploymentPhase::Routing, defaults.routing_seconds),
+            (DeploymentPhase::Committing, defaults.committing_seconds),
+        ] {
+            let deadline = PhaseDeadline::entering(phase, plan, 1_000).context("no deadline")?;
+            assert_eq!(deadline.phase, phase);
+            assert_eq!(deadline.entered_at_unix_millis, 1_000);
+            assert_eq!(deadline.deadline_at_unix_millis, 1_000 + u64::from(seconds) * 1000);
+        }
+        for phase in [
+            DeploymentPhase::Sealing,
+            DeploymentPhase::Starting,
+            DeploymentPhase::Warming,
+            DeploymentPhase::Complete,
+        ] {
+            assert!(PhaseDeadline::entering(phase, plan, 1_000).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transition_stamps_the_deadline_of_the_phase_it_enters() -> Result<()> {
+        let world = EngineFixture::new()?;
+        // Routing, already holding the route receipt Committing requires.
+        let (_, mut transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[3].1)?;
+        assert_eq!(transaction.phase, DeploymentPhase::Routing);
+        transaction.routing = fixture_transaction(FIXTURE_TRANSACTIONS[4].1)?.1.routing;
+        let envelope = transaction_envelope(&transaction, transaction.updated_at_unix_millis)?;
+        let command = command_envelope(&command(CommandKind::Continuity), 100)?;
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store).compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: command.key.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: transaction.transaction_id.clone(),
+                        current: None,
+                    },
+                ],
+                &[command, envelope],
+            )?
+        );
+        let stored = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .next()
+            .context("stored transaction vanished")?;
+        world.engine.transition(&stored, DeploymentPhase::Committing)?;
+        let advanced = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .next()
+            .context("advanced transaction vanished")?;
+        let deadline = advanced.value.phase_deadline.context("no deadline stamped")?;
+        assert_eq!(deadline.phase, DeploymentPhase::Committing);
+        assert_eq!(
+            deadline.deadline_at_unix_millis - deadline.entered_at_unix_millis,
+            u64::from(advanced.value.plan.as_ref().unwrap().phase_deadlines().committing_seconds)
+                * 1000
+        );
+        assert_eq!(deadline.entered_at_unix_millis, advanced.value.updated_at_unix_millis);
+        Ok(())
+    }
+
+    #[test]
+    fn a_deadline_must_describe_the_current_post_fencing_phase() -> Result<()> {
+        let (_, mut transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[2].1)?;
+        let plan = transaction.plan.clone().unwrap();
+        let now = transaction.updated_at_unix_millis;
+        transaction.phase_deadline =
+            PhaseDeadline::entering(DeploymentPhase::AwaitingReady, &plan, now);
+        transaction.validate()?;
+        let mut wrong_phase = transaction.clone();
+        wrong_phase.phase_deadline =
+            PhaseDeadline::entering(DeploymentPhase::Routing, &plan, now);
+        assert!(wrong_phase.validate().is_err());
+        let mut backwards = transaction.clone();
+        backwards.phase_deadline.as_mut().unwrap().deadline_at_unix_millis = now;
+        assert!(backwards.validate().is_err());
+        let mut from_the_future = transaction;
+        from_the_future.phase_deadline =
+            PhaseDeadline::entering(DeploymentPhase::AwaitingReady, &plan, now + 1);
+        assert!(from_the_future.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lease_adoption_names_only_the_granted_lease() -> Result<()> {
+        let lease = write_lease();
+        let lease_sha256 = lease.canonical_sha256()?;
+        let adoption = LeaseAdoptionEvidence {
+            write_lease_sha256: lease_sha256.clone(),
+            signed_presence_sha256: sha256_id(b"adopting-presence"),
+            source: AdoptionSource::Direct,
+            observed_at_unix_millis: 100,
+        };
+        adoption.validate_shape()?;
+        let granted = LeasingEvidence::Granted {
+            lease: lease.clone(),
+            lease_sha256: lease_sha256.clone(),
+        };
+        assert!(adoption.names(&granted));
+        // Prepared is not granted, stateless has nothing to adopt, and another
+        // lease's digest is not this lease.
+        assert!(!adoption.names(&LeasingEvidence::Prepared {
+            lease,
+            lease_sha256,
+        }));
+        assert!(!adoption.names(&LeasingEvidence::SkippedStateless));
+        let mut other = adoption.clone();
+        other.write_lease_sha256 = sha256_id(b"another-lease");
+        assert!(!other.names(&granted));
+
+        // On a transaction, adoption without a granted lease is refused.
+        let (_, mut transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[2].1)?;
+        transaction.lease_adoption = Some(adoption);
+        assert!(transaction.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn an_operator_required_recovery_must_say_why() -> Result<()> {
+        let (_, mut failed) = fixture_transaction(FIXTURE_TRANSACTIONS[5].1)?;
+        let Some(TransactionCompletion::FailedAfterFencing { recovery, .. }) =
+            failed.completion.as_mut()
+        else {
+            panic!("fixture is not a post-fencing failure")
+        };
+        *recovery = TerminalRecovery::OperatorRequired {
+            reason: "adopted-lease".into(),
+        };
+        failed.validate()?;
+        assert!(failed.is_terminal());
+        let Some(TransactionCompletion::FailedAfterFencing { recovery, .. }) =
+            failed.completion.as_mut()
+        else {
+            unreachable!()
+        };
+        *recovery = TerminalRecovery::OperatorRequired {
+            reason: String::new(),
+        };
+        assert!(failed.validate().is_err());
+        Ok(())
     }
 }
