@@ -11827,6 +11827,7 @@ mod tests {
 
         // Every tick answers: the wedged abort records its error and waits,
         // and the rest of the scheduler goes on to freeze the queued command.
+        write_service_binding(&world)?;
         for _ in 0..6 {
             world.engine.run_scheduler_tick()?;
         }
