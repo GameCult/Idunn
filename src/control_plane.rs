@@ -14753,7 +14753,7 @@ mod tests {
         meters.charge_route(now + ROUTE_ACTUATION_WINDOW_MILLIS, RouteActuation::Forward)?;
 
         // Waits set for the future are due, not stalled for the length of the step.
-        assert!(!meters.continuity_is_waiting(now));
+        assert!(!read_only.continuity_is_waiting(now));
         let route = RouteSupervisionState {
             next_challenge_at_unix_millis: Some(t),
             ..RouteSupervisionState::default()
@@ -16807,7 +16807,11 @@ mod tests {
             let Some(TransactionCompletion::FailedBeforeFencing { error }) =
                 record_of(&routed.world, &id)?.completion
             else {
-                bail!("the deployment did not fail before the fence");
+                let record = record_of(&routed.world, &id)?;
+                bail!(
+                    "the deployment did not fail before the fence: phase {:?} completion {:?} abort {:?} error {:?}",
+                    record.phase, record.completion, record.pre_fencing_abort, record.last_error
+                );
             };
             assert!(error.contains(&format!("reopens at unix ms {reopens_at}")), "{error}");
             assert_eq!(routed.world.route_stubs.count(""), 0, "a program ran");
