@@ -11747,7 +11747,9 @@ mod tests {
 
     /// A workload whose candidate can neither be stopped nor recover: an abort
     /// that cannot finish its first step.
-    struct WedgedWorkload;
+    struct WedgedWorkload {
+        observe_fails: bool,
+    }
 
     impl WorkloadPort for WedgedWorkload {
         fn install(
@@ -11789,6 +11791,7 @@ mod tests {
             activation: &IdunnRuntimeActivationRecord,
             prior: &WorkloadObservation,
         ) -> Result<WorkloadObservation> {
+            ensure!(!self.observe_fails, "the unit cannot be observed");
             StillWorkload.observe(expected, activation, prior)
         }
         fn stop(&self, _: &WorkloadObservation) -> Result<()> {
@@ -11801,7 +11804,9 @@ mod tests {
 
     #[test]
     fn one_wedged_pre_fence_abort_does_not_stop_the_scheduler() -> Result<()> {
-        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload))?;
+        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload {
+            observe_fails: false,
+        }))?;
         let wedged = transaction_at(&world, DeploymentPhase::Warming)?;
         world
             .engine
@@ -11825,6 +11830,10 @@ mod tests {
             )?
         );
 
+        // The first pass records the error and reports progress; the same
+        // error again changes nothing.
+        assert!(world.engine.resume_one_transaction()?);
+        assert!(!world.engine.resume_one_transaction()?);
         // Every tick answers: the wedged abort records its error and waits,
         // and the rest of the scheduler goes on to freeze the queued command.
         write_service_binding(&world)?;
@@ -11841,6 +11850,29 @@ mod tests {
                 .any(|transaction| transaction.command_id == command.command_id),
             "the queued command was never frozen"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dead_candidate_past_the_fence_aborts_and_a_wedged_post_fence_abort_only_waits() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(WedgedWorkload {
+            observe_fails: true,
+        }))?;
+        let dead = transaction_at(&world, DeploymentPhase::AwaitingReady)?;
+
+        // The candidate cannot be observed and can never run again, so the
+        // transaction abandons it after the fence.
+        world.engine.run_scheduler_tick()?;
+        assert!(record_of(&world, &dead.transaction_id)?.post_fencing_abort.is_some());
+
+        // Its abort cannot stop the unit: that is a resumable error, and the
+        // tick answers every time.
+        for _ in 0..3 {
+            world.engine.run_scheduler_tick()?;
+        }
+        let stuck = record_of(&world, &dead.transaction_id)?;
+        assert!(!stuck.is_terminal());
+        assert!(stuck.last_error.is_some());
         Ok(())
     }
 
