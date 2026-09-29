@@ -275,6 +275,10 @@ pub struct OperatorBinding {
     pub process_write_lease: Option<ProcessWriteLeaseBinding>,
     pub brakes: BrakeBinding,
     pub rollout: RolloutBinding,
+    /// Optional per-phase deadline overrides; absent fields take Idunn's defaults
+    /// when the plan is compiled.
+    #[serde(default)]
+    pub deadlines: Option<DeadlineBinding>,
     pub placement: PlacementBinding,
     #[serde(default)]
     pub external_capabilities: Vec<ExternalCapabilityBinding>,
@@ -707,6 +711,44 @@ pub struct RolloutBinding {
     pub strategy: RolloutStrategy,
     pub drain_seconds: u32,
     pub retain_releases: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeadlineBinding {
+    #[serde(default)]
+    pub fencing_seconds: Option<u32>,
+    #[serde(default)]
+    pub leasing_seconds: Option<u32>,
+    #[serde(default)]
+    pub awaiting_ready_seconds: Option<u32>,
+    #[serde(default)]
+    pub routing_seconds: Option<u32>,
+    #[serde(default)]
+    pub committing_seconds: Option<u32>,
+}
+
+/// Longest deadline a binding may declare: one day.
+pub const MAXIMUM_DEADLINE_SECONDS: u32 = 86_400;
+
+impl DeadlineBinding {
+    fn validate(&self) -> Result<()> {
+        for (name, seconds) in [
+            ("fencing", self.fencing_seconds),
+            ("leasing", self.leasing_seconds),
+            ("awaiting-ready", self.awaiting_ready_seconds),
+            ("routing", self.routing_seconds),
+            ("committing", self.committing_seconds),
+        ] {
+            if let Some(seconds) = seconds {
+                ensure!(
+                    (1..=MAXIMUM_DEADLINE_SECONDS).contains(&seconds),
+                    "{name} deadline must be between 1 and {MAXIMUM_DEADLINE_SECONDS} seconds"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1343,6 +1385,9 @@ impl OperatorBinding {
 
     /// The part of validation that does not depend on where the workload runs.
     fn validate_shared_tail(&self) -> Result<()> {
+        if let Some(deadlines) = &self.deadlines {
+            deadlines.validate()?;
+        }
         ensure!(
             self.rollout.retain_releases >= 2,
             "candidate rollout must retain at least current and prior releases"

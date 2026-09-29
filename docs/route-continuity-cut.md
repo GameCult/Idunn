@@ -456,7 +456,59 @@ reverted (Idunn).**
 - F0 is not required. This cut could land before F0 if Self wants the drift
   closed first.
 
+**B1 status, 2026-09-29 (Self).** Landed on `idunn/route-b1` (`87fa57d` revert of `a148802`,
+`4427769`, `4a9fe87`); 177 tests pass. **Soul (Opus): do not close.** The rule held (one
+rule, one resolution, exact activation, the Expected never withdrawn, foreign activations
+refused, the revert exact). The transition failed:
+- **High, CONFIRMED:** a continuity abort persisted under the old rule (`Skipped` although
+  an activation was issued) fails the new validation (`control_plane.rs:1031-1044`).
+  `ControlSnapshot::read` fails the whole store on one record, so a resident record stops
+  Idunn from booting, for every target.
+- **Medium, CONFIRMED:** supervision's pre-restart demotion failure is only logged
+  (`:3557-3576`). A continuity failing between `prepare_activation` and
+  `publish_observed_activation` then wedges its abort on "substituted" every tick. Drift
+  left by a pre-B1 failed continuity wedges a later deploy abort the same way.
+- Low: `docs/deployment-authority.md` says the projection "never drifts".
+
+**Self's ruling for the B1 fix batch, which runs on top of F0 because F0 owns the legacy lift:**
+1. The legacy-transaction lift maps a pre-B1 continuity abort that issued an activation to
+   `Pending`. The new single resolution then demotes its own activation, which also cleans
+   the residue that record left behind.
+2. Supervision owns the Expected-only precondition. It does not mint a continuity while its
+   pre-restart demotion fails; the failure is recorded, not merely logged.
+3. A one-time boot reconciliation demotes a projected activation only when its issuing
+   transaction is a failed transaction in history (exact identity). It never adopts.
+4. Engine-layer tests for both abort paths, using Soul's EngineFixture probe shape (candidate
+   cleanup already Complete, so no systemctl runs). cargo-mutants found 6 Engine-path mutants
+   missed.
+5. Correct the doc's "never drifts".
+Before any deploy, check the live host for resident continuity abort records. That is a read
+of `control.cc`, and the operator's to authorise.
+
 **B2 — Bounded, backed-off route and unit repair (Idunn).**
+
+*Widened 2026-09-29 by Self, from Soul's S1 pass.* S1 closed the healthy-target storm, and
+Soul found two storm paths S1 does not claim. Both are B2's:
+- **A failing reload deletes the fragment** (`restore_admitted_membership`,
+  `drivers.rs:5472-5478`). The next tick reads the file as missing, treats that as drift, and
+  restores again: one `systemd-run`, ufw, `nginx -t` and reload every 500 ms, unbounded.
+  This was probed over 4 ticks. A broken global nginx config does the same through the
+  private-mount unit.
+- **`NginxRouteDriver::install` (`drivers.rs:5402`) runs ufw, `nginx -t` and reload
+  unconditionally.** The Routing phase re-runs it on every resume, and a post-fence proof
+  failure resumes forever (F17), so a candidate failing its proof reloads every tick. A
+  stateless candidate reloads twice (install, then rollback). The post-fence abort's
+  `withdraw_candidate_membership` then calls `restore`, which does the same.
+
+So B2's actuation ceiling covers **`install`, `restore` and `restore_admitted_membership`**,
+not only supervision. B2 also adds the seam Soul specified: the route actuator program paths
+and `preflight_root` on `RuntimeOptions`, defaulting to today's paths and used at every
+`NginxRouteDriver::new` site, plus a routed `Stored<AdmittedGeneration>` fixture beside
+`EngineFixture`. Deleting `supervise_admitted_route`'s body currently survives every test
+(cargo-mutants), and B2's reload-count timeline test needs the same seam. A failed proof
+marks the route degraded (Q5 a). Today nothing is written and the next tick re-challenges
+with no backoff.
+
 - Challenges back off exponentially per target on consecutive failures, with a
   floor at max age and a cap.
 - Route actuations (write, reload, ufw) go through a per-target rolling
@@ -520,6 +572,35 @@ reverted (Idunn).**
   rather than a constant `active`.
 - The lease pickup contract is unchanged.
 - Tests are in the package. Verify under the node image on Yggdrasil.
+
+**C1 status, 2026-09-29 (Self).** Landed on CultLib `idunn-ts/route-c1` (`795fd10`). Soul closed
+it on conditions, and a fix batch is in Hands:
+- stateful, lease-bound Rust vectors;
+- the signer owns health (`reportHealth`), starting at `warming`;
+- the signer records every warming it signs, so a route-proof stateful target can take its lease;
+- one signer per authority, a frozen authority, and a subpath export without the Odin publisher.
+**Two consequences for later cuts:**
+- **C2 covers the StreamPixels service too.** `apps/service/src/app.ts:155` answers route
+  challenges through `publishRouteObservation`, which C1 removed, so the gitlink bump breaks
+  the service unless C2 moves it to `answerRouteObservation` and `reportHealth`.
+- **B3 surfaces the typed capacity shortfall** on the route path. Today it reads as a
+  generic "disagrees with current authority" (`control_plane.rs:5190`).
+
+**S3 + C2 code status, 2026-09-29 (Self).** Landed on StreamPixels `route/s3-c2` (`8e6d891`),
+after Soul and a fix batch:
+- `vendor/CultLib` is at `30ee8b9`, and the web has no Odin dependency or env.
+- Both apps answer through the signer, with one health owner, `driveRuntimeHealth`.
+- CI now builds the vendored gitlink, not a sibling `main`.
+- A production-named launcher test runs `runIdunnRuntime`. It caught a dropped `publish`
+  argument that would have broken the service's write lease.
+- Checks: 172 tests, typecheck, the web build and the release assembly.
+**Not merged to StreamPixels `main` until B3 lands.** Idunn cannot yet admit a web with no
+Odin dependency, so a deploy of `main` would fail readiness.
+Follow-up: the production fixtures are generated by applying
+`test-data/idunn-runtime/fixture.patch` to CultLib's `idunn_runtime_fixture.rs`. The generator
+should take the target, contract and dependencies as input, so no consumer patches it.
+Recorded: web `/api/healthz` is constant `{ok:true}`, so the route proves "HTTP answers", not
+store health.
 
 **C2 — StreamPixels web binding proves invariant 3 end to end (StreamPixels,
 after C1, S3, B3).**
