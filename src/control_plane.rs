@@ -13998,10 +13998,12 @@ mod tests {
 
         drive(&world, |transaction| transaction.completion.is_some())?;
         let finished = latest(&world)?;
-        assert!(matches!(
+        assert!(
+            matches!(finished.completion, Some(TransactionCompletion::FailedBeforeFencing { .. })),
+            "{:?} / {:?}",
             finished.completion,
-            Some(TransactionCompletion::FailedBeforeFencing { .. })
-        ));
+            finished.pre_fencing_abort
+        );
         assert!(finished.is_terminal());
         // The target is released and nothing of the incumbent was touched.
         assert!(!finished.blocks_new_target_mutation());
