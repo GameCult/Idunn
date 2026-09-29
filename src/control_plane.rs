@@ -754,7 +754,9 @@ use cleanup_evidence::CleanupEvidence;
 /// Decoding a stored record is the one other way in, and it stays here too.
 /// `transaction_envelope` refuses a record carrying the marker; the schema
 /// migration, which persists what the lift produced, writes through
-/// `migrated_transaction_envelope`, defined here beside the only constructor.
+/// `migrate_transaction_record`, and a fault note on an existing record through
+/// `last_error_envelope`; both are defined here beside the only constructor,
+/// and the encoder they share is private to this module.
 mod cleanup_evidence {
     use super::*;
 
@@ -828,13 +830,26 @@ mod cleanup_evidence {
         }
     }
 
-    /// The envelope for a record the schema migration persists, the one write
-    /// path that may carry the marker.
-    pub(super) fn migrated_transaction_envelope(
+    /// The schema migration's one entry point: read a stored v2, v3 or v4
+    /// transaction (lifting older ones) and return its key and current-shape
+    /// envelope. The record may carry the marker the lift just set.
+    pub(super) fn migrate_transaction_record(
+        envelope: &CultCacheEnvelope,
+    ) -> Result<(String, CultCacheEnvelope)> {
+        let value = read_transaction_record(envelope)?;
+        let next = encode_transaction(&value, value.updated_at_unix_millis)?;
+        Ok((value.transaction_id, next))
+    }
+
+    /// The envelope for an existing record with only its `last_error` set. The
+    /// record may already carry the marker; this cannot add one.
+    pub(super) fn last_error_envelope(
         value: &DeploymentTransaction,
-        now: u64,
+        detail: &str,
     ) -> Result<CultCacheEnvelope> {
-        encode_transaction(value, now)
+        let mut next = value.clone();
+        next.last_error = Some(detail.to_string());
+        encode_transaction(&next, next.updated_at_unix_millis)
     }
 
 /// A continuity abort written before the single resolution rule recorded no
@@ -2877,12 +2892,8 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
     let mut migrated = 0;
     for envelope in stale {
         let (record_type, key, mut next) = if envelope.r#type == DeploymentTransaction::TYPE {
-            let value = read_transaction_record(&envelope)?;
-            let next = cleanup_evidence::migrated_transaction_envelope(
-                &value,
-                value.updated_at_unix_millis,
-            )?;
-            (DeploymentTransaction::TYPE, value.transaction_id, next)
+            let (key, next) = cleanup_evidence::migrate_transaction_record(&envelope)?;
+            (DeploymentTransaction::TYPE, key, next)
         } else {
             let value = read_generation_record(&envelope)?;
             let next = admitted_envelope(&value, value.admitted_at_unix_millis)?;
@@ -3067,6 +3078,19 @@ fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
             Vec::new()
         }
     }
+}
+
+/// How long to wait after `failures` consecutive failures: one poll interval
+/// after the first, doubling each time, never past the ceiling.
+fn backoff_wait(poll_millis: u64, failures: u32) -> u64 {
+    poll_millis
+        .saturating_mul(1u64 << failures.min(20))
+        .min(RESUME_BACKOFF_CEILING_MILLIS)
+}
+
+/// Whether an attempt due at `not_before` must still wait at `now`.
+fn is_waiting(now: u64, not_before: u64) -> bool {
+    now < not_before
 }
 
 /// Whether a transaction moved between two reads. An error note (`last_error`)
@@ -4145,10 +4169,13 @@ impl Engine {
                 .or_default()
                 .offer(Some(detail.clone()))
         };
+        let recorded = self.record_last_error(transaction_id, &detail);
         if offered.is_some() {
             eprintln!("Idunn {what} {transaction_id}: {detail}");
+            if let Err(error) = recorded {
+                eprintln!("Idunn could not leave that in the record of {transaction_id}: {error:#}");
+            }
         }
-        let _ = self.record_last_error(transaction_id, &detail);
     }
 
     fn clear_fault(&self, transaction_id: &str) {
@@ -4172,9 +4199,7 @@ impl Engine {
         if stored.value.last_error.as_deref() == Some(detail) {
             return Ok(());
         }
-        let mut next = stored.value.clone();
-        next.last_error = Some(detail.to_string());
-        let envelope = transaction_envelope(&next, next.updated_at_unix_millis)?;
+        let envelope = cleanup_evidence::last_error_envelope(&stored.value, detail)?;
         ensure!(
             SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
                 &[CultCacheExpectedEnvelope {
@@ -4213,10 +4238,7 @@ impl Engine {
                 continue;
             }
             match self.resume_candidate(current) {
-                Ok(moved) => {
-                    self.clear_fault(&current.value.transaction_id);
-                    progressed |= moved;
-                }
+                Ok(moved) => progressed |= moved,
                 Err(error) => {
                     self.note_fault(
                         "could not resume transaction",
@@ -4244,17 +4266,20 @@ impl Engine {
             .expect("resume backoff mutex")
             .get(id)
             .is_some_and(|backoff| {
-                now_millis().is_ok_and(|now| now < backoff.not_before_unix_millis)
+                now_millis().is_ok_and(|now| is_waiting(now, backoff.not_before_unix_millis))
             })
         {
             return Ok(false);
         }
         let advanced = self.advance_transaction(current);
         if advanced.is_ok() {
+            // The step ran and succeeded: the fault, if any, has recovered, so
+            // a later failure is news. A skipped or failed attempt clears nothing.
             self.resume_backoff
                 .lock()
                 .expect("resume backoff mutex")
                 .remove(id);
+            self.clear_fault(id);
         }
         if let Err(error) = advanced {
             let latest_snapshot = ControlSnapshot::read(&self.options.state_store)?;
@@ -4308,11 +4333,7 @@ impl Engine {
         let now = now_millis()?;
         let mut all = self.resume_backoff.lock().expect("resume backoff mutex");
         let failures = all.get(transaction_id).map_or(0, |backoff| backoff.failures);
-        let wait = self
-            .options
-            .poll_millis
-            .saturating_mul(1u64 << failures.min(20))
-            .min(RESUME_BACKOFF_CEILING_MILLIS);
+        let wait = backoff_wait(self.options.poll_millis, failures);
         all.insert(
             transaction_id.to_string(),
             ResumeBackoff {
@@ -11883,7 +11904,7 @@ mod tests {
         make_resident(
             &world,
             &second,
-            cleanup_evidence::migrated_transaction_envelope(&second, 200)?,
+            cleanup_evidence::last_error_envelope(&second, "second")?,
         )?;
 
         // The store reads: three records, one of them live, none of the
@@ -12105,7 +12126,7 @@ mod tests {
 
     /// A wedged abort whose `stop()` error carries a changing counter, as
     /// systemctl output with a PID or timestamp would.
-    struct ChangingErrorWorkload(std::sync::atomic::AtomicU32);
+    struct ChangingErrorWorkload(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicBool);
 
     impl WorkloadPort for ChangingErrorWorkload {
         fn install(
@@ -12151,6 +12172,9 @@ mod tests {
         }
         fn stop(&self, _: &WorkloadObservation) -> Result<()> {
             let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
             bail!("the unit will not stop (main pid {n})")
         }
         fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
@@ -12184,6 +12208,7 @@ mod tests {
     fn a_wedge_whose_error_text_changes_every_tick_does_not_starve_other_targets() -> Result<()> {
         let world = EngineFixture::with_workload(Arc::new(ChangingErrorWorkload(
             std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicBool::new(false),
         )))?;
         transaction_at(&world, DeploymentPhase::Warming)?;
         world
@@ -12219,7 +12244,10 @@ mod tests {
 
     #[test]
     fn a_failing_step_is_retried_after_a_backoff_not_every_tick() -> Result<()> {
-        let workload = Arc::new(ChangingErrorWorkload(std::sync::atomic::AtomicU32::new(0)));
+        let workload = Arc::new(ChangingErrorWorkload(
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
         let world = EngineFixture::with_workload(workload.clone())?;
         transaction_at(&world, DeploymentPhase::Warming)?;
         world
@@ -12333,7 +12361,7 @@ mod tests {
         let error = error_text(transaction_envelope(&lifted, 1).map(|_| ()));
         assert!(error.contains("legacy lift"), "{error}");
         // The migration's own path still writes it, and it reads back.
-        let migrated = cleanup_evidence::migrated_transaction_envelope(&lifted, 1)?;
+        let (_, migrated) = cleanup_evidence::migrate_transaction_record(&envelope)?;
         assert!(read_transaction_record(&migrated)?.carries_legacy_marker());
         Ok(())
     }
@@ -12353,6 +12381,96 @@ mod tests {
         let outcome = world.engine.reconcile_failed_continuity_projections()?;
         assert_eq!(outcome.demoted.len(), 1);
         assert_eq!(projected_under(&world, &expected)?, expected_only());
+        Ok(())
+    }
+
+    #[test]
+    fn backoff_doubles_caps_and_waits_exactly() {
+        assert_eq!(backoff_wait(500, 0), 500);
+        assert_eq!(backoff_wait(500, 1), 1000);
+        assert_eq!(backoff_wait(500, 2), 2000);
+        assert_eq!(backoff_wait(500, 3), 4000);
+        assert_eq!(backoff_wait(500, 30), RESUME_BACKOFF_CEILING_MILLIS);
+        assert_eq!(backoff_wait(u64::MAX, 5), RESUME_BACKOFF_CEILING_MILLIS);
+        assert!(is_waiting(9, 10));
+        assert!(!is_waiting(10, 10));
+        assert!(!is_waiting(11, 10));
+    }
+
+    #[test]
+    fn a_persistent_fault_is_reported_once_and_again_only_after_recovery() -> Result<()> {
+        let workload = Arc::new(ChangingErrorWorkload(
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let wedged = transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let id = wedged.transaction_id;
+        let expire = || {
+            world.engine.resume_backoff.lock().unwrap().clear();
+        };
+        let reported = || world.engine.fault_reports.lock().unwrap().contains_key(&id);
+        // A fault already reported for this transaction (an Err from the
+        // resume itself); a handled, still-failing step must not re-arm it.
+        world
+            .engine
+            .note_fault("could not resume transaction", &id, &anyhow!("store hiccup"));
+        assert!(reported());
+        world.engine.resume_one_transaction()?;
+        assert!(reported(), "a failing handled step re-armed the report");
+        // Skipped inside the backoff: the fault is still the same fault.
+        world.engine.resume_one_transaction()?;
+        assert!(reported(), "a backoff skip re-armed the report");
+        // Still failing after the backoff expires: still the same fault.
+        expire();
+        world.engine.resume_one_transaction()?;
+        assert!(reported());
+        // A real recovery clears it.
+        workload.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        expire();
+        world.engine.resume_one_transaction()?;
+        assert!(!reported(), "a step that ran and succeeded left the fault armed");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unretirable_legacy_marked_record_shows_its_fault_in_the_record() -> Result<()> {
+        write_fixture_anchor()?;
+        let envelope = fixture_envelope(FIXTURE_PRE_B1_ABORTS[1].1, DeploymentTransaction::TYPE)?;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let first = read_transaction_record(&envelope)?;
+        make_resident(&world, &first, envelope)?;
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+        assert!(record_of(&world, &first.transaction_id)?.carries_legacy_marker());
+        corrupt_history(&world)?;
+        assert!(!world.engine.retire_one_terminal_transaction()?);
+        let noted = record_of(&world, &first.transaction_id)?;
+        assert!(
+            noted.last_error.is_some() && noted.last_error != first.last_error,
+            "the retire fault never reached the record"
+        );
+        assert!(noted.carries_legacy_marker());
+        Ok(())
+    }
+
+    #[test]
+    fn a_tick_that_only_freezes_or_only_advances_reports_progress() -> Result<()> {
+        // Only a freeze.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        queue_deploy_for_nowhere(&world)?;
+        write_service_binding(&world)?;
+        assert!(world.engine.run_scheduler_tick()?, "a freeze-only tick reported no progress");
+
+        // Only a phase advance.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        transaction_at(&world, DeploymentPhase::Fencing)?;
+        assert!(world.engine.resume_one_transaction()?, "a real advance reported none");
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        transaction_at(&world, DeploymentPhase::Fencing)?;
+        assert!(world.engine.run_scheduler_tick()?);
         Ok(())
     }
 
