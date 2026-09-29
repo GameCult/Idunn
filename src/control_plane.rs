@@ -13443,6 +13443,7 @@ mod tests {
             odin: Odin,
             minimum_capacity: u32,
             phase: DeploymentPhase,
+            provides_odin: bool,
         ) -> Result<RoutedWorld> {
             use crate::deployment_plan::tests::{
                 BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
@@ -13484,7 +13485,14 @@ mod tests {
                 .context("recipe is empty")?
                 .replace(
                     "capability = \"service.runtime\"",
-                    &format!("capability = \"service.runtime\"\ncapacity = {minimum_capacity}"),
+                    &format!(
+                        "capability = \"{}\"\ncapacity = {minimum_capacity}",
+                        if provides_odin {
+                            ODIN_RENDEZVOUS_CAPABILITY
+                        } else {
+                            "service.runtime"
+                        }
+                    ),
                 );
             let plan = compile_deployment_plan(
                 recipe.as_bytes(),
@@ -13503,7 +13511,14 @@ mod tests {
             )?;
             let expected = release.expected_projection(&plan)?;
             assert!(expected.route.is_some() && expected.dependencies.is_empty());
-            assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
+            assert_eq!(
+                ReadinessClass::of(&expected),
+                if provides_odin {
+                    ReadinessClass::OdinSelf
+                } else {
+                    ReadinessClass::RouteProof
+                }
+            );
 
             let now = now_millis()?;
             let command = DeploymentCommand {
@@ -13566,7 +13581,22 @@ mod tests {
             stub.listen(candidate_listener, true);
             stub.listen(stable_listener, false);
 
-            if phase >= DeploymentPhase::Fencing {
+            if phase >= DeploymentPhase::Fencing && provides_odin {
+                // Odin's own first word about the candidate, as for any
+                // Odin-correlated target.
+                let warming = signed_correlation(&world, &transaction, 4, false)?;
+                let authenticated = world.engine.authenticate_topology_bytes(
+                    &ControlSnapshot::read(&world.state_store)?,
+                    &transaction,
+                    &warming,
+                    None,
+                    now,
+                )?;
+                transaction.warming = Some(WarmingEvidence::OdinTopology {
+                    evidence: TopologyEvidence::from_authenticated(&authenticated, now)?,
+                });
+                transaction.odin_publisher_sequence_cursor = 4;
+            } else if phase >= DeploymentPhase::Fencing {
                 let CandidateAnswer::Answered { evidence, .. } =
                     world
                         .engine
@@ -13575,6 +13605,8 @@ mod tests {
                     bail!("the stub candidate did not answer");
                 };
                 transaction.warming = Some(WarmingEvidence::RouteProofDirect { evidence });
+            }
+            if phase >= DeploymentPhase::Fencing {
                 let rendered = NginxRouteDriver::new(
                     transaction
                         .plan
@@ -13627,6 +13659,10 @@ mod tests {
             // valid correlation that says the target is not Ready.
             let store = &world.engine.options.odin_correlation_store;
             let poisoned = match odin {
+                _ if provides_odin => {
+                    odin_reports_ready(&world, &transaction, 5)?;
+                    Vec::new()
+                }
                 Odin::Unreachable => {
                     let garbage = b"odin is not a cache".to_vec();
                     std::fs::write(store, &garbage)?;
@@ -13719,7 +13755,7 @@ mod tests {
 
         /// A route-proof generation from a real admission.
         pub(super) fn committed_generation() -> Result<AdmittedGeneration> {
-            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
             routed.stub.set_state("active");
             routed.run_to_routing()?;
             routed.promote_by_hand()?;
@@ -13738,7 +13774,7 @@ mod tests {
 
         #[test]
         fn a_route_proof_target_admits_with_odin_unreachable_and_never_reads_it() -> Result<()> {
-            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
             // Fencing, Leasing, AwaitingReady: the candidate is still warming.
             for _ in 0..12 {
                 routed.step()?;
@@ -13790,7 +13826,7 @@ mod tests {
 
         #[test]
         fn an_odin_correlation_about_a_route_proof_target_decides_nothing() -> Result<()> {
-            let routed = routed_world(Odin::NotReady, 1, DeploymentPhase::Fencing)?;
+            let routed = routed_world(Odin::NotReady, 1, DeploymentPhase::Fencing, false)?;
             routed.stub.set_state("active");
             routed.run_to_routing()?;
             routed.promote_by_hand()?;
@@ -13805,7 +13841,7 @@ mod tests {
 
         #[test]
         fn a_route_proof_candidate_that_has_not_answered_is_waited_on_not_aborted() -> Result<()> {
-            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming)?;
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
             routed.step()?;
             let warmed = routed.transaction()?;
             assert_eq!(warmed.phase, DeploymentPhase::Warming);
@@ -13817,7 +13853,7 @@ mod tests {
             routed.assert_odin_untouched()?;
 
             // Nothing listens: the same step waits, and says why.
-            let silent = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming)?;
+            let silent = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
             silent.stub.stop.store(true, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(50));
             silent.step()?;
@@ -13836,7 +13872,7 @@ mod tests {
 
         #[test]
         fn a_capacity_below_the_expected_minimum_is_named_on_the_route_path() -> Result<()> {
-            let routed = routed_world(Odin::Unreachable, 2, DeploymentPhase::Fencing)?;
+            let routed = routed_world(Odin::Unreachable, 2, DeploymentPhase::Fencing, false)?;
             routed.stub.set_state("active");
             routed.run_to_routing()?;
             routed.promote_by_hand()?;
@@ -13852,7 +13888,7 @@ mod tests {
 
         #[test]
         fn odin_itself_is_never_route_proof() -> Result<()> {
-            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming)?;
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
             let mut expected = routed.stub.expected.clone();
             assert_eq!(ReadinessClass::of(&expected), ReadinessClass::RouteProof);
             // Odin provides the rendezvous capability and declares no dependency.
@@ -13873,9 +13909,33 @@ mod tests {
         }
 
         #[test]
+        fn a_target_providing_the_rendezvous_commits_on_odin_evidence_and_carries_the_authority()
+        -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, true)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            let ready = routed.transaction()?;
+            assert!(ready.ready.as_ref().and_then(ReadinessEvidence::odin).is_some());
+            routed.promote_by_hand()?;
+            routed.step()?;
+            let generation = admitted(&routed)?;
+            generation.validate()?;
+            assert_eq!(generation.ready.class(), ReadinessClass::OdinCorrelated);
+            assert_eq!(
+                generation.odin_authority,
+                Some(routed.world.engine.bootstrap_odin_authority.clone())
+            );
+            assert!(generation.latest_odin_observation.is_some());
+            // Boot re-authenticates every Odin receipt this generation carries.
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            routed.world.engine.validate_durable_authority(&snapshot)?;
+            Ok(())
+        }
+
+        #[test]
         fn a_store_of_route_proof_generations_boots_and_resolves_the_bootstrap_authority()
         -> Result<()> {
-            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
             routed.stub.set_state("active");
             routed.run_to_routing()?;
             routed.promote_by_hand()?;
