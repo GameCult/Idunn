@@ -12,13 +12,16 @@ use sha2::{Digest, Sha256};
 
 use crate::control_plane::SequenceAdmittedReady;
 use crate::deployment::{
-    CapabilityDependency, DependencyKind, ExternalCapabilityBinding, OperatorBinding,
+    CapabilityDependency, DeadlineBinding, DependencyKind, ExternalCapabilityBinding, OperatorBinding,
     ServiceTransport, SourceSelectionPolicy, StartupOrder, StateDeclaration, TargetDeclaration,
     capability_compatible,
 };
 
 pub const SOURCE_SELECTION_FACTS_SCHEMA: &str = "idunn.source_selection_facts.v1";
-pub const COMPILED_DEPLOYMENT_PLAN_SCHEMA: &str = "idunn.compiled_deployment_plan.v2";
+pub const COMPILED_DEPLOYMENT_PLAN_SCHEMA: &str = "idunn.compiled_deployment_plan.v3";
+/// Plans sealed before phase deadlines existed. They keep their bytes, and so
+/// their plan id; their deadlines are Idunn's defaults at read time.
+pub const COMPILED_DEPLOYMENT_PLAN_SCHEMA_V2: &str = "idunn.compiled_deployment_plan.v2";
 pub const SEALED_RELEASE_SCHEMA: &str = "idunn.sealed_release.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +463,86 @@ pub fn select_dependencies(
         .collect()
 }
 
+/// Idunn's default duration for each post-fencing phase, in seconds. A binding
+/// overrides any of them; the resolved values are frozen into the plan.
+pub const DEFAULT_FENCING_DEADLINE_SECONDS: u32 = 120;
+pub const DEFAULT_LEASING_DEADLINE_SECONDS: u32 = 120;
+pub const DEFAULT_AWAITING_READY_DEADLINE_SECONDS: u32 = 300;
+pub const DEFAULT_ROUTING_DEADLINE_SECONDS: u32 = 120;
+pub const DEFAULT_COMMITTING_DEADLINE_SECONDS: u32 = 120;
+
+/// The resolved per-phase deadline durations a plan carries. Nothing reads
+/// them at the cut that introduced them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseDeadlines {
+    pub fencing_seconds: u32,
+    pub leasing_seconds: u32,
+    pub awaiting_ready_seconds: u32,
+    pub routing_seconds: u32,
+    pub committing_seconds: u32,
+}
+
+impl PhaseDeadlines {
+    pub const IDUNN_DEFAULTS: Self = Self {
+        fencing_seconds: DEFAULT_FENCING_DEADLINE_SECONDS,
+        leasing_seconds: DEFAULT_LEASING_DEADLINE_SECONDS,
+        awaiting_ready_seconds: DEFAULT_AWAITING_READY_DEADLINE_SECONDS,
+        routing_seconds: DEFAULT_ROUTING_DEADLINE_SECONDS,
+        committing_seconds: DEFAULT_COMMITTING_DEADLINE_SECONDS,
+    };
+
+    /// Binding overrides over Idunn's defaults.
+    pub fn resolve(binding: Option<&DeadlineBinding>) -> Self {
+        let defaults = Self::IDUNN_DEFAULTS;
+        let Some(binding) = binding else {
+            return defaults;
+        };
+        Self {
+            fencing_seconds: binding.fencing_seconds.unwrap_or(defaults.fencing_seconds),
+            leasing_seconds: binding.leasing_seconds.unwrap_or(defaults.leasing_seconds),
+            awaiting_ready_seconds: binding
+                .awaiting_ready_seconds
+                .unwrap_or(defaults.awaiting_ready_seconds),
+            routing_seconds: binding.routing_seconds.unwrap_or(defaults.routing_seconds),
+            committing_seconds: binding
+                .committing_seconds
+                .unwrap_or(defaults.committing_seconds),
+        }
+    }
+
+    fn validate_against(&self, binding: &OperatorBinding) -> Result<()> {
+        let declared = binding.deadlines.clone().unwrap_or_default();
+        for (name, frozen, declared) in [
+            ("fencing", self.fencing_seconds, declared.fencing_seconds),
+            ("leasing", self.leasing_seconds, declared.leasing_seconds),
+            (
+                "awaiting-ready",
+                self.awaiting_ready_seconds,
+                declared.awaiting_ready_seconds,
+            ),
+            ("routing", self.routing_seconds, declared.routing_seconds),
+            (
+                "committing",
+                self.committing_seconds,
+                declared.committing_seconds,
+            ),
+        ] {
+            ensure!(
+                (1..=crate::deployment::MAXIMUM_DEADLINE_SECONDS).contains(&frozen),
+                "frozen {name} deadline is out of range"
+            );
+            if let Some(declared) = declared {
+                ensure!(
+                    frozen == declared,
+                    "frozen {name} deadline differs from the binding"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Private Idunn control-plane state. This contains host binding details and is
 /// never an Odin/CultMesh projection. The shared CultNet Expected incarnation
 /// is the sanitized topology projection derived only after a release validates
@@ -476,12 +559,17 @@ pub struct CompiledDeploymentPlan {
     pub binding_blob: Vec<u8>,
     pub dependencies: Vec<DependencySelection>,
     pub candidate_port: Option<u16>,
+    /// Present exactly on v3 plans. Skipped when absent so a v2 plan re-encodes
+    /// to its original bytes and keeps its plan id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadlines: Option<PhaseDeadlines>,
 }
 
 impl CompiledDeploymentPlan {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.schema == COMPILED_DEPLOYMENT_PLAN_SCHEMA,
+            self.schema == COMPILED_DEPLOYMENT_PLAN_SCHEMA
+                || self.schema == COMPILED_DEPLOYMENT_PLAN_SCHEMA_V2,
             "unsupported deployment-plan schema"
         );
         require_sha256(&self.plan_id, "plan id")?;
@@ -492,6 +580,11 @@ impl CompiledDeploymentPlan {
         );
         let (declaration, binding) = self.parsed_inputs()?;
         self.source.validate_against(&binding)?;
+        match (&self.schema[..], &self.deadlines) {
+            (COMPILED_DEPLOYMENT_PLAN_SCHEMA, Some(deadlines)) => deadlines.validate_against(&binding)?,
+            (COMPILED_DEPLOYMENT_PLAN_SCHEMA_V2, None) => {}
+            _ => bail!("deployment plan deadlines differ from its schema"),
+        }
         ensure!(
             sha256_id(&self.recipe_blob) == self.source.recipe_blob_sha256,
             "selected recipe blob differs from the exact plan recipe bytes"
@@ -525,6 +618,12 @@ impl CompiledDeploymentPlan {
             "deployment plan digest is not canonical"
         );
         Ok(())
+    }
+
+    /// The deadline durations this plan runs under: frozen for v3, Idunn's
+    /// defaults for a v2 plan that predates them.
+    pub fn phase_deadlines(&self) -> PhaseDeadlines {
+        self.deadlines.unwrap_or(PhaseDeadlines::IDUNN_DEFAULTS)
     }
 
     pub(crate) fn parsed_inputs(&self) -> Result<(TargetDeclaration, OperatorBinding)> {
@@ -589,6 +688,7 @@ pub(crate) fn compile_deployment_plan(
         binding_blob: binding_bytes.to_vec(),
         dependencies,
         candidate_port,
+        deadlines: Some(PhaseDeadlines::resolve(binding.deadlines.as_ref())),
     };
     plan.plan_id = plan.recomputed_plan_id()?;
     plan.validate()?;
@@ -1593,5 +1693,93 @@ nodes = ["yggdrasil"]
         let mut changed = release;
         changed.external_inputs[0].size_bytes = 18;
         assert!(changed.validate_against(&plan).is_err());
+    }
+
+    fn binding_with_deadlines(table: &str) -> String {
+        BINDING.replace("[placement]", &format!("{table}\n[placement]"))
+    }
+
+    fn plan_under(binding: &str) -> Result<CompiledDeploymentPlan> {
+        let providers = [ready_odin_provider("odin", "odin-yggdrasil", 1)];
+        compile_deployment_plan(
+            RECIPE.as_bytes(),
+            binding.as_bytes(),
+            source(RECIPE),
+            "service-incarnation-1",
+            Some(18001),
+            110,
+            &providers,
+        )
+    }
+
+    #[test]
+    fn a_compiled_plan_freezes_idunn_default_deadlines() {
+        let plan = plan();
+        assert_eq!(plan.schema, COMPILED_DEPLOYMENT_PLAN_SCHEMA);
+        assert_eq!(plan.deadlines, Some(PhaseDeadlines::IDUNN_DEFAULTS));
+        assert_eq!(plan.phase_deadlines(), PhaseDeadlines::IDUNN_DEFAULTS);
+        plan.validate().unwrap();
+    }
+
+    #[test]
+    fn a_binding_overrides_only_the_deadlines_it_names() {
+        let binding = binding_with_deadlines("[deadlines]\nawaiting_ready_seconds = 45\n");
+        let plan = plan_under(&binding).unwrap();
+        let frozen = plan.phase_deadlines();
+        assert_eq!(frozen.awaiting_ready_seconds, 45);
+        assert_eq!(
+            PhaseDeadlines {
+                awaiting_ready_seconds: DEFAULT_AWAITING_READY_DEADLINE_SECONDS,
+                ..frozen
+            },
+            PhaseDeadlines::IDUNN_DEFAULTS
+        );
+    }
+
+    #[test]
+    fn deadline_bounds_and_unknown_phases_are_refused() {
+        for table in [
+            "[deadlines]\nrouting_seconds = 0\n",
+            "[deadlines]\nrouting_seconds = 86401\n",
+            "[deadlines]\nwarming_seconds = 5\n",
+        ] {
+            assert!(
+                OperatorBinding::parse(&binding_with_deadlines(table)).is_err(),
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_deadlines_must_agree_with_the_binding_and_the_plan_schema() {
+        let binding = binding_with_deadlines("[deadlines]\nrouting_seconds = 45\n");
+        let sealed = |mut plan: CompiledDeploymentPlan| {
+            plan.plan_id = plan.recomputed_plan_id().unwrap();
+            plan
+        };
+        let honest = plan_under(&binding).unwrap();
+
+        let mut drifted = honest.clone();
+        drifted.deadlines.as_mut().unwrap().routing_seconds = 46;
+        assert!(sealed(drifted).validate().is_err());
+
+        let mut absent = honest.clone();
+        absent.deadlines = None;
+        assert!(sealed(absent).validate().is_err());
+
+        let mut v2_with_deadlines = honest.clone();
+        v2_with_deadlines.schema = COMPILED_DEPLOYMENT_PLAN_SCHEMA_V2.into();
+        assert!(sealed(v2_with_deadlines).validate().is_err());
+
+        // A plan sealed before deadlines existed keeps its nine-field encoding,
+        // so its plan id still holds, and it runs on Idunn's defaults.
+        let mut v2 = plan();
+        v2.schema = COMPILED_DEPLOYMENT_PLAN_SCHEMA_V2.into();
+        v2.deadlines = None;
+        let v2 = sealed(v2);
+        v2.validate().unwrap();
+        assert_eq!(v2.phase_deadlines(), PhaseDeadlines::IDUNN_DEFAULTS);
+        assert_eq!(rmp_serde::to_vec(&v2).unwrap()[0], 0x99);
+        assert_eq!(rmp_serde::to_vec(&honest).unwrap()[0], 0x9a);
     }
 }
