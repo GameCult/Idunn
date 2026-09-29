@@ -5452,6 +5452,8 @@ impl NginxRouteDriver {
         self.restore(preflight.incumbent_configuration.as_deref())
     }
 
+    /// A fragment already equal to the admitted membership is left alone: no
+    /// write, no `nginx -t`, no firewall call, no reload.
     pub fn restore_admitted_membership(
         &self,
         expected: &IdunnExpectedIncarnationRecord,
@@ -5462,10 +5464,11 @@ impl NginxRouteDriver {
             membership_sha256 == sha256_id(&rendered),
             "admitted route receipt does not describe the expected membership"
         );
-        self.validate_candidate_in_private_mount(&rendered)?;
-        if self.current_configuration()?.as_deref() != Some(rendered.as_slice()) {
-            atomic_replace(&self.binding.config_path, &rendered)?;
+        if self.current_configuration()?.as_deref() == Some(rendered.as_slice()) {
+            return Ok(());
         }
+        self.validate_candidate_in_private_mount(&rendered)?;
+        atomic_replace(&self.binding.config_path, &rendered)?;
         if let Err(reload) = self.admit_endpoint().and_then(|()| self.reload()) {
             return match self.write_fragment(None) {
                 Ok(()) => Err(reload).context("reloading the exact admitted route membership"),
@@ -10347,6 +10350,83 @@ mod tests {
         );
         fs::write(ufw.with_extension("absent"), b"gone\n")?;
         driver.restore(None)?;
+        Ok(())
+    }
+
+    /// Observation observes: restoring a membership whose fragment is already
+    /// exact touches nothing, and drifted bytes are restored with one reload.
+    #[cfg(unix)]
+    #[test]
+    fn restoring_an_exact_admitted_membership_actuates_nothing_and_drift_reloads_once()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let calls = temp.path().join("calls");
+        let program = |name: &str| -> Result<PathBuf> {
+            let path = temp.path().join(name);
+            fs::write(
+                &path,
+                format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\nexit 0\n", calls.display()),
+            )?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+            Ok(path)
+        };
+        let config = temp.path().join("service.conf");
+        let driver = NginxRouteDriver {
+            binding: RouteBinding {
+                driver: RouteDriver::NginxStreamTcp,
+                route_id: "service-route".into(),
+                stable_endpoint: "http://127.0.0.1:4103".into(),
+                private_host: "127.0.0.1".into(),
+                private_port_start: 4104,
+                private_port_end: 4109,
+                config_path: config.clone(),
+                reload_unit: "nginx.service".into(),
+            },
+            nginx_program: program("nginx")?,
+            systemd_run_program: program("systemd-run")?,
+            systemctl_program: program("systemctl")?,
+            ufw_program: program("ufw")?,
+            preflight_root: temp.path().join("preflight"),
+        };
+        let mut candidate = expected();
+        candidate.route = Some(cultnet_rs::IdunnExpectedRoute {
+            route_id: "service-route".into(),
+            transport: "http".into(),
+            stable_endpoint: "http://127.0.0.1:4103".into(),
+            candidate_endpoint: "http://127.0.0.1:4104".into(),
+        });
+        let rendered = driver.render(&candidate)?;
+        let membership_sha256 = sha256_id(&rendered);
+        let count = |prefix: &str| -> Result<usize> {
+            Ok(fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .count())
+        };
+
+        fs::write(&config, &rendered)?;
+        let modified = fs::metadata(&config)?.modified()?;
+        driver.restore_admitted_membership(&candidate, &membership_sha256)?;
+        driver.restore_admitted_membership(&candidate, &membership_sha256)?;
+        assert!(!calls.exists(), "an exact fragment must run no program");
+        assert!(!driver.preflight_root.exists());
+        assert_eq!(fs::read(&config)?, rendered);
+        assert_eq!(fs::metadata(&config)?.modified()?, modified);
+
+        fs::write(&config, b"drifted bytes\n")?;
+        driver.restore_admitted_membership(&candidate, &membership_sha256)?;
+        assert_eq!(fs::read(&config)?, rendered);
+        assert_eq!(count("systemctl reload")?, 1);
+        assert_eq!(count("systemd-run")?, 1);
+        assert_eq!(count("ufw allow")?, 1);
+        assert_eq!(count("nginx -t")?, 1);
+
+        driver.restore_admitted_membership(&candidate, &membership_sha256)?;
+        assert_eq!(count("systemctl reload")?, 1, "restored bytes never reload again");
+        assert_eq!(count("ufw")?, 1);
         Ok(())
     }
 
