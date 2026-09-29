@@ -9844,23 +9844,22 @@ mod tests {
     #[test]
     fn a_stored_abort_whose_candidate_cleanup_disagrees_with_the_owed_rule_is_refused() -> Result<()> {
         let world = ContinuityProjection::after_candidate_observed()?;
-        // (activation issued, workload observed, recorded cleanup, accepted).
-        // Workload-only rows are omitted: the fixture refuses that shape for other reasons.
+        // (activation issued, recorded cleanup, accepted).
+        // Rows with a workload are omitted: a transaction holding one is refused on
+        // other grounds, so they could not speak for this rule. The workload operand
+        // of the owed rule is pinned by the method-level test above.
         let rows = [
-            (false, false, CleanupEvidence::Skipped, true),
-            (false, false, CleanupEvidence::Pending, false),
-            (false, false, CleanupEvidence::Complete, false),
-            (true, false, CleanupEvidence::Skipped, false),
-            (true, false, CleanupEvidence::Pending, true),
-            (true, false, CleanupEvidence::Complete, true),
-            (true, true, CleanupEvidence::Skipped, false),
-            (true, true, CleanupEvidence::Complete, true),
+            (false, CleanupEvidence::Skipped, true),
+            (false, CleanupEvidence::Pending, false),
+            (false, CleanupEvidence::Complete, false),
+            (true, CleanupEvidence::Skipped, false),
+            (true, CleanupEvidence::Pending, true),
+            (true, CleanupEvidence::Complete, true),
         ];
-        for (has_activation, has_workload, recorded, accepted) in rows {
-            let label = format!("activation {has_activation}, workload {has_workload}, {recorded:?}");
+        for (has_activation, recorded, accepted) in rows {
+            let label = format!("activation {has_activation}, {recorded:?}");
             let shape = |mut transaction: DeploymentTransaction| -> DeploymentTransaction {
                 transaction.activation = has_activation.then(|| world.candidate_activation.clone());
-                transaction.workload = has_workload.then(|| workload(1000, 1, 2));
                 transaction
             };
 
