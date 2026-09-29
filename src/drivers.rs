@@ -10557,6 +10557,72 @@ Content-Le".to_vec()), |_| {}),
         Ok(())
     }
 
+    /// A real partial clone: the origin advertises `uploadpack.allowFilter`,
+    /// so `--filter=blob:none` is honoured and the checkout holds no blobs.
+    /// Every other fixture's origin ignores the filter and clones in full,
+    /// so `bulk_fetch_objects` never had a missing blob to fetch and never
+    /// met Git's post-fetch connectivity check on a bare blob id. The blob
+    /// is checked with `GIT_NO_LAZY_FETCH=1`, so only the bulk fetch itself
+    /// can have delivered it.
+    #[cfg(unix)]
+    #[test]
+    fn bulk_fetch_objects_delivers_a_blob_into_a_blob_none_partial_clone() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let origin_repo = temp.path().join("origin");
+        fs::create_dir(&origin_repo)?;
+        git_at(&origin_repo, &["init", "--initial-branch=main"])?;
+        git_at(&origin_repo, &["config", "user.name", "Idunn Test"])?;
+        git_at(
+            &origin_repo,
+            &["config", "user.email", "idunn-test@example.invalid"],
+        )?;
+        git_at(&origin_repo, &["config", "uploadpack.allowFilter", "true"])?;
+        git_at(&origin_repo, &["config", "uploadpack.allowAnySHA1InWant", "true"])?;
+        fs::write(origin_repo.join("payload.txt"), b"partial clone payload\n")?;
+        git_at(&origin_repo, &["add", "--all"])?;
+        git_at(&origin_repo, &["commit", "-m", "fixture"])?;
+        let blob = git_at(&origin_repo, &["rev-parse", "HEAD:payload.txt"])?;
+
+        let source_cache_root = temp.path().join("source-cache");
+        fs::create_dir(&source_cache_root)?;
+        let driver = GitSourceDriver::new(
+            source_cache_root.clone(),
+            temp.path().join("frozen"),
+            None,
+        );
+        let checkout = source_cache_root.join("checkout");
+        driver.git([
+            OsString::from("clone"),
+            OsString::from("--filter=blob:none"),
+            OsString::from("--no-checkout"),
+            OsString::from(format!("file://{}", origin_repo.display())),
+            checkout.as_os_str().to_owned(),
+        ])?;
+
+        let blob_present = || -> Result<bool> {
+            Ok(Command::new("/usr/bin/git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(["cat-file", "-t", &blob])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .output()?
+                .status
+                .success())
+        };
+        ensure!(
+            !blob_present()?,
+            "fixture is not a partial clone: the blob is already local"
+        );
+        driver.bulk_fetch_objects(&checkout, std::slice::from_ref(&blob))?;
+        assert!(
+            blob_present()?,
+            "bulk fetch succeeded but did not deliver the blob"
+        );
+        Ok(())
+    }
+
     /// F2/F3 (Self's rulings, second Cut 1 fix batch): a tree with two
     /// entries literally named `a` at the same level -- one a symlink
     /// pointing outside the frozen root, one a subtree holding `pwn` -- must
