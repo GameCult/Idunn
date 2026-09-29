@@ -8627,19 +8627,89 @@ mod tests {
                 ]
                 .concat(),
             ),
-            (
-                "headers over the bound together",
-                [
-                    b"HTTP/1.1 200 OK\r\n".to_vec(),
-                    b"X: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n".repeat(600),
-                ]
-                .concat(),
-            ),
             ("headers that are not UTF-8", b"HTTP/1.1 200 OK\r\nX: \xff\r\n\r\n".to_vec()),
             ("a status that is not UTF-8", b"HTTP/1.1 \xff\r\n\r\n".to_vec()),
         ] {
             assert_refused(challenge(scripted_peer(move |_| reply), |_| {}), why);
         }
+    }
+
+    /// Every header line is small and the answer is honest and whole; only the
+    /// headers' total size refuses it.
+    #[test]
+    fn headers_that_are_over_their_bound_together_refuse_an_otherwise_honest_answer() {
+        let filler = b"X: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+        let answer_with = |lines: usize| {
+            move |id: &str| {
+                let body = honest_body(id);
+                let mut reply =
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n", body.len()).into_bytes();
+                reply.extend_from_slice(&filler.repeat(lines));
+                reply.extend_from_slice(b"\r\n");
+                reply.extend_from_slice(&body);
+                reply
+            }
+        };
+        let lines = ROUTE_HTTP_MAX_HEADER_BYTES / filler.len();
+        challenge(scripted_peer(answer_with(lines / 2)), |_| {}).expect("headers inside the bound");
+        assert_refused(
+            challenge(scripted_peer(answer_with(lines * 2)), |_| {}),
+            "headers over the bound together",
+        );
+    }
+
+    /// A reader that fails `interruptions` times with `kind`, then serves `bytes`.
+    struct Flaky {
+        kind: ErrorKind,
+        interruptions: usize,
+        bytes: &'static [u8],
+    }
+
+    impl Read for Flaky {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.interruptions > 0 {
+                self.interruptions -= 1;
+                return Err(self.kind.into());
+            }
+            let served = self.bytes.len().min(buffer.len());
+            buffer[..served].copy_from_slice(&self.bytes[..served]);
+            self.bytes = &self.bytes[served..];
+            Ok(served)
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_and_any_other_failure_is_a_stopped_peer() {
+        let mut interrupted = Answer::new(Flaky {
+            kind: ErrorKind::Interrupted,
+            interruptions: 3,
+            bytes: b"abcd",
+        });
+        let mut buffer = [0_u8; 4];
+        interrupted.read_all(&mut buffer, "in the test").expect("the read is retried");
+        assert_eq!(&buffer, b"abcd");
+
+        // Before any byte the peer is silent; after some, it is refused.
+        let mut failing = Answer::new(Flaky {
+            kind: ErrorKind::TimedOut,
+            interruptions: 1,
+            bytes: b"abcd",
+        });
+        assert!(matches!(
+            failing.read_all(&mut buffer, "in the test"),
+            Err(ChallengeFailure::Silent(_))
+        ));
+        let mut failing = Answer::new(Flaky {
+            kind: ErrorKind::TimedOut,
+            interruptions: 0,
+            bytes: b"ab",
+        });
+        let mut wanted = [0_u8; 3];
+        failing.read_all(&mut wanted[..2], "in the test").expect("two bytes");
+        assert!(matches!(
+            failing.read_all(&mut wanted[2..], "in the test"),
+            Err(ChallengeFailure::Refused(_))
+        ));
     }
 
     fn assert_silent(outcome: Result<RouteSnapshotResponse, ChallengeFailure>, why: &str) {
