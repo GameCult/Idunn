@@ -11,6 +11,31 @@ on CultLib `codex/fix-node24-ajv-esm`. Behaviour cuts re-take their
 `file:line` anchors in their own briefs. The operator has asked for no live
 mitigation on Yggdrasil yet.
 
+**B3 status, 2026-09-30 (Self).** Hands pushed B3 to `idunn/route-b3` at `5ca7760`; it is based on
+B1's merge `a61540b`, not stacked on B2. The Opus Soul pass found:
+- Full suite green: 252 passed, 2 ignored.
+- `cargo-mutants --in-diff`: 31 caught, 4 missed.
+- Soul's probe P1 drove a stateful route-proof target through the Engine, so the stateful path works; it
+  was only untested.
+
+Verdict: safe to merge for the StreamPixels web ship. The fix batch, in Hands, covers these findings:
+- the evidence tag is a second class authority, and a pre-B3 transaction wedges Routing;
+- the driver's rejections of a bad answer become gate waits instead of errors;
+- the shortfall is prose;
+- `OdinSelf` is decorative, and "is Odin" is still decided by name in five places;
+- Warming is never driven past one step;
+- seven unpinned checks.
+
+Before `idunn up`, one read-only decode of a *copy* of the live `control.cc` checks for non-terminal
+transactions of routed targets with no Odin declaration (operator approved, 2026-09-30).
+
+**Ruling, 2026-09-30: the recipe declares readiness; Idunn infers nothing.** This settles the fork
+Hands raised against a literal Q1(b). An unrouted target whose recipe declares neither a route nor an
+Odin dependency is refused at admission with a typed error. It does not fall back to Odin correlation
+because it has no route. `raven-muninn` and Heimdall both publish to Odin, so their recipes declare it.
+The rejected alternative let Odin's availability gate Muninn's crash recovery through an undeclared,
+inferred dependency.
+
 Heads read for this map:
 
 | Repo | Ref | Notes |
