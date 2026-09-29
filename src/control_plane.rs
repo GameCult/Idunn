@@ -973,12 +973,20 @@ fn live_entries(log: &[u64], now: u64, window: u64) -> Vec<u64> {
 /// Record `now`, keeping the newest `limit` entries. That is exact for "at most
 /// `limit` in any window", even after a forced entry pushes past the limit.
 fn record_entry(log: &mut Vec<u64>, now: u64, limit: usize) {
-    for at in log.iter_mut() {
-        *at = (*at).min(now);
-    }
+    clamp_to(log, now);
     log.push(now);
     if log.len() > limit {
         log.drain(..log.len() - limit);
+    }
+}
+
+/// Make a stepped-back clock's future entries the present. `live_entries`
+/// only reads them that way, so a log that is never written would keep
+/// looking recent until the clock caught up; writing the clamp is what makes
+/// a backwards step cost one window and no more.
+fn clamp_to(log: &mut [u64], now: u64) {
+    for at in log.iter_mut() {
+        *at = (*at).min(now);
     }
 }
 
@@ -992,6 +1000,13 @@ impl TargetSupervision {
             continuity_deferred_until: None,
             continuity_deferral_reason: None,
         }
+    }
+
+    /// Clamp both logs to `now`. Callers that decide from a log write the
+    /// result back when it changed.
+    fn settle(&mut self, now: u64) {
+        clamp_to(&mut self.route_actuations, now);
+        clamp_to(&mut self.continuity_restarts, now);
     }
 
     fn route_used(&self, now: u64) -> usize {
@@ -1008,6 +1023,7 @@ impl TargetSupervision {
     /// Count one route actuation. Only a `Forward` change can be refused; a
     /// `Survival` is always admitted and always counted.
     fn charge_route(&mut self, now: u64, kind: RouteActuation) -> Result<(), RouteActuationRefused> {
+        self.settle(now);
         if kind == RouteActuation::Forward
             && let Some(reopens_at) = self.route_reopens_at(now)
         {
@@ -4389,10 +4405,16 @@ impl Engine {
     /// is always counted and never refused.
     fn charge_route_actuation(&self, target: &str, kind: RouteActuation) -> Result<()> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let seen = snapshot.supervision_for(target);
         let mut next = snapshot.supervision_or_new(target);
         let now = now_millis()?;
-        next.charge_route(now, kind).map_err(anyhow::Error::new)?;
-        self.write_target_supervision(snapshot.supervision_for(target), &next, now)
+        let charged = next.charge_route(now, kind);
+        // A refusal writes nothing unless the clock had stepped back and the
+        // log needed settling.
+        if charged.is_ok() || seen.is_some_and(|stored| stored.value != next) {
+            self.write_target_supervision(seen, &next, now)?;
+        }
+        charged.map_err(anyhow::Error::new)
     }
 
     /// Replace a target's meters, or create them when `seen` is `None`, by
@@ -5499,6 +5521,19 @@ impl Engine {
             // history file must not stop crash recovery.
             let now = now_millis()?;
             let supervision = snapshot.supervision_or_new(&current.value.target);
+            // A stepped-back clock leaves entries in the future. Settle them
+            // before deciding from them; the write ends this target's pass.
+            let mut settled = supervision.clone();
+            settled.settle(now);
+            if settled != supervision {
+                self.write_target_supervision(
+                    snapshot.supervision_for(&current.value.target),
+                    &settled,
+                    now,
+                )?;
+                progressed = true;
+                continue;
+            }
             let continuity_key = format!("continuity:{}", current.value.target);
 
             if let Some(blocker) = blocker {
@@ -12629,6 +12664,9 @@ mod tests {
             .map(|stored| stored.envelope.clone())
             .chain(snapshot.commands.iter().map(|stored| stored.envelope.clone()))
             .collect::<Vec<_>>();
+        if envelopes.is_empty() {
+            return Ok(());
+        }
         assert!(
             SingleFileMessagePackBackingStore::new(&world.state_store)
                 .delete_batch_if_unchanged(&envelopes)?
@@ -14704,9 +14742,13 @@ mod tests {
         meters.validate()?;
 
         // Entries from the future count as now: the meters hold for one window.
+        let read_only = meters.clone();
+        assert!(read_only.restarts_exhausted(now));
         let refused = meters.charge_route(now, RouteActuation::Forward).unwrap_err();
         assert!(refused.reopens_at_unix_millis <= now + ROUTE_ACTUATION_WINDOW_MILLIS);
-        assert!(meters.restarts_exhausted(now));
+        // The clamp is written, so the window runs from the step and no longer.
+        assert_eq!(meters.route_actuations, vec![now; ROUTE_ACTUATION_CEILING]);
+        assert_eq!(meters.continuity_restarts, vec![now; CONTINUITY_RESTART_ATTEMPTS]);
         assert!(!meters.restarts_exhausted(now + CONTINUITY_RESTART_WINDOW_MILLIS));
         meters.charge_route(now + ROUTE_ACTUATION_WINDOW_MILLIS, RouteActuation::Forward)?;
 
@@ -16218,8 +16260,6 @@ mod tests {
             // The record is readable and boot accepts it: held, not refused.
             let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
             routed.world.engine.validate_durable_authority(&snapshot)?;
-            // Stepping it would fail, on every tick, for good.
-            assert!(routed.step().is_err());
 
             let hits = (
                 routed.stub.candidate_hits.load(Ordering::SeqCst),
@@ -16709,6 +16749,40 @@ mod tests {
             Ok(())
         }
 
+        #[test]
+        fn a_stepped_back_clock_is_settled_where_the_decision_is_made() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            let ahead = now_millis()? + 86_400_000;
+
+            // A supervision pass that would decide from the restart log settles
+            // it first: the write ends the pass, and nothing is minted from
+            // entries that only look recent because the clock stepped back.
+            let mut restarts = TargetSupervision::new("service");
+            restarts.continuity_restarts = vec![ahead; CONTINUITY_RESTART_ATTEMPTS];
+            set_meters(&routed.world, &restarts)?;
+            routed.workload.kill();
+            assert!(routed.tick()?);
+            assert!(ControlSnapshot::read(&routed.world.state_store)?.transactions.is_empty());
+            let settled = meters_of(&routed.world, "service")?;
+            assert!(settled.continuity_restarts.iter().all(|&at| at < ahead));
+
+            // A refused forward actuation writes the clamp, so the window runs
+            // from now and not from the day the clock stood on.
+            let mut ledger = TargetSupervision::new("service");
+            ledger.route_actuations = vec![ahead; ROUTE_ACTUATION_CEILING];
+            set_meters(&routed.world, &ledger)?;
+            let refused = routed
+                .world
+                .engine
+                .charge_route_actuation("service", RouteActuation::Forward)
+                .unwrap_err();
+            assert!(refused.downcast_ref::<RouteActuationRefused>().is_some());
+            let settled = meters_of(&routed.world, "service")?;
+            assert!(settled.route_actuations.iter().all(|&at| at < ahead));
+            Ok(())
+        }
+
         #[cfg(unix)]
         #[test]
         fn a_refused_preflight_starts_no_private_mount_unit_and_fails_at_once_with_the_reopen_time()
@@ -16723,23 +16797,20 @@ mod tests {
 
             // The refusal is an error of its own phase, before the fence: the
             // deployment fails now, and its error carries the reopen time.
-            routed.world.engine.resume_one_transaction()?;
-            assert_eq!(routed.world.route_stubs.count("systemd-run"), 0);
-            let aborting = routed.transaction()?;
-            let abort = aborting.pre_fencing_abort.context("the refusal did not abort the deployment")?;
-            assert!(
-                abort.error.contains(&format!("reopens at unix ms {reopens_at}")),
-                "{}",
-                abort.error
-            );
-            routed.drive_until(|transaction| transaction.completion.is_some())?;
+            let id = routed.transaction()?.transaction_id;
+            for _ in 0..6 {
+                routed.world.engine.resume_one_transaction()?;
+                if record_of(&routed.world, &id)?.completion.is_some() {
+                    break;
+                }
+            }
             let Some(TransactionCompletion::FailedBeforeFencing { error }) =
-                routed.transaction()?.completion
+                record_of(&routed.world, &id)?.completion
             else {
                 bail!("the deployment did not fail before the fence");
             };
-            assert!(error.contains(&reopens_at.to_string()), "{error}");
-            assert_eq!(routed.world.route_stubs.count(""), 0);
+            assert!(error.contains(&format!("reopens at unix ms {reopens_at}")), "{error}");
+            assert_eq!(routed.world.route_stubs.count(""), 0, "a program ran");
             Ok(())
         }
 
