@@ -73,6 +73,23 @@ live host on install. 294 passed, 2 ignored. `cargo mutants --in-diff`: 53 caugh
 record on its own. An operator can discard a held Deploy that has not reached the fence with `idunn cancel`.
 Nothing is fenced, so the incumbent is untouched.
 
+**B3 follow-ups landed on `idunn/route-b3` at `5c49646`, 2026-09-30.**
+- Cancel accepts a held pre-fence Deploy. It shares `pre_fencing_abort_intent` with the scheduler.
+- The P1b test is now in direct-supervision form, with a positive control.
+- The reader is strict: trailers share the 32 KiB header budget; digits only; header names without whitespace.
+- The `Silent` doc is corrected.
+- Tests: 301 pass. `a_failing_step_is_retried_after_a_backoff_not_every_tick` is flaky under a full parallel
+  run, on the base too.
+- `cargo mutants --in-diff`: 24 caught, 0 missed.
+- A narrow Soul pass gates the install.
+
+**Ruling, 2026-09-30 (operator): the dead-hold report is stored on the generation.**
+- Add an optional `last_error` to `AdmittedGeneration` (new key 21), and make `status` render admitted
+  generations.
+- It is cleared when the generation is replaced or its hold is released.
+- The `generation:<target>` readiness report gets the same home.
+- It is queued after the ship, with the B2 rework.
+
 **Odin diagnosis (Eyes, read-only, 2026-09-30).**
 - The 109 Odin route timeouts are self-inflicted. Live Idunn (`8ae00a1`, pre-S1) reloads nginx inside
   `restore_admitted_membership` before every Odin challenge. The reload moves the reuseport UDP flow, so
