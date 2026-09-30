@@ -714,12 +714,15 @@ pub(crate) mod tests {
             assert!(outcome.is_err());
         }
         assert_eq!(std::fs::read(&path).unwrap(), before, "a contended write changed the file");
-        assert!(!temp.path().join("incident-history.cc").exists());
 
         // Nothing was lost by the refusal: the same calls land once it is free.
+        // (Retirement archives first, so its refused delete left the record in
+        // history too; the repeat archives nothing twice.)
         assert!(store.open(condition, "new", CLOSED).unwrap());
         assert!(store.close(condition, "open", CloseReason::Recovered, CLOSED).unwrap());
         assert!(store.retire_closed(retired).unwrap());
+        let history = SingleFileMessagePackBackingStore::new(&temp.path().join("incident-history.cc"));
+        assert_eq!(history.pull_all_read_only_snapshot().unwrap().len(), 1);
     }
 
     #[cfg(unix)]
