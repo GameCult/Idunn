@@ -467,15 +467,17 @@ pub fn select_dependencies(
 /// overrides any of them; the resolved values are frozen into the plan.
 pub const DEFAULT_FENCING_DEADLINE_SECONDS: u32 = 120;
 pub const DEFAULT_LEASING_DEADLINE_SECONDS: u32 = 120;
-// Unsafe for streampixels-service (startup = "create-or-open-after-write-lease"):
-// its Postgres migrations run inside AwaitingReady. B5 requires an explicit
-// binding value for stateful targets instead of this default.
+// A stateful candidate may run migrations inside AwaitingReady (streampixels-
+// service runs Postgres's there). When this passes, a deployment whose
+// candidate was issued a write lease is left to the operator, not aborted; a
+// continuity is aborted and its release restarted.
 pub const DEFAULT_AWAITING_READY_DEADLINE_SECONDS: u32 = 300;
 pub const DEFAULT_ROUTING_DEADLINE_SECONDS: u32 = 120;
 pub const DEFAULT_COMMITTING_DEADLINE_SECONDS: u32 = 120;
 
-/// The resolved per-phase deadline durations a plan carries. Nothing reads
-/// them at the cut that introduced them.
+/// The resolved per-phase deadline durations a plan carries. Entering a
+/// post-fencing phase stamps its deadline from them, and the deadline
+/// resolver ends the phase once it passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhaseDeadlines {
