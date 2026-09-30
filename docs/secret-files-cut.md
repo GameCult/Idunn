@@ -29,6 +29,20 @@ happen again".
   - **S5-4 to S5-7.** Test gaps: canary position, the `errorIdentity` filters, pool close, spread-env reads.
   - A flaky live-Postgres test.
 - Noted, not in scope: **S5-8**, forced RLS with no policy passes the check.
+- **Batch 6** (`b5d7b6b..6c0c876`): S5-1 through S5-7 fixed, and the flaky live test fixed (template DB clone, `fixturePool`).
+  Result: 241 passed, 24/24 live, 40 of 41 mutants killed. The survivor, X13, is equivalent: pg-pool destroys a
+  failed client.
+- **Soul pass 6: hold.** Batch 7 is in Hands.
+  - **F1.** An invalid or not-ready unique index passes the check. That breaks sign-in (42P10) and R21.1, because a
+    consume takes 2 rows.
+  - **F2.** A key index under a nondeterministic collation passes, and the upsert then moves one account's identity
+    row to another account.
+  - **F3.** The predicate normaliser is unsound: it strips parentheses and lowercases literals.
+  - **F4.** Some databases the store could serve are refused: indexes are required by name, and column-level grants
+    are not accepted.
+  - **F5.** The recipe exploration's all-at-once run stops early; mutants Z4, Z5 and Z6 survive.
+  - **F6-F8.** An inspected `cause` is not covered, a narrowed predicate has no fixture, and an added NOT NULL on a
+    nullable column is not caught. CHECK constraints and triggers are out of scope, as S5-8 is.
 
 **Rulings and defaults, 2026-09-30 (Self).**
 - **Q3 A is the operator's ruling:** "I'll rotate before prod". Cuts 1-4 land with the current values; rotation
