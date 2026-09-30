@@ -43,6 +43,25 @@ happen again".
   - **F5.** The recipe exploration's all-at-once run stops early; mutants Z4, Z5 and Z6 survive.
   - **F6-F8.** An inspected `cause` is not covered, a narrowed predicate has no fixture, and an added NOT NULL on a
     nullable column is not caught. CHECK constraints and triggers are out of scope, as S5-8 is.
+- **Batch 7** (`6c0c876..ca2366c`): F1-F8 fixed.
+  - Keys must be `indisvalid` with deterministic collations.
+  - Predicates are printed by Postgres, using a TEMP table in a rolled-back transaction, and compared as sets of
+    AND conditions.
+  - Index names are not required. Column privileges are checked with `has_column_privilege`. A nullable column must
+    stay nullable.
+  - Results: 241 passed, 39/39 live, 60/61 mutants killed.
+- **Soul pass 7: merge.** Nothing blocks.
+  - 1400 predicate pairs were checked, and no two different predicates compared equal.
+  - The `indisvalid` argument held under interrupted concurrent DDL.
+  - TEMP is never refused for the real deployment, because the service role owns the database.
+- **MERGED: Heimdall main fast-forwarded to `ca2366c` (2026-09-30).**
+- Follow-up branch in Hands:
+  - S7-1: the recipe exploration never runs the production start shape.
+  - S7-2: extra unique indexes and similar documented as out of scope.
+  - S7-3: the column collation must be deterministic.
+  - S7-4: one more fixture each for Y3, Y4, Y5 and Y8.
+- **Recorded:** a least-privilege column-subset grant is refused (F4(b)). That is theoretically servable, but it is
+  not how Heimdall is deployed.
 
 **Rulings and defaults, 2026-09-30 (Self).**
 - **Q3 A is the operator's ruling:** "I'll rotate before prod". Cuts 1-4 land with the current values; rotation
