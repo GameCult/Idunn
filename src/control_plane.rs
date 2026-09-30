@@ -78,10 +78,11 @@ const CONTINUITY_RESTART_BACKOFF_MILLIS: u64 = 5_000;
 /// ceiling, never counted against it and never refused by it, so a target
 /// whose continuity spent its restarts can still be rescued by a deploy.
 /// Survival is bounded elsewhere: a continuity's actuations by the restart log
-/// times what one transaction can do before its phase deadline ends it, an
-/// admitted-route repair by the challenge backoff, and a withdrawal by the
-/// route driver, which does not reload a fragment that is already correct.
-/// Nothing bounds reloads across the host.
+/// times what one transaction can do before its phase deadline ends it (none,
+/// over its admitted route), and an admitted-route repair by the challenge
+/// backoff. A withdrawal that keeps failing retries, reloading each time,
+/// under the resume backoff alone: the abort has no deadline. Nothing bounds
+/// reloads across the host.
 const ROUTE_ACTUATION_CEILING: usize = 12;
 const ROUTE_ACTUATION_WINDOW_MILLIS: u64 = 3_600_000;
 /// How many Survival route actuation times a target keeps, for `status`
@@ -17868,10 +17869,7 @@ mod tests {
                 .engine
                 .begin_post_fencing_abort(&resident(&aborting.world)?, anyhow!("test"))?;
             aborting.step()?;
-            // Nothing was installed, so the withdrawal has no fragment to
-            // remove and no reload to run: it withdraws the endpoint.
-            assert_eq!(aborting.reloads(), 0);
-            assert_eq!(aborting.world.route_stubs.count("ufw delete"), 1, "the withdrawal did not run");
+            assert_eq!(aborting.reloads(), 1, "the withdrawal did not run");
             assert!(newest(&aborting.world)? > before, "the withdrawal was not recorded");
 
             // (ii) Supervision repairs a drifted admitted fragment.
@@ -17964,7 +17962,7 @@ mod tests {
                 &preflight,
                 &engine.route_gate("service", CommandKind::Deploy),
             )?;
-            assert_eq!(routed.world.route_stubs.count("ufw delete"), 1, "the unrecorded withdrawal did not run");
+            assert_eq!(routed.reloads(), 1, "the unrecorded withdrawal did not run");
             Ok(())
         }
 
@@ -18191,7 +18189,7 @@ mod tests {
 
         #[cfg(unix)]
         #[test]
-        fn a_failing_reload_that_deletes_the_fragment_backs_the_route_off() -> Result<()> {
+        fn a_failing_reload_that_puts_the_drift_back_backs_the_route_off() -> Result<()> {
             let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
             routed.admit()?;
             routed.world.route_stubs.refuse_reloads()?;
@@ -18201,7 +18199,7 @@ mod tests {
                 routed.tick()?;
             }
             assert_eq!(routed.reloads() - reloads, 1, "the route was reloaded again and again");
-            assert!(!routed.fragment_path().exists());
+            assert_eq!(std::fs::read(routed.fragment_path())?, b"drifted bytes\n");
             assert!(admitted(&routed)?.route_supervision.unwrap().degraded_since_unix_millis.is_some());
             Ok(())
         }
@@ -18302,8 +18300,7 @@ mod tests {
         /// Soul's F1 probe, committed. A continuity's route changes are
         /// Survival, so no ceiling refuses its install and rollback while its
         /// route proof keeps failing. The Routing deadline ends it: no attempt
-        /// runs after the deadline, and the withdrawal of a rolled-back route
-        /// reloads nothing.
+        /// runs after the deadline.
         #[cfg(unix)]
         #[test]
         fn a_continuity_whose_route_proof_fails_ends_at_its_routing_deadline() -> Result<()> {
@@ -18344,7 +18341,9 @@ mod tests {
                 "{:?}",
                 finished.completion
             );
-            assert_eq!(routed.reloads(), 6, "a reload ran after the deadline");
+            // After the deadline no attempt runs; the withdrawal writes and
+            // reloads once, whatever the rolled-back disk shows.
+            assert_eq!(routed.reloads(), 7, "an attempt ran after the deadline");
             Ok(())
         }
 
@@ -18386,33 +18385,28 @@ mod tests {
             Ok(())
         }
 
-        /// Soul's F2 probe, committed: a post-fence withdrawal whose
-        /// `ufw delete` keeps failing reloads once, then repeats only the
-        /// firewall step.
+        /// The abort's withdrawal wrote the baseline back and Idunn died before
+        /// the reload: the disk already shows the baseline, and the retry still
+        /// reloads, so nginx does not keep proxying to the stopped candidate.
         #[cfg(unix)]
         #[test]
-        fn a_withdrawal_whose_firewall_step_keeps_failing_reloads_once() -> Result<()> {
+        fn an_abort_whose_reload_a_crash_cut_off_reloads_on_retry() -> Result<()> {
             let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
             routed.stub.set_state("active");
             routed.run_to_routing()?;
             routed.promote()?;
-            assert!(routed.fragment_path().exists());
             let installed = routed.reloads();
-            routed.world.route_stubs.refuse_ufw_deletes()?;
             routed
                 .world
                 .engine
                 .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("test"))?;
-            for _ in 0..20 {
-                routed.resume()?;
-            }
-            assert_eq!(routed.reloads(), installed + 1, "a failing withdrawal reloaded again");
-            assert_eq!(routed.world.route_stubs.count("ufw delete"), 20);
-            assert!(!routed.fragment_path().exists());
+            std::fs::remove_file(routed.fragment_path())?;
+            routed.resume()?;
             assert_eq!(
                 routed.transaction()?.post_fencing_abort.context("no abort")?.route_restoration,
-                CleanupEvidence::Pending
+                CleanupEvidence::Complete
             );
+            assert_eq!(routed.reloads(), installed + 1, "the withdrawal trusted unloaded bytes");
             Ok(())
         }
 

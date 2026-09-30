@@ -707,6 +707,14 @@ const ROUTE_HTTP_CHUNK_LINE_BYTES: usize = 128;
 const ROUTE_HTTP_SNAPSHOT_PATH: &str = "/cultnet/snapshot";
 
 impl RoutePreflightReceipt {
+    /// Whether the candidate's membership differs from the baseline the
+    /// preflight found. A continuity over its admitted route does not: its
+    /// transaction has no route change to make or to undo.
+    pub fn changes_route(&self) -> bool {
+        self.incumbent_membership_sha256.as_deref()
+            != Some(self.candidate_membership_sha256.as_str())
+    }
+
     pub fn validate(&self) -> Result<()> {
         require_driver_id(&self.route_id, "route preflight")?;
         require_sha256_id(
@@ -5332,28 +5340,21 @@ impl NginxRouteDriver {
         }
     }
 
-    /// Put `prior` back as the route's fragment. Bytes on disk are what nginx
-    /// last loaded: every write here and in `install` is undone when the
-    /// reload after it fails. So a fragment that already equals `prior` is
-    /// live, and is neither written nor reloaded; a retry of a withdrawal
-    /// whose firewall step failed repeats only that step.
+    /// Put `prior` back as the route's fragment, and always write and reload:
+    /// on a transaction path, bytes on disk that already equal `prior` may be
+    /// a write whose reload a crash cut off. A reload that fails puts the
+    /// previous fragment back, so the disk shows what nginx still serves.
     fn restore(&self, prior: Option<&[u8]>, gate: &dyn RouteActuationGate) -> Result<()> {
-        let current = self.current_configuration()?;
-        let rewrite = current.as_deref() != prior;
-        if !rewrite && prior.is_some() {
-            return Ok(());
-        }
         gate.admit(RouteActuation::Survival)?;
-        if rewrite {
-            self.write_fragment(prior)?;
-            if let Err(reload) = self.reload() {
-                return match self.write_fragment(current.as_deref()) {
-                    Ok(()) => Err(reload).context("reloading the restored route"),
-                    Err(undo) => Err(reload).context(format!(
-                        "reloading the restored route; putting the previous fragment back also failed: {undo:#}"
-                    )),
-                };
-            }
+        let current = self.current_configuration()?;
+        self.write_fragment(prior)?;
+        if let Err(reload) = self.reload() {
+            return match self.write_fragment(current.as_deref()) {
+                Ok(()) => Err(reload).context("reloading the restored route"),
+                Err(undo) => Err(reload).context(format!(
+                    "reloading the restored route; putting the previous fragment back also failed: {undo:#}"
+                )),
+            };
         }
         // No prior membership means the stable endpoint no longer routes to
         // anything; its firewall allow goes with the fragment.
@@ -5435,11 +5436,15 @@ impl NginxRouteDriver {
                     && prior_sha256 == preflight.incumbent_membership_sha256),
             "route baseline changed after preflight"
         );
-        // Bytes on disk are what nginx last loaded (see `restore`), so a
-        // candidate already written is installed: a retry changes nothing.
-        if candidate_already_written {
+        // A candidate whose membership is the baseline's (a continuity over
+        // its admitted route) changes nothing, so nothing is written, and no
+        // crash can have cut a write of this transaction short.
+        if !preflight.changes_route() {
             return Ok(sha256_id(&rendered));
         }
+        // Otherwise bytes already on disk prove nothing: a crash may have cut
+        // off the reload after an earlier attempt's write. So it always
+        // writes and reloads.
         gate.admit(RouteActuation::Forward)?;
         atomic_replace(&self.binding.config_path, &rendered)?;
         if let Err(error) = self.admit_endpoint().and_then(|()| self.reload()) {
@@ -5488,12 +5493,6 @@ impl NginxRouteDriver {
         Ok(self.current_configuration()?.as_deref() == Some(rendered.as_slice()))
     }
 
-    /// Restore the exact membership owned by an admitted generation. Any
-    /// different fragment is drift, not a rollback baseline, so it is never
-    /// restored after a failed reload. A failed reload removes the newly
-    /// written fragment so the next continuity pass cannot mistake disk bytes
-    /// for an adopted route. The caller must still challenge the stable
-    /// listener to prove that nginx workers adopted this membership.
     /// Put the route back exactly as the candidate found it.
     ///
     /// The preflight receipt captured the incumbent's configuration before this
@@ -5510,11 +5509,21 @@ impl NginxRouteDriver {
             preflight.route_id == self.binding.route_id,
             "route preflight receipt describes another route"
         );
+        if !preflight.changes_route() {
+            return Ok(());
+        }
         self.restore(preflight.incumbent_configuration.as_deref(), gate)
     }
 
+    /// Restore the exact membership owned by an admitted generation. A failed
+    /// reload puts back the bytes it replaced, so the disk still shows what
+    /// nginx serves and the next pass sees the drift again rather than taking
+    /// unloaded bytes for an adopted route. The caller must still challenge
+    /// the stable listener to prove that nginx workers adopted this membership.
+    ///
     /// A fragment already equal to the admitted membership is left alone: no
-    /// write, no `nginx -t`, no firewall call, no reload.
+    /// write, no `nginx -t`, no firewall call, no reload. Supervision is the
+    /// only path that skips on equal bytes.
     pub fn restore_admitted_membership(
         &self,
         expected: &IdunnExpectedIncarnationRecord,
@@ -5531,12 +5540,13 @@ impl NginxRouteDriver {
         }
         gate.admit(RouteActuation::Survival)?;
         self.validate_candidate_in_private_mount(&rendered)?;
+        let replaced = self.current_configuration()?;
         atomic_replace(&self.binding.config_path, &rendered)?;
         if let Err(reload) = self.admit_endpoint().and_then(|()| self.reload()) {
-            return match self.write_fragment(None) {
+            return match self.write_fragment(replaced.as_deref()) {
                 Ok(()) => Err(reload).context("reloading the exact admitted route membership"),
-                Err(cleanup) => Err(reload).context(format!(
-                    "reloading the exact admitted route membership; removing its unproved fragment also failed: {cleanup:#}"
+                Err(undo) => Err(reload).context(format!(
+                    "reloading the exact admitted route membership; putting the replaced fragment back also failed: {undo:#}"
                 )),
             };
         }
@@ -5671,6 +5681,9 @@ impl NginxRouteDriver {
             self.current_configuration()?.as_deref() == Some(rendered.as_slice()),
             "candidate route changed before rollback"
         );
+        if !preflight.changes_route() {
+            return Ok(());
+        }
         self.restore(preflight.incumbent_configuration.as_deref(), gate)
     }
 }
@@ -11882,49 +11895,57 @@ Content-Le".to_vec()), |_| {}),
         }
     }
 
-    /// A retry whose fragment is already what it would write reloads nothing:
-    /// an install already written, and a withdrawal whose firewall step is
-    /// what failed, repeat only what is still undone.
+    /// On a transaction path, bytes already on disk prove nothing: a crash may
+    /// have cut off the reload after the write. The install past the fence and
+    /// the withdrawal both write and reload whatever the disk shows, and the
+    /// install admits its firewall allow again.
     #[cfg(unix)]
     #[test]
-    fn a_retry_with_an_already_correct_fragment_performs_zero_reloads() -> Result<()> {
+    fn a_crash_between_a_write_and_its_reload_is_reloaded_on_retry() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let (driver, candidate, calls) = failable_route_driver(temp.path())?;
         let receipt = preflight_receipt(&driver, &candidate)?;
+        let rendered = driver.render(&candidate)?;
+
+        // The install wrote its fragment and Idunn died before the reload.
+        fs::write(&driver.binding.config_path, &rendered)?;
+        driver.install(&candidate, &digest('a'), &receipt, false, &Unmetered)?;
+        assert_eq!(logged(&calls, "systemctl reload"), 1, "the unloaded install was not reloaded");
+        assert_eq!(logged(&calls, "ufw allow"), 1, "the first deploy's allow was skipped");
+
+        // The withdrawal removed it and Idunn died before the reload.
+        fs::remove_file(&driver.binding.config_path)?;
+        driver.withdraw_candidate_membership(&receipt, &Unmetered)?;
+        assert_eq!(logged(&calls, "systemctl reload"), 2, "the unloaded withdrawal was not reloaded");
+        assert_eq!(logged(&calls, "ufw delete"), 1);
+        Ok(())
+    }
+
+    /// A continuity over its admitted route has the baseline's membership: its
+    /// install, rollback and withdrawal change nothing and run nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_transaction_that_does_not_change_the_route_runs_nothing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (driver, candidate, calls) = failable_route_driver(temp.path())?;
+        let rendered = driver.render(&candidate)?;
+        let mut receipt = preflight_receipt(&driver, &candidate)?;
+        receipt.incumbent_runtime_instance_id = Some(digest('b'));
+        receipt.incumbent_membership_sha256 = Some(sha256_id(&rendered));
+        receipt.incumbent_configuration = Some(rendered.clone());
+        assert!(!receipt.changes_route());
+        fs::write(&driver.binding.config_path, &rendered)?;
         let gate = Recording(Default::default());
 
         driver.install(&candidate, &digest('a'), &receipt, false, &gate)?;
-        assert_eq!(logged(&calls, "systemctl reload"), 1);
-        for _ in 0..3 {
-            driver.install(&candidate, &digest('a'), &receipt, false, &gate)?;
-        }
-        assert_eq!(logged(&calls, "systemctl reload"), 1, "an installed candidate reloaded again");
-        assert_eq!(logged(&calls, "ufw allow"), 1);
-        assert_eq!(*gate.0.borrow(), [RouteActuation::Forward], "a no-op was charged");
-
-        // The withdrawal removes the fragment and reloads, then its firewall
-        // step fails. Each retry repeats the firewall step and nothing else.
-        fs::write(temp.path().join("ufw.fail"), b"x")?;
-        assert!(driver.withdraw_candidate_membership(&receipt, &gate).is_err());
-        assert!(!driver.binding.config_path.exists());
-        assert_eq!(logged(&calls, "systemctl reload"), 2);
-        for _ in 0..5 {
-            assert!(driver.withdraw_candidate_membership(&receipt, &gate).is_err());
-        }
-        assert_eq!(logged(&calls, "systemctl reload"), 2, "a failing withdrawal reloaded again");
-        assert_eq!(logged(&calls, "ufw delete"), 6);
-        fs::remove_file(temp.path().join("ufw.fail"))?;
+        driver.rollback(&candidate, &digest('a'), &receipt, &gate)?;
         driver.withdraw_candidate_membership(&receipt, &gate)?;
-        assert_eq!(logged(&calls, "systemctl reload"), 2);
-        assert_eq!(logged(&calls, "ufw delete"), 7);
+        assert_eq!(logged(&calls, ""), 0, "an unchanged route ran a program");
+        assert!(gate.0.borrow().is_empty(), "an unchanged route was charged");
+        assert_eq!(fs::read(&driver.binding.config_path)?, rendered);
 
-        // A restore to bytes already on disk runs no program and asks nothing.
-        let rendered = driver.render(&candidate)?;
-        fs::write(&driver.binding.config_path, &rendered)?;
-        let (programs, asked) = (logged(&calls, ""), gate.0.borrow().len());
-        driver.restore(Some(&rendered), &gate)?;
-        assert_eq!(logged(&calls, ""), programs);
-        assert_eq!(gate.0.borrow().len(), asked);
+        // The first-route receipt does change it.
+        assert!(preflight_receipt(&driver, &candidate)?.changes_route());
         Ok(())
     }
 
@@ -12219,7 +12240,9 @@ Content-Le".to_vec()), |_| {}),
                 .restore_admitted_membership(&candidate, &admitted.membership_sha256, &Unmetered)
                 .is_err()
         );
-        assert!(!config.exists());
+        // The failed reload puts back what it replaced: the disk shows what
+        // nginx still serves.
+        assert_eq!(fs::read(&config)?, b"foreign route after admission\n");
         fs::remove_file(systemctl.with_extension("fail"))?;
         driver.restore_admitted_membership(&candidate, &admitted.membership_sha256, &Unmetered)?;
         assert_eq!(fs::read(&config)?, admitted_bytes);
