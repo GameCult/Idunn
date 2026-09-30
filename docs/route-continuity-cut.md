@@ -590,6 +590,20 @@ have written. (c) trusts a declaration over evidence.
 Depends on it: B5, the recovery variants of the terminal record, and the
 replacement for `idunn cancel`.
 
+**Q3 follow-ups from B5 Hands (`hands/b5` `c06ff2b`), 2026-09-30:**
+- **Q3-i: does an issued lease with no adoption evidence count as possibly
+  written?** **RULED yes** by the operator, 2026-09-30. A candidate cannot prove
+  it holds the lease while warming, and streampixels-service migrates in exactly
+  that window. So any issued lease on a deploy is treated as possibly adopted.
+- **Q3-ii: after an adopted-lease deploy expires, what stops continuity from
+  restarting the incumbent on state the candidate may have migrated?** OPEN.
+  The operator on the offered hold-until-next-`idunn up` option, verbatim: "I
+  don't like any of these options, unless a stateful deploy running out of time
+  is an extreme edge case, in which case A". It is not extreme: the default
+  `awaiting_ready` deadline is 300 s (`deployment_plan.rs:474`), so any stateful
+  release that migrates and then fails to reach Ready lands here. Alternatives
+  are being put to the operator.
+
 **Q4. The operator's recovery verb after `8ae00a1` is deleted.**
 
 **RULED (b) by the operator, 2026-09-29.**
