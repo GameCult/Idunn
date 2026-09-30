@@ -4483,25 +4483,23 @@ impl Engine {
     }
 
     /// Replace an admitted generation by compare-exchange against the envelope
-    /// that was read.
+    /// that was read. `Ok(false)` is a lost race: another writer moved the
+    /// record, so the caller's snapshot is stale. `Err` is a write the store
+    /// refused, which changed nothing.
     fn replace_generation(
         &self,
         seen: &Stored<AdmittedGeneration>,
         next: &AdmittedGeneration,
         now: u64,
-    ) -> Result<()> {
-        ensure!(
-            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
-                &[CultCacheExpectedEnvelope {
-                    r#type: AdmittedGeneration::TYPE.into(),
-                    key: seen.value.target.clone(),
-                    current: Some(seen.envelope.clone()),
-                }],
-                &[admitted_envelope(next, now)?],
-            )?,
-            "admitted generation changed before its write"
-        );
-        Ok(())
+    ) -> Result<bool> {
+        Ok(SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: AdmittedGeneration::TYPE.into(),
+                key: seen.value.target.clone(),
+                current: Some(seen.envelope.clone()),
+            }],
+            &[admitted_envelope(next, now)?],
+        )?)
     }
 
     /// Say a fault once while it lasts, under `key`.
@@ -5884,12 +5882,14 @@ impl Engine {
                 ("failed", due)
             }
         };
-        // Progress is a record that landed. A write the store refused changed
-        // nothing: the pass reports no progress, the scheduler sleeps if nothing
-        // else moved, and the in-memory wait spaces the next challenge.
+        // Progress is a store that changed: our record landed, or another
+        // writer beat it (the snapshot is stale either way, so the pass ends).
+        // A write the store refused changed nothing: no progress, the scheduler
+        // sleeps if nothing else moved, and the in-memory wait spaces the next
+        // challenge.
         let record_key = format!("route-record:{}", current.value.target);
         match self.replace_generation(current, &next, now) {
-            Ok(()) => {
+            Ok(_) => {
                 self.challenge_wait
                     .lock()
                     .expect("challenge wait mutex")
