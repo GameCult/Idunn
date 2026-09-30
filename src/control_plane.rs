@@ -18829,9 +18829,19 @@ mod tests {
                 schema_id: Some(cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into()),
             };
             replace_odin_entry(&routed.world.engine.options.odin_correlation_store, ready)?;
-            routed.step()?;
+            // One step admits the new sequence, the next records Ready from it.
+            for _ in 0..3 {
+                if routed.transaction()?.ready.is_some() {
+                    break;
+                }
+                routed.step()?;
+            }
             let adopted = routed.transaction()?;
-            assert!(matches!(adopted.ready, Some(ReadinessEvidence::OdinCorrelated { .. })));
+            assert!(
+                matches!(adopted.ready, Some(ReadinessEvidence::OdinCorrelated { .. })),
+                "{:?}",
+                adopted.last_error
+            );
             let adoption = adopted.lease_adoption.context("Odin's Ready recorded no adoption")?;
             assert_eq!(adoption.source, AdoptionSource::OdinTopology);
             assert_eq!(adoption.write_lease_sha256, lease);
