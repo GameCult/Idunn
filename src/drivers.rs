@@ -5894,10 +5894,16 @@ fn request_http_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, 
             let mut response = Vec::new();
             loop {
                 let size = answer.read_line(ROUTE_HTTP_CHUNK_LINE_BYTES, body)?;
+                // RFC 9112 7.1: `chunk-size [ chunk-ext ] CRLF`, where an
+                // extension may follow whitespace. Nothing else is trimmed.
                 let size = std::str::from_utf8(&size)
                     .ok()
-                    .and_then(|size| size.split(';').next())
-                    .and_then(|size| parse_digits(size.trim_matches([' ', '\t']), 16))
+                    .and_then(|line| match line.split_once(';') {
+                        Some((digits, _extension)) => {
+                            parse_digits(digits.trim_end_matches([' ', '\t']), 16)
+                        }
+                        None => parse_digits(line, 16),
+                    })
                     .context("stable CultNet HTTP chunk size is invalid")
                     .map_err(refused)?;
                 if size == 0 {
@@ -8876,9 +8882,15 @@ mod tests {
 
     /// An honest chunked answer with `after_body` in place of its end.
     fn chunked_honest_then(id: &str, after_body: &[u8]) -> Vec<u8> {
+        chunked_honest_sized(id, "", "", after_body)
+    }
+
+    /// An honest chunked answer whose chunk-size line is the hex length between
+    /// `before` and `after`.
+    fn chunked_honest_sized(id: &str, before: &str, after: &str, after_body: &[u8]) -> Vec<u8> {
         let body = honest_body(id);
         let mut reply = CHUNKED_HEAD.to_vec();
-        reply.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        reply.extend_from_slice(format!("{before}{:x}{after}\r\n", body.len()).as_bytes());
         reply.extend_from_slice(&body);
         reply.extend_from_slice(b"\r\n");
         reply.extend_from_slice(after_body);
@@ -8892,6 +8904,34 @@ mod tests {
             .expect("an honest chunked answer");
         challenge(scripted_peer(|id| chunked_honest_then(id, b"0\r\nT: 1\r\nU: 2\r\n\r\n")), |_| {})
             .expect("an honest chunked answer with trailers");
+
+        // RFC 9112 7.1: whitespace may precede a chunk extension and nothing
+        // else. The answer is otherwise honest, so only the size line differs.
+        for (before, after) in [("", ";x"), ("", " ;x"), ("", "\t;x"), ("", ";x=1;y")] {
+            challenge(
+                scripted_peer(move |id| chunked_honest_sized(id, before, after, b"0\r\n\r\n")),
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("size line {before:?}+size+{after:?}: {error:?}"));
+        }
+        for (why, before, after) in [
+            ("whitespace before the chunk size", " ", ""),
+            ("a tab before the chunk size", "\t", ""),
+            ("whitespace after the chunk size and no extension", "", " "),
+            ("whitespace before the size, ahead of an extension", " ", ";x"),
+            ("a vertical tab before an extension", "", "\x0b;x"),
+            ("a carriage return before an extension", "", "\r;x"),
+            ("a bare carriage return ends the size line", "", "\r"),
+            ("a doubled carriage return ends the size line", "", "\r\r"),
+        ] {
+            assert_refused(
+                challenge(
+                    scripted_peer(move |id| chunked_honest_sized(id, before, after, b"0\r\n\r\n")),
+                    |_| {},
+                ),
+                why,
+            );
+        }
 
         // A trailer that begins and then the peer stops.
         assert_refused(

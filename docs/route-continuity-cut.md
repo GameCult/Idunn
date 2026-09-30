@@ -1239,7 +1239,7 @@ Engine-level on `RoutedWorld` with `RouteStubs`, `#[cfg(unix)]`, except where ma
 | Restart ceiling reads no history | rename `unreadable_history_stops_continuity…` (`:13516`) as B2 did: a corrupt history still restarts, and the target's own log exhausts it | re-adding `history_for_decision` |
 | Backoff and window | port `continuity_restarts_are_backed_off_and_bounded_per_target` on `SwitchWorkload` | halving the wait; resetting the log on a new generation |
 | Storm (a) | port `a_failing_reload_that_deletes_the_fragment_backs_the_route_off`: 200 ticks give one reload | the `is_waiting` gate deleted |
-| Storm (b) | port `a_candidate_whose_route_proof_fails_reloads_at_most_the_ceiling`: Forward installs are capped at 12 | the install gate deleted |
+| Storm (b) | port `a_candidate_whose_route_proof_fails_reloads_at_most_the_ceiling`: installs and their Survival rollbacks share the 12-per-hour route ledger, so a stateless candidate whose proof keeps failing gets 6 install+rollback pairs per hour; only Forward is refused at the ceiling, and Survival is always admitted (counted when the ledger can record it; ruled 2026-09-30 after B2 Soul) | the install gate deleted |
 | Driver gates | split B2's refusing-gate test in two: Forward refused runs no program; Survival under a gate that "refuses" Forward still runs | a gate call moved after the write |
 
 - Run `cargo mutants --in-diff` on the cut. The target is 0 missed in the meters, the

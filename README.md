@@ -204,7 +204,9 @@ purpose; Idunn discovers no authority implicitly.
 
 Idunn targets Linux and does not compile on Windows (`drivers.rs` uses
 `std::os::unix` unconditionally). A local `cargo check` on a Windows
-workstation proves nothing. Test and build where it runs, in the same image
+workstation proves nothing. `scripts/verify.sh` is the verification command:
+the library tests plus a Windows-target check of `idunn-host`. Run it on Linux
+with the `x86_64-pc-windows-gnu` std installed. Test and build where it runs, in the same image
 Odin uses, with the working tree shipped to the host's build root:
 
 ```bash
