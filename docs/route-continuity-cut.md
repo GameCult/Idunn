@@ -204,6 +204,13 @@ The rework is a fresh branch from `583b2a7`, not a rebase of `1786ddf`. Its map 
   into the store-version bump that F1 needs: a v4 generation, with a typed lift from v3.
 
 **Rulings, 2026-09-30 (operator, on the B2 rework map).**
+- **3d A (2026-09-30, morning handoff):** separate budgets. The 12/h route actuation ceiling counts only
+  Forward actuations (deploys). Survival actuations (continuity restarts, rollbacks, repairs) are still recorded
+  for visibility but do not charge the ceiling; each stays bounded by its own mechanism (the 6/h per-target
+  restart log, the challenge backoff). A crash-looping target can therefore always be rescued by a deploy.
+  Option D (reset the restart log when a new release is admitted) was not chosen: a new release still inherits
+  its predecessor's restart history. B2 is merged (`46d9c2f`) but not installed; this follow-up (B2-3d) lands
+  before the install.
 - **Q-B2-1 (a):** the continuity restart log moves into `TargetSupervision`; the restart ceiling reads the
   target's own log; the carry compensator is deleted.
 - **Q-B2-2: fail at once.** A deploy refused by the route/actuation ceiling before the fence fails immediately,
