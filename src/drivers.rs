@@ -5080,8 +5080,9 @@ impl Default for RouteActuators {
 }
 
 /// Why a route actuation is being asked for. Only a `Forward` change can be
-/// refused: restoring the admitted or incumbent route is survival, not
-/// deployment, so a `Survival` is always admitted and always counted.
+/// refused: restoring the admitted or incumbent route, and every actuation of a
+/// continuity, is survival, not deployment, so a `Survival` is always admitted
+/// and counted whenever the ledger can record it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteActuation {
     Forward,
