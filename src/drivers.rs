@@ -5332,31 +5332,35 @@ impl NginxRouteDriver {
         }
     }
 
+    /// Put `prior` back as the route's fragment. Bytes on disk are what nginx
+    /// last loaded: every write here and in `install` is undone when the
+    /// reload after it fails. So a fragment that already equals `prior` is
+    /// live, and is neither written nor reloaded; a retry of a withdrawal
+    /// whose firewall step failed repeats only that step.
     fn restore(&self, prior: Option<&[u8]>, gate: &dyn RouteActuationGate) -> Result<()> {
+        let current = self.current_configuration()?;
+        let rewrite = current.as_deref() != prior;
+        if !rewrite && prior.is_some() {
+            return Ok(());
+        }
         gate.admit(RouteActuation::Survival)?;
-        self.write_fragment(prior)?;
-        self.reload()?;
+        if rewrite {
+            self.write_fragment(prior)?;
+            if let Err(reload) = self.reload() {
+                return match self.write_fragment(current.as_deref()) {
+                    Ok(()) => Err(reload).context("reloading the restored route"),
+                    Err(undo) => Err(reload).context(format!(
+                        "reloading the restored route; putting the previous fragment back also failed: {undo:#}"
+                    )),
+                };
+            }
+        }
         // No prior membership means the stable endpoint no longer routes to
         // anything; its firewall allow goes with the fragment.
         if prior.is_none() {
             self.withdraw_endpoint()?;
         }
         Ok(())
-    }
-
-    fn fail_after_rollback<T>(
-        &self,
-        prior: Option<&[u8]>,
-        failure: anyhow::Error,
-        context: &str,
-        gate: &dyn RouteActuationGate,
-    ) -> Result<T> {
-        match self.restore(prior, gate) {
-            Ok(()) => Err(failure).context(context.to_owned()),
-            Err(rollback) => Err(failure).context(format!(
-                "{context}; route rollback also failed: {rollback:#}"
-            )),
-        }
     }
 
     pub fn preflight(
@@ -5431,22 +5435,38 @@ impl NginxRouteDriver {
                     && prior_sha256 == preflight.incumbent_membership_sha256),
             "route baseline changed after preflight"
         );
-        gate.admit(RouteActuation::Forward)?;
-        if !candidate_already_written {
-            atomic_replace(&self.binding.config_path, &rendered)?;
+        // Bytes on disk are what nginx last loaded (see `restore`), so a
+        // candidate already written is installed: a retry changes nothing.
+        if candidate_already_written {
+            return Ok(sha256_id(&rendered));
         }
+        gate.admit(RouteActuation::Forward)?;
+        atomic_replace(&self.binding.config_path, &rendered)?;
         if let Err(error) = self.admit_endpoint().and_then(|()| self.reload()) {
-            if rollback_allowed {
-                return self.fail_after_rollback(
-                    preflight.incumbent_configuration.as_deref(),
-                    error,
-                    "candidate route validation or reload failed",
-                    gate,
-                );
-            }
-            return Err(error).context(
-                "candidate route reload failed after incumbent route authority was fenced; candidate fragment retained for retry",
-            );
+            // nginx did not load the candidate, so it still serves the
+            // baseline. The disk is put back to match it, which is the whole
+            // rollback, and a retry installs and reloads again rather than
+            // mistaking unloaded bytes for a live route. Past the fence the
+            // firewall allow stays for that retry; before it, an allow the
+            // baseline never had goes too.
+            let context = if rollback_allowed {
+                "candidate route validation or reload failed"
+            } else {
+                "candidate route reload failed after incumbent route authority was fenced; the fragment was put back for retry"
+            };
+            let undo = self.write_fragment(prior.as_deref()).and_then(|()| {
+                if rollback_allowed && prior.is_none() {
+                    self.withdraw_endpoint()
+                } else {
+                    Ok(())
+                }
+            });
+            return match undo {
+                Ok(()) => Err(error).context(context),
+                Err(undo) => Err(error).context(format!(
+                    "{context}; putting the route back also failed: {undo:#}"
+                )),
+            };
         }
         ensure!(
             self.current_configuration()?.as_deref() == Some(rendered.as_slice()),
@@ -11817,6 +11837,140 @@ Content-Le".to_vec()), |_| {}),
         Ok(())
     }
 
+    /// Stub host programs that log every call. `systemctl reload` fails while
+    /// `<dir>/systemctl.fail` exists, `ufw delete` while `<dir>/ufw.fail` does.
+    #[cfg(unix)]
+    fn failable_route_driver(
+        temp: &Path,
+    ) -> Result<(NginxRouteDriver, IdunnExpectedIncarnationRecord, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut driver, candidate, calls) = stubbed_route_driver(temp)?;
+        let failable = |name: &str, verb: &str| -> Result<PathBuf> {
+            let path = temp.join(name);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{name} $*\" >> '{}'\nif [ \"$1\" = {verb} ] && [ -e \"$0.fail\" ]; then exit 1; fi\nexit 0\n",
+                    calls.display()
+                ),
+            )?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+            Ok(path)
+        };
+        driver.systemctl_program = failable("systemctl", "reload")?;
+        driver.ufw_program = failable("ufw", "delete")?;
+        Ok((driver, candidate, calls))
+    }
+
+    #[cfg(unix)]
+    fn logged(calls: &Path, prefix: &str) -> usize {
+        fs::read_to_string(calls)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .count()
+    }
+
+    /// Admits everything and records what it was asked.
+    struct Recording(std::cell::RefCell<Vec<RouteActuation>>);
+
+    impl RouteActuationGate for Recording {
+        fn admit(&self, kind: RouteActuation) -> Result<()> {
+            self.0.borrow_mut().push(kind);
+            Ok(())
+        }
+    }
+
+    /// A retry whose fragment is already what it would write reloads nothing:
+    /// an install already written, and a withdrawal whose firewall step is
+    /// what failed, repeat only what is still undone.
+    #[cfg(unix)]
+    #[test]
+    fn a_retry_with_an_already_correct_fragment_performs_zero_reloads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (driver, candidate, calls) = failable_route_driver(temp.path())?;
+        let receipt = preflight_receipt(&driver, &candidate)?;
+        let gate = Recording(Default::default());
+
+        driver.install(&candidate, &digest('a'), &receipt, false, &gate)?;
+        assert_eq!(logged(&calls, "systemctl reload"), 1);
+        for _ in 0..3 {
+            driver.install(&candidate, &digest('a'), &receipt, false, &gate)?;
+        }
+        assert_eq!(logged(&calls, "systemctl reload"), 1, "an installed candidate reloaded again");
+        assert_eq!(logged(&calls, "ufw allow"), 1);
+        assert_eq!(*gate.0.borrow(), [RouteActuation::Forward], "a no-op was charged");
+
+        // The withdrawal removes the fragment and reloads, then its firewall
+        // step fails. Each retry repeats the firewall step and nothing else.
+        fs::write(temp.path().join("ufw.fail"), b"x")?;
+        assert!(driver.withdraw_candidate_membership(&receipt, &gate).is_err());
+        assert!(!driver.binding.config_path.exists());
+        assert_eq!(logged(&calls, "systemctl reload"), 2);
+        for _ in 0..5 {
+            assert!(driver.withdraw_candidate_membership(&receipt, &gate).is_err());
+        }
+        assert_eq!(logged(&calls, "systemctl reload"), 2, "a failing withdrawal reloaded again");
+        assert_eq!(logged(&calls, "ufw delete"), 6);
+        fs::remove_file(temp.path().join("ufw.fail"))?;
+        driver.withdraw_candidate_membership(&receipt, &gate)?;
+        assert_eq!(logged(&calls, "systemctl reload"), 2);
+        assert_eq!(logged(&calls, "ufw delete"), 7);
+
+        // A restore to bytes already on disk runs no program and asks nothing.
+        let rendered = driver.render(&candidate)?;
+        fs::write(&driver.binding.config_path, &rendered)?;
+        let (programs, asked) = (logged(&calls, ""), gate.0.borrow().len());
+        driver.restore(Some(&rendered), &gate)?;
+        assert_eq!(logged(&calls, ""), programs);
+        assert_eq!(gate.0.borrow().len(), asked);
+        Ok(())
+    }
+
+    /// Bytes on disk are what nginx loaded: a write whose reload fails is
+    /// undone, so the retry writes and reloads again instead of taking the
+    /// unloaded bytes for a live route.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_reload_puts_the_fragment_back_so_the_retry_reloads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (driver, candidate, calls) = failable_route_driver(temp.path())?;
+        let receipt = preflight_receipt(&driver, &candidate)?;
+        let rendered = driver.render(&candidate)?;
+        let fail = temp.path().join("systemctl.fail");
+
+        // Install, fenced (no rollback) and not.
+        for rollback_allowed in [false, true] {
+            fs::write(&fail, b"x")?;
+            assert!(
+                driver
+                    .install(&candidate, &digest('a'), &receipt, rollback_allowed, &Unmetered)
+                    .is_err()
+            );
+            assert!(!driver.binding.config_path.exists(), "an unloaded candidate stayed on disk");
+            fs::remove_file(&fail)?;
+            let before = logged(&calls, "systemctl reload");
+            driver.install(&candidate, &digest('a'), &receipt, rollback_allowed, &Unmetered)?;
+            assert_eq!(logged(&calls, "systemctl reload"), before + 1, "the retry did not reload");
+            assert_eq!(fs::read(&driver.binding.config_path)?, rendered);
+            if !rollback_allowed {
+                fs::remove_file(&driver.binding.config_path)?;
+            }
+        }
+
+        // Restore: the candidate is live; withdrawing it fails at the reload.
+        fs::write(&fail, b"x")?;
+        assert!(driver.withdraw_candidate_membership(&receipt, &Unmetered).is_err());
+        assert_eq!(fs::read(&driver.binding.config_path)?, rendered, "the unloaded removal stayed");
+        fs::remove_file(&fail)?;
+        let before = logged(&calls, "systemctl reload");
+        driver.withdraw_candidate_membership(&receipt, &Unmetered)?;
+        assert_eq!(logged(&calls, "systemctl reload"), before + 1, "the retry did not reload");
+        assert!(!driver.binding.config_path.exists());
+        Ok(())
+    }
+
     /// Observation observes: restoring a membership whose fragment is already
     /// exact touches nothing, and drifted bytes are restored with one reload.
     #[cfg(unix)]
@@ -12014,8 +12168,6 @@ Content-Le".to_vec()), |_| {}),
         assert!(!config.exists());
         assert_eq!(fs::read_dir(&driver.preflight_root)?.count(), 0);
 
-        let candidate_bytes = driver.render(&candidate)?;
-        fs::write(&config, &candidate_bytes)?;
         let membership_sha256 = driver.install(&candidate, &digest('a'), &preflight, true, &Unmetered)?;
         assert_eq!(
             fs::read_to_string(systemctl.with_extension("calls"))?,
@@ -12040,15 +12192,16 @@ Content-Le".to_vec()), |_| {}),
 
         let next_preflight = driver.preflight(&candidate, &digest('b'), Some(&admitted), &Unmetered)?;
         assert_eq!(fs::read(&config)?, admitted_bytes);
+        // The next candidate renders the bytes already live: installing it
+        // runs nothing, even while a reload would fail.
         fs::write(systemctl.with_extension("fail"), b"fail\n")?;
-        assert!(
-            driver
-                .install(&candidate, &digest('b'), &next_preflight, false, &Unmetered)
-                .is_err()
-        );
-        assert_eq!(fs::read(&config)?, admitted_bytes);
-        fs::remove_file(systemctl.with_extension("fail"))?;
         driver.install(&candidate, &digest('b'), &next_preflight, false, &Unmetered)?;
+        assert_eq!(fs::read(&config)?, admitted_bytes);
+        assert_eq!(
+            fs::read_to_string(systemctl.with_extension("calls"))?,
+            "reload\n"
+        );
+        fs::remove_file(systemctl.with_extension("fail"))?;
         fs::write(&config, b"foreign route\n")?;
         assert!(
             driver

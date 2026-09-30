@@ -17467,7 +17467,10 @@ mod tests {
                 .engine
                 .begin_post_fencing_abort(&resident(&aborting.world)?, anyhow!("test"))?;
             aborting.step()?;
-            assert_eq!(aborting.reloads(), 1, "the withdrawal did not run");
+            // Nothing was installed, so the withdrawal has no fragment to
+            // remove and no reload to run: it withdraws the endpoint.
+            assert_eq!(aborting.reloads(), 0);
+            assert_eq!(aborting.world.route_stubs.count("ufw delete"), 1, "the withdrawal did not run");
             assert!(newest(&aborting.world)? > before, "the withdrawal was not recorded");
 
             // (ii) Supervision repairs a drifted admitted fragment.
@@ -17560,7 +17563,7 @@ mod tests {
                 &preflight,
                 &engine.route_gate("service", CommandKind::Deploy),
             )?;
-            assert_eq!(routed.reloads(), 1, "the unrecorded withdrawal did not run");
+            assert_eq!(routed.world.route_stubs.count("ufw delete"), 1, "the unrecorded withdrawal did not run");
             Ok(())
         }
 
