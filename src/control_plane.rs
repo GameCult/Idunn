@@ -560,6 +560,15 @@ impl LeasingEvidence {
         }
     }
 
+    /// The lease Idunn issued, granted or only prepared. A prepared lease may
+    /// already be on disk: the physical grant runs before `Granted` is durable.
+    fn issued_lease(&self) -> Option<&IdunnProcessWriteLeaseRecord> {
+        match self {
+            Self::SkippedStateless => None,
+            Self::Prepared { lease, .. } | Self::Granted { lease, .. } => Some(lease),
+        }
+    }
+
     fn prepared_lease(&self) -> Option<(&IdunnProcessWriteLeaseRecord, &str)> {
         match self {
             Self::Prepared {
@@ -1584,7 +1593,7 @@ impl DeploymentTransaction {
     fn phase_end(&self) -> PhaseEnd {
         let leasing = self.leasing.as_ref();
         let granted = leasing.and_then(LeasingEvidence::lease).is_some();
-        let issued = granted || leasing.and_then(LeasingEvidence::prepared_lease).is_some();
+        let issued = leasing.and_then(LeasingEvidence::issued_lease).is_some();
         match self.command_kind {
             CommandKind::Deploy if issued => PhaseEnd::OperatorRequired,
             _ => PhaseEnd::Abort {
@@ -8740,11 +8749,14 @@ impl Engine {
         if abort.lease_withdrawal == CleanupEvidence::Pending {
             let expected = required(&current.value.expected, "Expected projection")?;
             let activation = required(&current.value.activation, "activation")?;
+            // A prepared lease is withdrawn too: its physical grant may have
+            // landed before `Granted` was durable. Revoking an absent lease,
+            // and withdrawing an absent projection, are no-ops.
             let lease = current
                 .value
                 .leasing
                 .as_ref()
-                .and_then(LeasingEvidence::lease)
+                .and_then(LeasingEvidence::issued_lease)
                 .context("post-fencing abort lost the lease it must withdraw")?;
             let binding = current.value.plan.as_ref().unwrap().parsed_inputs()?.1;
             let lease_path = binding
@@ -9093,7 +9105,7 @@ fn post_fencing_abort_intent(
         lease_withdrawal: if transaction
             .leasing
             .as_ref()
-            .and_then(LeasingEvidence::lease)
+            .and_then(LeasingEvidence::issued_lease)
             .is_some()
         {
             CleanupEvidence::Pending
@@ -18603,6 +18615,37 @@ mod tests {
             assert!(held.post_fencing_abort.is_none(), "a leased deployment was aborted");
             assert_eq!(held.phase, DeploymentPhase::AwaitingReady);
             assert_eq!(held.last_error.as_deref(), Some("candidate is still warming"), "its step did not run");
+            Ok(())
+        }
+
+        /// B5 Soul A. The physical grant lands before `Granted` is durable. A
+        /// continuity that dies in that window and passes its deadline is
+        /// aborted from `Prepared`; the abort still withdraws the lease on
+        /// disk, so the next fencing of the target is not refused.
+        #[test]
+        fn an_abort_from_a_prepared_lease_withdraws_a_grant_already_on_disk() -> Result<()> {
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            routed.drive_until(|t| matches!(t.leasing, Some(LeasingEvidence::Granted { .. })))?;
+            let current = resident(&routed.world)?;
+            let mut crashed = current.value.clone();
+            let Some(LeasingEvidence::Granted { lease, lease_sha256 }) = crashed.leasing.clone() else {
+                bail!("no granted lease");
+            };
+            crashed.leasing = Some(LeasingEvidence::Prepared { lease: lease.clone(), lease_sha256 });
+            replace_transaction(&routed.world.state_store, &current, &crashed)?;
+            let driver = CultCacheWriteLeaseDriver::new(
+                "service",
+                routed.world.root.join("lease/process-write-lease.cc"),
+            );
+            assert!(driver.observe_exact(&lease)?, "the grant is not on disk");
+
+            pass_deadline(&routed.world)?;
+            routed.resume()?;
+            assert!(routed.transaction()?.post_fencing_abort.is_some(), "the deadline did not end it");
+            routed.resume_until_terminal()?;
+            assert!(driver.observe_empty()?, "the abort left the granted lease on disk");
+            // What the next fencing does to a candidate's lease path.
+            driver.revoke_exact(None)?;
             Ok(())
         }
 
