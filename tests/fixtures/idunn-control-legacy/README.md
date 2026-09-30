@@ -42,3 +42,21 @@ borrowed from `transaction-fencing`.
 | `transaction-pre-fence-abort-terminal` | the same abort finished: Complete, `FailedBeforeFencing` |
 | `transaction-post-fence-abort` | Fencing continuity, post-fencing abort in flight |
 | `provider-anchor` | one line: the provider trust-anchor file bytes, hex. A test writes it to the fixed path so the Engine can read the plan's anchor |
+
+## Generation v3 (the B2 lift)
+
+`generation-v3-odin` and `generation-v3-route-proof` are the exact
+`idunn.admitted_generation.v3` payloads the encoder at Idunn `583b2a7` wrote
+(`admitted_envelope` over `rmp_serde::to_vec`), printed by a throwaway test that
+is not kept. The first is the v2 `generation-with-receipts` record lifted by that
+revision's own `LegacyAdmittedGeneration::into_current`, the second is the
+generation `route_proof::committed_generation` admits through a real route-proof
+deployment. Both are synthetic.
+
+| File | Schema | What it is |
+|---|---|---|
+| `generation-v3-odin` | `idunn.admitted_generation.v3` | routed, Odin-correlated generation |
+| `generation-v3-route-proof` | `idunn.admitted_generation.v3` | routed, route-proof generation, no Odin receipts |
+
+`control_plane.rs` decodes them through `LegacyAdmittedGenerationV3`; the
+fixtures die with that struct.
