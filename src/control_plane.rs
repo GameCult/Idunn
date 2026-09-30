@@ -4660,12 +4660,14 @@ impl Engine {
     }
 
     /// Settle the outcome of one incident operation. A failure never leaves
-    /// this function: it is traced once, under its operation, and continuity
-    /// decides exactly as it would have with a healthy store. It names the
-    /// operation and the root cause and never a path or a value. Incident
-    /// writes are never progress.
-    fn record_incident<T>(&self, operation: &str, outcome: Result<T>) {
-        let key = format!("incident-store:{operation}");
+    /// this function: it is traced once per episode, under the operation and
+    /// the subject it was decided for (`*` for a pass over the whole store),
+    /// and continuity decides exactly as it would have with a healthy store.
+    /// Each decision site has its own key, so one site's success never ends
+    /// another site's episode. The message names the operation and the root
+    /// cause and never a path or a value. Incident writes are never progress.
+    fn record_incident<T>(&self, operation: &str, subject: &str, outcome: Result<T>) {
+        let key = format!("incident-store:{operation}:{subject}");
         match outcome {
             Ok(_) => self.clear_fault(&key),
             Err(error) => self.report_once(
@@ -4699,8 +4701,8 @@ impl Engine {
             }
             Ok(())
         };
-        self.record_incident("close", close_unadmitted());
-        self.record_incident("retire", now_millis().and_then(|now| store.retire_closed(now)));
+        self.record_incident("close", "*", close_unadmitted());
+        self.record_incident("retire", "*", now_millis().and_then(|now| store.retire_closed(now)));
     }
 
     fn host_access(&self) -> Result<HostActuatorAccess<'_>> {
@@ -5738,6 +5740,7 @@ impl Engine {
                 // The window sliding alone is not health and never closes one.
                 self.record_incident(
                     "close",
+                    &current.value.target,
                     now_millis().and_then(|now| {
                         // Running is not enough while the window still holds
                         // the restarts that exhausted it: a release that
@@ -5837,6 +5840,7 @@ impl Engine {
                 // this record's shadow, never its substitute.
                 self.record_incident(
                     "open",
+                    &current.value.target,
                     self.incidents().open(
                         IncidentCondition::ContinuityExhausted,
                         &current.value.target,
@@ -14929,6 +14933,29 @@ mod tests {
         assert_eq!(incident_store, PathBuf::from("/tmp/j.cc"));
     }
 
+    /// A standing fault is traced once. A key is cleared only by an operation
+    /// that succeeded, so another site's short-circuit must not end it: a
+    /// target that is running but still exhausted closes nothing, and that
+    /// used to clear the reconcile pass's fault and print it again every pass.
+    #[test]
+    fn a_failing_reconcile_is_traced_once_while_a_running_target_stays_exhausted() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        std::fs::write(incident_path(&world), b"not an incident store")?;
+        spend_the_window(&world)?;
+
+        for pass in 0..6 {
+            world.engine.supervise_one_admitted_generation()?;
+            let reports = world.engine.fault_reports.lock().unwrap();
+            assert!(
+                reports.contains_key("incident-store:close:*"),
+                "pass {pass}: the standing reconcile fault was cleared, so it prints again"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_release_that_runs_one_pass_after_each_restart_keeps_one_incident() -> Result<()> {
         let workload = SwitchWorkload::new();
@@ -15002,7 +15029,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_held_incident_lock_changes_nothing_continuity_decides() -> Result<()> {
-        use crate::incident::tests::{hold_lock_of, run_while_held};
+        use crate::incident::tests::{STUCK_AFTER, hold_lock_of, run_while_held};
 
         let healthy_workload = SwitchWorkload::new();
         let healthy = EngineFixture::with_workload(healthy_workload.clone())?;
@@ -15034,7 +15061,7 @@ mod tests {
 
         // The lock is free again: the next pass retries and the incident lands.
         // (A child another test forked while it was held can keep it a moment.)
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + STUCK_AFTER;
         while !incidents_of(&world)?.iter().any(|record| record.is_open()) {
             assert!(std::time::Instant::now() < deadline, "the incident never landed");
             world.engine.supervise_one_admitted_generation()?;

@@ -177,8 +177,8 @@ impl Snapshot {
 /// scheduler tick, so no write waits: each is one nonblocking compare-exchange
 /// of the whole file against the snapshot it was decided on. A lost race or a
 /// held lock is an error and a no-op, retried on a later pass. The lock beside
-/// the file is not published: the readers of `incidents.cc` take no lock, so
-/// only Idunn can ever hold it.
+/// the file is not published and is created 0600 (`secure_lock`): the readers
+/// of `incidents.cc` take no lock, so only Idunn can ever hold it.
 pub(crate) struct IncidentStore {
     path: PathBuf,
 }
@@ -231,6 +231,7 @@ impl IncidentStore {
         expected: &[CultCacheEnvelope],
         replacements: &[CultCacheEnvelope],
     ) -> Result<()> {
+        secure_lock(path)?;
         match SingleFileMessagePackBackingStore::new(path)
             .try_compare_exchange_snapshot(expected, replacements)?
         {
@@ -332,6 +333,46 @@ impl IncidentStore {
         publish_file_mode(&self.path)?;
         Ok(true)
     }
+}
+
+/// Make the lock beside `store` Idunn's alone, before CultCache opens it.
+///
+/// CultCache creates a lock with mode 0666, so the published directory decides
+/// who may open it: under Yggdrasil's default ACL (`u::rw g::r o::r`) that is
+/// 0644, and any uid could hold the lock and keep every incident from being
+/// recorded. Created here with 0600 the create mode is intersected with the
+/// ACL and still holds, and no wider file ever exists. A lock left wider by an
+/// earlier run is tightened on the descriptor just opened (a descriptor some
+/// other uid already holds is not revoked). Readers of the store take no lock,
+/// so nothing but Idunn needs to open this file.
+fn secure_lock(store: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut name = store
+            .file_name()
+            .context("the incident store has no file name")?
+            .to_owned();
+        name.push(".lock");
+        let lock = store.with_file_name(name);
+        if let Some(parent) = lock.parent() {
+            std::fs::create_dir_all(parent).context("creating the incident store directory")?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock)
+            .context("opening the incident lock")?
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .context("making the incident lock private")?;
+    }
+    #[cfg(not(unix))]
+    let _ = store;
+    Ok(())
 }
 
 /// The lines `idunn status` prints for one target's incidents: each open one,
@@ -600,10 +641,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Idunn runs with `UMask=027`, so a file it creates lands 0640 unless the
-    /// store publishes it. The umask is process-wide, so it is held only around
-    /// each write and only one test at a time may hold it.
-    #[cfg(unix)]
+    /// Idunn runs with `UMask=027`. The umask is process-wide, so it is held
+    /// only around each call and only one test at a time may hold it.
+    #[cfg(target_os = "linux")]
     fn under_service_umask<T>(write: impl FnOnce() -> T) -> T {
         static UMASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _held = UMASK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -614,36 +654,126 @@ pub(crate) mod tests {
         result
     }
 
-    #[cfg(unix)]
+    /// The body's condition: a directory carrying the default ACL
+    /// `u::rw g::r o::r` that Yggdrasil's idunn-projection directory has. Under
+    /// it the umask is ignored and a file created with mode 0666 lands 0644.
+    #[cfg(target_os = "linux")]
+    fn give_default_acl(dir: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        // posix_acl_xattr: version 2, then (tag, perm, id) entries. The tags
+        // are ACL_USER_OBJ, ACL_GROUP_OBJ and ACL_OTHER; the id is undefined.
+        let mut value = 2u32.to_le_bytes().to_vec();
+        for (tag, perm) in [(0x01u16, 6u16), (0x04, 4), (0x20, 4)] {
+            value.extend(tag.to_le_bytes());
+            value.extend(perm.to_le_bytes());
+            value.extend(u32::MAX.to_le_bytes());
+        }
+        let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        // SAFETY: both strings are NUL-terminated and the value is a live buffer.
+        let rc = unsafe {
+            libc::setxattr(
+                dir.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "the test filesystem must accept a default POSIX ACL: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Whether uid 65534 can read `path`; `None` when the uid cannot be
+    /// switched (not root, or no setpriv), which leaves the question unproven.
+    #[cfg(target_os = "linux")]
+    fn readable_by_another_uid(path: &Path) -> Option<bool> {
+        std::process::Command::new("setpriv")
+            .args(["--reuid=65534", "--regid=65534", "--clear-groups", "cat"])
+            .arg(path)
+            .output()
+            .ok()
+            .map(|output| output.status.success())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn published_incident_store_is_world_readable_and_its_lock_is_not() {
-        use std::os::unix::fs::PermissionsExt;
+    fn under_a_default_acl_the_store_is_published_and_its_locks_are_private() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let temp = TempDir::new().unwrap();
-        let path = temp.path().join("incidents.cc");
-        let lock = temp.path().join("incidents.cc.lock");
+        let dir = temp.path();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        give_default_acl(dir);
+        let path = dir.join("incidents.cc");
+        let lock = dir.join("incidents.cc.lock");
+        let history_lock = dir.join("incident-history.cc.lock");
         let store = IncidentStore::new(&path);
         let condition = IncidentCondition::ContinuityExhausted;
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
 
+        // Control: the lock CultCache would have made here, open(2) mode 0666
+        // under Idunn's umask. Without the ACL in force this reads 0640 and the
+        // test below proves nothing about the body.
+        let control = dir.join("control.lock");
+        under_service_umask(|| {
+            std::fs::OpenOptions::new().create(true).write(true).mode(0o666).open(&control)
+        })
+        .unwrap();
+        assert_eq!(mode(&control), 0o644, "the default ACL is not in force");
+
         assert!(under_service_umask(|| store.open(condition, "service", OPENED)).unwrap());
         assert_eq!(mode(&path), 0o644, "after open");
-        assert_eq!(mode(&lock) & 0o007, 0, "the lock is open to others after open");
+        assert_eq!(mode(&lock), 0o600, "the lock after open");
 
-        // Each write replaces the file, and the replacement is published too.
         assert!(
             under_service_umask(|| store.close(condition, "service", CloseReason::Recovered, CLOSED))
                 .unwrap()
         );
         assert_eq!(mode(&path), 0o644, "after close");
-        assert_eq!(mode(&lock) & 0o007, 0, "the lock is open to others after close");
+        assert_eq!(mode(&lock), 0o600, "the lock after close");
 
         assert!(
             under_service_umask(|| store.retire_closed(CLOSED + INCIDENT_RETENTION_MILLIS + 1))
                 .unwrap()
         );
         assert_eq!(mode(&path), 0o644, "after retire");
-        assert_eq!(mode(&lock) & 0o007, 0, "the lock is open to others after retire");
+        assert_eq!(mode(&lock), 0o600, "the lock after retire");
+        assert_eq!(mode(&history_lock), 0o600, "the history lock after retire");
+
+        // The consequence: another uid cannot open the lock, so it cannot hold
+        // it. Provable only as root with setpriv, and only if the same uid can
+        // read the control file, which shows the switch itself works.
+        if readable_by_another_uid(&control) == Some(true) {
+            assert_eq!(readable_by_another_uid(&lock), Some(false));
+            assert_eq!(readable_by_another_uid(&history_lock), Some(false));
+        } else {
+            eprintln!("UNPROVEN: no uid switch here; the lock modes above stand alone");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_left_wider_by_an_earlier_run_is_tightened_before_it_is_used() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("incidents.cc");
+        let lock = temp.path().join("incidents.cc.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(
+            IncidentStore::new(&path)
+                .open(IncidentCondition::ContinuityExhausted, "service", OPENED)
+                .unwrap()
+        );
+        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// An exclusive lock on a store's lock file, held through another file
@@ -671,30 +801,46 @@ pub(crate) mod tests {
         HeldLock(file)
     }
 
-    /// Run `work` while `held` is held, and fail if it waited on it. The
-    /// holder lets go after three seconds so that work which does wait ends,
-    /// late, and the test fails instead of hanging.
+    /// How long a test lets a held lock, or a released lock's last straggler,
+    /// stand in its way before it calls the store stuck. Nothing correct ever
+    /// spends it: the code under test finishes in milliseconds, and the limit
+    /// is only what stops a blocked write from hanging the suite. No
+    /// assertion compares elapsed time to a bound the machine's load can move.
+    #[cfg(unix)]
+    pub(crate) const STUCK_AFTER: Duration = Duration::from_secs(30);
+
+    /// Run `work` while `held` is held, and fail if it waited on it. The holder
+    /// lets go only when `work` has returned, or after `STUCK_AFTER`: work that
+    /// waits on the lock is freed by that second release and is then seen to
+    /// have waited, so the test fails instead of hanging.
     #[cfg(unix)]
     pub(crate) fn run_while_held<T>(held: HeldLock, work: impl FnOnce() -> T) -> T {
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            let _ = released.recv_timeout(Duration::from_secs(3));
-            drop(held);
-        });
-        let started = Instant::now();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        let (finished, work_done) = mpsc::channel::<()>();
+        let gave_up = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let gave_up = Arc::clone(&gave_up);
+            std::thread::spawn(move || {
+                if work_done.recv_timeout(STUCK_AFTER) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    gave_up.store(true, Ordering::SeqCst);
+                }
+                drop(held);
+            })
+        };
         let result = work();
-        let waited = started.elapsed();
-        let _ = release.send(());
+        let _ = finished.send(());
         holder.join().unwrap();
-        assert!(waited < Duration::from_secs(2), "the work waited {waited:?} on a held lock");
+        assert!(!gave_up.load(Ordering::SeqCst), "the work waited on a held lock");
         result
     }
 
-    /// Retry `attempt` for up to two seconds. A released lock can stay held for
-    /// a moment by a child another test forked while it was held.
+    /// Retry `attempt` until it lands. A released lock can stay held for a
+    /// moment by a child another test forked while it was held.
     #[cfg(unix)]
     fn eventually<T>(mut attempt: impl FnMut() -> Result<T>) -> T {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + STUCK_AFTER;
         loop {
             match attempt() {
                 Ok(value) => return value,
