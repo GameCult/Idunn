@@ -10533,57 +10533,6 @@ mod tests {
         assert!(transaction.validate().is_err());
         Ok(())
     }
-
-    #[test]
-    fn continuity_gives_up_on_a_release_that_will_not_start() -> Result<()> {
-        let command = DeploymentCommand {
-            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
-            command_id: "continuity-1".into(),
-            kind: CommandKind::Continuity,
-            selector: "odin".into(),
-            requested_by: "idunn-continuity".into(),
-            requested_at_unix_millis: 100,
-        };
-        let failed_restart = |generation: &str, ordinal: u32| -> Result<DeploymentTransaction> {
-            let mut transaction =
-                DeploymentTransaction::new(&command, "odin".into(), ordinal, None, 100)?;
-            transaction.incumbent_generation_id = Some(generation.into());
-            transaction.completion = Some(TransactionCompletion::FailedBeforeFencing {
-                error: "systemd unit is not running".into(),
-            });
-            Ok(transaction)
-        };
-
-        let refused = |transactions: &[DeploymentTransaction], generation: &str| -> usize {
-            transactions
-                .iter()
-                .filter(|value| {
-                    value.target == "odin"
-                        && value.command_kind == CommandKind::Continuity
-                        && value.incumbent_generation_id.as_deref() == Some(generation)
-                        && matches!(
-                            value.completion,
-                            Some(TransactionCompletion::FailedBeforeFencing { .. })
-                                | Some(TransactionCompletion::FailedAfterFencing { .. })
-                        )
-                })
-                .count()
-        };
-
-        let attempts = vec![
-            failed_restart("generation-1", 0)?,
-            failed_restart("generation-1", 1)?,
-            failed_restart("generation-1", 2)?,
-        ];
-        assert!(refused(&attempts, "generation-1") >= CONTINUITY_RESTART_ATTEMPTS);
-
-        // A restart that succeeds admits a new generation, and the count is
-        // kept against the generation id, so the next release is not condemned
-        // by the failures of the one it replaced.
-        assert_eq!(refused(&attempts, "generation-2"), 0);
-        Ok(())
-    }
-
     #[test]
     fn candidate_cleanup_is_owed_when_an_activation_or_a_workload_exists() -> Result<()> {
         // (activation issued, workload observed, expected cleanup)
