@@ -18348,6 +18348,44 @@ mod tests {
             Ok(())
         }
 
+        /// The live shape of F1. A continuity reuses the admitted Expected, so
+        /// its membership is the admitted fragment already on disk: while its
+        /// proof fails, the install and the rollback write nothing and reload
+        /// nothing, and neither does the withdrawal after its deadline.
+        #[cfg(unix)]
+        #[test]
+        fn a_continuity_over_its_admitted_route_reloads_nothing_while_its_proof_fails()
+        -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let current = resident(&routed.world)?;
+            let mut next = current.value.clone();
+            let binding = next.plan.as_ref().unwrap().parsed_inputs()?.1;
+            let admitted = NginxRouteDriver::new(binding.route.context("no route binding")?)
+                .render(next.expected.as_ref().context("no Expected")?)?;
+            let preflight = next.route_preflight.as_mut().context("no preflight")?;
+            preflight.incumbent_runtime_instance_id = Some(sha256_id(b"admitted-instance"));
+            preflight.incumbent_membership_sha256 = Some(sha256_id(&admitted));
+            preflight.incumbent_configuration = Some(admitted.clone());
+            replace_transaction(&routed.world.state_store, &current, &next)?;
+            std::fs::write(routed.fragment_path(), &admitted)?;
+
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.stub.hang_up.store(true, Ordering::SeqCst);
+            for _ in 0..5 {
+                routed.resume()?;
+            }
+            assert_eq!(routed.transaction()?.phase, DeploymentPhase::Routing);
+            assert!(routed.transaction()?.last_error.is_some(), "the proof did not fail");
+            assert_eq!(routed.world.route_stubs.count(""), 0, "a failing continuity ran a host program");
+
+            pass_deadline(&routed.world)?;
+            routed.resume_until_terminal()?;
+            assert_eq!(routed.world.route_stubs.count(""), 0, "its withdrawal ran a host program");
+            assert_eq!(std::fs::read(routed.fragment_path())?, admitted, "the admitted route moved");
+            Ok(())
+        }
+
         /// Soul's F2 probe, committed: a post-fence withdrawal whose
         /// `ufw delete` keeps failing reloads once, then repeats only the
         /// firewall step.
