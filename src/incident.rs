@@ -12,14 +12,15 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use cultcache_rs::{
-    CultCacheEnvelope, CultCacheExpectedEnvelope, DatabaseEntry, SingleFileMessagePackBackingStore,
+    CultCacheEnvelope, DatabaseEntry, SingleFileMessagePackBackingStore,
+    TryCompareExchangeSnapshotOutcome,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::{decode_record, require_id, typed_envelope};
-use crate::drivers::publish_projection_mode;
+use crate::drivers::publish_file_mode;
 
 const INCIDENT_SCHEMA: &str = "idunn.operator_incident.v1";
 
@@ -39,6 +40,15 @@ impl IncidentCondition {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::ContinuityExhausted => "continuity-exhausted",
+        }
+    }
+
+    /// Whether the subject is an admitted target, so that the target leaving
+    /// admission ends the condition. A condition about anything else (a
+    /// transaction, a store) answers false and is closed by its own owner.
+    pub(crate) const fn ends_with_admission(self) -> bool {
+        match self {
+            Self::ContinuityExhausted => true,
         }
     }
 }
@@ -98,6 +108,14 @@ impl IncidentRecord {
         self.closed_at_unix_millis.is_none()
     }
 
+    /// Whether the record still belongs in the published file: open, or closed
+    /// no more than `INCIDENT_RETENTION_MILLIS` ago. The one predicate behind
+    /// both retirement and `idunn status`.
+    pub(crate) fn inside_retention(&self, now: u64) -> bool {
+        self.closed_at_unix_millis
+            .is_none_or(|closed_at| now.saturating_sub(closed_at) <= INCIDENT_RETENTION_MILLIS)
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == INCIDENT_SCHEMA,
@@ -139,14 +157,28 @@ impl IncidentRecord {
     }
 }
 
-struct Stored {
-    envelope: CultCacheEnvelope,
-    record: IncidentRecord,
+/// One read of the incident file: its envelopes exactly as stored, and the
+/// records decoded from them, in the same order. Every write expects exactly
+/// these envelopes, so a write only lands on the file it was decided against.
+struct Snapshot {
+    envelopes: Vec<CultCacheEnvelope>,
+    records: Vec<IncidentRecord>,
 }
 
-/// The incident file and its history sibling. Every write is a compare-exchange
-/// against exactly what was read, and every write is followed by the
-/// world-readable publication mode.
+impl Snapshot {
+    fn open_record(&self, condition: IncidentCondition, subject: &str) -> Option<usize> {
+        self.records.iter().position(|record| {
+            record.is_open() && record.condition == condition && record.subject == subject
+        })
+    }
+}
+
+/// The incident file and its history sibling. Incidents are written from the
+/// scheduler tick, so no write waits: each is one nonblocking compare-exchange
+/// of the whole file against the snapshot it was decided on. A lost race or a
+/// held lock is an error and a no-op, retried on a later pass. The lock beside
+/// the file is not published: the readers of `incidents.cc` take no lock, so
+/// only Idunn can ever hold it.
 pub(crate) struct IncidentStore {
     path: PathBuf,
 }
@@ -162,57 +194,54 @@ impl IncidentStore {
         self.path.with_file_name("incident-history.cc")
     }
 
-    fn backing(&self) -> SingleFileMessagePackBackingStore {
-        SingleFileMessagePackBackingStore::new(&self.path)
-    }
-
     /// Every record, oldest key first. An absent file is empty. The file
     /// refuses any document that is not an operator incident.
     pub(crate) fn read(&self) -> Result<Vec<IncidentRecord>> {
-        Ok(self
-            .read_stored()?
-            .into_iter()
-            .map(|stored| stored.record)
-            .collect())
+        let mut records = self.snapshot()?.records;
+        records.sort_by(|left, right| left.incident_key.cmp(&right.incident_key));
+        Ok(records)
     }
 
-    fn read_stored(&self) -> Result<Vec<Stored>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let mut stored = Vec::new();
-        for envelope in self
-            .backing()
+    fn snapshot(&self) -> Result<Snapshot> {
+        let envelopes = SingleFileMessagePackBackingStore::new(&self.path)
             .pull_all_read_only_snapshot()
-            .context("reading the incident store")?
-        {
+            .context("reading the incident store")?;
+        let mut records = Vec::new();
+        for envelope in &envelopes {
             ensure!(
                 envelope.r#type == IncidentRecord::TYPE
                     && envelope.schema_id.as_deref() == Some(INCIDENT_SCHEMA),
                 "the incident store holds a document that is not an operator incident"
             );
-            let record: IncidentRecord = decode_record(&envelope)?;
+            let record: IncidentRecord = decode_record(envelope)?;
             record.validate()?;
             ensure!(
                 envelope.key == record.incident_key,
                 "incident store key differs from the incident's identity"
             );
-            stored.push(Stored { envelope, record });
+            records.push(record);
         }
-        stored.sort_by(|left, right| left.record.incident_key.cmp(&right.record.incident_key));
-        Ok(stored)
+        Ok(Snapshot { envelopes, records })
     }
 
-    fn open_record<'a>(
-        stored: &'a [Stored],
-        condition: IncidentCondition,
-        subject: &str,
-    ) -> Option<&'a Stored> {
-        stored.iter().find(|stored| {
-            stored.record.is_open()
-                && stored.record.condition == condition
-                && stored.record.subject == subject
-        })
+    /// Replace `path`'s whole content with `replacements` if it is still
+    /// exactly `expected`. Never waits for the lock.
+    fn exchange(
+        path: &Path,
+        expected: &[CultCacheEnvelope],
+        replacements: &[CultCacheEnvelope],
+    ) -> Result<()> {
+        match SingleFileMessagePackBackingStore::new(path)
+            .try_compare_exchange_snapshot(expected, replacements)?
+        {
+            TryCompareExchangeSnapshotOutcome::Exchanged => Ok(()),
+            TryCompareExchangeSnapshotOutcome::Mismatch => {
+                bail!("the incident store changed while it was being written")
+            }
+            TryCompareExchangeSnapshotOutcome::LockContended => {
+                bail!("the incident store is locked by another holder")
+            }
+        }
     }
 
     /// Open an incident unless one is already open for `(condition, subject)`.
@@ -223,23 +252,24 @@ impl IncidentStore {
         subject: &str,
         now: u64,
     ) -> Result<bool> {
-        let stored = self.read_stored()?;
-        if Self::open_record(&stored, condition, subject).is_some() {
+        self.open_on(&self.snapshot()?, condition, subject, now)
+    }
+
+    fn open_on(
+        &self,
+        snapshot: &Snapshot,
+        condition: IncidentCondition,
+        subject: &str,
+        now: u64,
+    ) -> Result<bool> {
+        if snapshot.open_record(condition, subject).is_some() {
             return Ok(false);
         }
-        let record = IncidentRecord::opened(condition, subject, now);
-        let written = self.backing().compare_exchange(
-            &[CultCacheExpectedEnvelope {
-                r#type: IncidentRecord::TYPE.into(),
-                key: record.incident_key.clone(),
-                current: None,
-            }],
-            &[record.envelope(now)?],
-        )?;
-        if written {
-            publish_projection_mode(&self.path)?;
-        }
-        Ok(written)
+        let mut replacements = snapshot.envelopes.clone();
+        replacements.push(IncidentRecord::opened(condition, subject, now).envelope(now)?);
+        Self::exchange(&self.path, &snapshot.envelopes, &replacements)?;
+        publish_file_mode(&self.path)?;
+        Ok(true)
     }
 
     /// Close the open incident for `(condition, subject)`, if there is one.
@@ -251,60 +281,56 @@ impl IncidentStore {
         reason: CloseReason,
         now: u64,
     ) -> Result<bool> {
-        let stored = self.read_stored()?;
-        let Some(open) = Self::open_record(&stored, condition, subject) else {
+        let snapshot = self.snapshot()?;
+        let Some(index) = snapshot.open_record(condition, subject) else {
             return Ok(false);
         };
-        let mut closed = open.record.clone();
+        let mut closed = snapshot.records[index].clone();
         // A clock stepped back must not close an incident before it opened.
         closed.closed_at_unix_millis = Some(now.max(closed.opened_at_unix_millis));
         closed.close_reason = Some(reason);
-        let written = self.backing().compare_exchange(
-            &[CultCacheExpectedEnvelope {
-                r#type: IncidentRecord::TYPE.into(),
-                key: closed.incident_key.clone(),
-                current: Some(open.envelope.clone()),
-            }],
-            &[closed.envelope(now)?],
-        )?;
-        if written {
-            publish_projection_mode(&self.path)?;
-        }
-        Ok(written)
+        let mut replacements = snapshot.envelopes.clone();
+        replacements[index] = closed.envelope(now)?;
+        Self::exchange(&self.path, &snapshot.envelopes, &replacements)?;
+        publish_file_mode(&self.path)?;
+        Ok(true)
     }
 
-    /// Move every incident closed more than `INCIDENT_RETENTION_MILLIS` ago to
-    /// the history file, then delete it here. History first: a crash between
-    /// the two leaves the record in both, and `insert_entry_if_absent` makes
-    /// the repeat a no-op. An open incident never moves.
+    /// Move every incident that has left retention to the history file, then
+    /// drop it here. History first: a crash between the two leaves the record
+    /// in both, and the repeat finds it already archived. An open incident
+    /// never moves.
     pub(crate) fn retire_closed(&self, now: u64) -> Result<bool> {
-        let retiring = self
-            .read_stored()?
-            .into_iter()
-            .filter(|stored| {
-                stored.record.closed_at_unix_millis.is_some_and(|closed_at| {
-                    now.saturating_sub(closed_at) > INCIDENT_RETENTION_MILLIS
-                })
-            })
-            .map(|stored| stored.envelope)
-            .collect::<Vec<_>>();
+        let snapshot = self.snapshot()?;
+        let (kept, retiring): (Vec<_>, Vec<_>) = snapshot
+            .envelopes
+            .iter()
+            .zip(&snapshot.records)
+            .partition(|(_, record)| record.inside_retention(now));
         if retiring.is_empty() {
             return Ok(false);
         }
-        let history = SingleFileMessagePackBackingStore::new(&self.history_path());
-        for envelope in &retiring {
-            history
-                .insert_entry_if_absent(envelope.clone())
-                .context("archiving a closed incident")?;
+        let history_path = self.history_path();
+        let archived = SingleFileMessagePackBackingStore::new(&history_path)
+            .pull_all_read_only_snapshot()
+            .context("reading the incident history")?;
+        let mut history = archived.clone();
+        history.extend(
+            retiring
+                .iter()
+                .filter(|(envelope, _)| !archived.iter().any(|held| held.key == envelope.key))
+                .map(|(envelope, _)| (*envelope).clone()),
+        );
+        if history.len() != archived.len() {
+            Self::exchange(&history_path, &archived, &history)?;
         }
-        let deleted = self
-            .backing()
-            .delete_batch_if_unchanged(&retiring)
-            .context("retiring a closed incident")?;
-        if deleted {
-            publish_projection_mode(&self.path)?;
-        }
-        Ok(deleted)
+        let kept = kept
+            .into_iter()
+            .map(|(envelope, _)| envelope.clone())
+            .collect::<Vec<_>>();
+        Self::exchange(&self.path, &snapshot.envelopes, &kept)?;
+        publish_file_mode(&self.path)?;
+        Ok(true)
     }
 }
 
@@ -313,12 +339,7 @@ impl IncidentStore {
 pub(crate) fn render_incidents(records: &[IncidentRecord], target: &str, now: u64) -> Vec<String> {
     records
         .iter()
-        .filter(|record| record.subject == target)
-        .filter(|record| {
-            record.closed_at_unix_millis.is_none_or(|closed_at| {
-                now.saturating_sub(closed_at) <= INCIDENT_RETENTION_MILLIS
-            })
-        })
+        .filter(|record| record.subject == target && record.inside_retention(now))
         .map(|record| {
             let mut line = format!(
                 "  incident {} opened-at {}",
@@ -336,7 +357,10 @@ pub(crate) fn render_incidents(records: &[IncidentRecord], target: &str, now: u6
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
     use tempfile::TempDir;
 
     use super::*;
@@ -592,7 +616,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn published_incident_store_is_world_readable() {
+    fn published_incident_store_is_world_readable_and_its_lock_is_not() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().unwrap();
@@ -603,19 +627,156 @@ mod tests {
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
 
         assert!(under_service_umask(|| store.open(condition, "service", OPENED)).unwrap());
-        assert_eq!((mode(&path), mode(&lock)), (0o644, 0o644), "after open");
+        assert_eq!(mode(&path), 0o644, "after open");
+        assert_eq!(mode(&lock) & 0o007, 0, "the lock is open to others after open");
 
         // Each write replaces the file, and the replacement is published too.
         assert!(
             under_service_umask(|| store.close(condition, "service", CloseReason::Recovered, CLOSED))
                 .unwrap()
         );
-        assert_eq!((mode(&path), mode(&lock)), (0o644, 0o644), "after close");
+        assert_eq!(mode(&path), 0o644, "after close");
+        assert_eq!(mode(&lock) & 0o007, 0, "the lock is open to others after close");
 
         assert!(
             under_service_umask(|| store.retire_closed(CLOSED + INCIDENT_RETENTION_MILLIS + 1))
                 .unwrap()
         );
         assert_eq!(mode(&path), 0o644, "after retire");
+        assert_eq!(mode(&lock) & 0o007, 0, "the lock is open to others after retire");
+    }
+
+    /// An exclusive lock on a store's lock file, held through another file
+    /// description. flock conflicts between descriptions, so the holder need
+    /// not be another process or another uid: the test does not depend on who
+    /// it runs as.
+    #[cfg(unix)]
+    pub(crate) struct HeldLock(#[allow(dead_code)] std::fs::File);
+
+    #[cfg(unix)]
+    pub(crate) fn hold_lock_of(store: &Path) -> HeldLock {
+        use std::os::unix::io::AsRawFd;
+
+        let mut name = store.file_name().unwrap().to_owned();
+        name.push(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(store.with_file_name(name))
+            .unwrap();
+        // SAFETY: flock on a descriptor this function owns.
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        HeldLock(file)
+    }
+
+    /// Run `work` while `held` is held, and fail if it waited on it. The
+    /// holder lets go after three seconds so that work which does wait ends,
+    /// late, and the test fails instead of hanging.
+    #[cfg(unix)]
+    pub(crate) fn run_while_held<T>(held: HeldLock, work: impl FnOnce() -> T) -> T {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(3));
+            drop(held);
+        });
+        let started = Instant::now();
+        let result = work();
+        let waited = started.elapsed();
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(waited < Duration::from_secs(2), "the work waited {waited:?} on a held lock");
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_incident_write_waits_on_a_held_lock_and_each_lands_when_it_is_freed() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("incidents.cc");
+        let store = IncidentStore::new(&path);
+        let condition = IncidentCondition::ContinuityExhausted;
+        assert!(store.open(condition, "closing", OPENED).unwrap());
+        assert!(store.close(condition, "closing", CloseReason::Recovered, OPENED + 1).unwrap());
+        assert!(store.open(condition, "open", OPENED).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let retired = OPENED + 1 + INCIDENT_RETENTION_MILLIS + 1;
+
+        let outcomes = run_while_held(hold_lock_of(&path), || {
+            (
+                store.open(condition, "new", CLOSED),
+                store.close(condition, "open", CloseReason::Recovered, CLOSED),
+                store.retire_closed(retired),
+            )
+        });
+        for outcome in [outcomes.0, outcomes.1, outcomes.2] {
+            assert!(outcome.is_err());
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a contended write changed the file");
+        assert!(!temp.path().join("incident-history.cc").exists());
+
+        // Nothing was lost by the refusal: the same calls land once it is free.
+        assert!(store.open(condition, "new", CLOSED).unwrap());
+        assert!(store.close(condition, "open", CloseReason::Recovered, CLOSED).unwrap());
+        assert!(store.retire_closed(retired).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_history_lock_keeps_the_incident_where_it_is() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("incidents.cc");
+        let history = temp.path().join("incident-history.cc");
+        let store = IncidentStore::new(&path);
+        let condition = IncidentCondition::ContinuityExhausted;
+        assert!(store.open(condition, "old", OPENED).unwrap());
+        assert!(store.close(condition, "old", CloseReason::Recovered, OPENED + 1).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let retired = OPENED + 1 + INCIDENT_RETENTION_MILLIS + 1;
+
+        let outcome = run_while_held(hold_lock_of(&history), || store.retire_closed(retired));
+        assert!(outcome.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(store.retire_closed(retired).unwrap());
+    }
+
+    #[test]
+    fn a_write_decided_on_a_stale_snapshot_does_not_land() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("incidents.cc");
+        let store = IncidentStore::new(&path);
+        let condition = IncidentCondition::ContinuityExhausted;
+
+        // Two writers read the file with no incident open for the subject.
+        let stale = store.snapshot().unwrap();
+        assert!(store.open(condition, "service", OPENED).unwrap());
+
+        // The slower one must lose: one open incident per subject.
+        let error = store
+            .open_on(&stale, condition, "service", OPENED + 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("changed"), "{error}");
+        let records = store.read().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].opened_at_unix_millis, OPENED);
+    }
+
+    #[test]
+    fn retiring_after_a_crash_between_history_and_delete_archives_once() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("incidents.cc");
+        let store = IncidentStore::new(&path);
+        let condition = IncidentCondition::ContinuityExhausted;
+        assert!(store.open(condition, "old", OPENED).unwrap());
+        assert!(store.close(condition, "old", CloseReason::Recovered, OPENED + 1).unwrap());
+        // History already holds the record: the delete never ran.
+        let envelope = store.snapshot().unwrap().envelopes[0].clone();
+        let history = SingleFileMessagePackBackingStore::new(&temp.path().join("incident-history.cc"));
+        assert!(history.insert_entry_if_absent(envelope).unwrap());
+
+        assert!(store.retire_closed(OPENED + 1 + INCIDENT_RETENTION_MILLIS + 1).unwrap());
+        assert!(store.read().unwrap().is_empty());
+        assert_eq!(history.pull_all_read_only_snapshot().unwrap().len(), 1);
     }
 }

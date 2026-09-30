@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -2476,7 +2477,12 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             state_store,
             incident_store,
             command_id,
-        } => status(&state_store, &incident_store, command_id.as_deref()),
+        } => status(
+            &mut std::io::stdout().lock(),
+            &state_store,
+            &incident_store,
+            command_id.as_deref(),
+        ),
         Command::Cancel {
             state_store,
             command_id,
@@ -4112,7 +4118,12 @@ fn submit(
     }
 }
 
-fn status(store_path: &Path, incident_store: &Path, command_id: Option<&str>) -> Result<()> {
+fn status(
+    out: &mut impl Write,
+    store_path: &Path,
+    incident_store: &Path,
+    command_id: Option<&str>,
+) -> Result<()> {
     let snapshot = ControlSnapshot::read(store_path)?;
     // Commands stay resident; their finished transactions do not. Without
     // history a completed command would report as though it had never run,
@@ -4140,10 +4151,11 @@ fn status(store_path: &Path, incident_store: &Path, command_id: Option<&str>) ->
         );
         transactions.sort_by_key(|value| value.ordinal);
         let (state, detail) = derived_command_status(&transactions);
-        println!(
+        writeln!(
+            out,
             "{} {} {} {}",
             command.command_id, command.selector, state, detail
-        );
+        )?;
         // Naming one command asks about that command, so print what a stuck
         // transaction is actually waiting on. A gate reason lives in
         // `last_error` and was never rendered anywhere, which left "Sealing"
@@ -4152,49 +4164,53 @@ fn status(store_path: &Path, incident_store: &Path, command_id: Option<&str>) ->
         // ids are here because they are exactly what a brake release must name.
         if command_id.is_some() {
             for transaction in transactions {
-                println!("  transaction {}", transaction.transaction_id);
-                println!(
+                writeln!(out, "  transaction {}", transaction.transaction_id)?;
+                writeln!(
+                    out,
                     "    target {} phase {:?}",
                     transaction.target, transaction.phase
-                );
+                )?;
                 if let Some(expected) = &transaction.expected {
-                    println!("    runtime {}", expected.runtime_id);
-                    println!("    release {}", expected.sealed_release_id);
+                    writeln!(out, "    runtime {}", expected.runtime_id)?;
+                    writeln!(out, "    release {}", expected.sealed_release_id)?;
                 }
-                println!(
+                writeln!(
+                    out,
                     "    odin publisher cursor {}",
                     transaction.odin_publisher_sequence_cursor
-                );
+                )?;
                 if let Some(evidence) = &transaction.latest_odin_observation {
-                    println!(
+                    writeln!(
+                        out,
                         "    latest odin observation sequence {}",
                         evidence.publisher_sequence
-                    );
+                    )?;
                 }
                 if let Some(reason) = &transaction.last_error {
-                    println!("    waiting on {reason}");
+                    writeln!(out, "    waiting on {reason}")?;
                 }
                 // A Complete transaction that is not terminal still owns its
                 // target through unfinished cleanup. Without this an operator
                 // sees "Complete" and a stale reason and cannot tell what is
                 // holding the target.
                 if let Some(completion) = &transaction.completion {
-                    println!("    completion {completion:?}");
+                    writeln!(out, "    completion {completion:?}")?;
                 }
                 if let Some(abort) = &transaction.pre_fencing_abort {
-                    println!("    pre-fencing abort {abort:?}");
+                    writeln!(out, "    pre-fencing abort {abort:?}")?;
                 }
                 if let Some(abort) = &transaction.post_fencing_abort {
-                    println!("    post-fencing abort {abort:?}");
+                    writeln!(out, "    post-fencing abort {abort:?}")?;
                 }
                 if let Some(cleanup) = &transaction.post_commit_cleanup {
-                    println!("    post-commit cleanup {cleanup:?}");
+                    writeln!(out, "    post-commit cleanup {cleanup:?}")?;
                 }
-                println!(
+                writeln!(
+                    out,
                     "    terminal {} owns-target {}",
                     transaction.is_terminal(),
                     transaction.blocks_new_target_mutation()
-                );
+                )?;
             }
         }
     }
@@ -4202,7 +4218,7 @@ fn status(store_path: &Path, incident_store: &Path, command_id: Option<&str>) ->
     // generations and the metered targets, so a target that has only been
     // deployed to (no generation yet) still shows what it has used.
     for line in render_targets(&snapshot, incident_store, now_millis()?) {
-        println!("{line}");
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }
@@ -4648,7 +4664,7 @@ impl Engine {
     /// decides exactly as it would have with a healthy store. It names the
     /// operation and the root cause and never a path or a value. Incident
     /// writes are never progress.
-    fn record_incident(&self, operation: &str, outcome: Result<bool>) {
+    fn record_incident<T>(&self, operation: &str, outcome: Result<T>) {
         let key = format!("incident-store:{operation}");
         match outcome {
             Ok(_) => self.clear_fault(&key),
@@ -4662,21 +4678,18 @@ impl Engine {
         }
     }
 
-    /// Close every open incident whose target is no longer admitted, then
-    /// retire what has been closed past retention.
+    /// Close every open incident whose subject is a target that is no longer
+    /// admitted, then retire what has been closed past retention.
     fn reconcile_incidents(&self, snapshot: &ControlSnapshot) {
         let store = self.incidents();
-        let close_unadmitted = || -> Result<bool> {
+        let close_unadmitted = || -> Result<()> {
             let now = now_millis()?;
-            let mut closed = false;
             for record in store.read()? {
                 if record.is_open()
-                    && !snapshot
-                        .admitted
-                        .iter()
-                        .any(|stored| stored.value.target == record.subject)
+                    && record.condition.ends_with_admission()
+                    && snapshot.admitted_for(&record.subject).is_none()
                 {
-                    closed |= store.close(
+                    store.close(
                         record.condition,
                         &record.subject,
                         CloseReason::NoLongerAdmitted,
@@ -4684,7 +4697,7 @@ impl Engine {
                     )?;
                 }
             }
-            Ok(closed)
+            Ok(())
         };
         self.record_incident("close", close_unadmitted());
         self.record_incident("retire", now_millis().and_then(|now| store.retire_closed(now)));
@@ -5121,7 +5134,13 @@ fn boot(options: RuntimeOptions) -> Result<(ProcessLock, Engine)> {
 
 fn serve(options: RuntimeOptions) -> Result<()> {
     let (_lock, engine) = boot(options)?;
-    loop {
+    serve_while(&engine, || true)
+}
+
+/// The daemon's loop: tick, sleep, and go again while `again` says so. `serve`
+/// says so forever; a test says so a few times.
+fn serve_while(engine: &Engine, mut again: impl FnMut() -> bool) -> Result<()> {
+    while again() {
         match engine.run_scheduler_tick() {
             Ok(true) => continue,
             Ok(false) => {}
@@ -5136,6 +5155,7 @@ fn serve(options: RuntimeOptions) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(engine.options.poll_millis));
     }
+    Ok(())
 }
 
 impl Engine {
@@ -5714,11 +5734,21 @@ impl Engine {
             };
             if observation.is_some() {
                 // The admitted workload was seen running: the only evidence
-                // that ends an exhaustion incident. The restart window sliding
-                // is not health and never closes one.
+                // that ends an exhaustion incident, once the window no longer holds it.
+                // The window sliding alone is not health and never closes one.
                 self.record_incident(
                     "close",
                     now_millis().and_then(|now| {
+                        // Running is not enough while the window still holds
+                        // the restarts that exhausted it: a release that
+                        // survives one poll after each restart is still the
+                        // same incident.
+                        if snapshot
+                            .supervision_or_new(&current.value.target)
+                            .restarts_exhausted(now)
+                        {
+                            return Ok(false);
+                        }
                         self.incidents().close(
                             IncidentCondition::ContinuityExhausted,
                             &current.value.target,
@@ -14897,6 +14927,177 @@ mod tests {
             panic!("expected status")
         };
         assert_eq!(incident_store, PathBuf::from("/tmp/j.cc"));
+    }
+
+    #[test]
+    fn a_release_that_runs_one_pass_after_each_restart_keeps_one_incident() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+
+        // Each cycle: the restarts are spent, the release dies, is seen running
+        // for one pass (its last restart took), and dies again.
+        for _ in 0..4 {
+            workload.kill();
+            spend_the_window(&world)?;
+            world.engine.supervise_one_admitted_generation()?;
+            workload.revive();
+            world.engine.supervise_one_admitted_generation()?;
+            let records = incidents_of(&world)?;
+            assert_eq!(records.len(), 1, "a flapping release opened another incident");
+            assert!(records[0].is_open(), "running while still exhausted closed the incident");
+        }
+
+        // Real recovery: running, and the window no longer holds the restarts.
+        slide_the_window(&world)?;
+        world.engine.supervise_one_admitted_generation()?;
+        let records = incidents_of(&world)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].close_reason, Some(CloseReason::Recovered));
+        assert_control_store_holds_no_incident(&world)
+    }
+
+    #[test]
+    fn a_target_leaving_admission_closes_only_its_own_incident() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let service = admit_incumbent(&world)?;
+        let store = IncidentStore::new(&incident_path(&world));
+        let condition = IncidentCondition::ContinuityExhausted;
+        let now = now_millis()?;
+        for subject in ["service", "neighbour", "gone"] {
+            assert!(store.open(condition, subject, now)?);
+        }
+
+        // Two targets are admitted: service, and a neighbour. Only the target
+        // that is not admitted has its incident closed.
+        let mut snapshot = ControlSnapshot::read(&world.state_store)?;
+        let envelope = snapshot
+            .admitted_for("service")
+            .context("no admitted generation")?
+            .envelope
+            .clone();
+        snapshot.admitted.push(Stored {
+            envelope,
+            value: AdmittedGeneration {
+                target: "neighbour".into(),
+                ..service
+            },
+        });
+        world.engine.reconcile_incidents(&snapshot);
+
+        let closed = |subject: &str| -> Result<Option<CloseReason>> {
+            Ok(incidents_of(&world)?
+                .into_iter()
+                .find(|record| record.subject == subject)
+                .context("no such incident")?
+                .close_reason)
+        };
+        assert_eq!(closed("service")?, None);
+        assert_eq!(closed("neighbour")?, None);
+        assert_eq!(closed("gone")?, Some(CloseReason::NoLongerAdmitted));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_incident_lock_changes_nothing_continuity_decides() -> Result<()> {
+        use crate::incident::tests::{hold_lock_of, run_while_held};
+
+        let healthy_workload = SwitchWorkload::new();
+        let healthy = EngineFixture::with_workload(healthy_workload.clone())?;
+        admit_incumbent(&healthy)?;
+        let expected = continuity_decisions(&healthy, &healthy.engine, &healthy_workload)?;
+
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        let path = incident_path(&world);
+        let actual = run_while_held(hold_lock_of(&path), || {
+            continuity_decisions(&world, &world.engine, &workload)
+        })?;
+        assert_eq!(actual, expected, "a held incident lock changed a continuity decision");
+        assert!(!path.exists(), "a contended write landed");
+
+        // Every refused write is a traced fault naming no path.
+        {
+            let reports = world.engine.fault_reports.lock().unwrap();
+            let faults = reports
+                .iter()
+                .filter(|(key, _)| key.starts_with("incident-store:"))
+                .map(|(_, report)| report.last.lock().unwrap().clone().unwrap_or_default())
+                .collect::<Vec<_>>();
+            assert!(!faults.is_empty());
+            let root = world.root.display().to_string();
+            assert!(faults.iter().all(|fault| !fault.contains(&root)), "{faults:?}");
+        }
+
+        // The lock is free again: the next pass retries and the incident lands.
+        world.engine.supervise_one_admitted_generation()?;
+        assert!(incidents_of(&world)?.iter().any(|record| record.is_open()));
+        assert_control_store_holds_no_incident(&world)
+    }
+
+    #[test]
+    fn status_prints_an_open_incident_under_its_target() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        workload.kill();
+        spend_the_window(&world)?;
+        world.engine.supervise_one_admitted_generation()?;
+        let opened = incidents_of(&world)?[0].opened_at_unix_millis;
+
+        let mut printed = Vec::new();
+        status(&mut printed, &world.state_store, &incident_path(&world), None)?;
+        let printed = String::from_utf8(printed)?;
+        let target = printed.find("target service ").context("no target line")?;
+        let incident = printed
+            .find(&format!("  incident continuity-exhausted opened-at {opened}"))
+            .context("status printed no incident")?;
+        assert!(target < incident, "{printed}");
+        Ok(())
+    }
+
+    #[test]
+    fn serve_ticks_until_told_to_stop() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        workload.kill();
+        spend_the_window(&world)?;
+        let mut options = world.engine.options.clone();
+        options.poll_millis = 1;
+        let engine = Engine::open_with_systemd_workload(options, workload.clone())?;
+
+        let mut asked = 0;
+        serve_while(&engine, || {
+            asked += 1;
+            asked <= 3
+        })?;
+        assert_eq!(asked, 4);
+        assert!(incidents_of(&world)?.iter().any(|record| record.is_open()), "no tick ran");
+        Ok(())
+    }
+
+    #[test]
+    fn run_dispatches_serve_and_status() {
+        let temp = TempDir::new().unwrap();
+        let args = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect::<Vec<_>>();
+        // A control store beneath a regular file: serve's boot cannot make it,
+        // and a serve that returned at once would say Ok instead.
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, b"a file").unwrap();
+        let store = file.join("control.cc");
+        assert!(
+            run(args(&["serve", "--state-store", store.to_str().unwrap()]).into_iter()).is_err()
+        );
+        // A control store that is not one: status reads it and refuses.
+        let junk = temp.path().join("junk.cc");
+        std::fs::write(&junk, b"not a cultcache file").unwrap();
+        assert!(
+            run(args(&["status", "--state-store", junk.to_str().unwrap()]).into_iter()).is_err()
+        );
     }
 
     #[test]

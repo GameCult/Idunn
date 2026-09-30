@@ -7659,29 +7659,34 @@ fn ensure_bundle_is_reachable_by_workload(
     Ok(())
 }
 
+/// One published file: `0644`, because Idunn's `UMask=027` would land it
+/// `0640 root:root` and deny its readers. A chmod by hand does not hold, since
+/// each publish writes a new file.
+pub(crate) fn publish_file_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("publishing {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// The topology store is Idunn's *published* surface: every managed target
 /// reads it to verify its own Expected incarnation against the Idunn anchor.
 ///
 /// Idunn runs with `UMask=027`, which is right for its private state and wrong
 /// for this one file -- it lands `0640 root:root`, and a `DynamicUser` workload
-/// gets EACCES. A chmod by hand does not hold, because each publish writes a
-/// new file. Integrity here comes from the signatures over the records, not
-/// from the mode, so the published copy is readable.
-pub(crate) fn publish_projection_mode(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // The lock sibling too: CultCache opens it alongside the store, so a
-        // 0640 lock denies the read just as surely as a 0640 store, and it is
-        // created fresh under Idunn's umask on every publish.
-        for path in [path.to_path_buf(), authority_lock_path(path)] {
-            if path.exists() {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
-                    .with_context(|| format!("publishing {}", path.display()))?;
-            }
-        }
-    }
-    Ok(())
+/// gets EACCES. Integrity here comes from the signatures over the records, not
+/// from the mode, so the published copy is readable. The lock sibling too:
+/// CultCache opens it alongside the store, so a 0640 lock denies the read just
+/// as surely as a 0640 store, and it is created fresh under Idunn's umask on
+/// every publish.
+fn publish_projection_mode(path: &Path) -> Result<()> {
+    publish_file_mode(path)?;
+    publish_file_mode(&authority_lock_path(path))
 }
 
 fn build_machine_id(workspace: &Path) -> Result<String> {
