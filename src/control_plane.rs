@@ -16985,6 +16985,7 @@ mod tests {
                 routed.world.route_stubs.refuse_reloads()?;
                 routed.drift()?;
                 let before = routed.reloads();
+                let began = now_millis()?;
                 break_store_writes(&routed.world);
                 let stored_wait = |routed: &RoutedWorld| -> Result<Option<u64>> {
                     Ok(ControlSnapshot::read(&routed.world.state_store)?
@@ -17003,7 +17004,7 @@ mod tests {
                 assert_eq!(stored_wait(&routed)?, stored, "the record changed though writes fail");
                 let due = challenge_due(&routed.world).expect("no in-memory wait after a failed record");
                 let age = routed.world.engine.options.topology_maximum_age_millis;
-                assert!(due >= now_millis()? + age / 2, "the wait is not the widening wait: {due}");
+                assert!(due >= began + age, "the wait is shorter than one observation age: {due}");
 
                 // The wait expiring is the only thing that admits another
                 // attempt, and each one is again a single reload with no
