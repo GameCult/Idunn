@@ -15496,7 +15496,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_held_incident_lock_changes_nothing_continuity_decides() -> Result<()> {
         use crate::incident::tests::{STUCK_AFTER, hold_lock_of, run_while_held};
@@ -15510,7 +15510,8 @@ mod tests {
         let world = EngineFixture::with_workload(workload.clone())?;
         admit_incumbent(&world)?;
         let path = incident_path(&world);
-        let actual = run_while_held(hold_lock_of(&path), || {
+        // Three ticks reach the open of an exhausted target, one exchange each.
+        let actual = run_while_held(hold_lock_of(&path), 3, || {
             continuity_decisions(&world, &world.engine, &workload)
         })?;
         assert_eq!(actual, expected, "a held incident lock changed a continuity decision");
@@ -15538,6 +15539,91 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_control_store_holds_no_incident(&world)
+    }
+
+    /// A publish that could not land is not done, at the tick: the demotion
+    /// continuity needs before a restart is one exchange on the topology lock,
+    /// and another holder of it defers the restart instead of waiting for it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_topology_lock_defers_continuity_and_mints_nothing() -> Result<()> {
+        use crate::incident::tests::{hold_lock_of, run_while_held};
+
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        project_admitted(&world, &incumbent)?;
+        let store = world.engine.options.topology_store.clone();
+        let projected = projected_under(&world, &incumbent.expected)?;
+        assert!(projected.contains(&IdunnRuntimeActivationRecord::TYPE.to_owned()));
+        let before = std::fs::read(&store)?;
+        workload.kill();
+
+        // One exchange: the demotion. The window is not spent, so continuity
+        // would restart if the projection could be demoted.
+        let moved = run_while_held(hold_lock_of(&store), 1, || {
+            world.engine.supervise_one_admitted_generation()
+        })?;
+        assert!(moved, "the deferral is a write the tick made");
+        assert_eq!(std::fs::read(&store)?, before, "a contended publish changed the projection");
+        let snapshot = ControlSnapshot::read(&world.state_store)?;
+        assert!(snapshot.transactions.is_empty(), "continuity minted over a projection it could not demote");
+        let recorded = snapshot.supervision_for("service").context("no deferral recorded")?.value.clone();
+        assert!(recorded.continuity_restarts.is_empty(), "a deferral spent an attempt");
+        let reason = recorded.continuity_deferral_reason.clone().context("no deferral reason")?;
+        assert!(reason.contains("locked by another holder"), "{reason}");
+        assert!(!reason.contains(&world.root.display().to_string()), "{reason}");
+
+        // The holder is gone and the deferral has run out: the demotion lands
+        // and the restart proceeds.
+        let mut ran_out = recorded;
+        ran_out.continuity_deferred_until = Some(1);
+        set_meters(&world, &ran_out)?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(ControlSnapshot::read(&world.state_store)?.transactions.len(), 1);
+        assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
+        Ok(())
+    }
+
+    /// A deployment phase records a publication digest only after the publish
+    /// returned: the digest is the claim that it landed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_contended_expected_publish_is_not_recorded_as_published() -> Result<()> {
+        use crate::incident::tests::{hold_lock_of, run_while_held};
+
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let seeded = transaction_at(&world, DeploymentPhase::Warming)?;
+        let stored = resident(&world)?;
+        let mut starting = seeded.clone();
+        starting.phase = DeploymentPhase::Starting;
+        starting.expected_publication_sha256 = None;
+        starting.activation = None;
+        starting.workload = None;
+        starting.activation_publication_sha256 = None;
+        starting.warming = None;
+        replace_transaction(&world.state_store, &stored, &starting)?;
+        let store = world.engine.options.topology_store.clone();
+        let stored = resident(&world)?;
+
+        let error = run_while_held(hold_lock_of(&store), 1, || {
+            world.engine.advance_transaction(&stored)
+        })
+        .expect_err("a contended publish must not advance the phase");
+        assert!(format!("{error:#}").contains("locked by another holder"), "{error:#}");
+        assert!(!store.exists(), "a contended publish wrote the projection");
+        let after = resident(&world)?.value;
+        assert_eq!(after.phase, DeploymentPhase::Starting);
+        assert_eq!(after.expected_publication_sha256, None);
+
+        // Free again: the same step publishes and records what it published.
+        world.engine.advance_transaction(&resident(&world)?)?;
+        let expected = seeded.expected.context("seeded transaction has no Expected")?;
+        assert_eq!(
+            resident(&world)?.value.expected_publication_sha256,
+            Some(expected.canonical_sha256()?)
+        );
+        Ok(())
     }
 
     #[test]

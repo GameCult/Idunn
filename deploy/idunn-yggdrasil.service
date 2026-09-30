@@ -77,7 +77,10 @@ ReadWritePaths=/etc/ufw
 # idunn-projection is deliberately outside Idunn's own 0750 directory: the
 # topology store is Idunn's *published* surface, and every managed target must
 # read it to verify its own Expected incarnation against the Idunn anchor. It
-# was inside the private root, where no workload could traverse to it.
+# was inside the private root, where no workload could traverse to it. The
+# published topology store is read lock-free (Odin) and incidents.cc is read by
+# Bifrost's reader; managed targets get Expected from their runtime bundle. Only
+# the stores are readable: each .lock beside them is Idunn's alone, 0600.
 ReadWritePaths=/var/lib/gamecult/idunn /var/lib/gamecult/idunn-authority /var/lib/gamecult/idunn-projection
 ReadWritePaths=/srv/build
 # Each managed target gets only its bound roots. A target Idunn cannot write is
