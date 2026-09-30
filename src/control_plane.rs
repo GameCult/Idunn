@@ -18473,8 +18473,8 @@ mod tests {
         }
 
         /// The `expire` verb as the CLI parses and runs it: the options land
-        /// where they say, and it finds only a live transaction of its own
-        /// command.
+        /// where they say, and it asks only about its own command's live
+        /// transaction.
         #[test]
         fn idunn_expire_parses_its_options_and_asks_only_about_its_own_live_transaction()
         -> Result<()> {
@@ -18499,17 +18499,37 @@ mod tests {
                 .expect_err("expired a command with no transaction");
             assert!(format!("{refused:#}").contains("no live transaction"), "{refused:#}");
 
-            // A finished transaction of the command is not a live one.
+            // Another target's deployment in flight is not this command's.
             let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
-            routed
-                .world
-                .engine
-                .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("test"))?;
-            routed.resume_until_terminal()?;
-            assert!(resident(&routed.world)?.value.is_terminal(), "the record was archived");
-            let refused = expire(&routed.world.state_store, "continuity-service", "operator")
-                .expect_err("expired a finished transaction");
-            assert!(format!("{refused:#}").contains("no live transaction"), "{refused:#}");
+            let now = now_millis()?;
+            let other = DeploymentCommand {
+                schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+                command_id: "up-other".into(),
+                kind: CommandKind::Deploy,
+                selector: "other".into(),
+                requested_by: "test".into(),
+                requested_at_unix_millis: now,
+            };
+            let sealing = DeploymentTransaction::new(&other, "other".into(), 0, None, now)?;
+            assert!(SingleFileMessagePackBackingStore::new(&routed.world.state_store).compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: other.command_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: sealing.transaction_id.clone(),
+                        current: None,
+                    },
+                ],
+                &[command_envelope(&other, now)?, transaction_envelope(&sealing, now)?],
+            )?);
+            expire(&routed.world.state_store, "continuity-service", "operator")?;
+            let requests = ControlSnapshot::read(&routed.world.state_store)?.expiry_requests;
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].value.command_id, "continuity-service");
             Ok(())
         }
 
