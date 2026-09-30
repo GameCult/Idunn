@@ -94,9 +94,29 @@ docs only.
 | C15 | Bridge CLI contract | Bifrost `tools/bifrost-bridge.mjs:1266-1289`; `tools/persona-discord-delivery.mjs:45` | The bridge refuses to act without `--cultmesh-command-id`. The Persona precedent spawns it with `--receipt-store` under its private state directory and parses stdout JSON. |
 | C16 | Crash-recovery precedent | Bifrost `tests/persona-discord-delivery.test.mjs`, "running journal recovers as terminal unknown without a second Discord post" | A `running` execution found at start becomes terminal `unknown` and is never re-posted. |
 | C17 | Discord nonce | docs.discord.com/developers/resources/message (fetched 2026-09-30) | `nonce`: integer or string, "up to 25 characters". `enforce_nonce`: "checked for uniqueness in the past few minutes"; on a duplicate from the same author, "that message will be returned and no new message will be created". |
-| C18 | Bifrost tests and mutation tooling | Bifrost: no root `package.json`, `node:test` files under `tests/`, `grep stryker` returns nothing | Tests run with `node --test`, with CultLib found through `VOIDBOT_CULTLIB_ROOT`. StrykerJS is not installed. |
+| C18 | Bifrost tests and mutation tooling | Bifrost: no root `package.json`, `node:test` files under `tests/`, `grep stryker` returns nothing | Tests run with `node --test`. StrykerJS is not installed. How the tests find CultLib: C23 (the tests ignore `VOIDBOT_CULTLIB_ROOT`). |
 | C19 | Idunn verification | `scripts/verify.sh`; eureka `tools/stopgap/ygg-verify.sh` (rust image carries cargo-mutants) | `cargo check` for the Windows GNU target twice, then `cargo test --locked --lib`. |
 | C20 | Idunn source mentions no transport | `grep -rin "discord\|bifrost" src/` at `487f4f1` | No hits. This is the negative-grep baseline. |
+
+### Bifrost suite probes (2026-09-30, 15:00-15:30 UTC)
+
+Pinned heads: Bifrost `42728a67` (origin/main) and `hands/watchdog-bifrost-retire`
+`4619939e`; CultLib pin `36ea08d3` (origin/main `016df462`); Epiphany origin/main
+`4d1113ef`. Probes ran in a scratch clone, never in `F:\Projects\Bifrost`. Suite
+runs went through `ygg-verify.sh` in `node:24.14.1-bookworm`, with CultLib cloned
+to `/CultLib`, the sibling of `/src`, then `npm ci` and `npm run build:ts`. Each
+file ran alone with the TAP reporter, then the whole glob ran once.
+
+| # | What | Where / command | Result |
+|---|---|---|---|
+| C21 | Bare `cultcache-ts` require sites | Bifrost `git grep -nF '("cultcache-ts")'` at `42728a67` | `tests/persona-feedback-cli.test.mjs:15,55,62`, `tests/persona-discord-delivery.test.mjs:33`, `tests/persona-discord-crossing-rust-smoke.test.mjs:13`, `tools/persona-feedback.mjs:114`, `tools/agent-transport.mjs:40`, `tools/governance-threads.mjs:36`, and `tools/operator-notification.mjs:186`, which cut `bifrost-retire-alarm` deletes. `persona-feedback.mjs` calls `loadRuntime()` at module top (`:23`), so every verb fails at import. The bare `cultnet-ts` and `cultmesh-ts` sites resolve. Tools that load `dist/index.js` by path do not depend on the name: `bifrost-crossing-documents.mjs:271`, `bifrost-repository-release-authority.mjs:161`, `cultmesh-bridge-commands.mjs:313-314` and `provider-advertisement.mjs:47-119`. |
+| C22 | What CultLib publishes | `git show <rev>:packages/{cultcache,cultnet,cultmesh}-ts/package.json` at `36ea08d3` and `016df462`; `git log -S'"@gamecult/cultcache-ts"'` | Only `cultcache-ts` is scoped: `@gamecult/cultcache-ts`, renamed in `8cb3b728` (2026-09-04). `cultnet-ts` and `cultmesh-ts` are still bare and depend on `@gamecult/cultcache-ts ^0.14.0`. The commit message says they "move with it", but only their dependency moved. The directory `packages/cultcache-ts` keeps its name, and every package declares `exports`. A local resolve at `016df462`, anchored at `packages/cultcache-ts/package.json`, gives `@gamecult/cultcache-ts` -> `dist/index.js` and `cultcache-ts` -> `MODULE_NOT_FOUND`. |
+| C23 | How Bifrost finds CultLib | C21 sites; `ls .github/workflows` | Tools use `VOIDBOT_CULTLIB_ROOT`, falling back to the sibling `../CultLib`. **Tests hard-code the sibling `../CultLib` and ignore the variable.** Bifrost has no `package.json` and no CultLib dependency. No CI runs the node tests: the only workflow is `publish-container.yml`. |
+| C24 | **Production Persona crossing is not broken by the rename** | `ssh ygg`, read-only: `systemctl cat bifrost-persona-mouth bifrost-persona-feedback`; `cat .../runtime/current/release-manifest.txt`; `createRequire(<release>/CultLib/packages/cultcache-ts/package.json).resolve("cultcache-ts")` | Both units run release `cb3239a…-f67f5122…`. The manifest says `cultlib_commit=f67f5122`, node `v24.14.1`. `VOIDBOT_CULTLIB_ROOT` points at the release's own CultLib. There the package is named `cultcache-ts`, `node_modules` holds real `cultcache-ts`, `cultmesh-ts` and `cultnet-ts` directories, and the bare name resolves to the release's `dist/index.js`. `f67f5122` is an ancestor of `8cb3b728`, so it predates the rename. A restart reloads the same pinned bundle. Since the C21 fix, Bifrost needs CultLib `8cb3b728` or later. A release that pairs it with an older CultLib fails at import (follow_up `stale-bifrost-persona-manifest` owns that path). |
+| C25 | The Rust fixture tests have no producer | `tests/persona-discord-crossing-rust-smoke.test.mjs:17`, `tests/persona-discord-rudp-cross-language.test.mjs:21`; Epiphany `git log -S persona-discord-crossing-fixture`, `git grep` at `4d1113ef` | Both tests `cargo run --bin epiphany-persona-discord-{crossing,rudp-client}-fixture` in the sibling `../Epiphany`, with `CARGO_TARGET_DIR` hard-coded to `C:\\Users\\Meta\\.cargo-target-codex`. Epiphany deleted both bins in `387afe49` (2026-08-23), and neither exists at `4d1113ef`. So since 2026-08-23 these tests fail on every host, with cargo or without. `persona_discord_crossing.rs` survives as a library module. |
+| C26 | Suite at base | ygg-verify Bifrost `42728a67`, CultLib `36ea08d3` at `/CultLib` | Per file (tests/pass/fail/skip): rust-smoke 1/0/1/0 (`spawn cargo ENOENT`); delivery 9/3/6/0 (`MODULE_NOT_FOUND 'cultcache-ts'`); permit 2/2/0/0; rudp 1/0/1/0 (`spawn cargo ENOENT`); feedback-cli 1/0/1/0 (the file fails to load, so its 8 tests are counted as 1); idunn-health 3/3/0/0. Glob total 17/8/9, exit 1, the same as Hands h1. |
+| C27 | Suite with the fix | scratch commit `a6770c5` on `42728a67`: the scoped name at the seven live C21 sites, a skip guard on both Rust tests, and the `CARGO_TARGET_DIR` override removed. Same command. | rust-smoke 1/0/0/1 (`# SKIP`); delivery 9/9/0/0; permit 2/2/0/0; rudp 1/0/0/1 (`# SKIP`); feedback-cli 8/8/0/0; idunn-health 3/3/0/0. Glob total 24 tests, 22 pass, 0 fail, 2 skipped, exit 0. `agent-transport.mjs` and `governance-threads.mjs` were checked only by name resolution (C22), because no test loads them. |
+| C28 | C3 at the reader's install pin | `git show 36ea08d3:packages/cultcache-ts/src/single-file-messagepack-backing-store.ts` | `pullAll` is at `:43`, and the file has no lock. C3 holds at `36ea08d3`, which is the CultLib that cut `ops-notice-deploy` installs. |
 
 ## Model page
 
@@ -245,3 +265,31 @@ cut is independent and lands before the reader, so the reader is written
 against a tree with one Discord command vocabulary. The gamecult-ops
 subtraction is independent too. The ops deploy cut comes last and needs both
 behaviour cuts merged.
+
+**The Bifrost suite follows the owner's name, with no fallback.** CultLib
+renamed `cultcache-ts` to `@gamecult/cultcache-ts` so that the org owns the
+name on a public registry (C22). The consumer changes the string at each live
+require site (C21) and keeps the directory anchor, which did not move. A
+try-both-names loader was rejected. It would be a local shim that keeps the
+old name alive in Bifrost after its owner retired it. It would also let a
+release silently pair new Bifrost with a pre-rename CultLib. After the change
+that pairing fails loudly at import (C24). Production does not move: its
+bundle pins CultLib `f67f5122` (C24). `cultnet-ts` and `cultmesh-ts` stay bare
+because that is what CultLib publishes. Whether they should follow the scope
+is CultLib's decision, not Bifrost's.
+
+**The Rust fixture tests skip with a reason; they are not deleted.** Their
+producers were deleted from Epiphany on 2026-08-23 (C25), so installing cargo
+would not make them pass. Each one skips unless cargo and its named fixture
+source are present, and the skip reason names the Epiphany commit that removed
+the fixture. Deleting them would throw away the only Rust-authored byte seam
+test the Persona crossing has. Restoring a producer belongs to Epiphany and the
+Persona crossing, both outside this campaign (follow_up
+`bifrost-rust-fixture-producer`). The hard-coded Windows `CARGO_TARGET_DIR`
+goes, because it is wrong on every host except one workstation.
+
+**`bifrost-suite` does not depend on `bifrost-retire-alarm`.** It leaves
+`operator-notification.mjs` alone, because that cut deletes the file, so the
+two branches merge in either order without conflict. The reader depends on
+both. It is written against a tree with one Discord command vocabulary, and it
+is verified by a suite that loads.
