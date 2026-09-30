@@ -4388,6 +4388,7 @@ impl CultCacheTopologyDriver {
     {
         if let Some(parent) = self.projection_store.parent() {
             fs::create_dir_all(parent)?;
+            publish_directory_default_mode(parent)?;
         }
         let store = SingleFileMessagePackBackingStore::new(&self.projection_store);
         for _ in 0..8 {
@@ -4395,7 +4396,7 @@ impl CultCacheTopologyDriver {
             let Some(replacement) = mutate(&entries)? else {
                 return Ok(());
             };
-            if with_published_umask(|| store.compare_exchange_snapshot(&entries, &replacement))? {
+            if store.compare_exchange_snapshot(&entries, &replacement)? {
                 return Ok(());
             }
         }
@@ -7581,37 +7582,52 @@ fn ensure_bundle_is_reachable_by_workload(
 /// reads it to verify its own Expected incarnation against the Idunn anchor.
 ///
 /// Idunn runs with `UMask=027`, which is right for its private state and wrong
-/// for this one file and its `.lock` sibling: they would land `0640 root:root`
-/// and a `DynamicUser` workload gets EACCES. CultCache stages a temporary file
-/// and renames it over the store, so the mode must be right when the staged
-/// file is *created*; a chmod after the rename leaves a window in which the
-/// visible file is unreadable. Integrity here comes from the signatures over
-/// the records, not from the mode, so the published copy is readable.
-///
-/// `action` runs on a helper thread with its own umask (`unshare(CLONE_FS)`),
-/// so files it creates are `0644` while the umask of every other thread in
-/// Idunn stays `0027`. CultCache has no mode parameter to do this itself.
+/// for this directory: the store and its `.lock` sibling would land `0640
+/// root:root` and a `DynamicUser` workload gets EACCES. CultCache stages a
+/// temporary file and renames it over the store, so the mode has to be right
+/// when the staged file is *created*; a chmod after the rename leaves a window
+/// in which the visible file is unreadable. CultCache has no mode parameter and
+/// a process umask is shared by every thread, so the directory carries the
+/// mode: a default ACL of `u::rw-,g::r--,o::r--` overrides the umask for
+/// everything created inside it. This directory holds only the published
+/// projection. Integrity comes from the signatures over the records, not from
+/// the mode, so the published copy is readable.
 #[cfg(target_os = "linux")]
-fn with_published_umask<T: Send>(action: impl FnOnce() -> Result<T> + Send) -> Result<T> {
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                // SAFETY: both calls only touch this thread's filesystem attributes.
-                if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
-                    return Err(anyhow::Error::from(std::io::Error::last_os_error())
-                        .context("giving the projection writer its own umask"));
-                }
-                unsafe { libc::umask(0o022) };
-                action()
-            })
-            .join()
-            .unwrap_or_else(|_| bail!("projection writer thread panicked"))
-    })
+fn publish_directory_default_mode(dir: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    // POSIX ACL xattr: version 2 header, then (tag u16, perm u16, id u32) entries.
+    const USER_OBJ: u16 = 0x01;
+    const GROUP_OBJ: u16 = 0x04;
+    const OTHER: u16 = 0x20;
+    const READ: u16 = 4;
+    const WRITE: u16 = 2;
+    const NO_ID: u32 = u32::MAX;
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, perm) in [(USER_OBJ, READ | WRITE), (GROUP_OBJ, READ), (OTHER, READ)] {
+        acl.extend_from_slice(&tag.to_le_bytes());
+        acl.extend_from_slice(&perm.to_le_bytes());
+        acl.extend_from_slice(&NO_ID.to_le_bytes());
+    }
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    let status = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            c"system.posix_acl_default".as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Err(anyhow::Error::from(std::io::Error::last_os_error()))
+            .with_context(|| format!("setting the default mode of {}", dir.display()));
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn with_published_umask<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
-    action()
+fn publish_directory_default_mode(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn build_machine_id(workspace: &Path) -> Result<String> {
@@ -9543,39 +9559,51 @@ Content-Le".to_vec()), |_| {}),
         ));
     }
 
-    /// Runs `body` on a thread whose umask is Idunn's `027`, without touching
-    /// the umask of the test process.
+    /// Sets the process umask to Idunn's `027` for a scope.
     #[cfg(target_os = "linux")]
-    fn on_thread_with_umask_027<T: Send>(body: impl FnOnce() -> T + Send) -> T {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    assert_eq!(unsafe { libc::unshare(libc::CLONE_FS) }, 0);
-                    unsafe { libc::umask(0o027) };
-                    body()
-                })
-                .join()
-                .unwrap()
-        })
+    struct Umask027(libc::mode_t);
+
+    #[cfg(target_os = "linux")]
+    impl Umask027 {
+        fn set() -> Self {
+            Self(unsafe { libc::umask(0o027) })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Umask027 {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_published_projection_is_never_visible_in_another_mode() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    fn the_published_projection_is_never_visible_in_another_mode() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let temp = tempfile::tempdir().unwrap();
-        let store = temp.path().join("topology.cc");
-        let lock = temp.path().join("topology.cc.lock");
+        struct Done<'a>(&'a AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let (expected, _activation, _warming, provider_anchor) =
+            authenticated_warming(temp.path())?;
+        let published = temp.path().join("published");
+        let driver = topology_driver(&published, "topology");
+        let lock = authority_lock_path(&driver.projection_store);
         let done = AtomicBool::new(false);
-        let (observed, ()) = std::thread::scope(|scope| {
-            // A reader in another process sees only what the directory shows:
+        let observed = std::thread::scope(|scope| -> Result<_> {
+            // A reader as another user sees only what the directory shows:
             // record the mode of every store and lock inode it can open.
             let reader = scope.spawn(|| {
                 let mut seen = std::collections::BTreeSet::new();
                 while !done.load(Ordering::Acquire) {
-                    for path in [&store, &lock] {
+                    for path in [&driver.projection_store, &lock] {
                         if let Ok(meta) = fs::metadata(path) {
                             seen.insert((path.clone(), meta.ino(), meta.mode() & 0o777));
                         }
@@ -9583,33 +9611,16 @@ Content-Le".to_vec()), |_| {}),
                 }
                 seen
             });
-            struct Done<'a>(&'a AtomicBool);
-            impl Drop for Done<'_> {
-                fn drop(&mut self) {
-                    self.0.store(true, Ordering::Release);
-                }
-            }
             let _done = Done(&done);
-            let writes = on_thread_with_umask_027(|| {
-                let store_backing = SingleFileMessagePackBackingStore::new(&store);
-                let mut current: Vec<CultCacheEnvelope> = Vec::new();
-                for round in 0..300u32 {
-                    let mut next = current.clone();
-                    next.push(CultCacheEnvelope {
-                        key: format!("k{round}"),
-                        r#type: "probe".into(),
-                        payload: vec![round as u8],
-                        stored_at: "2026-09-30T00:00:00Z".into(),
-                        schema_id: None,
-                    });
-                    with_published_umask(|| store_backing.compare_exchange_snapshot(&current, &next))
-                        .unwrap();
-                    current = next;
-                }
-            });
+            // Idunn's own umask, in force while it publishes.
+            let _umask = Umask027::set();
+            for _ in 0..150 {
+                driver.publish_expected(&expected, &provider_anchor)?;
+                driver.withdraw_incarnation(&expected, &provider_anchor, None, None)?;
+            }
             drop(_done);
-            (reader.join().unwrap(), writes)
-        });
+            Ok(reader.join().unwrap())
+        })?;
         assert!(!observed.is_empty(), "the reader never saw the store");
         for (path, _, mode) in &observed {
             assert_eq!(
@@ -9619,8 +9630,7 @@ Content-Le".to_vec()), |_| {}),
                 path.display()
             );
         }
-        let final_mode = fs::metadata(&store).unwrap().permissions().mode() & 0o777;
-        assert_eq!(final_mode, 0o644);
+        Ok(())
     }
 
     #[cfg(unix)]
