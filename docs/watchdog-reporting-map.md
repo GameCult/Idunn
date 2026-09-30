@@ -68,6 +68,36 @@ probes ran on Yggdrasil over `ssh ygg`, read-only, 2026-09-30 13:51-13:55 UTC
 | V1 | Peer precedent | VoidBot `packages/core/src/bifrost-discord-command.ts:39-68` | The caller opens Bifrost's store, derives `commandId` from its `idempotencyKey`, optionally spawns the pump itself, and **waits** for the receipt. An unconditional `put` of an existing id overwrites a `completed` command back to `pending`. |
 | V2 | VoidBot `notify_owner` | Self's mapper, not re-probed | Not live on Yggdrasil; no Discord-capable VoidBot process runs there. |
 
+### Cut-mapping probes (2026-09-30, 14:00-14:10 UTC)
+
+Pinned heads: Idunn `487f4f14` (origin/main), Bifrost `42728a67`, gamecult-ops
+`14df7ce4`, all read with `git ls-remote origin refs/heads/main`. Line numbers
+in Idunn are unchanged from `4951125`, because `153af6a` and `487f4f1` touched
+docs only.
+
+| # | What | Where / command | Result |
+|---|---|---|---|
+| C1 | `control.cc` refuses unknown types | Idunn `src/control_plane.rs:2845` | `_ => bail!("Idunn control store contains a foreign document")`. A new type in `control.cc` makes every older binary unable to read the store at all, so a rollback of the incident cut would take continuity down for every target. |
+| C2 | Idunn's store writes take a blocking exclusive lock; reads can skip it | CultLib `packages/cultcache-rs/src/lib.rs:737-785` | `pull_all_read_only_snapshot` reads unlocked. Writes are `fs2::lock_exclusive`, which blocks. A reader that held the lock could stall an Idunn write. |
+| C3 | The TS store takes no lock | CultLib `packages/cultcache-ts/src/single-file-messagepack-backing-store.ts` (no `lock` anywhere); present at Bifrost's pinned CultLib `f67f5122` (`pullAll` at `:44`) | A Bifrost reader using `pullAll` cannot block Idunn. |
+| C4 | A JS reader decodes an Idunn-written store | `scp ygg:/var/lib/gamecult/idunn-projection/topology.cc`; scratch `probe-read.mjs` with cultcache-ts `pullAll` | 18 envelopes decoded (`gamecult.service_trust_anchor.v1`, ...). No `.lock` file was created beside the copy. |
+| C5 | Rust `DatabaseEntry` payload shape in JS | scratch `probe-decode.mjs`, `@msgpack/msgpack` `decode(envelope.payload)` | A **positional array**: index `n` is `#[cultcache(key = n)]`. The Bifrost reader decodes a tuple, so the seam must be pinned by bytes Idunn wrote, not by a hand-built object. |
+| C6 | Projection publish mode | Idunn `src/drivers.rs:4385-4404`, `:7670-7685` | Publication is compare-exchange, then `chmod 0644` on the store and its `.lock` sibling. |
+| C7 | Continuity's healthy site | Idunn `src/control_plane.rs:5631-5633` | `if observation.is_some() { continue; }`: the admitted workload was observed running this pass. The exhaustion decision is `:5709`, and the fault clears at `:5723`. |
+| C8 | Test harness for exhaustion | Idunn `src/control_plane.rs:17659-17689` | Existing tests use `routed_world(Odin::Unreachable, 1, ...)`, `set_meters`, `routed.workload.kill()` and `routed.tick()`. |
+| C9 | Idunn has no one-shot or timer workload | `grep -i "oneshot\|\.timer\|OnCalendar" src/` returns nothing; recipe schema `src/deployment.rs:1935-2000` | A target is a resident service with `[service]`, health contract and state slots. Idunn cannot deploy a systemd timer. |
+| C10 | No Bifrost binding in current Idunn | `sudo ls /etc/gamecult/idunn/bindings/` on ygg | ghostlight, heimdall, odin, raven-muninn, streampixels-service, streampixels-web. No Bifrost. |
+| C11 | Bifrost's old Idunn manifest is residue | `/srv/odin/deploy-manifests/bifrost-persona-feedback` on ygg (2026-09-04); `grep deploy-manifests\|IDUNN_ACTUATOR src/` in Idunn returns nothing | It requires `IDUNN_ACTUATOR=1` / `IDUNN_COMMAND_AUTHORITY=idunn-daemon` env from the pre-rebuild Idunn, which no longer exists. gamecult-ops `runbooks/bifrost-persona-feedback-yggdrasil.md` still describes that path. The persona-feedback `current` has pointed at `cb3239a` since 2026-08-08. |
+| C12 | How Idunn itself is installed | ygg `/usr/local/sbin/idunn-a96ad9d-build.sh`; `ls -la /usr/local/bin/idunn` (2026-09-30 13:22) | One hand-written script per commit. It runs `cargo test --lib` and `cargo build --release` in a pinned rust image under `/srv/build/idunn-<sha>` and copies the unit. The install is manual. No such script is in any repo. |
+| C13 | Legacy alarm consumers in gamecult-ops | `scripts/idunn/notify-idunn-operator-alarm.{ps1,cmd}` (25 + 2 lines); `scripts/idunn/start-idunn-local.ps1:10,134-136` | The only callers of `publish-idunn-alarm`. They pass `--operator-alarm-command` to the deleted pre-rebuild Idunn (I14). No Idunn scheduled task or process runs on Starfire (`Get-ScheduledTask`, `Get-Process`). |
+| C14 | `discord-dm` consumers in Bifrost | `grep discord-dm` | `cultmesh-bridge-commands.mjs:152,227` exist only for `operator-notification.mjs` (BF6). `bifrost-bridge.mjs` `discord-dm` (`:48`, `:473-535`) is also used by `docs/bridge.md:156` and `tests/Bifrost.Web.Tests/BridgeCliTests.cs:481`, so it stays. |
+| C15 | Bridge CLI contract | Bifrost `tools/bifrost-bridge.mjs:1266-1289`; `tools/persona-discord-delivery.mjs:45` | The bridge refuses to act without `--cultmesh-command-id`. The Persona precedent spawns it with `--receipt-store` under its private state directory and parses stdout JSON. |
+| C16 | Crash-recovery precedent | Bifrost `tests/persona-discord-delivery.test.mjs`, "running journal recovers as terminal unknown without a second Discord post" | A `running` execution found at start becomes terminal `unknown` and is never re-posted. |
+| C17 | Discord nonce | docs.discord.com/developers/resources/message (fetched 2026-09-30) | `nonce`: integer or string, "up to 25 characters". `enforce_nonce`: "checked for uniqueness in the past few minutes"; on a duplicate from the same author, "that message will be returned and no new message will be created". |
+| C18 | Bifrost tests and mutation tooling | Bifrost: no root `package.json`, `node:test` files under `tests/`, `grep stryker` returns nothing | Tests run with `node --test`, with CultLib found through `VOIDBOT_CULTLIB_ROOT`. StrykerJS is not installed. |
+| C19 | Idunn verification | `scripts/verify.sh`; eureka `tools/stopgap/ygg-verify.sh` (rust image carries cargo-mutants) | `cargo check` for the Windows GNU target twice, then `cargo test --locked --lib`. |
+| C20 | Idunn source mentions no transport | `grep -rin "discord\|bifrost" src/` at `487f4f1` | No hits. This is the negative-grep baseline. |
+
 ## Model page
 
 A row per persistent kind this campaign creates or depends on. "New" means the
@@ -76,8 +106,7 @@ cut spec fixes them.
 
 | Kind | Identity | Lifecycle | Authority |
 |---|---|---|---|
-| **Incident record** (new, Idunn `control.cc`, e.g. `idunn.operator_incident.v1`) | Key `<condition>:<subject>:<opened_at_unix_ms>`. Namespace: Idunn's control store, one type. `condition` is a closed enum (`continuity-exhausted`, `route-degraded`, `operator-required`, `odin-store-contested`, ...). `subject` is the target for target conditions and the `transaction_id` for `operator-required`. `opened_at` is written once at opening by Idunn's clock. Injective because of one rule: **at most one open incident per `(condition, subject)`**; the opener checks it before writing. Two different faults on one target are different conditions, so they never collide. Nothing in the key comes from Bifrost or Odin. | **Created** at the site that decides the condition (I2, I3, I6, Odin read) in the same store transaction family as that condition's own write, before any trace line. **Closed** by a write of `closed_at` and `close_reason` on the same record, never a delete: continuity-exhausted closes when the supervision pass sees the admitted workload running or a new generation is admitted, **not** when the window slides (I2 would flap otherwise); route-degraded closes on `record_proved_challenge` or when its generation is replaced; odin-store-contested closes when Odin's catalog stops reporting it; operator-required closes when its transaction leaves the phase, for which **no path exists yet** (I6). **Reopened**: never revived; a recurrence is a new record with a new `opened_at`. **Replayed after an Idunn restart**: the record is durable, so the decision site finds the open incident and writes nothing; `ReportOnce` is not consulted. **Pruned**: a closed record retires to `history.cc` one per tick, like a terminal transaction, after the projection has carried its closure for a retention period (length is a cut detail). After pruning, `idunn status` shows only open incidents. | Idunn's daemon, at the condition's decision site, is the only writer. Forbidden: the CLI (it may request, as `ExpiryRequest` does, never write the record), Bifrost, Odin, any reader of the projection, `ReportOnce`, a repair loop that opens incidents from log text. |
-| **Incident projection** (new, derived) | One file in `/var/lib/gamecult/idunn-projection/` beside `topology.cc`, holding the open incidents plus closed ones inside retention, keyed exactly as the record. World-readable (Y9). | Rewritten whenever an incident opens or closes. Idunn restart: regenerated from `control.cc`. Never an input to Idunn. | Derived, notification-only. Idunn writes it; nothing else does. Whether it is signed with Idunn's service identity, as the topology projection is, follows that precedent (cut detail). Forbidden: Idunn reading it back, any Bifrost write. |
+| **Incident record** (new, `idunn.operator_incident.v1`, its own file `/var/lib/gamecult/idunn-projection/incidents.cc`, published 0644 beside `topology.cc`) | Key `<condition>:<subject>:<opened_at_unix_ms>`. Namespace: `incidents.cc`, one type; the file refuses any other. It is never written to `control.cc`, which bails on unknown types, so a rollback would stop continuity (C1). `condition` is a closed enum (`continuity-exhausted` first; `odin-store-contested`, `odin-store-unpersisted` and `operator-required` join when their sources exist). `subject` is the target for target conditions and the `transaction_id` for `operator-required`. `opened_at` is written once by Idunn's clock. Injective because of one rule: **at most one open incident per `(condition, subject)`**, checked by a compare-exchange create. | **Created** at the site that decides the condition, after that decision and before its trace line. **Closed** by writing `closed_at` and `close_reason` on the same record, never by deleting it. Continuity-exhausted closes when the pass sees the workload running (`recovered`) or the target is no longer admitted, **not** when the window slides (I2). Odin conditions close when the catalog stops reporting them. `operator-required` has **no closing path yet** (I6; follow_up `b5-operator-required-no-exit`). **Reopened**: never; a recurrence is a new record with a new `opened_at`. **Replayed after an Idunn restart**: the durable open record makes the site write nothing. **Pruned**: closed more than 7 days ago, it retires to `history.cc`. **Store failure**: reported once as a fault and never returned into the tick (`survival-independent`). | Idunn's daemon, at the decision site, is the only writer. The same file is the record and what Bifrost reads, so no separate projection exists to drift. Forbidden: the CLI (`status` reads only), Bifrost and every other reader, Odin, `ReportOnce`, `control.cc`, a repair loop that opens incidents from log text. |
 | **Stderr trace** (exists) | `report_once` key, in memory | Printed once per process lifetime per fault; lost on restart (I1). | **Demoted**: `ReportOnce` is no longer an owner of "has the operator been told". It de-dups stderr only. |
 | **Delivery request / journal entry** (Bifrost store) | Keyed by the Idunn incident key plus the notice kind (`opened`, and `closed` if Q `closure-notice` says so). Injective because the incident key is. Not derived from payload text or time (BF1's `raisedAt` hash is the counter-example). | **Created** by Bifrost when its reader first sees a notice-worthy incident state in the projection. **Revised**: `pending` -> `sent` or `failed`, with an attempt count and last error. **Retried** until sent, with backoff; a create for an existing key writes nothing (V1's unconditional `put` is the counter-example). **Replayed after a Bifrost restart**: journal is durable; a `pending` entry is retried. **Pruned** only after the incident key has left Idunn's projection. | Bifrost's reader only. Forbidden: Idunn (it never writes Bifrost's store, even though Y2 shows it physically could), VoidBot, the operator by hand. Which Bifrost process: see Rationale. |
 | **Delivery receipt** (Bifrost, `discord_post_receipt.v1` or the journal's `sent` state) | Same key as the request. | Written once on success with the Discord message id. | Bifrost. **Idunn does nothing with it**: it neither reads it in the daemon nor waits on it (`survival-independent`). `idunn status` does not show delivery state; Bifrost's journal is where a failed delivery is visible. |
@@ -146,3 +175,73 @@ one notice, per slide.
 make an in-memory de-dup cache the owner of "was the operator told", keyed by
 free-form strings, with no closure and no subject. The incident record puts
 that decision at the condition's own site, as `record-before-delivery` asks.
+
+**The incident store is its own file, and that file is the projection.** The
+model page placed the record in `control.cc` with a separate projection
+derived from it. C1 overturns that: an unknown type in `control.cc` makes every
+older Idunn binary refuse the whole store, so rolling back the incident cut
+would stop continuity for every target. The record therefore lives in its own
+CultCache file, `/var/lib/gamecult/idunn-projection/incidents.cc`, written by
+Idunn with compare-exchange and published `0644` like `topology.cc` (C6). An
+incident carries nothing sensitive (`no-sensitive-egress`), so there is no
+private half to keep apart, and the derived copy disappears. What is lost: the
+open write is not atomic with any `control.cc` write. That costs nothing
+today, because the exhaustion decision writes nothing to `control.cc` (I2),
+and later sources are read-only observations. The model page's
+"Incident record" and "Incident projection" rows collapse into this one file.
+Self owns the edit to the model page.
+
+**A broken incident store never reaches the tick.** Every incident operation
+returns its error to one call site, which traces it once with `report_once`
+and moves on. An unreadable store means no incident opens (the stderr trace
+still prints); it never changes what continuity decides. The Idunn cut's
+survival test pins this with an unwritable store path.
+
+**Bifrost reads without the lock.** Idunn's writes block on an exclusive lock
+(C2). A reader that took the lock could stall a tick. cultcache-ts `pullAll`
+takes none (C3, C4), and Idunn's rename is atomic, so the reader only ever sees
+a whole snapshot. The reader never opens Idunn's file through a CultMesh node,
+which could flush.
+
+**Delivery at most once, with the nonce as the second guard.** This follows
+the Persona precedent (C16): a journal entry found `running` at start becomes
+`unknown` and is never re-posted. A bridge exit that failed is retried on a
+later run, with the same nonce and `enforce_nonce` (C17). A retry inside
+Discord's "past few minutes" returns the original message instead of creating
+another. The remaining duplicate needs the bridge to have posted, then exited
+non-zero, and the retry to fall outside that window. The attempt cap and
+timer period bound it, and it is recorded as a residual risk rather than
+engineered away.
+
+**Who sees a delivery failure: Bifrost, through systemd.** There is one
+channel to the operator, and it is the one that failed, so a failure cannot
+page over it. The reader exits non-zero while any journal entry is `unknown`
+or has exhausted its attempts. The unit then shows in `systemctl --failed` and
+in its journal, and the reader's `status` verb lists the entries. Idunn reads
+none of this (`survival-independent`). This is a default: the alternatives
+either couple Idunn to delivery state or need a second channel that does not
+exist.
+
+**Deployment of the reader has no Idunn path.** Idunn deploys resident
+services, and a timer does not fit its recipe model (C9). No Bifrost binding
+exists in current Idunn (C10), and the old Bifrost manifest belongs to the
+Idunn that was rebuilt away (C11). The ruled one-shot reader can be
+hand-installed by a gamecult-ops script and runbook, the same interim footing
+as `huginn.service` and `bifrost-persona-mouth`. Otherwise Idunn must first
+learn a new workload kind. That choice is an operator question raised in the
+ops cut.
+
+**The reader gets its own release root.** It installs under
+`/srv/bifrost/watchdog-notice/releases/<bifrost>-<cultlib>` and does not
+repoint `/srv/bifrost/persona-feedback/runtime/current`. Repointing that link
+would stage new code under `bifrost-persona-mouth`. With the token file now
+present (Y3, Y6), the mouth's next restart would also make the Persona crossing
+able to post. That crossing is out of scope and must not change as a side
+effect.
+
+**Cut order.** The Idunn incident cut comes first. It writes the golden
+fixture that Bifrost's reader is tested against (C5). The Bifrost subtraction
+cut is independent and lands before the reader, so the reader is written
+against a tree with one Discord command vocabulary. The gamecult-ops
+subtraction is independent too. The ops deploy cut comes last and needs both
+behaviour cuts merged.
