@@ -2941,6 +2941,32 @@ impl ControlSnapshot {
         Ok(())
     }
 
+    /// Every stored record that concerns `target`, as read: the generation, the
+    /// meters and its transactions. Two reads with equal stamps saw no write
+    /// for the target between them.
+    fn target_stamp(&self, target: &str) -> Vec<CultCacheEnvelope> {
+        let mut stamp = self
+            .admitted
+            .iter()
+            .filter(|stored| stored.value.target == target)
+            .map(|stored| stored.envelope.clone())
+            .chain(
+                self.targets
+                    .iter()
+                    .filter(|stored| stored.value.target == target)
+                    .map(|stored| stored.envelope.clone()),
+            )
+            .chain(
+                self.transactions
+                    .iter()
+                    .filter(|stored| stored.value.target == target)
+                    .map(|stored| stored.envelope.clone()),
+            )
+            .collect::<Vec<_>>();
+        stamp.sort_by(|a, b| (&a.r#type, &a.key).cmp(&(&b.r#type, &b.key)));
+        stamp
+    }
+
     fn admitted_for(&self, target: &str) -> Option<&Stored<AdmittedGeneration>> {
         self.admitted
             .iter()
@@ -4307,6 +4333,13 @@ impl Drop for ProcessLock {
     }
 }
 
+/// One target's in-memory challenge wait: when it is due, and the stored
+/// records of the target as they were when the record failed to land.
+struct ChallengeWait {
+    due_unix_millis: u64,
+    stamp: Vec<CultCacheEnvelope>,
+}
+
 struct Engine {
     options: RuntimeOptions,
     idunn_signer: ServiceIdentitySigner<IdunnServiceIdentity>,
@@ -4325,11 +4358,13 @@ struct Engine {
     /// Process-local on purpose: a restart retries at once, and no schema
     /// carries a clock that only pacing reads.
     resume_backoff: Mutex<BTreeMap<String, ResumeBackoff>>,
-    /// When each routed target's next challenge is due, held only while the
-    /// stored `RouteSupervisionState` cannot be written. The stored value owns
-    /// the schedule and survives restarts; this spaces attempts when the record
-    /// of the last one did not land.
-    challenge_wait: Mutex<BTreeMap<String, u64>>,
+    /// When each routed target's next challenge is due, held only when the
+    /// stored `RouteSupervisionState` could not record the last one. The stored
+    /// value owns the schedule and survives restarts; this spaces attempts
+    /// while the record did not land. An entry ends the moment any write for
+    /// its target lands (its stamp no longer matches the store) or the target
+    /// is retired or withdrawn: it never outlives the episode that made it.
+    challenge_wait: Mutex<BTreeMap<String, ChallengeWait>>,
 }
 
 /// The route driver's door to the actuation ceiling: every group of host
@@ -5384,6 +5419,13 @@ impl Engine {
 
     fn supervise_one_admitted_generation(&self) -> Result<bool> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        // A wait belongs to the failed record it spaces. Once any write for its
+        // target has landed, or the target is no longer admitted, the stored
+        // schedule owns the target again.
+        self.challenge_wait
+            .lock()
+            .expect("challenge wait mutex")
+            .retain(|target, wait| snapshot.target_stamp(target) == wait.stamp);
         let mut progressed = false;
         let mut admitted = snapshot.admitted.iter().collect::<Vec<_>>();
         admitted.sort_by_key(|stored| stored.value.target.as_str());
@@ -5412,7 +5454,7 @@ impl Engine {
             }) {
                 continue;
             }
-            match self.supervise_admitted_route(current) {
+            match self.supervise_admitted_route(&snapshot, current) {
                 Ok(true) => {
                     progressed = true;
                     continue;
@@ -5748,7 +5790,11 @@ impl Engine {
         Ok(progressed)
     }
 
-    fn supervise_admitted_route(&self, current: &Stored<AdmittedGeneration>) -> Result<bool> {
+    fn supervise_admitted_route(
+        &self,
+        snapshot: &ControlSnapshot,
+        current: &Stored<AdmittedGeneration>,
+    ) -> Result<bool> {
         let Some(expected_route) = current.value.expected.route.as_ref() else {
             ensure!(
                 matches!(&current.value.routing, RoutingEvidence::SkippedUnrouted),
@@ -5779,10 +5825,10 @@ impl Engine {
             .lock()
             .expect("challenge wait mutex")
             .get(&current.value.target)
-            .is_some_and(|due| {
+            .is_some_and(|wait| {
                 is_waiting(
                     now,
-                    *due,
+                    wait.due_unix_millis,
                     ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS.max(self.options.topology_maximum_age_millis),
                 )
             })
@@ -5828,10 +5874,11 @@ impl Engine {
         }
         let route_key = format!("route:{}", current.value.target);
         // A failed repair or a failed proof changes observation state only: it
-        // marks the route degraded and widens the wait. It is a write, so it
-        // ends this target's supervision pass (`Ok(true)`), exactly as a
-        // proved challenge does: the caller's snapshot no longer matches the
-        // generation, and a later step in the same pass would lose its CAS.
+        // marks the route degraded and widens the wait. That record is written
+        // like a proved one: when it lands the pass ends (`Ok(true)`), because
+        // the caller's snapshot no longer matches the generation; when the store
+        // refuses it the pass reports no progress and the in-memory wait below
+        // spaces the next attempt.
         let challenge = (|| -> Result<RouteObservation> {
             // Actuates only when the fragment on disk differs from the
             // admitted membership; an exact fragment makes this a no-op. It is
@@ -5922,7 +5969,13 @@ impl Engine {
                 self.challenge_wait
                     .lock()
                     .expect("challenge wait mutex")
-                    .insert(current.value.target.clone(), wait_until);
+                    .insert(
+                        current.value.target.clone(),
+                        ChallengeWait {
+                            due_unix_millis: wait_until,
+                            stamp: snapshot.target_stamp(&current.value.target),
+                        },
+                    );
                 self.report_once(
                     &record_key,
                     format!(
@@ -17043,6 +17096,7 @@ mod tests {
                 set_meters(&self.world, &meters)
             }
 
+            #[cfg(unix)]
             fn reloads(&self) -> usize {
                 self.world.route_stubs.count("systemctl reload")
             }
@@ -17106,7 +17160,7 @@ mod tests {
 
         #[cfg(unix)]
         fn challenge_due(world: &EngineFixture) -> Option<u64> {
-            world.engine.challenge_wait.lock().unwrap().get("service").copied()
+            world.engine.challenge_wait.lock().unwrap().get("service").map(|wait| wait.due_unix_millis)
         }
 
         #[cfg(unix)]
@@ -17193,9 +17247,183 @@ mod tests {
             routed.admit()?;
             routed.world.route_stubs.refuse_reloads()?;
             routed.drift()?;
-            routed.world.engine.challenge_wait.lock().unwrap().insert("service".into(), 0);
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            routed.world.engine.challenge_wait.lock().unwrap().insert(
+                "service".into(),
+                ChallengeWait { due_unix_millis: 0, stamp: snapshot.target_stamp("service") },
+            );
             assert!(routed.tick()?, "a landed record is progress");
             assert_eq!(challenge_due(&routed.world), None);
+            Ok(())
+        }
+
+        /// A fragment that re-drifts after every restore, with the store
+        /// unwritable, is reloaded once per wait, however many laps run.
+        #[cfg(unix)]
+        #[test]
+        fn a_re_drifting_fragment_is_reloaded_once_per_wait_when_the_store_is_unwritable() -> Result<()> {
+            let name = "a_re_drifting_fragment_is_reloaded_once_per_wait_when_the_store_is_unwritable";
+            let Some(_) = in_unwritable_store_child(name)? else {
+                let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+                routed.admit()?;
+                let before = routed.reloads();
+                break_store_writes(&routed.world);
+                for _ in 0..30 {
+                    routed.drift()?;
+                    assert!(!routed.tick()?, "a refused write was reported as progress");
+                }
+                assert_eq!(routed.reloads() - before, 1, "a re-drifting fragment reloaded every lap");
+                for attempt in 2..=4 {
+                    routed.world.engine.challenge_wait.lock().unwrap().clear();
+                    routed.drift()?;
+                    assert!(!routed.tick()?);
+                    routed.drift()?;
+                    assert!(!routed.tick()?);
+                    assert_eq!(routed.reloads() - before, attempt);
+                }
+                return Ok(());
+            };
+            Ok(())
+        }
+
+        /// The wait of a proved challenge whose record failed is one
+        /// observation age from the attempt.
+        #[cfg(unix)]
+        #[test]
+        fn a_proved_challenge_that_cannot_be_recorded_waits_one_observation_age() -> Result<()> {
+            let name = "a_proved_challenge_that_cannot_be_recorded_waits_one_observation_age";
+            let Some(_) = in_unwritable_store_child(name)? else {
+                let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+                routed.admit()?;
+                let before = routed.reloads();
+                break_store_writes(&routed.world);
+                let began = now_millis()?;
+                routed.drift()?;
+                assert!(!routed.tick()?);
+                assert_eq!(routed.reloads() - before, 1, "the repair did not run");
+                let due = challenge_due(&routed.world).expect("no wait");
+                let age = routed.world.engine.options.topology_maximum_age_millis;
+                assert!(due >= began + age, "the wait is shorter than one age: {}", due - began);
+                return Ok(());
+            };
+            Ok(())
+        }
+
+        /// The stored schedule sets the in-memory wait: with three failures
+        /// recorded, the fourth failed challenge waits eight ages (capped), and
+        /// no repair runs inside that wait.
+        #[cfg(unix)]
+        #[test]
+        fn a_failed_challenge_that_cannot_be_recorded_waits_as_long_as_the_stored_schedule() -> Result<()> {
+            let name = "a_failed_challenge_that_cannot_be_recorded_waits_as_long_as_the_stored_schedule";
+            let Some(_) = in_unwritable_store_child(name)? else {
+                let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+                routed.admit()?;
+                routed.stub.hang_up.store(true, Ordering::SeqCst);
+                edit_incumbent(&routed.world, |generation| {
+                    let state = generation.route_supervision.as_mut().unwrap();
+                    state.consecutive_failures = 3;
+                    state.next_challenge_at_unix_millis = Some(1);
+                    state.degraded_since_unix_millis = Some(1);
+                })?;
+                break_store_writes(&routed.world);
+                let began = now_millis()?;
+                routed.drift()?;
+                assert!(!routed.tick()?);
+                let due = challenge_due(&routed.world).expect("no wait");
+                let age = routed.world.engine.options.topology_maximum_age_millis;
+                let want = (age * 8).min(ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS);
+                assert!(due >= began + want, "the wait ignores the stored doubling: {}", due - began);
+                let reloads = routed.reloads();
+                for _ in 0..10 {
+                    routed.drift()?;
+                    assert!(!routed.tick()?);
+                }
+                assert_eq!(routed.reloads(), reloads, "the route was repaired inside its wait");
+                return Ok(());
+            };
+            Ok(())
+        }
+
+        /// A lost race is progress, and the next pass is governed by the
+        /// winner's record, not by an in-memory wait of the loser.
+        #[cfg(unix)]
+        #[test]
+        fn a_lost_race_leaves_no_in_memory_wait() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            routed.world.route_stubs.refuse_reloads()?;
+            let old = ControlSnapshot::read(&routed.world.state_store)?;
+            let stale = old.admitted_for("service").context("no generation")?;
+            edit_incumbent(&routed.world, |generation| {
+                generation.route_supervision.as_mut().unwrap().last_challenge_at_unix_millis = Some(5);
+            })?;
+            routed.drift()?;
+            assert!(routed.world.engine.supervise_admitted_route(&old, stale)?);
+            assert_eq!(challenge_due(&routed.world), None, "a lost race left an in-memory wait");
+            Ok(())
+        }
+
+        /// The wait left by a full disk does not outlive it: once any write for
+        /// the target lands, the stored schedule owns the target again and a
+        /// drift is repaired without waiting.
+        #[cfg(unix)]
+        #[test]
+        fn a_wait_left_by_a_full_disk_ends_when_any_write_for_the_target_lands() -> Result<()> {
+            let name = "a_wait_left_by_a_full_disk_ends_when_any_write_for_the_target_lands";
+            let Some(_) = in_unwritable_store_child(name)? else {
+                let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+                routed.admit()?;
+                let before = routed.reloads();
+                break_store_writes(&routed.world);
+                routed.drift()?;
+                assert!(!routed.tick()?);
+                assert!(challenge_due(&routed.world).is_some(), "no wait to outlive");
+                assert_eq!(routed.reloads() - before, 1);
+
+                // Space is freed. Nothing has landed yet, so the wait still holds.
+                unsafe {
+                    let limit = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
+                    assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+                }
+                routed.drift()?;
+                assert!(!routed.tick()?);
+                assert_eq!(routed.reloads() - before, 1, "the wait did not hold before any write landed");
+
+                // Something else writes for the target: the wait is over.
+                routed.ledger(1)?;
+                routed.drift()?;
+                assert!(routed.tick()?, "the drift was not repaired");
+                assert_eq!(routed.reloads() - before, 2, "a stale wait held the repair");
+                assert_eq!(challenge_due(&routed.world), None);
+                return Ok(());
+            };
+            Ok(())
+        }
+
+        /// A wait belongs to an admitted target: once the target is retired,
+        /// the wait is gone.
+        #[cfg(unix)]
+        #[test]
+        fn a_wait_ends_when_its_target_is_retired() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            routed.world.engine.challenge_wait.lock().unwrap().insert(
+                "service".into(),
+                ChallengeWait {
+                    due_unix_millis: now_millis()? + 500_000,
+                    stamp: snapshot.target_stamp("service"),
+                },
+            );
+            assert!(!routed.tick()?);
+            assert!(challenge_due(&routed.world).is_some(), "an unchanged store dropped the wait");
+            assert!(
+                SingleFileMessagePackBackingStore::new(&routed.world.state_store)
+                    .delete_batch_if_unchanged(&[snapshot.admitted_for("service").unwrap().envelope.clone()])?
+            );
+            routed.tick()?;
+            assert_eq!(challenge_due(&routed.world), None, "a retired target kept its wait");
             Ok(())
         }
 
