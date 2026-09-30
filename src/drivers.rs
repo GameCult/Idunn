@@ -4395,8 +4395,7 @@ impl CultCacheTopologyDriver {
             let Some(replacement) = mutate(&entries)? else {
                 return Ok(());
             };
-            if store.compare_exchange_snapshot(&entries, &replacement)? {
-                publish_projection_mode(&self.projection_store)?;
+            if with_published_umask(|| store.compare_exchange_snapshot(&entries, &replacement))? {
                 return Ok(());
             }
         }
@@ -7582,25 +7581,37 @@ fn ensure_bundle_is_reachable_by_workload(
 /// reads it to verify its own Expected incarnation against the Idunn anchor.
 ///
 /// Idunn runs with `UMask=027`, which is right for its private state and wrong
-/// for this one file -- it lands `0640 root:root`, and a `DynamicUser` workload
-/// gets EACCES. A chmod by hand does not hold, because each publish writes a
-/// new file. Integrity here comes from the signatures over the records, not
-/// from the mode, so the published copy is readable.
-fn publish_projection_mode(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // The lock sibling too: CultCache opens it alongside the store, so a
-        // 0640 lock denies the read just as surely as a 0640 store, and it is
-        // created fresh under Idunn's umask on every publish.
-        for path in [path.to_path_buf(), authority_lock_path(path)] {
-            if path.exists() {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
-                    .with_context(|| format!("publishing {}", path.display()))?;
-            }
-        }
-    }
-    Ok(())
+/// for this one file and its `.lock` sibling: they would land `0640 root:root`
+/// and a `DynamicUser` workload gets EACCES. CultCache stages a temporary file
+/// and renames it over the store, so the mode must be right when the staged
+/// file is *created*; a chmod after the rename leaves a window in which the
+/// visible file is unreadable. Integrity here comes from the signatures over
+/// the records, not from the mode, so the published copy is readable.
+///
+/// `action` runs on a helper thread with its own umask (`unshare(CLONE_FS)`),
+/// so files it creates are `0644` while the umask of every other thread in
+/// Idunn stays `0027`. CultCache has no mode parameter to do this itself.
+#[cfg(target_os = "linux")]
+fn with_published_umask<T: Send>(action: impl FnOnce() -> Result<T> + Send) -> Result<T> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // SAFETY: both calls only touch this thread's filesystem attributes.
+                if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
+                    return Err(anyhow::Error::from(std::io::Error::last_os_error())
+                        .context("giving the projection writer its own umask"));
+                }
+                unsafe { libc::umask(0o022) };
+                action()
+            })
+            .join()
+            .unwrap_or_else(|_| bail!("projection writer thread panicked"))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_published_umask<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
+    action()
 }
 
 fn build_machine_id(workspace: &Path) -> Result<String> {
@@ -9532,27 +9543,77 @@ Content-Le".to_vec()), |_| {}),
         ));
     }
 
-    #[cfg(unix)]
+    /// Runs `body` on a thread whose umask is Idunn's `027`, without touching
+    /// the umask of the test process.
+    #[cfg(target_os = "linux")]
+    fn on_thread_with_umask_027<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert_eq!(unsafe { libc::unshare(libc::CLONE_FS) }, 0);
+                    unsafe { libc::umask(0o027) };
+                    body()
+                })
+                .join()
+                .unwrap()
+        })
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn the_published_projection_is_readable_by_a_workload() {
-        use std::os::unix::fs::PermissionsExt;
+    fn the_published_projection_is_never_visible_in_another_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("topology.cc");
-        std::fs::write(&path, b"x").unwrap();
-        // What Idunn's UMask=027 leaves behind.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let store = temp.path().join("topology.cc");
         let lock = temp.path().join("topology.cc.lock");
-        std::fs::write(&lock, b"").unwrap();
-        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o640)).unwrap();
-        publish_projection_mode(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o644,
-            "every target must be able to read the projection"
-        );
-        let lock_mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
-        assert_eq!(lock_mode, 0o644, "the lock is opened alongside the store");
+        let done = AtomicBool::new(false);
+        let (observed, ()) = std::thread::scope(|scope| {
+            // A reader in another process sees only what the directory shows:
+            // record the mode of every store and lock inode it can open.
+            let reader = scope.spawn(|| {
+                let mut seen = std::collections::BTreeSet::new();
+                while !done.load(Ordering::Acquire) {
+                    for path in [&store, &lock] {
+                        if let Ok(meta) = fs::metadata(path) {
+                            seen.insert((path.clone(), meta.ino(), meta.mode() & 0o777));
+                        }
+                    }
+                }
+                seen
+            });
+            let writes = on_thread_with_umask_027(|| {
+                let store_backing = SingleFileMessagePackBackingStore::new(&store);
+                let mut current: Vec<CultCacheEnvelope> = Vec::new();
+                for round in 0..300u32 {
+                    let mut next = current.clone();
+                    next.push(CultCacheEnvelope {
+                        key: format!("k{round}"),
+                        r#type: "probe".into(),
+                        payload: vec![round as u8],
+                        stored_at: "2026-09-30T00:00:00Z".into(),
+                        schema_id: None,
+                    });
+                    with_published_umask(|| store_backing.compare_exchange_snapshot(&current, &next))
+                        .unwrap();
+                    current = next;
+                }
+            });
+            done.store(true, Ordering::Release);
+            (reader.join().unwrap(), writes)
+        });
+        assert!(!observed.is_empty(), "the reader never saw the store");
+        for (path, _, mode) in &observed {
+            assert_eq!(
+                *mode,
+                0o644,
+                "{} was visible with mode {mode:o}",
+                path.display()
+            );
+        }
+        let final_mode = fs::metadata(&store).unwrap().permissions().mode() & 0o777;
+        assert_eq!(final_mode, 0o644);
     }
 
     #[cfg(unix)]
