@@ -2152,6 +2152,8 @@ it.
 
 #### Q3-ii.12 Operator questions
 
+**Rulings, operator, 2026-09-30:** "S1: Refuse / S2: Declared state / S3: Detect and refuse / S4: deploy or release". That is **Q-S1 (a), Q-S2 (a), Q-S3 (a), Q-S4 (a)**. Q-S5 was left blank and is re-asked.
+
 - **Q-S1. A stateful target whose binding declares no snapshot.**
   - Options:
     - (a) Refuse a new stateful Deploy plan at compile, with a typed error. Continuity of already-admitted plans is
