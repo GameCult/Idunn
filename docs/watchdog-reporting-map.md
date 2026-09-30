@@ -118,6 +118,32 @@ file ran alone with the TAP reporter, then the whole glob ran once.
 | C27 | Suite with the fix | scratch commit `a6770c5` on `42728a67`: the scoped name at the seven live C21 sites, a skip guard on both Rust tests, and the `CARGO_TARGET_DIR` override removed. Same command. | rust-smoke 1/0/0/1 (`# SKIP`); delivery 9/9/0/0; permit 2/2/0/0; rudp 1/0/0/1 (`# SKIP`); feedback-cli 8/8/0/0; idunn-health 3/3/0/0. Glob total 24 tests, 22 pass, 0 fail, 2 skipped, exit 0. `agent-transport.mjs` and `governance-threads.mjs` were checked only by name resolution (C22), because no test loads them. |
 | C28 | C3 at the reader's install pin | `git show 36ea08d3:packages/cultcache-ts/src/single-file-messagepack-backing-store.ts` | `pullAll` is at `:43`, and the file has no lock. C3 holds at `36ea08d3`, which is the CultLib that cut `ops-notice-deploy` installs. |
 
+### Topology-lock cut probes (2026-09-30, 21:00-21:25 UTC)
+
+Pinned heads: Idunn origin/main `bca3d85`; `hands/watchdog-idunn-incident`
+local `9549d00` (h3, not yet pushed at probe time; origin at `3ed5f26`);
+`hands/idunn-projection-mode` `15f7e18` (unmerged); Odin `665dc08`;
+CodexConnector `6519289`; Ghostlight `eeb3a68`; gamecult-ops `fdb4356`;
+cultcache-rs at Idunn's pin, CultLib `61549aa`. Line numbers marked *trial*
+are from a scratch merge of `9549d00` into `bca3d85` (clean, no conflicts),
+never in `F:\Projects\Idunn`. Yggdrasil probes were read-only over `ssh ygg`;
+the semantics probe (C36) ran in a container through `ygg-verify.sh`.
+
+| # | What | Where / command | Result |
+|---|---|---|---|
+| C29 | Every writer of `topology.cc` | trial `git grep` for `CultCacheTopologyDriver {`, `Engine::open(`, `mutate(` | One writer: the `idunn serve` daemon. `CultCacheTopologyDriver::mutate` (trial `src/drivers.rs:4393-4411`) is the only write path; its seven callers are `demote_to_expected_only` `:4455`, `withdraw_stale_incarnation` `:4567`, and the `TopologyPort` methods `:4778, 4846, 4897, 4940, 4992`. `Engine::open` has one production caller, `boot` (`src/control_plane.rs:5330`); the CLI verbs `up`, `status`, `cancel`, `expire` and `validate` write only `control.cc`. `idunn-host` and `idunn-provision` never touch the projection. |
+| C30 | Every reader of `topology.cc`, across repos | `git grep -e 'topology\.cc' -e idunn-projection HEAD` in every repo under `F:\Projects` | Readers: Odin (`crates/odin-daemon/src/lib.rs` `CultCacheIdunnProjectionSource::entries`, `pull_all_read_only_snapshot`, lock-free since its first commit `eedce4f`, 2026-09-04), Idunn itself (`snapshot`, trial `drivers.rs:4383-4388`, lock-free; every `control_plane.rs` read is `pull_all_read_only_snapshot`), and the nightly backup (C33). No managed target reads the file: CodexConnector, Ghostlight, Muninn and StreamPixels name only `odin.verse-topology.v1`, and they receive their Expected record in the runtime bundle (`GAMECULT_IDUNN_RUNTIME_BUNDLE`). The unit comment (`deploy/idunn-yggdrasil.service:77-80`) and `docs/migration.md:505-509` say that "every managed target must read it", which is stale. |
+| C31 | Shared-lock readers that rely on blocking a writer | cultcache-rs `61549aa` `lib.rs:337-395` (`with_read_only_shared_snapshot`), `:905-910` (`pull_all`, which takes `lock_shared`); cross-repo grep for `with_read_only_shared_snapshot` | That API holds the sibling lock shared so that no writer can replace the snapshot during `action`. Its production users are CodexConnector (`src/idunn_health.rs:441, 562`, `src/daemon.rs:205`) and Ghostlight (`crates/ghostlight-dungeon/src/idunn_health.rs:901`). All of them read the runtime authority record, the process-write-lease record, or their own configuration. None reads `topology.cc`. The write-lease lock is a different file under `idunn-authority` (`CultCacheWriteLeaseDriver`, trial `drivers.rs:4173, 4218`, already `try_compare_exchange_snapshot`). No reader of `topology.cc` takes a lock to get a consistent view. |
+| C32 | How a reader stays consistent without the lock | cultcache-rs `61549aa` `lib.rs:666-688` (`write_all_unlocked`) | Every write stages `<store>.tmp`, fsyncs it, `replace_file_atomically` renames it over the store, and fsyncs the directory. A reader that opens the path sees one whole inode. Consistency comes from the rename, not the lock. |
+| C33 | The nightly backup's lock use | live `/usr/local/sbin/gamecult-state-backup` sha256 `9d8ebd84...`, identical to gamecult-ops `scripts/gamecult-state-backup-yggdrasil.sh`; lines 98-126; `systemctl cat gamecult-state-backup.service` | Every file with a `<name>.lock` sibling is re-copied under `flock -s -w 20 -E 75 <lock> cp -a`. Past the wait it falls back to a double-read. The unit has no `User=`, so it runs as root: a `0600 root` lock still opens (`flock(1)` opens the path), and the backup keeps its shared lock. It skips a store whose lock is absent (`[[ -f lock ]] || continue`) and never creates one. The copy is milliseconds of `cp` once a night. Under a try-lock, a publish in that window is contended and retried on a later pass (C35). The backup does not need the lock for a whole copy (C32). |
+| C34 | Live state of the projection dir | `ls -la`, `getfacl -p /var/lib/gamecult/idunn-projection`; `/proc/locks` against the lock's inode; `find /proc/*/fd -lname` | `drwxr-xr-x+ root`, `default:user::rw- default:group::r-- default:other::r--`. `topology.cc` `0644`, 13436 bytes, written 21:07. `topology.cc.lock` is `0644 root`, inode 8227809, created 2026-09-06. No flock is held on it and no process has either file open. `incidents.cc` does not exist yet, because the incident cut is not installed. The default ACL **is** documented, in Idunn `docs/migration.md:523` (it closes the chmod window), though gamecult-ops does not record it. `idunn-yggdrasil.service`: `User=root`, `UMask=0027`, `WatchdogUSec=0`. Odin runs as DynamicUser uid 62025. |
+| C35 | What a failed topology publish does inside the tick | trial `src/control_plane.rs` at each call site | Every tick-path write returns `Err` through `?` **before** any evidence of it is persisted, and the step is retried. `advance_starting` records `expected_publication_sha256` or `activation_publication_sha256` only after publish returns `Ok` (`:6605`, `:6664`). `advance_leasing` does the same for the write-lease projection digest (`:7004`, `:7073`). `advance_fencing` withdraws the lease projection before recording (`:6894`, `:6926`). The post-fencing abort and pre-fencing cleanup write `CleanupEvidence::Complete` only after `reconcile_failed_candidate_projection` (`:8956`, `:9046`, `:9180-9204`). A failed continuity demotion (`:6099`) mints no restart and defers continuity. The admitted Expected repair (`:5870`) is logged and re-checked every pass. `retire_stale_incarnations` (`:7914`) returns `Err`. **The one path that is not retried is boot** (`reconcile_failed_continuity_projections`, `:5228-5275`, called once from `boot` `:5332`). It logs a failure and does not retry, and it is outside the tick. |
+| C36 | Lock semantics under the live ACL | `ygg-verify.sh Idunn bca3d85 python:3.12-slim` running scratch `probe_lock.py`, as root | (1) A file created with mode 0666 under this default ACL and umask 027 lands `0644`, CultCache's shape. (2) A separate process holding `LOCK_EX` on it makes a nonblocking try from the parent contend. (3) **`fchmod 0600` on the same inode does not revoke that holder**: the try still contends. (4) A 0600 `O_CREAT|O_EXCL` staged file renamed over the lock lands `0600`, and the try on the new inode **succeeds** while the old holder still holds the orphaned inode. (5) uid 65534 cannot open the replaced lock (`Permission denied`). |
+| C37 | The incident cut's private-lock mechanism | `git show 9549d00:src/incident.rs` `:229-245` (`exchange`), `:336-375` (`secure_lock`) | `exchange` calls `secure_lock(path)`, then `try_compare_exchange_snapshot`, and turns `Mismatch` and `LockContended` into errors. `secure_lock` opens `<store>.lock` with `create` and mode `0600`, then runs `set_permissions(0600)` on that descriptor. Its doc says that a descriptor another uid already holds is not revoked. So a lock left `0644` (C34's live `topology.cc.lock`) stays holdable by whoever opened it before (C36 step 3). It builds the lock name by hand, duplicating `authority_lock_path` (trial `drivers.rs:8194`). |
+| C38 | `hands/b5` | `git merge-base --is-ancestor` | `hands/b5` (`f85e743`) and `hands/b5-pins` (`1cfbeff`) are both ancestors of origin/main (merged at `fcb8ba1` and `ddc031a`). The topology cut has no B5 conflict. |
+| C39 | Unmerged branches that touch the topology driver | for each branch not in origin/main: `git diff origin/main...<b> -- src/drivers.rs` | Two. `hands/watchdog-idunn-incident` (the dependency). `hands/idunn-projection-mode` (`15f7e18`, 4 commits, 2026-09-30 01:15-02:40 UTC, no campaign doc) deletes `publish_projection_mode`, has `mutate` set a default ACL on the directory by `setxattr` (`publish_directory_default_mode`), and replaces the mode test with `the_published_projection_is_never_visible_in_another_mode`. That test asserts the **lock** is always `0644`, which contradicts `tick-lock-private`. It conflicts textually with this cut at `mutate` and at `publish_projection_mode`. |
+| C40 | The private root's locks | `ls -ld /var/lib/gamecult/idunn`; `sudo ls -la` inside it; `getent passwd idunn`; `ps` | `/var/lib/gamecult/idunn` is `drwxr-x--- idunn:idunn` (uid 986, group 978, which has no members; no process runs as `idunn`). `control.cc.lock` is `0644 root`. The tick's control-store writes use blocking `compare_exchange` (e.g. trial `control_plane.rs:5471`), so root (the backup's `flock -s`) or uid `idunn` could hold one. Nothing runs as `idunn` today. |
+
 ## Model page
 
 A row per persistent kind this campaign creates or depends on. "New" means the
@@ -127,6 +153,7 @@ cut spec fixes them.
 | Kind | Identity | Lifecycle | Authority |
 |---|---|---|---|
 | **Incident record** (new, `idunn.operator_incident.v1`, its own file `/var/lib/gamecult/idunn-projection/incidents.cc`, published 0644 beside `topology.cc`) | Key `<condition>:<subject>:<opened_at_unix_ms>`. Namespace: `incidents.cc`, one type; the file refuses any other. It is never written to `control.cc`, which bails on unknown types, so a rollback would stop continuity (C1). `condition` is a closed enum (`continuity-exhausted` first; `odin-store-contested`, `odin-store-unpersisted` and `operator-required` join when their sources exist). `subject` is the target for target conditions and the `transaction_id` for `operator-required`. `opened_at` is written once by Idunn's clock. Injective because of one rule: **at most one open incident per `(condition, subject)`**, checked by a compare-exchange create. | **Created** at the site that decides the condition, after that decision and before its trace line. **Closed** by writing `closed_at` and `close_reason` on the same record, never by deleting it. Continuity-exhausted closes when the pass sees the workload running (`recovered`) or the target is no longer admitted, **not** when the window slides (I2). Odin conditions close when the catalog stops reporting them. `operator-required` has **no closing path yet** (I6; follow_up `b5-operator-required-no-exit`). **Reopened**: never; a recurrence is a new record with a new `opened_at`. **Replayed after an Idunn restart**: the durable open record makes the site write nothing. **Pruned**: closed more than 7 days ago, it retires to `history.cc`. **Store failure**: reported once as a fault and never returned into the tick (`survival-independent`). | Idunn's daemon, at the decision site, is the only writer. The same file is the record and what Bifrost reads, so no separate projection exists to drift. Forbidden: the CLI (`status` reads only), Bifrost and every other reader, Odin, `ReportOnce`, `control.cc`, a repair loop that opens incidents from log text. |
+| **Projection lock files** (exist: `topology.cc.lock`; new with the incident cut: `incidents.cc.lock`, `incident-history.cc.lock`) | `<store>.lock` beside its store, named by `authority_lock_path`. One per store file. | **Created** by Idunn at mode `0600` before its first exchange on that store. **Replaced** by a staged `0600` file renamed over it whenever Idunn finds it wider than `0600` or not owned by Idunn's euid; a chmod cannot revoke an existing holder (C36). **Held** only for one nonblocking exchange. **Never published**: the store is `0644`, and its lock is not. | Idunn's daemon alone opens it for writing. The root backup may take it shared for its copy (C33), and a contended exchange is retried. Forbidden: any reader opening it (none does, C30-C31), `publish_file_mode` on it, a default ACL deciding its mode. |
 | **Stderr trace** (exists) | `report_once` key, in memory | Printed once per process lifetime per fault; lost on restart (I1). | **Demoted**: `ReportOnce` is no longer an owner of "has the operator been told". It de-dups stderr only. |
 | **Delivery request / journal entry** (Bifrost store) | Keyed by the Idunn incident key plus the notice kind (`opened`, and `closed` if Q `closure-notice` says so). Injective because the incident key is. Not derived from payload text or time (BF1's `raisedAt` hash is the counter-example). | **Created** by Bifrost when its reader first sees a notice-worthy incident state in the projection. **Revised**: `pending` -> `sent` or `failed`, with an attempt count and last error. **Retried** until sent, with backoff; a create for an existing key writes nothing (V1's unconditional `put` is the counter-example). **Replayed after a Bifrost restart**: journal is durable; a `pending` entry is retried. **Pruned** only after the incident key has left Idunn's projection. | Bifrost's reader only. Forbidden: Idunn (it never writes Bifrost's store, even though Y2 shows it physically could), VoidBot, the operator by hand. Which Bifrost process: see Rationale. |
 | **Delivery receipt** (Bifrost, `discord_post_receipt.v1` or the journal's `sent` state) | Same key as the request. | Written once on success with the Discord message id. | Bifrost. **Idunn does nothing with it**: it neither reads it in the daemon nor waits on it (`survival-independent`). `idunn status` does not show delivery state; Bifrost's journal is where a failed delivery is visible. |
@@ -217,10 +244,13 @@ and moves on. An unreadable store means no incident opens (the stderr trace
 still prints); it never changes what continuity decides. The Idunn cut's
 survival test pins this with an unwritable store path.
 
-**Bifrost reads without the lock.** Idunn's writes block on an exclusive lock
-(C2). A reader that took the lock could stall a tick. cultcache-ts `pullAll`
-takes none (C3, C4), and Idunn's rename is atomic, so the reader only ever sees
-a whole snapshot. The reader never opens Idunn's file through a CultMesh node,
+**Bifrost reads without the lock.** Idunn's writes once blocked on an
+exclusive lock (C2). The incident and topology cuts make every write in the
+projection directory a nonblocking exchange behind a private lock. A reader
+that took the lock is therefore unnecessary. It would also be refused, because
+it cannot open a `0600` lock. cultcache-ts `pullAll` takes no lock (C3, C4),
+and Idunn's rename is atomic (C32), so the reader only ever sees a whole
+snapshot. The reader never opens Idunn's file through a CultMesh node,
 which could flush.
 
 **Delivery at most once, with the nonce as the second guard.** This follows
@@ -293,3 +323,29 @@ goes, because it is wrong on every host except one workstation.
 two branches merge in either order without conflict. The reader depends on
 both. It is written against a tree with one Discord command vocabulary, and it
 is verified by a suite that loads.
+
+**The topology write stops waiting, and the lock stops being published.** The
+lock was published `0644` because a comment assumed that readers open it
+(`publish_projection_mode`, from `fbb9626`). None does (C30, C31), and
+consistency comes from the rename (C32). So the lock is Idunn's alone, and a
+contended publish is an error, not a wait. That is safe because every tick path
+treats a failed publish as not done: no publication digest, phase transition,
+cleanup evidence or continuity restart is persisted before the write returns
+`Ok` (C35). A contended publish is retried on a later pass or after backoff,
+and Idunn never believes it published what readers do not see. Boot
+reconciliation is the exception. It runs once, outside the tick, and it already
+logs failures and moves on. Only root processes can contend once the lock is
+private: the backup's copy, a few milliseconds a night. No retry machinery is
+added for it.
+
+**One lock rule for the whole projection directory.** The topology cut moves
+the incident cut's `secure_lock` into one crate-level exchange primitive that
+both stores call, rather than a second copy. It also strengthens the rule:
+a lock wider than `0600`, or owned by someone else, is replaced by a rename,
+not chmodded. A chmod does not revoke a holder (C36), and the live
+`topology.cc.lock` has been `0644` since 2026-09-06 (C34), so tightening it in
+place would leave any existing holder able to block every topology publish
+forever. The replacement runs only while the lock is not yet private. Once it
+is, no other uid can open it, so a later replacement never splits exclusion
+between two inodes. A root backup holding the old inode during the first
+replacement copies one whole inode anyway (C32).
