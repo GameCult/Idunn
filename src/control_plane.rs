@@ -10217,6 +10217,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_refuses_an_undeclared_binding_name_without_echoing_its_value() {
+        use crate::deployment::tests::{
+            UNDECLARED_INPUT_REFUSAL, binding_with_environment, recipe_declaring_inputs,
+        };
+
+        let canary = "canary-bound-value-4e91c7";
+        let directory = tempfile::tempdir().unwrap();
+        let recipe = directory.path().join("recipe.toml");
+        fs::write(&recipe, recipe_declaring_inputs()).unwrap();
+        let declared = directory.path().join("declared.toml");
+        fs::write(&declared, binding_with_environment("DECLARED_INPUT", canary)).unwrap();
+        let undeclared = directory.path().join("undeclared.toml");
+        fs::write(&undeclared, binding_with_environment("UNDECLARED_INPUT", canary)).unwrap();
+
+        validate(&recipe, Some(&declared)).unwrap();
+
+        // `idunn` returns this error from main, which prints its Debug form,
+        // context chain included, and exits non-zero.
+        let printed = format!("{:?}", validate(&recipe, Some(&undeclared)).unwrap_err());
+        assert!(printed.contains(UNDECLARED_INPUT_REFUSAL), "{printed}");
+        assert!(!printed.contains("canary"), "validate echoed a bound value");
+    }
+
+    #[test]
     fn cli_exposes_only_declarative_commands() {
         for arguments in [
             vec!["up", "ghostlight", "--deploy-command", "sh -c bad"],

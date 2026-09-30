@@ -1928,10 +1928,11 @@ fn require_host(value: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const RECIPE: &str = r#"
+    // `idunn validate`'s tests in control_plane reuse these two fixtures.
+    pub(crate) const RECIPE: &str = r#"
 schema = "gamecult.idunn.target_declaration.v1"
 target = "test-service"
 source_stamp_environment = "TEST_SERVICE_BUILD_COMMIT"
@@ -2003,7 +2004,7 @@ compatibility = "v1"
 startup = "before-promotion"
 "#;
 
-    const BINDING: &str = r#"
+    pub(crate) const BINDING: &str = r#"
 schema = "gamecult.idunn.operator_binding.v2"
 target = "test-service"
 profiles = ["aetheria", "full-gamecult"]
@@ -2175,15 +2176,81 @@ nodes = ["yggdrasil"]
         assert!(TargetDeclaration::parse(&input).is_err());
     }
 
-    #[test]
-    fn extra_operator_environment_is_rejected() {
-        let recipe = TargetDeclaration::parse(RECIPE).unwrap();
-        let input = BINDING.replace(
+    /// The refusal of a binding that sets a name its recipe does not declare.
+    /// A recipe declares a secret only as a `*_FILE` name, so this one rule is
+    /// what leaves a plaintext secret no place in a binding.
+    pub(crate) const UNDECLARED_INPUT_REFUSAL: &str =
+        "operator service environment contains an undeclared launch input";
+
+    /// RECIPE plus one declared plain input and one declared secret-file input.
+    pub(crate) fn recipe_declaring_inputs() -> String {
+        RECIPE.replace(
+            "required_environment = [",
+            "optional_environment = [\"DECLARED_INPUT\", \"DECLARED_SECRET_FILE\"]\nrequired_environment = [",
+        )
+    }
+
+    /// BINDING plus one `[workload.environment]` entry.
+    pub(crate) fn binding_with_environment(name: &str, value: &str) -> String {
+        BINDING.replace(
             "[workload.argument_bindings]",
-            "[workload.environment]\nUNDECLARED = \"no\"\n\n[workload.argument_bindings]",
+            &format!("[workload.environment]\n{name} = \"{value}\"\n\n[workload.argument_bindings]"),
+        )
+    }
+
+    /// BINDING plus one `[workload.secret_files]` entry.
+    fn binding_with_secret_file(name: &str) -> String {
+        BINDING.replace(
+            "[workload.secret_files]\n",
+            &format!(
+                "[workload.secret_files]\n{name} = \"/etc/gamecult/test-service/credentials/{name}\"\n"
+            ),
+        )
+    }
+
+    fn admit_refusal(recipe: &TargetDeclaration, binding: &str) -> String {
+        let binding = OperatorBinding::parse(binding).unwrap();
+        format!("{:#}", binding.admit(recipe).unwrap_err())
+    }
+
+    #[test]
+    fn binding_environment_sets_only_declared_names() {
+        let recipe = TargetDeclaration::parse(&recipe_declaring_inputs()).unwrap();
+        OperatorBinding::parse(&binding_with_environment("DECLARED_INPUT", "plain"))
+            .unwrap()
+            .admit(&recipe)
+            .unwrap();
+
+        assert_eq!(
+            admit_refusal(&recipe, &binding_with_environment("UNDECLARED_INPUT", "plain")),
+            UNDECLARED_INPUT_REFUSAL
         );
-        let binding = OperatorBinding::parse(&input).unwrap();
-        assert!(binding.admit(&recipe).is_err());
+    }
+
+    #[test]
+    fn binding_secret_files_set_only_declared_names() {
+        let recipe = TargetDeclaration::parse(&recipe_declaring_inputs()).unwrap();
+        OperatorBinding::parse(&binding_with_secret_file("DECLARED_SECRET_FILE"))
+            .unwrap()
+            .admit(&recipe)
+            .unwrap();
+
+        assert_eq!(
+            admit_refusal(&recipe, &binding_with_secret_file("UNDECLARED_SECRET_FILE")),
+            UNDECLARED_INPUT_REFUSAL
+        );
+    }
+
+    #[test]
+    fn declaring_a_secret_file_does_not_admit_its_plaintext_twin() {
+        // The shape of the Heimdall leak: the recipe declares only
+        // DECLARED_SECRET_FILE, and a binding puts the value itself under
+        // DECLARED_SECRET in plain environment.
+        let recipe = TargetDeclaration::parse(&recipe_declaring_inputs()).unwrap();
+        assert_eq!(
+            admit_refusal(&recipe, &binding_with_environment("DECLARED_SECRET", "plain")),
+            UNDECLARED_INPUT_REFUSAL
+        );
     }
 
     #[test]
