@@ -1,7 +1,7 @@
 # Narrow root actuator grant for the Idunn Yggdrasil deployment/continuity path.
-# One line per live target. codex-connector and gjallar were retired 2026-09-06;
-# their grants are removed here first, because the privileged half of a retired
-# target must not outlive its consumer.
+# One line per live target. codex-connector and gjallar were retired 2026-09-06,
+# and bifrost-persona-feedback on 2026-09-30; their grants are removed here first,
+# because the privileged half of a retired target must not outlive its consumer.
 Cmnd_Alias IDUNN_YGGDRASIL_DEPLOY = \
   /usr/local/libexec/idunn-yggdrasil deploy odin *, \
   /usr/local/libexec/idunn-yggdrasil deploy ghostlight *, \
@@ -9,7 +9,6 @@ Cmnd_Alias IDUNN_YGGDRASIL_DEPLOY = \
   /usr/local/libexec/idunn-yggdrasil deploy heimdall *, \
   /usr/local/libexec/idunn-yggdrasil deploy epiphany-capstone-17 *, \
   /usr/local/libexec/idunn-yggdrasil deploy epiphany *, \
-  /usr/local/libexec/idunn-yggdrasil deploy bifrost-persona-feedback *, \
   /usr/local/libexec/idunn-yggdrasil deploy repixelizer *, \
   /usr/local/libexec/idunn-yggdrasil deploy streampixels *
 Cmnd_Alias IDUNN_YGGDRASIL_RESTART = \
