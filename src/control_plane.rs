@@ -16717,7 +16717,7 @@ mod tests {
         #[test]
         fn a_stateful_target_that_provides_the_rendezvous_is_observed_directly_whatever_it_is_named()
         -> Result<()> {
-            let provider = build_routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, true, true)?;
+            let provider = build_routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, true, true, CommandKind::Continuity)?;
             let transaction = provider.transaction()?;
             assert_eq!(transaction.target, "service");
             assert!(transaction.expected.as_ref().unwrap().write_lease_required);
