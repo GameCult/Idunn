@@ -1370,6 +1370,30 @@ impl DeploymentTransaction {
         }
     }
 
+    /// Whether an abort owes the candidate's durable cleanup: it does once an
+    /// activation was issued or a workload was observed, either of which leaves
+    /// something behind.
+    fn candidate_cleanup_owed(&self) -> CleanupEvidence {
+        if self.activation.is_some() || self.workload.is_some() {
+            CleanupEvidence::Pending
+        } else {
+            CleanupEvidence::Skipped
+        }
+    }
+
+    /// Whether an abort's recorded candidate cleanup is what
+    /// `candidate_cleanup_owed` says it must be: owed cleanup is pending or
+    /// done, unowed cleanup is skipped.
+    fn candidate_cleanup_recorded(&self, recorded: CleanupEvidence) -> bool {
+        matches!(
+            (self.candidate_cleanup_owed(), recorded),
+            (
+                CleanupEvidence::Pending,
+                CleanupEvidence::Pending | CleanupEvidence::Complete
+            ) | (CleanupEvidence::Skipped, CleanupEvidence::Skipped)
+        )
+    }
+
     fn rejected(command: &DeploymentCommand, error: anyhow::Error, now: u64) -> Result<Self> {
         let mut transaction = Self::new(command, command.selector.clone(), 0, None, now)?;
         let detail = truncate(&format!("{error:#}"), 2048);
@@ -1644,14 +1668,7 @@ impl DeploymentTransaction {
                 "aborted transaction also carries post-commit cleanup"
             );
             ensure!(
-                matches!(
-                    (
-                        self.workload.is_some() || self.activation.is_some(),
-                        abort.candidate_cleanup
-                    ),
-                    (true, CleanupEvidence::Pending | CleanupEvidence::Complete)
-                        | (false, CleanupEvidence::Skipped)
-                ),
+                self.candidate_cleanup_recorded(abort.candidate_cleanup),
                 "abort candidate cleanup differs from its prepared activation"
             );
             ensure!(
@@ -1700,6 +1717,10 @@ impl DeploymentTransaction {
             ensure!(
                 self.phase >= DeploymentPhase::Fencing,
                 "post-fencing abort exists before the fence"
+            );
+            ensure!(
+                self.candidate_cleanup_recorded(abort.candidate_cleanup),
+                "abort candidate cleanup differs from its prepared activation"
             );
         }
 
@@ -7991,10 +8012,7 @@ fn incumbent_was_stopped_during_fencing(fencing: &FencingEvidence) -> bool {
 fn pre_fencing_abort_intent(transaction: &DeploymentTransaction, error: &str) -> PreFencingAbort {
     PreFencingAbort {
         error: truncate(error, 2048),
-        candidate_cleanup: candidate_cleanup_requirement(
-            transaction.activation.is_some(),
-            transaction.workload.is_some(),
-        ),
+        candidate_cleanup: transaction.candidate_cleanup_owed(),
         topology_reconciliation: transaction.abort_topology_reconciliation(),
         source_cleanup: if transaction.command_kind == CommandKind::Deploy {
             CleanupEvidence::Pending
@@ -8025,27 +8043,13 @@ fn post_fencing_abort_intent(
         } else {
             CleanupEvidence::Skipped
         },
-        candidate_cleanup: candidate_cleanup_requirement(
-            transaction.activation.is_some(),
-            transaction.workload.is_some(),
-        ),
+        candidate_cleanup: transaction.candidate_cleanup_owed(),
         topology_reconciliation: transaction.abort_topology_reconciliation(),
         source_cleanup: if transaction.command_kind == CommandKind::Deploy {
             CleanupEvidence::Pending
         } else {
             CleanupEvidence::Skipped
         },
-    }
-}
-
-fn candidate_cleanup_requirement(
-    has_prepared_activation: bool,
-    has_workload_observation: bool,
-) -> CleanupEvidence {
-    if has_prepared_activation || has_workload_observation {
-        CleanupEvidence::Pending
-    } else {
-        CleanupEvidence::Skipped
     }
 }
 
@@ -9803,19 +9807,99 @@ mod tests {
     }
 
     #[test]
-    fn activation_without_workload_still_requires_durable_candidate_cleanup() {
-        assert_eq!(
-            candidate_cleanup_requirement(true, false),
-            CleanupEvidence::Pending
-        );
-        assert_eq!(
-            candidate_cleanup_requirement(true, true),
-            CleanupEvidence::Pending
-        );
-        assert_eq!(
-            candidate_cleanup_requirement(false, false),
-            CleanupEvidence::Skipped
-        );
+    fn candidate_cleanup_is_owed_when_an_activation_or_a_workload_exists() -> Result<()> {
+        // (activation issued, workload observed, expected cleanup)
+        let rows = [
+            (false, false, CleanupEvidence::Skipped),
+            (true, false, CleanupEvidence::Pending),
+            (false, true, CleanupEvidence::Pending),
+            (true, true, CleanupEvidence::Pending),
+        ];
+        for (has_activation, has_workload, expected) in rows {
+            let world = ContinuityProjection::after_candidate_observed()?;
+            let mut transaction = world.continuity_transaction()?;
+            if !has_activation {
+                transaction.activation = None;
+            }
+            transaction.workload = has_workload.then(|| workload(1000, 1, 2));
+            assert_eq!(
+                transaction.candidate_cleanup_owed(),
+                expected,
+                "activation {has_activation}, workload {has_workload}"
+            );
+            assert_eq!(
+                pre_fencing_abort_intent(&transaction, "x").candidate_cleanup,
+                expected,
+                "pre-fencing intent, activation {has_activation}, workload {has_workload}"
+            );
+            assert_eq!(
+                post_fencing_abort_intent(&transaction, "x").candidate_cleanup,
+                expected,
+                "post-fencing intent, activation {has_activation}, workload {has_workload}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_abort_whose_candidate_cleanup_disagrees_with_the_owed_rule_is_refused() -> Result<()> {
+        let world = ContinuityProjection::after_candidate_observed()?;
+        // (activation issued, recorded cleanup, accepted).
+        // Rows with a workload are omitted: a transaction holding one is refused on
+        // other grounds, so they could not speak for this rule. The workload operand
+        // of the owed rule is pinned by the method-level test above.
+        let rows = [
+            (false, CleanupEvidence::Skipped, true),
+            (false, CleanupEvidence::Pending, false),
+            (false, CleanupEvidence::Complete, false),
+            (true, CleanupEvidence::Skipped, false),
+            (true, CleanupEvidence::Pending, true),
+            (true, CleanupEvidence::Complete, true),
+        ];
+        for (has_activation, recorded, accepted) in rows {
+            let label = format!("activation {has_activation}, {recorded:?}");
+            let shape = |mut transaction: DeploymentTransaction| -> DeploymentTransaction {
+                transaction.activation = has_activation.then(|| world.candidate_activation.clone());
+                transaction
+            };
+
+            let mut pre = shape(world.continuity_transaction()?);
+            pre.pre_fencing_abort = Some(PreFencingAbort {
+                error: "candidate refused".into(),
+                candidate_cleanup: recorded,
+                topology_reconciliation: pre.abort_topology_reconciliation(),
+                source_cleanup: CleanupEvidence::Skipped,
+            });
+            assert_eq!(pre.validate().is_ok(), accepted, "pre-fencing, {label}");
+
+            let mut post = shape(DeploymentTransaction::new(
+                &command(CommandKind::Deploy),
+                "ghostlight".into(),
+                0,
+                None,
+                100,
+            )?);
+            post.phase = DeploymentPhase::Complete;
+            post.post_fencing_abort = Some(PostFencingAbort {
+                error: "candidate died after the fence".into(),
+                route_restoration: CleanupEvidence::Skipped,
+                lease_withdrawal: CleanupEvidence::Skipped,
+                candidate_cleanup: recorded,
+                topology_reconciliation: post.abort_topology_reconciliation(),
+                source_cleanup: CleanupEvidence::Complete,
+            });
+            post.last_error = Some("candidate died after the fence".into());
+            post.completion = Some(TransactionCompletion::FailedAfterFencing {
+                error: "candidate died after the fence".into(),
+                recovery: TerminalRecovery::RestoreIncumbent,
+            });
+            // A Pending cleanup is not terminal, so this completed shape is
+            // only judged for the recorded values a terminal abort can carry.
+            if recorded != CleanupEvidence::Pending {
+                assert_eq!(post.validate().is_ok(), accepted, "post-fencing, {label}");
+            }
+        }
+        Ok(())
     }
 
     #[test]
