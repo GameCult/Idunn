@@ -4304,6 +4304,11 @@ struct Engine {
     /// Process-local on purpose: a restart retries at once, and no schema
     /// carries a clock that only pacing reads.
     resume_backoff: Mutex<BTreeMap<String, ResumeBackoff>>,
+    /// When each routed target's next challenge is due, held only while the
+    /// stored `RouteSupervisionState` cannot be written. The stored value owns
+    /// the schedule and survives restarts; this spaces attempts when the record
+    /// of the last one did not land.
+    challenge_wait: Mutex<BTreeMap<String, u64>>,
 }
 
 /// The route driver's door to the actuation ceiling: every group of host
@@ -4392,6 +4397,7 @@ impl Engine {
             history_report: ReportOnce::default(),
             fault_reports: Mutex::default(),
             resume_backoff: Mutex::default(),
+            challenge_wait: Mutex::default(),
         })
     }
 
@@ -5606,9 +5612,12 @@ impl Engine {
                 self.report_once(
                     &continuity_key,
                     format!(
-                        "Idunn stopped restarting admitted {}: {} restarts inside the window. The target is free for a deployment to replace it: {workload_error:#}",
+                        "Idunn stopped restarting admitted {}: {} restarts inside the window. The target is free for a deployment to replace it{}: {workload_error:#}",
                         current.value.target,
-                        supervision.restarts_used(now)
+                        supervision.restarts_used(now),
+                        supervision.route_reopens_at(now).map_or_else(String::new, |at| format!(
+                            ", but its route ceiling refuses the route change until it reopens at unix ms {at}"
+                        )),
                     ),
                 );
                 continue;
@@ -5746,6 +5755,21 @@ impl Engine {
         {
             return Ok(false);
         }
+        if self
+            .challenge_wait
+            .lock()
+            .expect("challenge wait mutex")
+            .get(&current.value.target)
+            .is_some_and(|due| {
+                is_waiting(
+                    now,
+                    *due,
+                    ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS.max(self.options.topology_maximum_age_millis),
+                )
+            })
+        {
+            return Ok(false);
+        }
         ensure!(
             observation.route_id == expected_route.route_id
                 && observation.runtime_instance_id == current.value.activation.runtime_instance_id,
@@ -5825,7 +5849,8 @@ impl Engine {
             Ok(refreshed)
         })();
         let mut next = current.value.clone();
-        match challenge {
+        // The wait the record carries, also held in memory until a record lands.
+        let (recorded, wait_until) = match challenge {
             Ok(refreshed) => {
                 next.routing = RoutingEvidence::Promoted {
                     observation: refreshed,
@@ -5835,12 +5860,10 @@ impl Engine {
                     state.record_proved_challenge(now);
                 }
                 self.clear_fault(&route_key);
-                if let Err(record) = self.replace_generation(current, &next, now) {
-                    eprintln!(
-                        "Idunn could not record the proved route challenge of {}: {record:#}",
-                        current.value.target
-                    );
-                }
+                (
+                    "proved",
+                    now.saturating_add(self.options.topology_maximum_age_millis),
+                )
             }
             Err(error) => {
                 if let Some(state) = next.route_supervision.as_mut() {
@@ -5853,15 +5876,42 @@ impl Engine {
                         current.value.target
                     ),
                 );
-                if let Err(record) = self.replace_generation(current, &next, now) {
-                    eprintln!(
-                        "Idunn could not record the failed route challenge of {}: {record:#}",
+                let due = next
+                    .route_supervision
+                    .as_ref()
+                    .and_then(|state| state.next_challenge_at_unix_millis)
+                    .unwrap_or(now);
+                ("failed", due)
+            }
+        };
+        // Progress is a record that landed. A write the store refused changed
+        // nothing: the pass reports no progress, the scheduler sleeps if nothing
+        // else moved, and the in-memory wait spaces the next challenge.
+        let record_key = format!("route-record:{}", current.value.target);
+        match self.replace_generation(current, &next, now) {
+            Ok(()) => {
+                self.challenge_wait
+                    .lock()
+                    .expect("challenge wait mutex")
+                    .remove(&current.value.target);
+                self.clear_fault(&record_key);
+                Ok(true)
+            }
+            Err(record) => {
+                self.challenge_wait
+                    .lock()
+                    .expect("challenge wait mutex")
+                    .insert(current.value.target.clone(), wait_until);
+                self.report_once(
+                    &record_key,
+                    format!(
+                        "Idunn could not record the {recorded} route challenge of {}: {record:#}",
                         current.value.target
-                    );
-                }
+                    ),
+                );
+                Ok(false)
             }
         }
-        Ok(true)
     }
 
     fn refresh_admitted_topology(
@@ -14305,6 +14355,41 @@ mod tests {
     }
 
     #[test]
+    fn an_exhausted_target_says_when_its_route_ceiling_reopens_only_if_it_is_full() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        workload.kill();
+        let said = || -> String {
+            world
+                .engine
+                .fault_reports
+                .lock()
+                .unwrap()
+                .get("continuity:service")
+                .and_then(|report| report.last.lock().unwrap().clone())
+                .unwrap_or_default()
+        };
+        let mut meters =
+            restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?;
+        set_meters(&world, &meters)?;
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        let open = said();
+        assert!(open.contains("free for a deployment"), "{open}");
+        assert!(!open.contains("route ceiling"), "{open}");
+
+        world.engine.clear_fault("continuity:service");
+        let now = now_millis()?;
+        meters.route_actuations = (0..ROUTE_ACTUATION_CEILING as u64).map(|n| now - 1_000 + n).collect();
+        set_meters(&world, &meters)?;
+        let reopens_at = meters.route_reopens_at(now).unwrap();
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        let full = said();
+        assert!(full.contains(&format!("reopens at unix ms {reopens_at}")), "{full}");
+        Ok(())
+    }
+
+    #[test]
     fn continuity_restarts_are_spaced_by_a_doubling_wait_and_counted_in_the_mint() -> Result<()> {
         let workload = SwitchWorkload::new();
         let world = EngineFixture::with_workload(workload.clone())?;
@@ -16834,6 +16919,146 @@ mod tests {
             fn tick(&self) -> Result<bool> {
                 self.world.engine.supervise_one_admitted_generation()
             }
+        }
+
+        // A store that reads but cannot be written (ENOSPC on the state volume)
+        // is simulated with RLIMIT_FSIZE, which is process-wide: the test
+        // re-runs itself in a child process so no sibling test loses its writes.
+        // Returns true in the child, which runs the body; the parent returns
+        // false after asserting the child passed and hands back its stderr.
+        #[cfg(unix)]
+        fn in_unwritable_store_child(test: &str) -> Result<Option<String>> {
+            if std::env::var_os("IDUNN_TEST_UNWRITABLE_STORE_CHILD").is_some() {
+                return Ok(None);
+            }
+            let path = module_path!().split_once("::").map_or("", |(_, rest)| rest);
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", &format!("{path}::{test}"), "--nocapture", "--test-threads=1"])
+                .env("IDUNN_TEST_UNWRITABLE_STORE_CHILD", "1")
+                .output()?;
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "child failed:\n{}\n{stderr}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the child ran no test: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            Ok(Some(stderr))
+        }
+
+        /// Cap file growth one byte under the store's size: reads work, every
+        /// write fails. Child process only.
+        #[cfg(unix)]
+        fn break_store_writes(world: &EngineFixture) {
+            let size = std::fs::metadata(&world.state_store).unwrap().len();
+            unsafe {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let limit = libc::rlimit { rlim_cur: size - 1, rlim_max: libc::RLIM_INFINITY };
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            }
+            assert!(
+                set_meters(world, &TargetSupervision::new("probe")).is_err(),
+                "the store is still writable"
+            );
+            assert!(ControlSnapshot::read(&world.state_store).is_ok(), "the store is unreadable");
+        }
+
+        #[cfg(unix)]
+        fn challenge_due(world: &EngineFixture) -> Option<u64> {
+            world.engine.challenge_wait.lock().unwrap().get("service").copied()
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn an_unwritable_store_neither_spins_a_failing_challenge_nor_reports_progress() -> Result<()> {
+            let name = "an_unwritable_store_neither_spins_a_failing_challenge_nor_reports_progress";
+            let Some(stderr) = in_unwritable_store_child(name)? else {
+                let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+                routed.admit()?;
+                routed.world.route_stubs.refuse_reloads()?;
+                routed.drift()?;
+                let before = routed.reloads();
+                break_store_writes(&routed.world);
+                let stored_wait = |routed: &RoutedWorld| -> Result<Option<u64>> {
+                    Ok(ControlSnapshot::read(&routed.world.state_store)?
+                        .admitted
+                        .iter()
+                        .find_map(|stored| stored.value.route_supervision.as_ref())
+                        .and_then(|state| state.next_challenge_at_unix_millis))
+                };
+                let stored = stored_wait(&routed)?;
+
+                // Fifty laps: one attempt, nothing reported as progress.
+                for _ in 0..50 {
+                    assert!(!routed.tick()?, "a write the store refused was reported as progress");
+                }
+                assert_eq!(routed.reloads() - before, 1, "the failing reload spun");
+                assert_eq!(stored_wait(&routed)?, stored, "the record changed though writes fail");
+                let due = challenge_due(&routed.world).expect("no in-memory wait after a failed record");
+                let age = routed.world.engine.options.topology_maximum_age_millis;
+                assert!(due >= now_millis()? + age / 2, "the wait is not the widening wait: {due}");
+
+                // The wait expiring is the only thing that admits another
+                // attempt, and each one is again a single reload with no
+                // progress. The failed record is said once, not per attempt.
+                for attempt in 2..=4 {
+                    routed.world.engine.challenge_wait.lock().unwrap().clear();
+                    assert!(!routed.tick()?);
+                    assert!(!routed.tick()?);
+                    assert_eq!(routed.reloads() - before, attempt);
+                }
+                return Ok(());
+            };
+            assert_eq!(
+                stderr.matches("could not record the failed route challenge of service").count(),
+                1,
+                "{stderr}"
+            );
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn an_unwritable_store_challenges_a_stale_route_once_per_wait() -> Result<()> {
+            let name = "an_unwritable_store_challenges_a_stale_route_once_per_wait";
+            let Some(stderr) = in_unwritable_store_child(name)? else {
+                let mut routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+                routed.admit()?;
+                routed.world.engine.options.topology_maximum_age_millis = 1_000;
+                std::thread::sleep(Duration::from_millis(1_300));
+                break_store_writes(&routed.world);
+                assert!(!routed.tick()?, "a write the store refused was reported as progress");
+                let first = challenge_due(&routed.world).expect("the proved challenge left no wait");
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(3));
+                    assert!(!routed.tick()?);
+                }
+                assert_eq!(challenge_due(&routed.world), Some(first), "the route was challenged again");
+                return Ok(());
+            };
+            assert_eq!(
+                stderr.matches("could not record the proved route challenge of service").count(),
+                1,
+                "{stderr}"
+            );
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_landed_challenge_record_is_progress_and_leaves_no_in_memory_wait() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            routed.world.route_stubs.refuse_reloads()?;
+            routed.drift()?;
+            routed.world.engine.challenge_wait.lock().unwrap().insert("service".into(), 0);
+            assert!(routed.tick()?, "a landed record is progress");
+            assert_eq!(challenge_due(&routed.world), None);
+            Ok(())
         }
 
         #[cfg(unix)]
