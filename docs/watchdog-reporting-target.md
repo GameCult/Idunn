@@ -61,9 +61,11 @@ the machine has a detector with no record, and a deliverer that nothing feeds.
   other. Its absence, failure or backlog may delay a message. It never delays
   or gates an Idunn decision, tick, restart, or deployment. An incident nobody
   has delivered stays visible in Idunn's own state and in `idunn status`.
-- **One message per incident, not per tick.** A fault that lasts hours
-  produces one opening notice, not a stream of them. Repeated delivery
-  attempts for one incident are idempotent at the recipient's end.
+- **Two messages per incident at most, never one per tick.** A fault that
+  lasts hours produces one opening notice, not a stream of them. When it
+  clears, one closure notice follows, and only if the opening notice was sent.
+  Repeated delivery attempts for either notice are idempotent at the
+  recipient's end.
 - **Nothing sensitive leaves.** A notice names the target, the condition and
   the time. It never carries a binding value, a path to a secret, a token, or
   a line of configuration.
