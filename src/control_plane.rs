@@ -15033,8 +15033,13 @@ mod tests {
         }
 
         // The lock is free again: the next pass retries and the incident lands.
-        world.engine.supervise_one_admitted_generation()?;
-        assert!(incidents_of(&world)?.iter().any(|record| record.is_open()));
+        // (A child another test forked while it was held can keep it a moment.)
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !incidents_of(&world)?.iter().any(|record| record.is_open()) {
+            assert!(std::time::Instant::now() < deadline, "the incident never landed");
+            world.engine.supervise_one_admitted_generation()?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert_control_store_holds_no_incident(&world)
     }
 

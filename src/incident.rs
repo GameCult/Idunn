@@ -690,6 +690,20 @@ pub(crate) mod tests {
         result
     }
 
+    /// Retry `attempt` for up to two seconds. A released lock can stay held for
+    /// a moment by a child another test forked while it was held.
+    #[cfg(unix)]
+    fn eventually<T>(mut attempt: impl FnMut() -> Result<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match attempt() {
+                Ok(value) => return value,
+                Err(error) if Instant::now() >= deadline => panic!("never landed: {error:#}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn no_incident_write_waits_on_a_held_lock_and_each_lands_when_it_is_freed() {
@@ -718,9 +732,9 @@ pub(crate) mod tests {
         // Nothing was lost by the refusal: the same calls land once it is free.
         // (Retirement archives first, so its refused delete left the record in
         // history too; the repeat archives nothing twice.)
-        assert!(store.open(condition, "new", CLOSED).unwrap());
-        assert!(store.close(condition, "open", CloseReason::Recovered, CLOSED).unwrap());
-        assert!(store.retire_closed(retired).unwrap());
+        assert!(eventually(|| store.open(condition, "new", CLOSED)));
+        assert!(eventually(|| store.close(condition, "open", CloseReason::Recovered, CLOSED)));
+        assert!(eventually(|| store.retire_closed(retired)));
         let history = SingleFileMessagePackBackingStore::new(&temp.path().join("incident-history.cc"));
         assert_eq!(history.pull_all_read_only_snapshot().unwrap().len(), 1);
     }
@@ -741,7 +755,7 @@ pub(crate) mod tests {
         let outcome = run_while_held(hold_lock_of(&history), || store.retire_closed(retired));
         assert!(outcome.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(store.retire_closed(retired).unwrap());
+        assert!(eventually(|| store.retire_closed(retired)));
     }
 
     #[test]
