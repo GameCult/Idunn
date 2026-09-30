@@ -66,7 +66,9 @@ the machine has a detector with no record, and a deliverer that nothing feeds.
   clears, one closure notice follows, and only if the opening notice was sent.
   Repeated delivery attempts for either notice are idempotent at the
   recipient's end.
-- **No tick waits on a lock someone else can hold.** Soul found that any
+- **No tick waits on a lock another uid can hold.** Root holders, such as
+  the nightly backup's millisecond shared lock, are trusted and bounded. The
+  operator ruled this scope on 2026-09-30, choosing uid-scoped. Soul found that any
   local uid could freeze Idunn's scheduler tick by holding a published
   `.lock` file. This was true for incidents during the campaign, and for
   `topology.cc` before it. Idunn's writes in its projection directory are
