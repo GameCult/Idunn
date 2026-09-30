@@ -211,6 +211,19 @@ The rework is a fresh branch from `583b2a7`, not a rebase of `1786ddf`. Its map 
   Option D (reset the restart log when a new release is admitted) was not chosen: a new release still inherits
   its predecessor's restart history. B2 is merged (`46d9c2f`) but not installed; this follow-up (B2-3d) lands
   before the install.
+- **B2-3d status (Self, 2026-09-30).** Built on `hands/b2-3d` (`e9c718e`, `057bdd5`). Soul re-ran `verify.sh`
+  clean (341) and killed every one of its own mutants on the Forward/Survival split. **But the premise the operator
+  ruled on is false:** "every Survival path has its own bound" does not hold.
+  - **F1:** a continuity transaction whose route proof keeps failing retries inside one transaction under the
+    60 s resume cap, reloading nginx twice per retry. That is about 120 reloads/h per target, with no end until B5.
+  - **F2:** a failing post-fence withdrawal reloads about 60/h. `restore` reloads even when the fragment is
+    already correct.
+  - **F3:** nothing bounds reloads across the host.
+  - None of these is new in 3d: Survival was never refused before either. The live Idunn, which predates B2, has
+    no reload bound at all. What 3d adds is the false claim, at `control_plane.rs:76-81`, plus the admitted
+    Deploy doubling to 24/h.
+  - The fix belongs to B5 ("every post-fencing phase ends"), plus a restore/install that skips the reload when
+    the fragment is already correct. The operator was told on 2026-09-30.
 - **Q-B2-1 (a):** the continuity restart log moves into `TargetSupervision`; the restart ceiling reads the
   target's own log; the carry compensator is deleted.
 - **Q-B2-2: fail at once.** A deploy refused by the route/actuation ceiling before the fence fails immediately,
