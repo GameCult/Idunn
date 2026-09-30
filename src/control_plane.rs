@@ -17589,7 +17589,7 @@ mod tests {
                 generation.route_supervision.as_mut().unwrap().last_challenge_at_unix_millis = Some(5);
             })?;
             routed.drift()?;
-            assert!(routed.world.engine.supervise_admitted_route(stale)?);
+            assert!(routed.world.engine.supervise_admitted_route(&old, stale)?);
             assert_eq!(
                 admitted(&routed)?.route_supervision.unwrap().last_challenge_at_unix_millis,
                 Some(5),
