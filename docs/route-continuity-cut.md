@@ -254,6 +254,27 @@ The rework is a fresh branch from `583b2a7`, not a rebase of `1786ddf`. Its map 
   - **H.** AwaitingReady and Routing keep the F16 shape. It is unreachable at today's heartbeats.
   - **I.** An `idunn expire` request written while Idunn is stopped lingers, and there is no verb to withdraw it,
     which is a downgrade hazard.
+- **B5 MERGED and INSTALLED (2026-09-30).** Merged to main at `fcb8ba1` (Soul passes 1-3). Built on Yggdrasil:
+  `/srv/build/idunn-fcb8ba1`, 360 passed. `idunn` sha256 `e96bcefa...`, `idunn-provision` `127902ef...`, unit unchanged.
+  Installed at 22:35 CEST.
+  - **Backup**, taken with Idunn stopped and byte-compared:
+    `/root/idunn-store-backup-20260930T203515Z-pre-route-b5/`. It holds `control.cc` `fab5b66b...`, `history.cc`
+    `a2627ea4...` and `idunn.running` `848c08e5...` (a96ad9d).
+  - **Preflight** found one live transaction: the raven-muninn continuity `990dfc25` in AwaitingReady for about 40
+    min. Raven had rebooted, and its actuator timed out at 21:36 and 21:49 CEST. The operator ruled "Feel free to
+    install".
+  - **After install:**
+    - No managed target's PID changed. Raven reattached after 15 s, and nginx made 0 reloads.
+    - B5 aborted the stale continuity at its passed deadline, and supervision opened `continuity-26737b91`.
+    - A single log line, "could not resume transaction tx-bcfbb693...: transaction disappeared while checking
+      scheduler progress", appeared at 20:35:38 UTC. It looks like a same-tick ordering quirk between the
+      resolver and resume. It goes to the next Soul pass.
+  - **Rollback rule:** stop Idunn and check `control.cc` for any `idunn.expiry_request` envelope. If one exists,
+    restore the backup instead of swapping the binary.
+  - **Named tradeoff (Soul batch-3 F1):** a persistent `ufw delete` failure while aborting a first routed deploy now
+    leaves the aborted candidate routed until ufw recovers. Before B5 the cost was reload churn. Q3-ii's abort
+    deadline bounds it.
+  - Test pins F2-F4 are in Hands (`hands/b5-pins`).
 - **B5 batch 2 (`c06ff2b..aef0da3`) and Soul pass 2 (2026-09-30): merge and install after batch 3.**
   - A, B, E, F and J hold. Verify: 356 passed. cargo-mutants caught 14 of 14 viable mutants, and Soul's hand
     mutants killed 16 of 20.
