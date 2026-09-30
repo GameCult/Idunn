@@ -13,6 +13,23 @@ secrets into a transcript. The operator's words: "I'll rotate before prod, not t
 concerned about Anthropic having my oauth; do map the cut that'll ensure it doesn't
 happen again".
 
+**Heimdall `hands/secret-files` status (Self, 2026-09-30).**
+- **Batch 5** (`efd1137..b5d7b6b`) fixed Soul pass 4's four findings:
+  - F1: command-plane diagnostics are fixed text plus the error's class and code, and every provider body goes
+    through `readProviderJson`.
+  - F2: patron support keeps only the Bifrost status.
+  - F3: the recipe test records the secrets `loadConfig` actually reads.
+  - F4: `checkSchema` runs on every start.
+- **Soul pass 5: hold.** F1-F3 held. Batch 6, in Hands, fixes:
+  - **S5-1.** `checkSchema` passes a DEFERRABLE key, a `UNIQUE ... INCLUDE`, a same-named non-unique replacement for
+    the partial unique index, and retyped columns. Each of these breaks the store at runtime.
+  - **S5-2.** The privilege check demands UPDATE on `audit_events`, which the store only INSERTs into.
+  - **S5-3 (older than this batch).** `app.ts:1310` writes a live, 300 s redeemable completion code into the audit
+    event `auth_completion_created`.
+  - **S5-4 to S5-7.** Test gaps: canary position, the `errorIdentity` filters, pool close, spread-env reads.
+  - A flaky live-Postgres test.
+- Noted, not in scope: **S5-8**, forced RLS with no policy passes the check.
+
 **Rulings and defaults, 2026-09-30 (Self).**
 - **Q3 A is the operator's ruling:** "I'll rotate before prod". Cuts 1-4 land with the current values; rotation
   overwrites the credential files later. The token-encryption and signing-key sub-question waits for rotation time.
