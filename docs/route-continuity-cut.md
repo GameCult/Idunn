@@ -234,6 +234,26 @@ The rework is a fresh branch from `583b2a7`, not a rebase of `1786ddf`. Its map 
   - After 10 min: no odin route-continuity rejections (about 95 in the previous 3 h), 0 nginx reloads, and the
     Odin post-deploy check `fails=0`.
   - B5 and skip-unneeded-reloads are in Hands (`hands/b5`).
+- **B5 Soul pass 1 (2026-09-30, on `a96ad9d..c06ff2b`): merge after the batch-2 fixes; no install before them.**
+  Soul reran verify: 352 passed. Batch 2, now in Hands, fixes:
+  - **A (high).** A continuity aborted from `Prepared` leaves a lease on disk that `driver.grant` wrote before
+    `Granted` was durable (`control_plane.rs:6916-6930`, `:9081`). The next fencing refuses, and the target is
+    wedged.
+  - **B (medium, a regression from `6ff7d5a`).** The reload skip hides a crash between the write and the reload on
+    the `restore`/`install` transaction paths, leaving nginx proxying to a dead port. The skip goes back to
+    supervision only.
+  - **E.** The resolver's command filter is unpinned.
+  - **F.** Odin-correlated adoption has no committed test; mutants M6 and M7 survive.
+  - **J.** A flaky backoff test (`:14200`).
+
+  Recorded:
+  - **C** (the abort has no deadline) is closed by the Q3-ii cut.
+  - **D.** There is no host-wide reload bound. 170/h is about a third of the F6 storm, and 4830af8 lowers the real
+    worst case.
+  - **G.** A newer Ready can rewrite `lease_adoption`. It names the same lease, so it is harmless.
+  - **H.** AwaitingReady and Routing keep the F16 shape. It is unreachable at today's heartbeats.
+  - **I.** An `idunn expire` request written while Idunn is stopped lingers, and there is no verb to withdraw it,
+    which is a downgrade hazard.
 - **Q-B2-1 (a):** the continuity restart log moves into `TargetSupervision`; the restart ceiling reads the
   target's own log; the carry compensator is deleted.
 - **Q-B2-2: fail at once.** A deploy refused by the route/actuation ceiling before the fence fails immediately,
