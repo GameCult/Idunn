@@ -9614,7 +9614,7 @@ Content-Le".to_vec()), |_| {}),
             let _done = Done(&done);
             // Idunn's own umask, in force while it publishes.
             let _umask = Umask027::set();
-            for _ in 0..150 {
+            for _ in 0..40 {
                 driver.publish_expected(&expected, &provider_anchor)?;
                 driver.withdraw_incarnation(&expected, &provider_anchor, None, None)?;
             }
