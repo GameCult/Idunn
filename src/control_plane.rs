@@ -14889,6 +14889,7 @@ mod tests {
             panic!("expected serve")
         };
         assert_eq!(options.incident_store, PathBuf::from("/tmp/i.cc"));
+        assert!(usage().contains("idunn status [--state-store PATH] [--incident-store PATH]"));
         let Command::Status { incident_store, .. } =
             parse(["status", "--incident-store", "/tmp/j.cc"].into_iter().map(str::to_owned))
                 .unwrap()

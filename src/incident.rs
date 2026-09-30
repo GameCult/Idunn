@@ -2,8 +2,8 @@
 //! opened, and that it closed.
 //!
 //! One file, `incidents.cc`, holds one type. Idunn's daemon is its only writer,
-//! at the site that decides the condition; it is also the file readers such as
-//! Bifrost open, so no second copy exists to drift. It is never `control.cc`,
+//! at the site that decides the condition; it is also the file external
+//! readers open, so no second copy exists to drift. It is never `control.cc`,
 //! which refuses any type it does not know: a type added there would stop
 //! continuity for every target on a rollback.
 //!
@@ -488,6 +488,8 @@ mod tests {
 
     #[test]
     fn closed_incidents_retire_to_history_after_retention() {
+        // The ruled retention: seven days.
+        assert_eq!(INCIDENT_RETENTION_MILLIS, 604_800_000);
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("incidents.cc");
         let store = IncidentStore::new(&path);
