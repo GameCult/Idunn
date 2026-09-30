@@ -5344,8 +5344,16 @@ impl NginxRouteDriver {
     /// on a transaction path, bytes on disk that already equal `prior` may be
     /// a write whose reload a crash cut off. A reload that fails puts the
     /// previous fragment back, so the disk shows what nginx still serves.
+    ///
+    /// With no prior membership the stable endpoint routes to nothing, and
+    /// its firewall allow is withdrawn first: a failing `ufw delete` then
+    /// retries without touching nginx, and a crash after it is safe, because
+    /// a rule already gone reads as withdrawn.
     fn restore(&self, prior: Option<&[u8]>, gate: &dyn RouteActuationGate) -> Result<()> {
         gate.admit(RouteActuation::Survival)?;
+        if prior.is_none() {
+            self.withdraw_endpoint()?;
+        }
         let current = self.current_configuration()?;
         self.write_fragment(prior)?;
         if let Err(reload) = self.reload() {
@@ -5355,11 +5363,6 @@ impl NginxRouteDriver {
                     "reloading the restored route; putting the previous fragment back also failed: {undo:#}"
                 )),
             };
-        }
-        // No prior membership means the stable endpoint no longer routes to
-        // anything; its firewall allow goes with the fragment.
-        if prior.is_none() {
-            self.withdraw_endpoint()?;
         }
         Ok(())
     }
@@ -11873,6 +11876,12 @@ Content-Le".to_vec()), |_| {}),
         };
         driver.systemctl_program = failable("systemctl", "reload")?;
         driver.ufw_program = failable("ufw", "delete")?;
+        // `<dir>/ufw.absent`: the rule is already gone, as ufw reports it.
+        let ufw = fs::read_to_string(&driver.ufw_program)?.replace(
+            "exit 0\n",
+            "if [ \"$1\" = delete ] && [ -e \"$0.absent\" ]; then echo 'Could not delete non-existent rule' >&2; exit 1; fi\nexit 0\n",
+        );
+        fs::write(&driver.ufw_program, ufw)?;
         Ok((driver, candidate, calls))
     }
 
@@ -11918,6 +11927,78 @@ Content-Le".to_vec()), |_| {}),
         driver.withdraw_candidate_membership(&receipt, &Unmetered)?;
         assert_eq!(logged(&calls, "systemctl reload"), 2, "the unloaded withdrawal was not reloaded");
         assert_eq!(logged(&calls, "ufw delete"), 1);
+        Ok(())
+    }
+
+    /// A redeploy over an existing route changes it: the candidate differs
+    /// from the incumbent's fragment, so it installs and reloads, and its
+    /// rollback and withdrawal put the incumbent back and reload.
+    #[cfg(unix)]
+    #[test]
+    fn a_deploy_over_an_incumbent_route_installs_and_reloads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (driver, candidate, calls) = failable_route_driver(temp.path())?;
+        let incumbent = b"# incumbent membership\n".to_vec();
+        let mut receipt = preflight_receipt(&driver, &candidate)?;
+        receipt.incumbent_runtime_instance_id = Some(digest('b'));
+        receipt.incumbent_membership_sha256 = Some(sha256_id(&incumbent));
+        receipt.incumbent_configuration = Some(incumbent.clone());
+        assert!(receipt.changes_route());
+        fs::write(&driver.binding.config_path, &incumbent)?;
+
+        driver.install(&candidate, &digest('a'), &receipt, true, &Unmetered)?;
+        assert_eq!(logged(&calls, "systemctl reload"), 1, "the redeploy did not install");
+        assert_eq!(fs::read(&driver.binding.config_path)?, driver.render(&candidate)?);
+        driver.rollback(&candidate, &digest('a'), &receipt, &Unmetered)?;
+        assert_eq!(logged(&calls, "systemctl reload"), 2, "the rollback did not reload");
+        assert_eq!(fs::read(&driver.binding.config_path)?, incumbent);
+        driver.install(&candidate, &digest('a'), &receipt, true, &Unmetered)?;
+        driver.withdraw_candidate_membership(&receipt, &Unmetered)?;
+        assert_eq!(logged(&calls, "systemctl reload"), 4, "the withdrawal did not reload");
+        assert_eq!(fs::read(&driver.binding.config_path)?, incumbent);
+        Ok(())
+    }
+
+    /// With nothing left to route, the withdrawal takes the firewall allow
+    /// first. A `ufw delete` that keeps failing retries without reloading
+    /// nginx; once it goes through, the fragment is removed and reloaded.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_firewall_withdrawal_retries_without_reloading() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (driver, candidate, calls) = failable_route_driver(temp.path())?;
+        let receipt = preflight_receipt(&driver, &candidate)?;
+        driver.install(&candidate, &digest('a'), &receipt, false, &Unmetered)?;
+        let installed = logged(&calls, "systemctl reload");
+
+        fs::write(temp.path().join("ufw.fail"), b"x")?;
+        for _ in 0..5 {
+            assert!(driver.withdraw_candidate_membership(&receipt, &Unmetered).is_err());
+        }
+        assert_eq!(logged(&calls, "systemctl reload"), installed, "a failing ufw delete reloaded nginx");
+        assert_eq!(logged(&calls, "ufw delete"), 5);
+        fs::remove_file(temp.path().join("ufw.fail"))?;
+        driver.withdraw_candidate_membership(&receipt, &Unmetered)?;
+        assert_eq!(logged(&calls, "systemctl reload"), installed + 1);
+        assert!(!driver.binding.config_path.exists());
+        Ok(())
+    }
+
+    /// A crash after the firewall rule went and before the fragment did: the
+    /// retry reads the gone rule as withdrawn and finishes the withdrawal.
+    #[cfg(unix)]
+    #[test]
+    fn a_withdrawal_resumed_after_its_firewall_rule_went_finishes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (driver, candidate, calls) = failable_route_driver(temp.path())?;
+        let receipt = preflight_receipt(&driver, &candidate)?;
+        driver.install(&candidate, &digest('a'), &receipt, false, &Unmetered)?;
+        let installed = logged(&calls, "systemctl reload");
+
+        fs::write(temp.path().join("ufw.absent"), b"x")?;
+        driver.withdraw_candidate_membership(&receipt, &Unmetered)?;
+        assert!(!driver.binding.config_path.exists(), "the fragment outlived the withdrawal");
+        assert_eq!(logged(&calls, "systemctl reload"), installed + 1, "nginx was not reloaded");
         Ok(())
     }
 

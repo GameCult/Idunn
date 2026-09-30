@@ -14235,8 +14235,24 @@ mod tests {
             .engine
             .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
         let attempts = || workload.0.load(std::sync::atomic::Ordering::SeqCst);
+        let before = now_millis()?;
         world.engine.run_scheduler_tick()?;
+        let after = now_millis()?;
         assert_eq!(attempts(), 1, "the step did not run");
+        // The first failure waits one poll interval: the wait back_off wrote.
+        let poll = world.engine.options.poll_millis;
+        let written = world
+            .engine
+            .resume_backoff
+            .lock()
+            .unwrap()
+            .get(&resident(&world)?.value.transaction_id)
+            .map(|backoff| backoff.not_before_unix_millis)
+            .expect("the failure set no backoff");
+        assert!(
+            (before + poll..=after + poll).contains(&written),
+            "back_off wrote {written}, not one poll ({poll} ms) after the failure"
+        );
         // The wait is set from the wall clock, and a loaded host can spend it
         // inside a few ticks. So the test owns the wait: held open, no tick
         // retries; once due, the next tick does.
@@ -18490,6 +18506,31 @@ mod tests {
             Ok(())
         }
 
+        /// Soul's F2 probe, committed: a post-fence withdrawal whose
+        /// `ufw delete` keeps failing withdraws the firewall allow first, so its
+        /// retries reload nginx not at all.
+        #[cfg(unix)]
+        #[test]
+        fn a_withdrawal_whose_firewall_step_keeps_failing_never_reloads() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.promote()?;
+            let installed = routed.reloads();
+            routed.world.route_stubs.refuse_ufw_deletes()?;
+            routed
+                .world
+                .engine
+                .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("test"))?;
+            for _ in 0..20 {
+                routed.resume()?;
+            }
+            assert_eq!(routed.reloads(), installed, "a failing withdrawal reloaded nginx");
+            assert_eq!(routed.world.route_stubs.count("ufw delete"), 20);
+            assert!(routed.fragment_path().exists(), "the route went before its firewall rule");
+            Ok(())
+        }
+
         /// A record lifted from before deadlines existed is timed once, from
         /// the first time the resolver sees it, and never again.
         #[test]
@@ -18622,9 +18663,13 @@ mod tests {
                 requested_at_unix_millis: now,
             };
             let sealing = DeploymentTransaction::new(&other, "other".into(), 0, None, now)?;
+            // The request names a command whose id has this transaction's
+            // length and first bytes, and differs only in its last.
+            let near = "continuity-servicx";
+            assert_eq!(near.len(), "continuity-service".len());
             let request = ExpiryRequest {
                 schema_version: EXPIRY_REQUEST_SCHEMA.into(),
-                command_id: other.command_id.clone(),
+                command_id: near.into(),
                 requested_by: "operator".into(),
                 requested_at_unix_millis: now,
             };
