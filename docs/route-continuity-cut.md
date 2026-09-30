@@ -1,6 +1,6 @@
 # Route continuity and admission: cut map
 
-Status: cut map, Imagination pass 0b (Opus), 2026-09-29. Nothing has landed.
+Status: cut map, Imagination pass 0b (Opus), 2026-09-29. Nothing has landed. 2026-09-30: the Odin-lifecycle authority audit is folded in (sections 3, 4 and 5); see the Cut status block.
 Ends are owned by route-continuity-target.md.
 **2026-09-29, Self (Eureka session "Codebase audit"; the campaign was handed
 over from the StreamPixels deployment session with the operator's
@@ -218,10 +218,24 @@ The rework is a fresh branch from `583b2a7`, not a rebase of `1786ddf`. Its map 
   pass). Operator: "the last few rulings on Odin are making my authority sense tingle, it feels like Odin is
   doing lifecycle work when that's very much Idunn's wheelhouse." B4 is blocked on that audit.
 
+**Odin-lifecycle audit rulings, 2026-09-30 (operator).** The audit landed as section 5. Q-O1: Idunn proves
+(supersedes Q1 (b); readiness classes end at A1 + A3). Q-O2: a private challenge endpoint for unrouted targets
+(A2 + a Muninn responder). Q-O4: the Odin dependency is optional and does not gate a compile. Q-O5: restart on bad
+auth (amends Q5 (a)). The held Q-B4 clause is struck; B4 becomes B4′. Q-O3 (redeploy order odin ->
+streampixels-service -> ghostlight -> web with the operator present, vs a one-shot relabel) is **not yet asked**
+and is needed before A1 installs. Odin keeps three permanent self-publication failures fatal until A3 + Q-O5 land
+(temporary rule, section 4).
+
 **Cut status, 2026-09-30.**
-- **Ready for Hands:** B2 (rework map in section 4); D1 (after B2); R1 (after B2).
-- **In progress** on `hands/idunn-w1-t1-t2`: W1, T1, T2.
-- **Blocked:** B4, on the Odin-lifecycle authority audit; H1 (Heimdall repo), on CultLib C1.
+- **Ready for Hands:** B2 (rework map in section 4); D1 (after B2). **R1 is never to be written**, superseded by A1.
+- **In progress:** `hands/idunn-b2-rework` (B2 rework); `hands/idunn-w1-t1-t2`: W1, T1, T2; X1 on Odin
+  `hands/odin-x1-residue`; the temporary fatal rule on Odin `hands/odin-session-table`.
+- **Next, in order:** A1 (after B2, and after Q-O3 is ruled), B4′, A2 with M1, A3 (irreversible store migration,
+  back up first), O-R, L-R (section 4, Odin-authority cuts).
+- **Open for Soul:** the continuity-restart stall probe and the journal check of the ghostlight/raven-muninn
+  exclusion (section 5.5).
+- **Unblocked:** B4 (now B4′). **Blocked:** H1 (Heimdall repo), on CultLib C1. A supervision change for Q-O5 has
+  no cut yet.
 
 
 Heads read for this map:
@@ -480,7 +494,7 @@ An empty or "none" cell is a finding. It is marked **(gap)**.
 **Q1. Readiness authority for a CultMesh-aware service such as
 `streampixels-service`.**
 
-**RULED (b) by the operator, 2026-09-29.**
+**RULED (b) by the operator, 2026-09-29. HISTORY, not live design: superseded 2026-09-30 by Q-O1 (Idunn proves; readiness classes end at A1 + A3). The text below is kept as the record of the ruling.**
 
 Options:
 - (a) Every non-Odin target proves Warming and Ready directly through Idunn's
@@ -564,7 +578,7 @@ Depends on it: S2 scope and the CLI surface.
 **Q5. Whether a sustained route-proof failure on an admitted target restarts
 its unit.**
 
-**RULED (a) by the operator, 2026-09-29.**
+**RULED (a) by the operator, 2026-09-29. Amended 2026-09-30 by Q-O5: an answer that does not authenticate as the admitted incarnation restarts the process under the continuity meter; silent answers stay degraded-only.**
 
 Options:
 - (a) No. The route is marked degraded, dependents stop selecting it (Q2b),
@@ -675,13 +689,87 @@ Ruled, from (b):
 - Capabilities come from the signed presence in the route proof (routed) or the admitted Ready receipt
   (unrouted).
 
-**Held open, NOT ruled:** the recommendation's clause that "a current Odin non-Ready word still excludes a
+**Held clause, STRUCK 2026-09-30 (operator, in Q-O1): "a current Odin non-Ready word still excludes a provider" is rejected. B4 becomes B4′ (section 4, Odin-authority cuts). The original held text follows as history.** The recommendation's clause that "a current Odin non-Ready word still excludes a
 provider" (a stale one would not). The operator: "the last few rulings on Odin are making my authority sense
 tingle, it feels like Odin is doing lifecycle work when that's very much Idunn's wheelhouse." That clause stays
 open pending the Odin-lifecycle authority audit, a separate Imagination pass. Until it is ruled, B4 carries
 no Odin-veto rule either way.
 
-Depends on it: B4, which is now **blocked on the Odin-lifecycle authority audit**, not on Q-B4.
+Depends on it: B4′, no longer blocked (the audit landed as section 5).
+
+**Q-O1. Who proves readiness for a target that declares the Odin discovery dependency?**
+
+**RULED (a) by the operator, 2026-09-30: Idunn proves.** Idunn's own route challenge always proves readiness. A
+discovery declaration (`odin.verse-rendezvous`) never picks a voucher. This re-opens and **supersedes Q1 (b)**;
+the Q1 text above is history, not live design. Readiness classes disappear at A1 + A3.
+
+Context (audit, section 5): Q1 (b) turned "declares `shared-infrastructure odin.verse-rendezvous`" into "Odin vouches
+for readiness", so a discovery declaration selected a lifecycle authority. That reached daemon survival: a
+continuity restart of ghostlight or streampixels-service waits in Warming with no end until Odin speaks (I2), and
+Idunn's own boot re-proves every stored Odin receipt against Odin's key (I12). `F:\Projects\CLAUDE.md` forbids that
+coupling. Every Odin-correlated target except raven-muninn is routed, so Idunn already owns the channel it needs.
+
+Options:
+- (a) Idunn's own challenge, always. The declaration stays a discovery and graph fact. A1, then A3. Kills I2's
+  survival gap, strikes the Q-B4 clause, supersedes R1.
+- (b) Keep Q1 (b). Keeps I1-I14 and O1-O3; continuity of ghostlight and streampixels-service needs Odin alive and
+  correct; Idunn's boot needs Odin's anchor and key.
+
+Outcome: (a). Depends on it: A1, A3, B4′, and the demotion of `ReadinessClass`.
+
+**Q-O2. How does Idunn prove an unrouted target (today only raven-muninn)?**
+
+**RULED (a) by the operator, 2026-09-30: a private challenge endpoint.** The binding declares a challenge endpoint
+without a stable route, and Idunn challenges it directly. Cut A2, plus a Muninn responder (M1).
+
+Options:
+- (a) A binding-declared private challenge endpoint (A2 + M1).
+- (b) Workload-alive only: no readiness proof; dependents can never see degradation, which contradicts Q5 (a).
+- (c) Keep Odin correlation for unrouted targets only: A3 is then impossible.
+
+Outcome: (a). raven-muninn is held today and has no continuity restarts, so there is no live regression while it
+waits. Depends on it: A2, M1, and raven-muninn leaving the held state.
+
+**Q-O3. The three admitted Odin-voucher generations once A1 installs.** **OPEN. NOT YET ASKED.** Needed before A1
+installs.
+
+Admitted generations on Odin receipts that A1 will hold as `WrongVoucher`: odin, streampixels-service, ghostlight
+(streampixels-web is Odin-free already).
+
+Options:
+- (a) Redeploy each immediately after install, in the order odin -> streampixels-service -> ghostlight -> web, with
+  the operator present for the window. No new code (the existing rule: "reported and held, never repaired"). Each
+  is continuity-less for its redeploy window; held generations mint no continuity (B3 F1). Audit recommendation.
+- (b) A one-shot relabel: supervision replaces the Odin receipts with a fresh stable-route proof once. No
+  continuity gap, but it adds the repair path the hold rule was written to forbid.
+
+**Q-O4. Does `shared-infrastructure odin.verse-rendezvous` still gate a dependent's plan compile?**
+
+**RULED (b) by the operator, 2026-09-30: the Odin dependency does not gate a dependent's compile; declare it
+optional.** It is a discovery need that never gates (I11). The service must tolerate Odin's absence at runtime and
+publish when Odin returns.
+
+Options:
+- (a) Yes. Odin is an ordinary provider judged by Idunn's own proof of Odin (B4′); an Odin outage blocks deploys,
+  not continuity, of Verse-advertising services.
+- (b) No. Services declare it `optional`.
+
+Outcome: (b). Depends on it: the ghostlight, streampixels-service and raven-muninn recipes (flipped inside A1's
+window), and the I11 graph gate.
+
+**Q-O5. A live process whose challenge answer does not authenticate as the admitted incarnation.**
+
+**RULED (a) by the operator, 2026-09-30: restart on bad auth.** Supervision restarts a live process whose
+challenge answer does not authenticate as the admitted incarnation (bad signature, wrong activation or instance,
+lease not held), under the continuity restart meter in `TargetSupervision`. Silent answers stay degraded-only.
+**This amends Q5 (a)** narrowly; it applies to every routed target, not only Odin.
+
+Rationale (audit): a refused-as-unauthenticatable answer is Idunn's own evidence that what runs is not what it
+admitted. That is survival authority, not health policy. It lets Odin's temporary fatal rule (section 4) be
+deleted. Rejected: (b) Q5 (a) unchanged, with the temporary rule kept permanently.
+
+Depends on it: a supervision change on B2's meter (no cut drawn yet; see the Cut status), and the deletion of
+Odin's temporary rule.
 
 ---
 
@@ -1366,7 +1454,9 @@ the brief, and the defects were confirmed from code and the probe.
 
 **Size.** One Dockerfile line and one map line. It adds no targets.
 
-**R1 — A routed target proves it answers the route challenge before its fence (Idunn; Q-R1 ruled (a)). READY FOR HANDS, after B2. Must land before Heimdall's first deploy.**
+**R1 — NEVER TO BE WRITTEN: superseded by A1 (2026-09-30, Q-O1).** Every routed target is proved by Idunn's own challenge whatever it declares, so the class guard below has nothing to guard. H1 (Heimdall responder) is still needed. The text is kept as history.
+
+**R1 (superseded) — A routed target proves it answers the route challenge before its fence (Idunn; Q-R1 ruled (a)).**
 
 - **Owner:** Warming's last step, the transition to Fencing (`:5742`).
 - **Inputs:**
@@ -1409,7 +1499,7 @@ the brief, and the defects were confirmed from code and the probe.
   decisions.
 
 **B4 — Provider currency from Idunn's own observation; `9f00e7a` reverted
-(Idunn). BLOCKED on the Odin-lifecycle authority audit.**
+(Idunn). Now B4′ (section 4, Odin-authority cuts), unblocked by the audit and Q-O1: its unrouted Odin-class branch and the Odin-veto clause are gone.**
 - Per Q2(b), `validate_selected_providers_current` and plan compile read the
   provider's current route observation within max age, and read capabilities
   from its signed presence.
@@ -1417,7 +1507,7 @@ the brief, and the defects were confirmed from code and the probe.
 - Revert the admission-time authentication.
 - `ManagedReady` carries a class-tagged evidence digest.
 
-**B4 status, 2026-09-30: BLOCKED on the Odin-lifecycle authority audit** (a separate Imagination pass), not on
+**B4 status, 2026-09-30: was blocked on the Odin-lifecycle authority audit; now B4′ after A1** (a separate Imagination pass), not on
 Q-B4. Q-B4 is ruled in part (section 3): routed providers are current by Idunn's route proof and not
 degraded; unrouted providers by admission plus a live workload observation. The clause "a current Odin
 non-Ready word still excludes a provider" is held open. B4 also takes B2's degraded state as input.
@@ -1471,7 +1561,7 @@ admitted provider … Unrouted providers fall back to their Q1 class evidence".
 - B4 must define currency as "the route is not degraded, and the last proof is within 2 × max
   age", or challenge on demand. That is a brief decision, not an operator one.
 
-**B5 — Every post-fencing phase ends (Idunn).**
+**B5 — Every post-fencing phase ends (Idunn).** *2026-09-30: B5 loses its Odin arm (the Odin part of the F16 fix) once A3 lands; route-proof targets never entered that path.*
 - A deadline resolver runs before `advance_transaction`.
 - For stateless targets, expiry aborts to the incumbent through the existing
   post-fence path.
@@ -1488,6 +1578,49 @@ admitted provider … Unrouted providers fall back to their Q1 class evidence".
   - An AwaitingReady state with no evidence resolves at its deadline.
   - An unadopted lease resolves without an operator.
   - Commit completes while Odin re-stamps every tick.
+
+### Odin-authority cuts (Imagination audit, 2026-09-30)
+
+Source: the Odin-lifecycle authority audit (anchors Idunn `94c7691`/`583b2a7`, Odin `5c37860`), folded in as
+section 5. It ends B4's "blocked on the audit" state. Sequenced against the B2 rework map. Line counts are
+estimates from function spans.
+
+| # | Cut | Repo | Blocked by | Subtraction / addition | Live relevance |
+|---|---|---|---|---|---|
+| **X1** | Delete the dead lifecycle residue: O12 (`idunn.rs` plus the `idunn.*` schemas in `documents.rs`), O13 (JS coordinator, its tests, `package.json start`, `start-/restart-odin.ps1`), O14 (the other services' deploy, restart and health scripts), O15 (doc sections rewritten to the live body); `gamecult-ops/compose/odin.yggdrasil.yaml`; the `idunn-deployment-targets.ps1` references to Odin scripts. **IN PROGRESS on Odin `hands/odin-x1-residue`** | Odin, ops | nothing | about **-7,000** lines (672 + 2,814 + 140 + 3,208 + docs), +~40 of docs | none. Muninn keeps compiling at its pin; its next bump must drop `IdunnDaemonHealthRecord` (follow-up **M2**) |
+| **A1** | Every routed target is proved by Idunn's own challenge, whatever it declares. `ReadinessClass::declared`: `routed -> Direct`. OdinSelf and OdinCorrelated apply only to unrouted targets until A2. Odin itself is routed, so its FirstOdinDirect path generalizes; delete the "is Odin" arms in Warming (`:5614-5640`). The recipes' Odin dependency flips to `optional` (Q-O4) | Idunn (+ recipes) | Q-O3; after B2 | about -60 / +20 | admitted ghostlight, streampixels-service and odin carry Odin receipts and become `WrongVoucher`-held on install (Q-O3). Continuity of ghostlight and service no longer needs Odin (fixes I2 for them). **Replaces R1**, which is never written (its class guard has nothing to guard). H1 (Heimdall responder) is still needed |
+| **B4′** | B4 as mapped, with its rule collapsed: provider currency is Idunn's own proof, not degraded, last within 2 x max age. `ManagedReady` carries a direct-evidence digest. Capabilities come from the challenged presence. **The held Q-B4 clause is struck** | Idunn | A1 (or with it) | B4's own estimate, minus the unrouted Odin branch | C2 run 2 admits |
+| **A2** | Unrouted targets get a challenge endpoint. The binding declares a private challenge endpoint without a stable route; `request_runtime_presence_at` (`drivers.rs:5488`) is reused against it; Expected carries it digest-bound. **M1** (Muninn): raven-muninn answers `SnapshotRequest` for its presence on that endpoint (the StreamPixels C2 and Heimdall H1 shape) | Idunn, Muninn, ops binding | Q-O2 (ruled) | about +80 Idunn, +~60 Muninn | raven-muninn gains a proof path and leaves the held state after a redeploy |
+| **A3** | Delete Odin consumption from Idunn entirely: every forbidden writer in section 5.3. Schema bump: transaction and generation lose `latest_odin_observation`, `odin_publisher_sequence_cursor` and `odin_authority`, plus the Odin enum variants. Boot stops requiring the Odin anchor. **B5 loses its Odin arm**: the Odin part of the F16 fix is deleted from B5's brief | Idunn | A1, A2, B4′; every admitted generation re-admitted Direct | about **-1,100** production and **-1,500 to -2,000** test lines; +~100 of negative tests | **store migration, irreversible; back up `control.cc` and `history.cc` first.** Fold the v2/v3 lift retirement in if the operator has retired those backups |
+| **O-R** | Odin stops originating readiness. Delete `ready`, `dependency_evidence` and `dependency_permits_ready` (O1-O3), and O7's re-verification. If nothing reads the correlation after A3, retire its publication, its signer and dedupe (O8), and `OdinTopologyIdentity` enrolment in `idunn-provision` | Odin (+ Idunn provision) | A3 | about -150 (verdict only) to about -600 (the correlation retired) | none after A3 |
+| **L-R** | Retire the `odin.runtime_topology_correlation.v2` contract in cultnet-rs (`runtime_authority_contracts.rs:455-~1100`: dependency evidence, record, authenticator), under CultLib's per-runtime rules. Only cultnet-rs implements it | CultLib | O-R | about -400 | none |
+
+**Order.**
+1. X1 lands any time (in progress).
+2. Then B2 as mapped, then A1 (Q-O1, after Q-O3 is ruled), and the redeploys for Q-O3. H1 is still needed; R1 is
+   never written.
+3. Then B4′, then A2 with M1, then A3, then O-R, then L-R.
+4. Meanwhile S3 (the web drops Odin) proceeds unchanged. B5 loses its Odin arm. T1, T2, W1 and D1 are unaffected.
+
+**Net estimate.** About -9,000 lines across Odin, Idunn and CultLib, of which about 7,000 is dead residue. Plus 1
+Idunn schema bump (A3), about 200 lines added in A2 and M1, and about 100 lines of new negative tests.
+
+**Verification gates (Soul, per cut).**
+- **A1.** With Odin stopped, a continuity of a routed target that declares Odin reaches Complete. An Odin
+  correlation that says not-Ready about it changes nothing. A held Odin-voucher generation mints no continuity
+  (existing F1 rule).
+- **A3.** `rg -i odin src/` in Idunn returns only strings: projection doc text, and the capability name inside test
+  recipes. Boot succeeds with no Odin anchor file. A store with a v4 Odin-voucher generation is refused or held,
+  never re-proved.
+- **O-R.** No Odin code path computes a boolean named or used as Ready for another target.
+
+**Temporary rule, Odin (deletion line: A3 plus Q-O5's supervision restart).** Until A3 and the Q-O5 restart land,
+Odin keeps three permanent self-publication failures fatal, as `WriteLeaseLost` is: no runtime authority,
+signer/anchor mismatch, and the fail-closed stored-presence branch (`lib.rs:945-954`). Without it `eeb6812`'s
+`survive` would swallow them, Odin's self-correlation would freeze stale, and by O2/I8/I9/I2 every dependent would
+be excluded and stall in Warming, deploys and continuity alike; before `eeb6812` the process exited and a restart
+cleared it. It is not a second lifecycle owner: it is Odin reporting its own death through the only signal Idunn
+acts on today, and `CONTINUITY_RESTART_ATTEMPTS` bounds the loop. Being added on Odin `hands/odin-session-table`.
 
 ### Owning-repo cuts
 
@@ -1574,3 +1707,153 @@ after C1, S3, B3).**
   is a later route-driver question.
 - Heimdall's repeated source and runner failures appear in `idunn status`, but
   that work is excluded.
+
+---
+
+## 5. Odin in Idunn's lifecycle: authority audit (Imagination, 2026-09-30)
+
+Operator concern, 2026-09-30: "it feels like Odin is doing lifecycle work when that's very much Idunn's wheelhouse."
+The operator is right. Source-read at Idunn `94c7691` (`src/` byte-identical to `583b2a7`), Odin `5c37860`
+(deployed; unmerged `hands/odin-session-table` = `eeb6812` is flagged "D"), CultLib `af7209a2`, gamecult-ops
+`7d5749f`. Nothing was probed on Yggdrasil. Rulings: Q-O1 to Q-O5 in section 3; cuts in section 4.
+
+**The live seam.** Idunn delegates readiness to Odin for every target that declares the Odin discovery dependency,
+and Odin originates `ready`, including a transitive dependency-freshness verdict. Idunn reads that word at Warming,
+lease grant, Ready, Routing, Commit, admitted refresh, provider selection, provider currency, and at its own boot.
+Worst consequence: a continuity restart of ghostlight or streampixels-service waits in Warming with no end until
+Odin speaks (I2). **The dead residue:** Odin's repo carries a complete keepalive/restart/deploy planner, about 30
+`idunn.*` lifecycle schemas, a retired JS coordinator, and about 3,200 lines of deploy/restart/health actuators for
+other services. None is deployed; the docs still name it as Odin's authority.
+
+**What was missing.** Idunn's only way to hear a signed presence is `request_candidate_runtime_presence`
+(`drivers.rs:5473-5486`), which needs `Expected.route`. A target with no route had no Idunn-owned eye, so Odin
+(which received every presence for discovery) was drafted as the eye (`ReadinessClass`), then grew the verdict
+(`ready`, Odin `lib.rs:773-777`), then the dependency policy (`:1002-1103`, `:1192`). Every Odin-correlated target
+except raven-muninn is routed, so for them Idunn already owns the channel.
+
+Classes: 1 = observation Idunn can equally get itself; 2 = Odin relaying a provider's self-report; 3 = a legitimate
+Odin concern that merely looks lifecycle-ish; 4 = Odin making a lifecycle judgment it should not own. "Gate" marks a
+site that decides, blocks or delays an Idunn outcome.
+
+### 5.1 Idunn sites (`src/control_plane.rs` unless named)
+
+| # | Site | What Odin decides | Class | Gate |
+|---|---|---|---|---|
+| I1 | `ReadinessClass::declared/of` `:632-670`; `CompiledDeploymentPlan::readiness_class` `deployment_plan.rs:645-661` | A discovery dependency makes Odin the readiness voucher | 1 (root conflation) | chooses every row below |
+| I2 | `advance_warming` Odin branch `:5597-5700`, gate text `:5653` | Warming waits for Odin's correlation. Only OdinSelf is exempt (`:5614-5618`); **Continuity is not exempt** for anyone else | 1 | Warming, deploy **and continuity** |
+| I3 | `is_semantic_warming` `:8098-8128`, `warming_disagreements_match_incumbent` `:8130-8145` | Interprets Odin's `present`, state and disagreements as Warming | 2 | Warming |
+| I4 | `fresh_warming_for_lease` OdinTopology arm `:6500-6544` | A newer post-fence Odin sequence is required before the write lease is granted | 1 | lease grant |
+| I5 | `advance_awaiting_ready` `:6050-6089` | Ready is Odin's `ready`, which Odin originates (O1, O2) | 1 + 4 | Ready |
+| I6 | `advance_routing` `:6096-6135` | A non-Ready latest word is `Err` post-fence (`:6116-6119`); the deploy resumes forever until B5 | 1 | Routing |
+| I7 | `advance_committing` `:6220-6330` | Topology admitted twice around the final proof (F16 livelock). Commit copies `current_odin_authority` onto the generation (`:6343`) | 1 | Commit |
+| I8 | `refresh_admitted_topology` `:5272-5339` | Supervision stores Odin's latest word, Ready or not (`:5320-5325`); only Ready moves `ready` | 1 / 2 | provider exclusion |
+| I9 | `current_ready_provider_tokens` / `rehydrate_admitted_ready` `:7398-7470`; `managed_ready_provider_refs` `deployment_plan.rs:264-316`; `ManagedReady` odin fields `:138-148` | Provider eligibility is Odin's latest word; capabilities are the provider's presence **as relayed by Odin** | 2 + 1 | plan compile (C2 run 2) |
+| I10 | `validate_selected_providers_current` `:7472-7534`, called at `:5466`, `:6140`, `:6253`, `:6327` | The same, re-checked at Starting, Routing and twice at Commit (Deploy only, `:8074-8080`) | 1 | deploy abort or resume |
+| I11 | Graph gate: every non-optional dependency needs a provider (`deployment_plan.rs:447-455`); the Odin dependency is `shared-infrastructure` | Odin must be admitted and current to *compile* any Verse-advertising target | 3 in intent, gate in effect | compile |
+| I12 | Boot: `Engine::open` requires the bootstrap Odin anchor file (`:3900-3902`); `validate_durable_authority` re-proves every Odin receipt against the admitted Odin's key (`:4110-4225`); `boot` refuses on any failure (`:4355`) | An Odin-owned key and anchor gate **Idunn's own startup** | 4-by-proxy (doctrine violation) | Idunn boot |
+| I13 | `current_odin_authority` `:4041-4054`; `AdmittedOdinAuthority` `:1905-1935` | Bootstrap key until Odin is admitted, then the admitted Odin's key. Odin's own commit copies the *current* authority (test `:14920-14936`), so Odin's topology key can never rotate through a deploy | 3 (trust anchoring), exists only for I1 | all of the above |
+| I14 | `odin_publisher_sequence_cursor`, `max_odin_sequence` `:2762-2808`, `sequence_requires_admission` `:8052-8072` | Idunn's anti-replay depends on Odin's persisted watermark. If Odin loses state, every Odin-correlated target gets "replayed or reordered" as `Err` | 3, exists only for I1 | Warming, refresh |
+| I15 | Topology projection: `CultCacheTopologyDriver` `drivers.rs:4238-4250`, `publish_*`, `demote_to_expected_only` | Idunn publishes Expected, activation and lease; Odin and the workloads read them | 3 (correct direction) | none. Its doc comment ("only Odin may correlate ... into Present/Ready", `drivers.rs:4239-4241`) is the misplaced doctrine in prose |
+| I16 | `AdoptionSource::OdinTopology` `:786-795` | No production writer (only tests, `:11502`, `:11692`). B5's adoption slot | dead variant | none |
+| I17 | `validate_live_providers_for_deploy` `:8074-8080` | Continuity skips provider currency. The only continuity exemption; I2 and I4-I7 have none | n/a | n/a |
+
+### 5.2 Odin sites (`crates/odin-daemon/src/lib.rs` at `5c37860` unless named)
+
+| # | Site | Mechanism | Class |
+|---|---|---|---|
+| O1 | `ready` `:773-777` | `presence.state == "active"`, relayed, and no disagreements, and every dependency permits Ready. Odin originates the verdict Idunn acts on (I5-I10) | 2 + **4** |
+| O2 | `dependency_evidence` `:1002-1103` (`ready` `:1098`, D `:1108`) | Authenticates the *provider's* stored correlation against **now**, 30 s window, plus capacity. A provider whose correlation is not re-stamped for 30 s flips every dependent to not-Ready: a transitive freshness verdict | **4** |
+| O3 | `dependency_permits_ready` `:1192` (D `:1202`) | Kind policy (`optional` and `external-operator-binding` never block) lives in Odin. It already bent recipes: Ghostlight `c5bf090` dropped its Heimdall dependency to dodge it (`gamecult-ops/runbooks/ghostlight-dungeon-yggdrasil.md:49-55`) | **4** |
+| O4 | `admit_presence` `:654-676`, `select_presence` `:886-897` | A presence is admitted only for an incarnation Idunn projects. Odin consumes Idunn's truth | 3, keep |
+| O5 | `same_publisher` `:929-956` (D `:961`/`:964`) | Anti-replay within one activation. Surfaced as a lifecycle outage only because of O1 -> I8/I9 | 3, keep |
+| O6 | Stored presence re-authenticated at its receipt time `:960-988`; 30 s max age and 5 s skew `:62-71` | Odin's admission window | 3 |
+| O7 | `correlate_write_lease` `:1126-1157`, `classify_runtime_authority` `:1196-1324`, `classify_current_lease` `:1326-1356` | Odin re-verifies Idunn's own artifacts. Redundant with Idunn | 1 |
+| O8 | Correlation dedupe and watermark `:541-575`, `:776-792` | Publisher discipline toward I14. Dies with the correlation | 3 |
+| O9 | `main.rs` `stored_snapshot` `:466-490`; `raw_snapshot` `:290-310` (D `main.rs:298-316`) | Filtered relay of provider bytes. Odin answers challenges to itself with `signed_presence_document`, the same signer and authority its self-publication uses | 2/3, keep |
+| O10 | `main.rs` activation waits for Idunn's lease, 300 s (`:67`, `:580-589`) | Odin as a stateful Idunn target | correct direction |
+| O11 | `survive` (D `main.rs:671`, `eeb6812`) | Every error except `WriteLeaseLost` is transient, including permanent self-publication failures | see the temporary rule in section 4 |
+
+**Dead residue** (class 4 in content; nothing deployed; cut by X1):
+
+| # | Residue | Status |
+|---|---|---|
+| O12 | `crates/odin-core/src/idunn.rs` (672 lines), including `plan_keepalive` `:14-173`; `documents.rs:28-59`, about 30 `idunn.*` lifecycle schemas | Uncalled. `odin-daemon` does not depend on `odin-core`. Muninn and Sleipnir (Muninn workspace) still emit `IdunnDaemonHealthRecord` via `odin-core` pinned at `3e96c6c`; no live Idunn reads it |
+| O13 | JS coordinator `src/` (2,814 lines) plus tests (140 lines): `probes.cjs` docker and adb probes, `state.cjs` mints service states, `provider-ingress.cjs` 120 s TTL and hard-coded `active` | Not deployed (`state/map.yaml:30`). Still reachable by `package.json start`, `scripts/start-odin.ps1`, `scripts/restart-odin.ps1`, and `gamecult-ops/compose/odin.yggdrasil.yaml` |
+| O14 | `scripts/` (3,208 lines): deploy, restart and health actuators for heimdall, streampixels, repixelizer, stonks, vili, weksa, nightwing and voidbot | Deploy scripts dead but armed (`IDUNN_ACTUATOR=1`, referenced by `gamecult-ops/scripts/idunn/idunn-deployment-targets.ps1:178-216`). Restart scripts target the retired Windows Idunn. Health scripts are stubs or orphans |
+| O15 | `docs/architecture.md` `:49-62`, `:97-109`, `:218-228`; `README.md` `:71-105` | Claim process lifecycle, health and "Rust lifecycle logic" for Odin, and name `crates/idunn-daemon`, which does not exist |
+
+**Recipes and ops.**
+- G1: Muninn `2260853` `raven-muninn.toml` declares the Odin dependency *to obtain a readiness class* (its own
+  comment says so). Unrouted. Held `Undeclared` on the live store, so it has no continuity restarts today.
+- G2: Ghostlight `c5bf090` and the ops runbook `:49-55`: a real dependency was removed to escape O2 and O3. Odin's
+  gate is shaping the dependency graph.
+- G3: `gamecult-ops/scripts/idunn/idunn-deployment-targets.ps1:94` labels "odin-correlated-runtime-presence";
+  display-only.
+
+### 5.3 Target authority map
+
+**The decision.** Is this admitted incarnation, or this candidate, Warming, Ready, or current enough to serve a
+dependent? And when does its absence restart it?
+
+- **Owner.** Idunn's phase engine and supervision, acting on **Idunn's own challenge** of the incarnation's
+  challenge endpoint (the candidate endpoint pre-promotion, the stable endpoint after), answered with a presence
+  signed under the Idunn-issued launch authority; and on Idunn's own workload observation (systemd or host
+  actuator). One proof path serves every target; there is no class.
+- **Inputs.** Expected, activation and lease (Idunn's own); the challenged signed presence (the provider's own
+  words, authenticated by Idunn end to end); workload observation; brakes; B2's route state, degraded or not;
+  `TargetSupervision` meters.
+- **Outputs.** Transaction evidence (`Direct` warming, `Direct` Ready); admitted generations; provider currency
+  (latest proof not degraded and within 2 x max age, B4′'s rule); capabilities from the challenged presence; the
+  topology projection (I15), unchanged, which Odin and the workloads read.
+- **Derived or demoted.**
+  - `ReadinessClass` is **dead**. What survives is "does the binding give Idunn a challenge endpoint?", and the
+    refusal when it does not.
+  - Odin's correlation, if Odin keeps publishing anything, is **display and discovery only**. Idunn never reads it.
+  - `ODIN_RENDEZVOUS_CAPABILITY` is an ordinary capability string; Idunn has no reason to name it.
+  - "Is Odin" is a question Idunn never asks.
+- **Forbidden writers.** None of these decides any lifecycle outcome:
+  - `CultCacheTopologyDriver::receive` and the `odin_correlation_store` option;
+  - `admit_latest_topology`, `refresh_admitted_topology`, `rehydrate_ready_token`, `rehydrate_warming_token`'s Odin
+    arm, `rehydrate_admitted_ready`'s Odin form;
+  - `is_semantic_warming` and `is_semantic_ready`;
+  - `current_odin_authority`, the bootstrap Odin anchor, `AdmittedOdinAuthority`;
+  - `odin_publisher_sequence_cursor`, `max_odin_sequence`, `sequence_requires_admission`;
+  - `WarmingEvidence::{OdinTopology, FirstOdinDirect}`, `ReadinessEvidence::OdinCorrelated`,
+    `AdoptionSource::OdinTopology`;
+  - boot's re-proof of Odin receipts;
+  - in Odin: `ready`, `dependency_evidence`, `dependency_permits_ready`.
+- **Shared paths.** The same `challenge_*` primitive and authentication serve deploy and continuity Warming, the
+  lease-grant freshness check, Ready, Routing, Commit, supervision and provider currency, and boot re-proof of
+  Idunn's own direct evidence only. Deploy and continuity differ only in the brake they ask and in the
+  provider-currency skip (I17).
+- **Deletion line.** Delete every forbidden writer above, plus the `latest_odin_observation` and `odin_authority`
+  fields and the `--odin-trust-anchor` and `--odin-correlation-store` options, before any new currency or health
+  behaviour is added on top.
+
+**Odin, in the target.** Odin consumes Idunn's projection (O4) to know which incarnations exist and which activation
+to trust; admits presences for discovery with anti-replay (O5, O6); serves the catalog, routes and Eve surfaces. It
+may *display* whether a provider looks alive; nothing downstream gates on that display. Odin's own lifecycle is
+Idunn's (O10). Schema ownership for `idunn.*` documents leaves Odin.
+
+### 5.4 Odin's own health (Soul input on `eeb6812`)
+
+`survive` swallows every error except `WriteLeaseLost`, including three permanent self-publication failures. Idunn
+restarts only on workload death (`control_plane.rs:4990-5050`), and Q5 (a) marked a failed route proof degraded
+without restart. What Idunn should observe is its own stable-route challenge of the admitted Odin
+(`supervise_admitted_route`, no new signal): Odin answers through `signed_presence_document`, so "no runtime
+authority" and "signer/anchor mismatch" make the challenge fail visibly. The fail-closed store branch breaks only
+Odin's catalog entry for itself: a discovery defect Odin should show on its own Eve surface, not exit over. Q-O5
+rules what Idunn does with an unauthenticatable answer; the interim is the temporary rule in section 4.
+
+### 5.5 Open items for Soul
+
+- **Continuity-restart stall probe** (not yet run). `build_routed_world` with the recipe's `[[dependencies]]` kept
+  (OdinCorrelated), `Odin::Unreachable` or an absent store, seeded at Warming as Continuity. Assert it stays in
+  Warming and `stub.candidate_hits == 0` even though the candidate would answer. Confirms I2 before A1 removes it.
+- **Journal confirmation** of the exclusion seen since 19:45 CEST. Ghostlight and raven-muninn have been excluded
+  ("latest ... not Ready") on every compile with Odin up. Unconfirmed hypothesis: by O2, their Odin-computed `ready`
+  is false whenever Odin's correlation about itself is more than 30 s old, and at `5c37860` Odin's self-presence
+  crosses its own RUDP session table (the fault `a9ed585`, unmerged, fixes); so O2 plus the self-presence
+  session-table bug produce the exclusion. Confirm from the `dependencies[].ready` of their latest correlation via
+  Idunn status or journal text, not a store read.
+- The Idunn status and Eve rendering of Odin fields was not audited. It is display, and dies with A3.
