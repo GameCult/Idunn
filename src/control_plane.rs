@@ -17032,8 +17032,8 @@ mod tests {
             let Some(stderr) = in_unwritable_store_child(name)? else {
                 let mut routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
                 routed.admit()?;
-                routed.world.engine.options.topology_maximum_age_millis = 3_000;
-                std::thread::sleep(Duration::from_millis(3_300));
+                routed.world.engine.options.topology_maximum_age_millis = 8_000;
+                std::thread::sleep(Duration::from_millis(8_300));
                 break_store_writes(&routed.world);
                 assert!(!routed.tick()?, "a write the store refused was reported as progress");
                 let first = challenge_due(&routed.world).expect("the proved challenge left no wait");
