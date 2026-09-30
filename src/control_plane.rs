@@ -59,6 +59,7 @@ const ADMITTED_GENERATION_SCHEMA_V2: &str = "idunn.admitted_generation.v2";
 /// The capability whose declaration makes a target Odin-correlated.
 pub(crate) const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
 const TARGET_SUPERVISION_SCHEMA: &str = "idunn.target_supervision.v1";
+const EXPIRY_REQUEST_SCHEMA: &str = "idunn.expiry_request.v1";
 /// How many times continuity will restart one target inside one window before
 /// it concludes the target itself is the problem. More than one because a
 /// start can fail for a passing reason -- a port still held, a peer not yet up
@@ -75,10 +76,12 @@ const CONTINUITY_RESTART_BACKOFF_MILLIS: u64 = 5_000;
 /// healthy target performs none; a legitimate deployment performs one or two.
 /// Only deployments count: a Survival actuation is recorded beside this
 /// ceiling, never counted against it and never refused by it, so a target
-/// whose continuity spent its restarts can still be rescued by a deploy. Each
-/// Survival path has its own bound instead: a continuity's actuations the
-/// restart log, an admitted-route repair the challenge backoff, and a
-/// deployment's rollback or withdrawal the Forward change it undoes.
+/// whose continuity spent its restarts can still be rescued by a deploy.
+/// Survival is bounded elsewhere: a continuity's actuations by the restart log
+/// times what one transaction can do before its phase deadline ends it, an
+/// admitted-route repair by the challenge backoff, and a withdrawal by the
+/// route driver, which does not reload a fragment that is already correct.
+/// Nothing bounds reloads across the host.
 const ROUTE_ACTUATION_CEILING: usize = 12;
 const ROUTE_ACTUATION_WINDOW_MILLIS: u64 = 3_600_000;
 /// How many Survival route actuation times a target keeps, for `status`
@@ -150,6 +153,51 @@ impl DeploymentCommand {
         }
         Ok(())
     }
+}
+
+/// An operator's request that a live transaction's post-fencing phase end now
+/// (`idunn expire`). The CLI only writes this record. The daemon's deadline
+/// resolver reads it as a deadline that has passed, and the record is deleted
+/// once its transaction no longer has a phase to end. No CLI writes a
+/// transaction field.
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(type = "idunn.expiry_request", schema = "idunn.expiry_request.v1")]
+struct ExpiryRequest {
+    #[cultcache(key = 0)]
+    schema_version: String,
+    #[cultcache(key = 1)]
+    command_id: String,
+    #[cultcache(key = 2)]
+    requested_by: String,
+    #[cultcache(key = 3)]
+    requested_at_unix_millis: u64,
+}
+
+impl ExpiryRequest {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema_version == EXPIRY_REQUEST_SCHEMA,
+            "expiry request schema is unsupported"
+        );
+        require_id(&self.command_id, "expiry request command id")?;
+        require_value(&self.requested_by, "expiry requester")?;
+        ensure!(
+            self.requested_at_unix_millis > 0,
+            "expiry request has no request time"
+        );
+        Ok(())
+    }
+}
+
+fn expiry_request_envelope(value: &ExpiryRequest, now: u64) -> Result<CultCacheEnvelope> {
+    value.validate()?;
+    typed_envelope(
+        &value.command_id,
+        ExpiryRequest::TYPE,
+        EXPIRY_REQUEST_SCHEMA,
+        value,
+        now,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -820,6 +868,22 @@ enum AdoptionSource {
 }
 
 impl LeaseAdoptionEvidence {
+    /// The adoption a stateful candidate's Ready proves: its signed presence
+    /// held exactly the granted lease. `None` for a stateless candidate.
+    fn with_ready(
+        granted_lease_sha256: Option<&str>,
+        signed_presence_sha256: &str,
+        source: AdoptionSource,
+        observed_at_unix_millis: u64,
+    ) -> Option<Self> {
+        granted_lease_sha256.map(|lease| Self {
+            write_lease_sha256: lease.to_owned(),
+            signed_presence_sha256: signed_presence_sha256.to_owned(),
+            source,
+            observed_at_unix_millis,
+        })
+    }
+
     /// Whether this evidence is about exactly the lease that was granted.
     fn names(&self, leasing: &LeasingEvidence) -> bool {
         leasing.lease_sha256() == Some(self.write_lease_sha256.as_str())
@@ -868,6 +932,17 @@ impl PhaseDeadline {
             deadline_at_unix_millis: now.saturating_add(u64::from(seconds) * 1000),
         })
     }
+}
+
+/// How the deadline resolver ends a post-fencing phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhaseEnd {
+    /// Abort through the post-fencing path. `lease_not_adopted` names a
+    /// granted lease with no adoption evidence.
+    Abort { lease_not_adopted: bool },
+    /// A stateful deployment whose candidate holds an issued lease: the phase
+    /// is reported and not resolved.
+    OperatorRequired,
 }
 
 /// How a post-fencing failure recovers. `RestoreIncumbent` is what a
@@ -1486,6 +1561,46 @@ impl DeploymentTransaction {
             .plan
             .as_ref()
             .and_then(|plan| PhaseDeadline::entering(phase, plan, now));
+    }
+
+    /// A live transaction past the fence that is not already being aborted:
+    /// the only kind whose phase a deadline, or an operator's expiry, ends.
+    fn resolves_by_deadline(&self) -> bool {
+        self.completion.is_none()
+            && self.pre_fencing_abort.is_none()
+            && self.post_fencing_abort.is_none()
+            && (DeploymentPhase::Fencing..=DeploymentPhase::Committing).contains(&self.phase)
+    }
+
+    /// What an ended post-fencing phase resolves to (Q3). A candidate that was
+    /// never issued a write lease cannot have written, so the transaction
+    /// aborts to the incumbent through the post-fencing path, stateless or not.
+    /// A continuity always aborts: its candidate is the admitted release, and
+    /// supervision restarts that release under the continuity backoff. A
+    /// deployment whose candidate was issued a lease may have written under a
+    /// new state contract, and restoring the incumbent over that is not
+    /// Idunn's call: it is left for the operator.
+    fn phase_end(&self) -> PhaseEnd {
+        let leasing = self.leasing.as_ref();
+        let granted = leasing.and_then(LeasingEvidence::lease).is_some();
+        let issued = granted || leasing.and_then(LeasingEvidence::prepared_lease).is_some();
+        match self.command_kind {
+            CommandKind::Deploy if issued => PhaseEnd::OperatorRequired,
+            _ => PhaseEnd::Abort {
+                lease_not_adopted: granted && self.lease_adoption.is_none(),
+            },
+        }
+    }
+
+    /// The recovery a completed post-fencing abort names. A continuity whose
+    /// candidate adopted its lease restarts the admitted release; everything
+    /// else restores the incumbent.
+    fn terminal_recovery(&self) -> TerminalRecovery {
+        if self.command_kind == CommandKind::Continuity && self.lease_adoption.is_some() {
+            TerminalRecovery::RestartAdmitted
+        } else {
+            TerminalRecovery::RestoreIncumbent
+        }
     }
 
     /// Whether this transaction's binding declares stop-then-start. A
@@ -2444,6 +2559,11 @@ enum Command {
         command_id: String,
         requested_by: String,
     },
+    Expire {
+        state_store: PathBuf,
+        command_id: String,
+        requested_by: String,
+    },
     Validate {
         recipe: PathBuf,
         binding: Option<PathBuf>,
@@ -2475,6 +2595,11 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             command_id,
             requested_by,
         } => cancel(&state_store, &command_id, &requested_by),
+        Command::Expire {
+            state_store,
+            command_id,
+            requested_by,
+        } => expire(&state_store, &command_id, &requested_by),
         Command::Validate { recipe, binding } => validate(&recipe, binding.as_deref()),
     }
 }
@@ -2526,6 +2651,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command> {
         "up" => parse_up(args),
         "status" => parse_status(args),
         "cancel" => parse_cancel(args),
+        "expire" => parse_expire(args),
         "validate" => parse_validate(args),
         "--help" | "-h" | "help" => bail!(usage()),
         _ => bail!("unknown Idunn command {command:?}\n\n{}", usage()),
@@ -2640,6 +2766,68 @@ fn parse_status(mut args: impl Iterator<Item = String>) -> Result<Command> {
         state_store,
         command_id,
     })
+}
+
+fn parse_expire(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let command_id = args
+        .next()
+        .ok_or_else(|| anyhow!("idunn expire requires a command id"))?;
+    require_id(&command_id, "command id")?;
+    let mut state_store = RuntimeOptions::default().state_store;
+    let mut requested_by = env::var("SUDO_USER")
+        .or_else(|_| env::var("USER"))
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "operator".into());
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--state-store" => state_store = path_value(&mut args, &argument)?,
+            "--requested-by" => requested_by = string_value(&mut args, &argument)?,
+            "--help" | "-h" => bail!(usage()),
+            _ => bail!("unknown Idunn expire option {argument:?}"),
+        }
+    }
+    require_value(&requested_by, "expiry requester")?;
+    Ok(Command::Expire {
+        state_store,
+        command_id,
+        requested_by,
+    })
+}
+
+/// Ask the daemon to end a live transaction's post-fencing phase now. This
+/// writes a request and nothing else: the daemon's deadline resolver ends the
+/// phase exactly as it ends one whose deadline has passed.
+fn expire(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()> {
+    let snapshot = ControlSnapshot::read(store_path)?;
+    let mut live = snapshot
+        .transactions
+        .iter()
+        .filter(|stored| stored.value.command_id == command_id && !stored.value.is_terminal());
+    let current = live
+        .next()
+        .context("command has no live transaction to expire")?;
+    ensure!(
+        live.next().is_none(),
+        "command has multiple live transactions"
+    );
+    ensure!(
+        current.value.resolves_by_deadline(),
+        "only a live transaction past the fence, and not already aborting, can be expired; before the fence, use idunn cancel"
+    );
+    let now = now_millis()?;
+    let request = ExpiryRequest {
+        schema_version: EXPIRY_REQUEST_SCHEMA.into(),
+        command_id: command_id.to_owned(),
+        requested_by: requested_by.to_owned(),
+        requested_at_unix_millis: now,
+    };
+    ensure!(
+        SingleFileMessagePackBackingStore::new(store_path)
+            .insert_entry_if_absent(expiry_request_envelope(&request, now)?)?,
+        "an expiry request for this command is already waiting"
+    );
+    println!("{command_id} expiry requested; Idunn ends its phase as an expired deadline");
+    Ok(())
 }
 
 fn parse_cancel(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -2787,6 +2975,7 @@ struct ControlSnapshot {
     transactions: Vec<Stored<DeploymentTransaction>>,
     admitted: Vec<Stored<AdmittedGeneration>>,
     targets: Vec<Stored<TargetSupervision>>,
+    expiry_requests: Vec<Stored<ExpiryRequest>>,
 }
 
 impl ControlSnapshot {
@@ -2841,6 +3030,19 @@ impl ControlSnapshot {
                         "target supervision key is not its target"
                     );
                     snapshot.targets.push(Stored { envelope, value });
+                }
+                ExpiryRequest::TYPE => {
+                    ensure!(
+                        envelope.schema_id.as_deref() == Some(EXPIRY_REQUEST_SCHEMA),
+                        "Idunn control store contains an unsupported expiry request"
+                    );
+                    let value: ExpiryRequest = decode_record(&envelope)?;
+                    value.validate()?;
+                    ensure!(
+                        envelope.key == value.command_id,
+                        "expiry request key is not its command"
+                    );
+                    snapshot.expiry_requests.push(Stored { envelope, value });
                 }
                 _ => bail!("Idunn control store contains a foreign document"),
             }
@@ -5172,7 +5374,7 @@ impl Engine {
     /// own command, so one target brake cannot suspend unrelated continuity.
     fn resume_one_transaction(&self) -> Result<bool> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-        let mut progressed = false;
+        let mut progressed = self.retire_spent_expiry_requests(&snapshot)?;
         let mut candidates = snapshot
             .transactions
             .iter()
@@ -5212,6 +5414,9 @@ impl Engine {
     /// transaction would report progress every tick.
     fn resume_candidate(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
         let id = current.value.transaction_id.as_str();
+        if let Some(moved) = self.resolve_phase_deadline(current)? {
+            return Ok(moved);
+        }
         if self
             .resume_backoff
             .lock()
@@ -5273,6 +5478,8 @@ impl Engine {
                 // finish.
                 self.begin_post_fencing_abort(latest, error)?;
             } else {
+                // Resumable only until the phase deadline: the resolver ends
+                // the phase before the next step once it has passed.
                 self.record_resumable_error(latest, &error)?;
             }
         }
@@ -6801,8 +7008,15 @@ impl Engine {
                     self.record_gate_wait(current, "candidate is still warming")
                 }
                 CandidateAnswer::Answered { evidence, .. } => {
+                    let adoption = LeaseAdoptionEvidence::with_ready(
+                        lease,
+                        &evidence.canonical_sha256,
+                        AdoptionSource::Direct,
+                        evidence.admitted_at_unix_millis,
+                    );
                     self.persist_same_phase(current, |next| {
                         next.ready = Some(ReadinessEvidence::RouteProof { evidence });
+                        next.lease_adoption = adoption;
                         Ok(())
                     })
                 }
@@ -6831,6 +7045,20 @@ impl Engine {
                 ensure!(semantic_ready, "stored Ready receipt changed meaning");
             } else if semantic_ready {
                 let evidence = latest.clone();
+                // A Ready stateful correlation carries exactly the current
+                // lease (the authenticator refuses one that does not).
+                let adoption = authenticated
+                    .record()
+                    .signed_presence_sha256
+                    .as_deref()
+                    .and_then(|presence| {
+                        LeaseAdoptionEvidence::with_ready(
+                            current_lease,
+                            presence,
+                            AdoptionSource::OdinTopology,
+                            evidence.admitted_at_unix_millis,
+                        )
+                    });
                 let _token = SequenceAdmittedReady {
                     transaction_id: admitted.value.transaction_id.clone(),
                     evidence: evidence.clone(),
@@ -6839,6 +7067,7 @@ impl Engine {
                 };
                 return self.persist_same_phase(&admitted, |next| {
                     next.ready = Some(ReadinessEvidence::OdinCorrelated { evidence });
+                    next.lease_adoption = adoption;
                     Ok(())
                 });
             } else {
@@ -6991,14 +7220,14 @@ impl Engine {
                 .as_ref()
                 .and_then(LeasingEvidence::lease_sha256)
                 .map(str::to_owned);
+            // A newer sequence admitted here changed the record, and commit
+            // goes on from that record rather than returning: returning let
+            // Odin's next re-stamp abort every attempt (F16).
             let Some((ready_current, authenticated)) =
                 self.admit_latest_topology(current, current_lease_sha256.as_deref())?
             else {
                 return Ok(());
             };
-            if ready_current.envelope != current.envelope {
-                return Ok(());
-            }
             ensure!(
                 is_semantic_ready(&authenticated),
                 "latest Odin observation is not Ready at admission commit"
@@ -7071,14 +7300,13 @@ impl Engine {
                 .as_ref()
                 .and_then(LeasingEvidence::lease_sha256)
                 .map(str::to_owned);
+            // The final proof's own presence makes Odin re-stamp, so this
+            // admission usually writes. Commit is from the record it wrote.
             let Some((commit_current, authenticated)) =
                 self.admit_latest_topology(&ready_current, current_lease_sha256.as_deref())?
             else {
                 return Ok(());
             };
-            if commit_current.envelope != ready_current.envelope {
-                return Ok(());
-            }
             ensure!(
                 is_semantic_ready(&authenticated),
                 "latest Odin observation is not Ready after the final admission challenge"
@@ -8329,6 +8557,90 @@ impl Engine {
         replace_transaction(&self.options.state_store, current, &next)
     }
 
+    /// Every post-fencing phase ends. Before a live transaction past the
+    /// fence runs its step, a phase whose deadline has passed, or whose
+    /// command an operator asked to expire, is resolved as `phase_end` says.
+    /// Returns `Some(moved)` when it decided the tick, `None` to run the step.
+    ///
+    /// The deadline is written only by `enter_phase`, so nothing here or in a
+    /// resume path extends it. A record lifted from before deadlines existed
+    /// has none; its phase is timed once, from the first time this sees it.
+    fn resolve_phase_deadline(
+        &self,
+        current: &Stored<DeploymentTransaction>,
+    ) -> Result<Option<bool>> {
+        let transaction = &current.value;
+        if !transaction.resolves_by_deadline() {
+            return Ok(None);
+        }
+        let now = now_millis()?;
+        let Some(deadline) = transaction.phase_deadline else {
+            let mut next = transaction.clone();
+            next.enter_phase(transaction.phase, now);
+            if next.phase_deadline.is_none() {
+                return Ok(None);
+            }
+            replace_transaction(&self.options.state_store, current, &next)?;
+            return Ok(Some(true));
+        };
+        let requested = ControlSnapshot::read(&self.options.state_store)?
+            .expiry_requests
+            .iter()
+            .any(|request| request.value.command_id == transaction.command_id);
+        let cause = if now >= deadline.deadline_at_unix_millis {
+            format!(
+                "the {:?} phase passed its deadline at unix ms {}",
+                transaction.phase, deadline.deadline_at_unix_millis
+            )
+        } else if requested {
+            format!("the {:?} phase was expired by the operator", transaction.phase)
+        } else {
+            return Ok(None);
+        };
+        match transaction.phase_end() {
+            PhaseEnd::Abort { lease_not_adopted } => {
+                let error = if lease_not_adopted {
+                    anyhow!("lease-not-adopted: {cause}, and the granted write lease has no adoption evidence")
+                } else {
+                    anyhow!("{cause}")
+                };
+                self.begin_post_fencing_abort(current, error)?;
+                Ok(Some(true))
+            }
+            PhaseEnd::OperatorRequired => {
+                self.report_once(
+                    &format!("deadline:{}", transaction.transaction_id),
+                    format!(
+                        "Idunn leaves {} to the operator: {cause}, and its stateful candidate was issued a write lease",
+                        transaction.transaction_id
+                    ),
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Delete expiry requests whose command has no phase left to end: it was
+    /// resolved, it finished, or its command is gone.
+    fn retire_spent_expiry_requests(&self, snapshot: &ControlSnapshot) -> Result<bool> {
+        let spent = snapshot
+            .expiry_requests
+            .iter()
+            .filter(|request| {
+                !snapshot.transactions.iter().any(|stored| {
+                    stored.value.command_id == request.value.command_id
+                        && stored.value.resolves_by_deadline()
+                })
+            })
+            .map(|request| request.envelope.clone())
+            .collect::<Vec<_>>();
+        if spent.is_empty() {
+            return Ok(false);
+        }
+        SingleFileMessagePackBackingStore::new(&self.options.state_store)
+            .delete_batch_if_unchanged(&spent)
+    }
+
     fn record_resumable_error(
         &self,
         current: &Stored<DeploymentTransaction>,
@@ -8540,7 +8852,7 @@ impl Engine {
         next.last_error = Some(abort.error.clone());
         next.completion = Some(TransactionCompletion::FailedAfterFencing {
             error: abort.error.clone(),
-            recovery: TerminalRecovery::RestoreIncumbent,
+            recovery: current.value.terminal_recovery(),
         });
         replace_transaction(&self.options.state_store, current, &next)
     }
@@ -9072,6 +9384,7 @@ fn usage() -> &'static str {
      idunn up <service|profile:name> [--state-store PATH] [--no-wait]\n\
      idunn status [--state-store PATH] [--command ID]\n\
      idunn cancel <command-id> [--state-store PATH]\n\
+     idunn expire <command-id> [--state-store PATH]\n\
      idunn validate --recipe PATH [--binding PATH]\n\n\
      Recipes describe capability and process requirements. Idunn seals exact\n\
      source and artifacts, admits one incarnation, and delegates execution to\n\
@@ -9215,6 +9528,7 @@ mod tests {
     struct RouteStubs {
         calls: PathBuf,
         reload_fails: PathBuf,
+        ufw_delete_fails: PathBuf,
     }
 
     #[cfg(unix)]
@@ -9226,6 +9540,7 @@ mod tests {
             std::fs::create_dir_all(&dir)?;
             let calls = dir.join("calls");
             let reload_fails = dir.join("reload-fails");
+            let ufw_delete_fails = dir.join("ufw-delete-fails");
             let program = |name: &str, refuse: &str| -> Result<PathBuf> {
                 let path = dir.join(name);
                 std::fs::write(
@@ -9248,14 +9563,33 @@ mod tests {
                         reload_fails.display()
                     ),
                 )?,
-                ufw: program("ufw", "")?,
+                ufw: program(
+                    "ufw",
+                    &format!(
+                        "if [ \"$1\" = delete ] && [ -e '{}' ]; then exit 1; fi\n",
+                        ufw_delete_fails.display()
+                    ),
+                )?,
                 preflight_root: root.join("route-preflight"),
             };
-            Ok((actuators, Self { calls, reload_fails }))
+            Ok((
+                actuators,
+                Self {
+                    calls,
+                    reload_fails,
+                    ufw_delete_fails,
+                },
+            ))
         }
 
         fn refuse_reloads(&self) -> Result<()> {
             std::fs::write(&self.reload_fails, b"x")?;
+            Ok(())
+        }
+
+        /// `ufw delete` exits non-zero with an error that is not "non-existent".
+        fn refuse_ufw_deletes(&self) -> Result<()> {
+            std::fs::write(&self.ufw_delete_fails, b"x")?;
             Ok(())
         }
 
@@ -12514,6 +12848,61 @@ mod tests {
         Ok(())
     }
 
+    /// Q3 as a table: which ended phases abort, which name the unadopted
+    /// lease, which are left to the operator, and which recovery the terminal
+    /// record names.
+    #[test]
+    fn an_ended_phase_aborts_unless_a_deployment_candidate_was_issued_a_lease() -> Result<()> {
+        let (_, mut transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[2].1)?;
+        let lease = write_lease();
+        let sha256 = lease.canonical_sha256()?;
+        let granted = LeasingEvidence::Granted {
+            lease: lease.clone(),
+            lease_sha256: sha256.clone(),
+        };
+        let prepared = LeasingEvidence::Prepared {
+            lease,
+            lease_sha256: sha256.clone(),
+        };
+        let adoption = LeaseAdoptionEvidence::with_ready(
+            Some(&sha256),
+            &sha256_id(b"adopting-presence"),
+            AdoptionSource::Direct,
+            1,
+        );
+        assert!(adoption.is_some());
+        assert_eq!(
+            LeaseAdoptionEvidence::with_ready(None, &sha256_id(b"p"), AdoptionSource::Direct, 1),
+            None
+        );
+        let abort = |lease_not_adopted| PhaseEnd::Abort { lease_not_adopted };
+        use CommandKind::{Continuity, Deploy};
+        let cases = [
+            (Deploy, None, None, abort(false)),
+            (Deploy, Some(LeasingEvidence::SkippedStateless), None, abort(false)),
+            (Deploy, Some(prepared.clone()), None, PhaseEnd::OperatorRequired),
+            (Deploy, Some(granted.clone()), None, PhaseEnd::OperatorRequired),
+            (Deploy, Some(granted.clone()), adoption.clone(), PhaseEnd::OperatorRequired),
+            (Continuity, Some(LeasingEvidence::SkippedStateless), None, abort(false)),
+            (Continuity, Some(prepared), None, abort(false)),
+            (Continuity, Some(granted.clone()), None, abort(true)),
+            (Continuity, Some(granted), adoption.clone(), abort(false)),
+        ];
+        for (kind, leasing, lease_adoption, expected) in cases {
+            transaction.command_kind = kind;
+            transaction.leasing = leasing.clone();
+            transaction.lease_adoption = lease_adoption.clone();
+            assert_eq!(transaction.phase_end(), expected, "{kind:?} {leasing:?} {lease_adoption:?}");
+            let recovery = if kind == Continuity && lease_adoption.is_some() {
+                TerminalRecovery::RestartAdmitted
+            } else {
+                TerminalRecovery::RestoreIncumbent
+            };
+            assert_eq!(transaction.terminal_recovery(), recovery, "{kind:?} {lease_adoption:?}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn an_operator_required_recovery_must_say_why() -> Result<()> {
         let (_, mut failed) = fixture_transaction(FIXTURE_TRANSACTIONS[5].1)?;
@@ -15384,6 +15773,8 @@ mod tests {
             /// that picked up Idunn's grant reports.
             lease: Mutex<Option<String>>,
             reply: Mutex<Reply>,
+            /// Runs when the stable listener accepts, before it answers.
+            on_stable_hit: Mutex<Option<Box<dyn Fn() + Send>>>,
         }
 
         /// How the runtime answers a well-formed challenge.
@@ -15540,6 +15931,11 @@ mod tests {
                                     &stub.stable_hits
                                 };
                                 hits.fetch_add(1, Ordering::SeqCst);
+                                if !candidate
+                                    && let Some(hook) = stub.on_stable_hit.lock().unwrap().as_ref()
+                                {
+                                    hook();
+                                }
                                 if !stub.hang_up.load(Ordering::SeqCst) {
                                     let _ = stub.serve_one(stream);
                                 }
@@ -15800,6 +16196,7 @@ mod tests {
                 hang_up: AtomicBool::new(false),
                 lease: Mutex::new(None),
                 reply: Mutex::new(Reply::Honest),
+                on_stable_hit: Mutex::new(None),
             });
             stub.listen(candidate_listener, true);
             stub.listen(stable_listener, false);
@@ -17859,6 +18256,318 @@ mod tests {
             assert!(routed.reloads() >= 1);
             let after = meters_of(&routed.world, "service")?;
             assert_eq!(after.route_actuations.len(), 2, "preflight and install are the Forward");
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // B5: every post-fencing phase ends.
+        // -----------------------------------------------------------------
+
+        impl RoutedWorld {
+            /// One scheduler pass over the transaction, as the daemon runs it:
+            /// through the deadline resolver, with the resume backoff spent.
+            fn resume(&self) -> Result<()> {
+                self.world.engine.resume_backoff.lock().unwrap().clear();
+                self.world.engine.resume_one_transaction()?;
+                Ok(())
+            }
+
+            fn resume_until_terminal(&self) -> Result<DeploymentTransaction> {
+                for _ in 0..12 {
+                    if latest(&self.world)?.completion.is_some() {
+                        break;
+                    }
+                    self.resume()?;
+                }
+                let finished = latest(&self.world)?;
+                ensure!(finished.completion.is_some(), "never finished: {:?}", finished.last_error);
+                Ok(finished)
+            }
+        }
+
+        /// The live transaction's phase deadline is already behind it.
+        fn pass_deadline(world: &EngineFixture) -> Result<()> {
+            let current = resident(world)?;
+            let mut next = current.value.clone();
+            let deadline = next.phase_deadline.as_mut().context("no deadline to pass")?;
+            deadline.entered_at_unix_millis = 1;
+            deadline.deadline_at_unix_millis = 2;
+            replace_transaction(&world.state_store, &current, &next)
+        }
+
+        /// Soul's F1 probe, committed. A continuity's route changes are
+        /// Survival, so no ceiling refuses its install and rollback while its
+        /// route proof keeps failing. The Routing deadline ends it: no attempt
+        /// runs after the deadline, and the withdrawal of a rolled-back route
+        /// reloads nothing.
+        #[cfg(unix)]
+        #[test]
+        fn a_continuity_whose_route_proof_fails_ends_at_its_routing_deadline() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            let deadline = routed.transaction()?.phase_deadline.context("Routing has no deadline")?;
+            routed.stub.hang_up.store(true, Ordering::SeqCst);
+            for _ in 0..3 {
+                routed.resume()?;
+            }
+            // Before the deadline each attempt installs and rolls back, and no
+            // resume moves the deadline.
+            assert_eq!(routed.reloads(), 6);
+            let waiting = routed.transaction()?;
+            assert_eq!(waiting.phase, DeploymentPhase::Routing);
+            assert!(waiting.post_fencing_abort.is_none(), "aborted before its deadline");
+            assert!(waiting.last_error.is_some());
+            assert_eq!(waiting.phase_deadline, Some(deadline), "a resume moved the deadline");
+
+            pass_deadline(&routed.world)?;
+            routed.resume()?;
+            let abort = routed
+                .transaction()?
+                .post_fencing_abort
+                .context("the passed deadline did not end the phase")?;
+            assert!(abort.error.contains("Routing phase passed its deadline"), "{}", abort.error);
+            assert!(!abort.error.contains("lease-not-adopted"), "{}", abort.error);
+            let finished = routed.resume_until_terminal()?;
+            assert!(
+                matches!(
+                    finished.completion,
+                    Some(TransactionCompletion::FailedAfterFencing {
+                        recovery: TerminalRecovery::RestoreIncumbent,
+                        ..
+                    })
+                ),
+                "{:?}",
+                finished.completion
+            );
+            assert_eq!(routed.reloads(), 6, "a reload ran after the deadline");
+            Ok(())
+        }
+
+        /// Soul's F2 probe, committed: a post-fence withdrawal whose
+        /// `ufw delete` keeps failing reloads once, then repeats only the
+        /// firewall step.
+        #[cfg(unix)]
+        #[test]
+        fn a_withdrawal_whose_firewall_step_keeps_failing_reloads_once() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.promote()?;
+            assert!(routed.fragment_path().exists());
+            let installed = routed.reloads();
+            routed.world.route_stubs.refuse_ufw_deletes()?;
+            routed
+                .world
+                .engine
+                .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("test"))?;
+            for _ in 0..20 {
+                routed.resume()?;
+            }
+            assert_eq!(routed.reloads(), installed + 1, "a failing withdrawal reloaded again");
+            assert_eq!(routed.world.route_stubs.count("ufw delete"), 20);
+            assert!(!routed.fragment_path().exists());
+            assert_eq!(
+                routed.transaction()?.post_fencing_abort.context("no abort")?.route_restoration,
+                CleanupEvidence::Pending
+            );
+            Ok(())
+        }
+
+        /// A record lifted from before deadlines existed is timed once, from
+        /// the first time the resolver sees it, and never again.
+        #[test]
+        fn a_post_fence_record_without_a_deadline_is_timed_once() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let current = resident(&routed.world)?;
+            let mut lifted = current.value.clone();
+            lifted.phase_deadline = None;
+            replace_transaction(&routed.world.state_store, &current, &lifted)?;
+            let engine = &routed.world.engine;
+
+            let before = now_millis()?;
+            assert_eq!(engine.resolve_phase_deadline(&resident(&routed.world)?)?, Some(true));
+            let stamped = routed.transaction()?.phase_deadline.context("the record was not timed")?;
+            assert_eq!(stamped.phase, DeploymentPhase::Fencing);
+            assert!(stamped.entered_at_unix_millis >= before);
+            assert_eq!(
+                stamped.deadline_at_unix_millis - stamped.entered_at_unix_millis,
+                u64::from(lifted.plan.as_ref().unwrap().phase_deadlines().fencing_seconds) * 1000
+            );
+            assert_eq!(engine.resolve_phase_deadline(&resident(&routed.world)?)?, None);
+            assert_eq!(routed.transaction()?.phase_deadline, Some(stamped));
+            Ok(())
+        }
+
+        /// `idunn expire` writes a request and nothing else; the resolver ends
+        /// the phase from it, and the spent request is deleted.
+        #[test]
+        fn an_operator_expiry_ends_the_phase_through_the_resolver() -> Result<()> {
+            let early = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            let refused = expire(&early.world.state_store, "continuity-service", "operator")
+                .expect_err("a transaction before the fence was expired");
+            assert!(format!("{refused:#}").contains("idunn cancel"), "{refused:#}");
+
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let untouched = resident(&routed.world)?.envelope;
+            expire(&routed.world.state_store, "continuity-service", "operator")?;
+            assert!(expire(&routed.world.state_store, "continuity-service", "operator").is_err());
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            assert_eq!(snapshot.expiry_requests.len(), 1);
+            assert_eq!(resident(&routed.world)?.envelope, untouched, "the CLI wrote the transaction");
+
+            routed.resume()?;
+            let abort = routed
+                .transaction()?
+                .post_fencing_abort
+                .context("the expiry did not end the phase")?;
+            assert!(abort.error.contains("Fencing phase was expired by the operator"), "{}", abort.error);
+            routed.resume()?;
+            assert!(
+                ControlSnapshot::read(&routed.world.state_store)?.expiry_requests.is_empty(),
+                "the spent request stayed"
+            );
+            Ok(())
+        }
+
+        /// Q3 at the deadline, through the Engine. A continuity whose candidate
+        /// was granted a lease and never proved it held it fails as
+        /// `lease-not-adopted`; one whose Ready proved it restarts the admitted
+        /// release. A deployment whose candidate holds a lease is left to the
+        /// operator: nothing is aborted and its step still runs.
+        #[test]
+        fn a_stateful_deadline_resolves_by_lease_adoption() -> Result<()> {
+            let granted = |routed: &RoutedWorld| -> Result<String> {
+                routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+                Ok(routed
+                    .transaction()?
+                    .leasing
+                    .as_ref()
+                    .and_then(LeasingEvidence::lease_sha256)
+                    .context("no granted lease")?
+                    .to_owned())
+            };
+
+            let unadopted = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            granted(&unadopted)?;
+            pass_deadline(&unadopted.world)?;
+            unadopted.resume()?;
+            let abort = unadopted.transaction()?.post_fencing_abort.context("not ended")?;
+            assert!(abort.error.starts_with("lease-not-adopted: "), "{}", abort.error);
+            assert!(abort.error.contains("AwaitingReady phase passed its deadline"), "{}", abort.error);
+            let finished = unadopted.resume_until_terminal()?;
+            assert!(matches!(
+                finished.completion,
+                Some(TransactionCompletion::FailedAfterFencing {
+                    recovery: TerminalRecovery::RestoreIncumbent,
+                    ..
+                })
+            ));
+
+            let adopted = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            let lease = granted(&adopted)?;
+            adopted.stub.set_state("active");
+            *adopted.stub.lease.lock().unwrap() = Some(lease.clone());
+            adopted.step()?;
+            let ready = adopted.transaction()?;
+            let Some(ReadinessEvidence::RouteProof { evidence }) = &ready.ready else {
+                bail!("the candidate was not Ready");
+            };
+            let adoption = ready.lease_adoption.clone().context("Ready recorded no adoption")?;
+            assert_eq!(adoption.write_lease_sha256, lease);
+            assert_eq!(adoption.signed_presence_sha256, evidence.canonical_sha256);
+            assert_eq!(adoption.source, AdoptionSource::Direct);
+            adopted.drive_until(|t| t.phase == DeploymentPhase::Routing)?;
+            pass_deadline(&adopted.world)?;
+            adopted.resume()?;
+            let abort = adopted.transaction()?.post_fencing_abort.context("not ended")?;
+            assert!(!abort.error.contains("lease-not-adopted"), "{}", abort.error);
+            let finished = adopted.resume_until_terminal()?;
+            assert!(
+                matches!(
+                    finished.completion,
+                    Some(TransactionCompletion::FailedAfterFencing {
+                        recovery: TerminalRecovery::RestartAdmitted,
+                        ..
+                    })
+                ),
+                "{:?}",
+                finished.completion
+            );
+
+            let deploy =
+                build_routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false, true, CommandKind::Deploy)?;
+            granted(&deploy)?;
+            pass_deadline(&deploy.world)?;
+            for _ in 0..3 {
+                deploy.resume()?;
+            }
+            let held = deploy.transaction()?;
+            assert!(held.post_fencing_abort.is_none(), "a leased deployment was aborted");
+            assert_eq!(held.phase, DeploymentPhase::AwaitingReady);
+            assert_eq!(held.last_error.as_deref(), Some("candidate is still warming"), "its step did not run");
+            Ok(())
+        }
+
+        /// F16: Commit goes on from the topology it admitted, so Odin
+        /// re-stamping before the step and again during the final proof does
+        /// not send it round again.
+        #[test]
+        fn commit_completes_while_odin_restamps_every_tick() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, true)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.promote()?;
+            let transaction = routed.transaction()?;
+            let cursor = transaction.odin_publisher_sequence_cursor;
+            let store = routed.world.engine.options.odin_correlation_store.clone();
+            replace_odin_entry(&store, odin_ready_envelope(&routed.world, &transaction, cursor + 1)?)?;
+            let later = odin_ready_envelope(&routed.world, &transaction, cursor + 2)?;
+            *routed.stub.on_stable_hit.lock().unwrap() = Some(Box::new(move || {
+                replace_odin_entry(&store, later.clone()).expect("Odin re-stamps");
+            }));
+            routed.step()?;
+            let generation = admitted(&routed)?;
+            assert_eq!(
+                generation.latest_odin_observation.context("no Odin receipt")?.publisher_sequence,
+                cursor + 2,
+                "commit did not go on from the re-stamped topology"
+            );
+            Ok(())
+        }
+
+        fn odin_ready_envelope(
+            world: &EngineFixture,
+            transaction: &DeploymentTransaction,
+            sequence: u64,
+        ) -> Result<CultCacheEnvelope> {
+            let expected = transaction.expected.as_ref().context("no Expected")?;
+            Ok(CultCacheEnvelope {
+                key: crate::drivers::incarnation_key_of(&expected.target, &expected.canonical_sha256()?),
+                r#type: OdinRuntimeTopologyCorrelationRecord::TYPE.into(),
+                payload: signed_correlation(world, transaction, sequence, true)?,
+                stored_at: rfc3339_millis(now_millis()?)?,
+                schema_id: Some(cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into()),
+            })
+        }
+
+        fn replace_odin_entry(store: &Path, envelope: CultCacheEnvelope) -> Result<()> {
+            let backing = SingleFileMessagePackBackingStore::new(store);
+            let current = backing
+                .pull_all_read_only_snapshot()?
+                .into_iter()
+                .find(|entry| entry.key == envelope.key && entry.r#type == envelope.r#type);
+            ensure!(
+                backing.compare_exchange(
+                    &[CultCacheExpectedEnvelope {
+                        r#type: envelope.r#type.clone(),
+                        key: envelope.key.clone(),
+                        current,
+                    }],
+                    &[envelope],
+                )?,
+                "the Odin store changed under the re-stamp"
+            );
             Ok(())
         }
     }
