@@ -5905,8 +5905,11 @@ impl Engine {
                 self.report_once(
                     &record_key,
                     format!(
-                        "Idunn could not record the {recorded} route challenge of {}: {record:#}",
-                        current.value.target
+                        "Idunn could not record the {recorded} route challenge of {}: {}",
+                        current.value.target,
+                        // The root cause only: the error chain names a fresh temp file each
+                        // attempt, which would defeat once-per-fault.
+                        record.root_cause()
                     ),
                 );
                 Ok(false)
