@@ -224,6 +224,16 @@ The rework is a fresh branch from `583b2a7`, not a rebase of `1786ddf`. Its map 
     Deploy doubling to 24/h.
   - The fix belongs to B5 ("every post-fencing phase ends"), plus a restore/install that skips the reload when
     the fragment is already correct. The operator was told on 2026-09-30.
+- **B2 + 3d installed (2026-09-30).** The operator accepted recommendation A: install now, with B5 next.
+  - Installed at 15:22 CEST: `a96ad9d`, `idunn` sha256 `848c08e5...`; the replaced binary was `01bde676`.
+  - The migration moved 5 control records to `deployment_transaction.v4` / `admitted_generation.v4`.
+  - Pre-install backup, taken with Idunn stopped and byte-compared: `/root/idunn-store-backup-20260930T132204Z-pre-route-b2/`
+    (control.cc `5f879f55...`, history.cc `bafa76ab...`, the other stores, and the old binaries).
+  - Preflight: 690 transactions, all terminal. They were identical after the install.
+  - No managed target's PID changed. Raven reattached after 15 s.
+  - After 10 min: no odin route-continuity rejections (about 95 in the previous 3 h), 0 nginx reloads, and the
+    Odin post-deploy check `fails=0`.
+  - B5 and skip-unneeded-reloads are in Hands (`hands/b5`).
 - **Q-B2-1 (a):** the continuity restart log moves into `TargetSupervision`; the restart ceiling reads the
   target's own log; the carry compensator is deleted.
 - **Q-B2-2: fail at once.** A deploy refused by the route/actuation ceiling before the fence fails immediately,
