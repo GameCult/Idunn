@@ -14272,9 +14272,26 @@ mod tests {
             world.engine.run_scheduler_tick()?;
         }
         assert_eq!(attempts(), 1, "the wedged step was retried inside its backoff");
-        set_due(1);
-        world.engine.run_scheduler_tick()?;
-        assert_eq!(attempts(), 2, "the step was not retried once its backoff was due");
+        // Each further failure doubles the wait back_off writes.
+        for (attempt, polls) in [(2, 2), (3, 4)] {
+            set_due(1);
+            let before = now_millis()?;
+            world.engine.run_scheduler_tick()?;
+            let after = now_millis()?;
+            assert_eq!(attempts(), attempt, "the step was not retried once its backoff was due");
+            let written = world
+                .engine
+                .resume_backoff
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|backoff| backoff.not_before_unix_millis)
+                .expect("the failure set no backoff");
+            assert!(
+                (before + polls * poll..=after + polls * poll).contains(&written),
+                "failure {attempt} waits {written}, not {polls} polls ({poll} ms each) after it"
+            );
+        }
         Ok(())
     }
 
@@ -18673,31 +18690,39 @@ mod tests {
                 requested_by: "operator".into(),
                 requested_at_unix_millis: now,
             };
+            // And commands whose ids are a strict prefix of this one's, and
+            // extend it: a match is the whole id, in neither direction a part.
+            let prefix = ExpiryRequest {
+                command_id: "continuity-servic".into(),
+                ..request.clone()
+            };
+            let extension = ExpiryRequest {
+                command_id: "continuity-service-2".into(),
+                ..request.clone()
+            };
             let store = SingleFileMessagePackBackingStore::new(&routed.world.state_store);
+            let absent = |r#type: &str, key: &str| CultCacheExpectedEnvelope {
+                r#type: r#type.into(),
+                key: key.into(),
+                current: None,
+            };
             assert!(store.compare_exchange(
                 &[
-                    CultCacheExpectedEnvelope {
-                        r#type: DeploymentCommand::TYPE.into(),
-                        key: other.command_id.clone(),
-                        current: None,
-                    },
-                    CultCacheExpectedEnvelope {
-                        r#type: DeploymentTransaction::TYPE.into(),
-                        key: sealing.transaction_id.clone(),
-                        current: None,
-                    },
-                    CultCacheExpectedEnvelope {
-                        r#type: ExpiryRequest::TYPE.into(),
-                        key: request.command_id.clone(),
-                        current: None,
-                    },
+                    absent(DeploymentCommand::TYPE, &other.command_id),
+                    absent(DeploymentTransaction::TYPE, &sealing.transaction_id),
+                    absent(ExpiryRequest::TYPE, &request.command_id),
+                    absent(ExpiryRequest::TYPE, &prefix.command_id),
+                    absent(ExpiryRequest::TYPE, &extension.command_id),
                 ],
                 &[
                     command_envelope(&other, now)?,
                     transaction_envelope(&sealing, now)?,
                     expiry_request_envelope(&request, now)?,
+                    expiry_request_envelope(&prefix, now)?,
+                    expiry_request_envelope(&extension, now)?,
                 ],
             )?);
+            assert_eq!(ControlSnapshot::read(&routed.world.state_store)?.expiry_requests.len(), 3);
             let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
             assert_eq!(snapshot.transactions.iter().filter(|t| !t.value.is_terminal()).count(), 2);
             let mine = snapshot
