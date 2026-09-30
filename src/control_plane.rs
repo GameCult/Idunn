@@ -14234,14 +14234,31 @@ mod tests {
         world
             .engine
             .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let attempts = || workload.0.load(std::sync::atomic::Ordering::SeqCst);
+        world.engine.run_scheduler_tick()?;
+        assert_eq!(attempts(), 1, "the step did not run");
+        // The wait is set from the wall clock, and a loaded host can spend it
+        // inside a few ticks. So the test owns the wait: held open, no tick
+        // retries; once due, the next tick does.
+        let id = resident(&world)?.value.transaction_id;
+        let set_due = |due: u64| {
+            world
+                .engine
+                .resume_backoff
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .expect("the failure set no backoff")
+                .not_before_unix_millis = due;
+        };
+        set_due(now_millis()? + RESUME_BACKOFF_CEILING_MILLIS / 2);
         for _ in 0..10 {
             world.engine.run_scheduler_tick()?;
         }
-        assert_eq!(
-            workload.0.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the wedged step was retried inside its backoff"
-        );
+        assert_eq!(attempts(), 1, "the wedged step was retried inside its backoff");
+        set_due(1);
+        world.engine.run_scheduler_tick()?;
+        assert_eq!(attempts(), 2, "the step was not retried once its backoff was due");
         Ok(())
     }
 
