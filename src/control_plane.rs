@@ -12211,6 +12211,20 @@ mod tests {
         sequence: u64,
         ready: bool,
     ) -> Result<Vec<u8>> {
+        signed_correlation_as(world, transaction, sequence, ready, "active", None, b"presence")
+    }
+
+    /// Odin's correlation about the transaction's incarnation, observing a
+    /// presence in `state` that holds `lease`, identified by `presence`.
+    fn signed_correlation_as(
+        world: &EngineFixture,
+        transaction: &DeploymentTransaction,
+        sequence: u64,
+        ready: bool,
+        state: &str,
+        lease: Option<&str>,
+        presence: &[u8],
+    ) -> Result<Vec<u8>> {
         let expected = transaction.expected.as_ref().context("no Expected")?;
         let activation = transaction.activation.as_ref().context("no activation")?;
         let mut record = OdinRuntimeTopologyCorrelationRecord {
@@ -12219,10 +12233,10 @@ mod tests {
             expected_projection_sha256: expected.canonical_sha256()?,
             expected: true,
             current_activation_sha256: Some(activation.canonical_sha256()?),
-            signed_presence_sha256: Some(sha256_id(b"presence")),
-            observed_presence_state: Some("active".into()),
+            signed_presence_sha256: Some(sha256_id(presence)),
+            observed_presence_state: Some(state.into()),
             observed_presence_publisher_sequence: Some(sequence),
-            observed_write_lease_sha256: None,
+            observed_write_lease_sha256: lease.map(str::to_owned),
             observed_capabilities: expected
                 .capabilities
                 .iter()
@@ -16221,7 +16235,17 @@ mod tests {
             if phase >= DeploymentPhase::Fencing && provides_odin {
                 // Odin's own first word about the candidate, as for any
                 // Odin-correlated target.
-                let warming = signed_correlation(&world, &transaction, 4, false)?;
+                // A stateful candidate is warming, not active, until it holds
+                // the lease Idunn grants after the fence.
+                let warming = signed_correlation_as(
+                    &world,
+                    &transaction,
+                    4,
+                    false,
+                    if stateful { "warming" } else { "active" },
+                    None,
+                    b"presence",
+                )?;
                 let authenticated = world.engine.authenticate_topology_bytes(
                     &ControlSnapshot::read(&world.state_store)?,
                     &transaction,
@@ -16286,6 +16310,33 @@ mod tests {
             // valid correlation that says the target is not Ready.
             let store = &world.engine.options.odin_correlation_store;
             let poisoned = match odin {
+                _ if provides_odin && stateful => {
+                    // A new warming word after the fence: what the lease
+                    // grant waits for.
+                    SingleFileMessagePackBackingStore::new(store).insert_entry_if_absent(
+                        CultCacheEnvelope {
+                            key: crate::drivers::incarnation_key_of(
+                                &transaction.target,
+                                &transaction.expected.as_ref().unwrap().canonical_sha256()?,
+                            ),
+                            r#type: OdinRuntimeTopologyCorrelationRecord::TYPE.into(),
+                            payload: signed_correlation_as(
+                                &world,
+                                &transaction,
+                                5,
+                                false,
+                                "warming",
+                                None,
+                                b"presence-5",
+                            )?,
+                            stored_at: rfc3339_millis(now_millis()?)?,
+                            schema_id: Some(
+                                cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into(),
+                            ),
+                        },
+                    )?;
+                    Vec::new()
+                }
                 _ if provides_odin => {
                     odin_reports_ready(&world, &transaction, 5)?;
                     Vec::new()
@@ -18710,6 +18761,64 @@ mod tests {
             assert!(driver.observe_empty()?, "the abort left the granted lease on disk");
             // What the next fencing does to a candidate's lease path.
             driver.revoke_exact(None)?;
+            Ok(())
+        }
+
+        /// B5 Soul F. A stateful candidate Odin reports on: its Ready word
+        /// carries the granted lease, and that Ready records the adoption,
+        /// sourced from Odin's topology and naming the presence Odin observed.
+        #[test]
+        fn an_odin_ready_word_records_a_stateful_candidates_lease_adoption() -> Result<()> {
+            let routed = build_routed_world(
+                Odin::Unreachable,
+                1,
+                DeploymentPhase::Fencing,
+                true,
+                true,
+                CommandKind::Continuity,
+            )?;
+            for _ in 0..8 {
+                if routed.transaction()?.phase == DeploymentPhase::AwaitingReady {
+                    break;
+                }
+                routed.step()?;
+            }
+            let waiting = routed.transaction()?;
+            assert_eq!(waiting.phase, DeploymentPhase::AwaitingReady, "{:?}", waiting.last_error);
+            let lease = waiting
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::lease_sha256)
+                .context("no granted lease")?
+                .to_owned();
+            assert_eq!(waiting.lease_adoption, None);
+
+            let ready = CultCacheEnvelope {
+                key: crate::drivers::incarnation_key_of(
+                    &waiting.target,
+                    &waiting.expected.as_ref().unwrap().canonical_sha256()?,
+                ),
+                r#type: OdinRuntimeTopologyCorrelationRecord::TYPE.into(),
+                payload: signed_correlation_as(
+                    &routed.world,
+                    &waiting,
+                    waiting.odin_publisher_sequence_cursor + 1,
+                    true,
+                    "active",
+                    Some(&lease),
+                    b"presence-ready",
+                )?,
+                stored_at: rfc3339_millis(now_millis()?)?,
+                schema_id: Some(cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into()),
+            };
+            replace_odin_entry(&routed.world.engine.options.odin_correlation_store, ready)?;
+            routed.step()?;
+            let adopted = routed.transaction()?;
+            assert!(matches!(adopted.ready, Some(ReadinessEvidence::OdinCorrelated { .. })));
+            let adoption = adopted.lease_adoption.context("Odin's Ready recorded no adoption")?;
+            assert_eq!(adoption.source, AdoptionSource::OdinTopology);
+            assert_eq!(adoption.write_lease_sha256, lease);
+            assert_eq!(adoption.signed_presence_sha256, sha256_id(b"presence-ready"));
             Ok(())
         }
 
