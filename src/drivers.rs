@@ -9583,6 +9583,13 @@ Content-Le".to_vec()), |_| {}),
                 }
                 seen
             });
+            struct Done<'a>(&'a AtomicBool);
+            impl Drop for Done<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let _done = Done(&done);
             let writes = on_thread_with_umask_027(|| {
                 let store_backing = SingleFileMessagePackBackingStore::new(&store);
                 let mut current: Vec<CultCacheEnvelope> = Vec::new();
@@ -9600,7 +9607,7 @@ Content-Le".to_vec()), |_| {}),
                     current = next;
                 }
             });
-            done.store(true, Ordering::Release);
+            drop(_done);
             (reader.join().unwrap(), writes)
         });
         assert!(!observed.is_empty(), "the reader never saw the store");
