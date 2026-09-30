@@ -41,6 +41,7 @@ ExecStart=/usr/local/bin/idunn serve \
   --source-root /var/lib/gamecult/idunn/sources \
   --staging-root /var/lib/gamecult/idunn/staging \
   --topology-store /var/lib/gamecult/idunn-projection/topology.cc \
+  --incident-store /var/lib/gamecult/idunn-projection/incidents.cc \
   --idunn-identity-store /var/lib/gamecult/idunn/idunn-service-identity.cc \
   --odin-correlation-store /var/lib/gamecult/odin/topology.cc \
   --odin-trust-anchor /etc/gamecult/idunn/odin-topology-anchor.cc \
