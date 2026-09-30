@@ -4,11 +4,16 @@
 kept because they are what is *running*, and a migration needs both sides.
 
 `idunn-yggdrasil` is a root shell actuator reached through the narrow sudo grant
-in `idunn-yggdrasil.sudoers`. It hardcodes eleven targets, their repositories
+in `idunn-yggdrasil.sudoers`. It hardcodes ten targets, their repositories
 and their admitted refs, then delegates to executable manifests under
-`/srv/odin/deploy-manifests/<target>`. It calls `idunn validate-release-authority`
-and `idunn validate-minimum-source-revision` — subcommands the current binary
-does not have.
+`/srv/odin/deploy-manifests/<target>`. It calls `idunn validate-minimum-source-revision`,
+a subcommand the current binary does not have.
+
+Checked on yggdrasil 2026-09-30: `/usr/local/libexec/idunn-yggdrasil` is installed
+and matches this file byte for byte (before the retirement below), but
+`idunn-yggdrasil.sudoers` is not installed. `sudo -l -U idunn` says the `idunn`
+user may not run sudo, so the daemon cannot reach this actuator; only an
+operator running it as root can.
 
 ## What replaced it
 
@@ -16,10 +21,10 @@ Everything this script does by convention, the current Idunn does by contract:
 
 | Legacy mechanism | Current owner |
 |---|---|
-| `deployment_target_policy()` — a `case` over eleven target names | one operator binding per target, in `--bindings-dir` |
+| `deployment_target_policy()` — a `case` over ten target names | one operator binding per target, in `--bindings-dir` |
 | `upstream_ref=refs/heads/...` in shell | `[repository] admitted_ref` |
 | `minimum_source_revision_required` | `[repository] minimum_revision` |
-| `requires_bifrost_authority` + `--release-authority-store` | `[repository] selection = "signed-release"`, per target |
+| `requires_bifrost_authority` + `--release-authority-store` (retired with its only target) | `[repository] selection = "signed-release"`, per target |
 | `/srv/odin/deploy-manifests/<target>` shell scripts | recipe `[[steps]]` in the target's own repository |
 | `run_manifest_while_holding_authority_locks` | the deployment transaction and process write-lease |
 | `flock` on a brake store | `[brakes] deployment_store` and `lifecycle_store` |
@@ -45,14 +50,25 @@ This is the real migration scope, read out of `deployment_target_policy()`:
 | `heimdall` | GameCult/Heimdall | `main` | restart is `docker compose restart` |
 | `epiphany` | GameCult/Epiphany | `codex/epiphany-shakedown-live` | |
 | `epiphany-capstone-17` | GameCult/Epiphany | `codex/epiphany-shakedown-live` | second target, same repo |
-| `bifrost-persona-feedback` | GameCult/Bifrost | `main` | **only** target requiring Bifrost release authority |
+| ~~`bifrost-persona-feedback`~~ | GameCult/Bifrost | `main` | **retired 2026-09-30**, see below |
 | `repixelizer` | GameCult/repixelizer | `main` | |
 | `streampixels` | GameCult/StreamPixels | `main` | two units, one target |
 | `gjallar` | GameCult/Gjallar | `codex/yggdrasil-aggregate-daemon` | |
 
-Seven of eleven are pinned to a non-`main` branch. That is its own problem — the
+Seven of the ten live targets are pinned to a non-`main` branch. That is its own problem — the
 swarm goal is everyone on `main` and current with each other — and migrating a
 target is the moment to fix its ref, not to copy it forward.
+
+## Retired targets
+
+- `bifrost-persona-feedback`, 2026-09-30. Its manifest ran the Bifrost compose lane
+  (`docker compose up persona-feedback`), while the live provider is the native
+  `bifrost-persona-feedback.service`, so firing it would have started a container
+  beside the native unit. The operator ruled "delete the Bifrost lane". Its grant,
+  dispatch case and the Bifrost release-authority check it alone used are gone; a
+  deploy request that claims a Bifrost authority is refused. It was the only
+  caller of `idunn validate-release-authority`. Rebinding persona-feedback to a
+  current Idunn binding is a separate follow-up.
 
 ## When these files die
 

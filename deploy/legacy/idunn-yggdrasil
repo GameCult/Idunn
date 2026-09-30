@@ -96,14 +96,12 @@ deployment_target_policy() {
       daemon_id=yggdrasil-odin
       repository_full_name=GameCult/Odin
       upstream_ref=refs/heads/codex/ygg-idunn-independent-bootstrap
-      requires_bifrost_authority=false
       manifest_takes_action=true
       ;;
     codex-connector)
       daemon_id=yggdrasil-codex-connector
       repository_full_name=GameCult/CodexConnector
       upstream_ref=refs/heads/codex/ghostlight-release-binding
-      requires_bifrost_authority=false
       minimum_source_revision_required=true
       manifest_takes_action=true
       ;;
@@ -111,7 +109,6 @@ deployment_target_policy() {
       daemon_id=yggdrasil-ghostlight
       repository_full_name=GameCult/Ghostlight
       upstream_ref=refs/heads/codex/ghostlight-dungeon-mvp
-      requires_bifrost_authority=false
       minimum_source_revision_required=true
       manifest_takes_action=true
       ;;
@@ -119,52 +116,39 @@ deployment_target_policy() {
       daemon_id=yggdrasil-voidbot
       repository_full_name=GameCult/VoidBot
       upstream_ref=refs/heads/main
-      requires_bifrost_authority=false
       manifest_takes_action=true
       ;;
     heimdall)
       daemon_id=yggdrasil-heimdall
       repository_full_name=GameCult/Heimdall
       upstream_ref=refs/heads/main
-      requires_bifrost_authority=false
       ;;
     epiphany-capstone-17)
       daemon_id=yggdrasil-epiphany-capstone-17
       repository_full_name=GameCult/Epiphany
       upstream_ref=refs/heads/codex/epiphany-shakedown-live
-      requires_bifrost_authority=false
       manifest_takes_action=true
       ;;
     epiphany)
       daemon_id=yggdrasil-epiphany
       repository_full_name=GameCult/Epiphany
       upstream_ref=refs/heads/codex/epiphany-shakedown-live
-      requires_bifrost_authority=false
       manifest_takes_action=true
-      ;;
-    bifrost-persona-feedback)
-      daemon_id=yggdrasil-bifrost-persona-feedback
-      repository_full_name=GameCult/Bifrost
-      upstream_ref=refs/heads/main
-      requires_bifrost_authority=true
       ;;
     repixelizer)
       daemon_id=yggdrasil-repixelizer
       repository_full_name=GameCult/repixelizer
       upstream_ref=refs/heads/main
-      requires_bifrost_authority=false
       ;;
     streampixels)
       daemon_id=yggdrasil-streampixels
       repository_full_name=GameCult/StreamPixels
       upstream_ref=refs/heads/main
-      requires_bifrost_authority=false
       ;;
     gjallar)
       daemon_id=yggdrasil-gjallar
       repository_full_name=GameCult/Gjallar
       upstream_ref=refs/heads/codex/yggdrasil-aggregate-daemon
-      requires_bifrost_authority=false
       ;;
     *) echo "deployment target has no root actuator policy: $target" >&2; exit 1 ;;
   esac
@@ -190,19 +174,10 @@ require_signed_deployment_grant() {
     *) echo "signed deployment request is not for root target $target" >&2; exit 1 ;;
   esac
 
-  case "$requires_bifrost_authority" in
-    true)
-      [ -n "$release_authority_id" ] || { echo "missing Bifrost release authority id" >&2; exit 1; }
-      case "$release_authority_sha256" in
-        *[!0-9a-f]*|'') echo "invalid or missing Bifrost release authority digest" >&2; exit 1 ;;
-      esac
-      [ "${#release_authority_sha256}" -eq 64 ] || { echo "Bifrost release authority digest must be 64 lowercase hex characters" >&2; exit 1; }
-      ;;
-    false)
-      [ -z "$release_authority_id" ] || { echo "source-observed release cannot claim Bifrost authority id" >&2; exit 1; }
-      [ -z "$release_authority_sha256" ] || { echo "source-observed release cannot claim Bifrost authority digest" >&2; exit 1; }
-      ;;
-  esac
+  # No target carries Bifrost release authority: its only one, bifrost-persona-feedback,
+  # was retired on 2026-09-30. A request that claims one is refused.
+  [ -z "$release_authority_id" ] || { echo "source-observed release cannot claim Bifrost authority id" >&2; exit 1; }
+  [ -z "$release_authority_sha256" ] || { echo "source-observed release cannot claim Bifrost authority digest" >&2; exit 1; }
 
   require_root_owned_resolved_executable "$idunn_provision"
   require_root_owned_regular_path "$brake_store"
@@ -233,18 +208,6 @@ require_signed_deployment_grant() {
     /usr/local/bin/idunn validate-minimum-source-revision \
       --daemon "$daemon_id" \
       --source-revision "$source_commit"
-  fi
-
-  if [ "$requires_bifrost_authority" = true ]; then
-    require_root_owned_resolved_executable /usr/local/bin/idunn
-    /usr/local/bin/idunn validate-release-authority \
-      --store /var/lib/gamecult/idunn/yggdrasil.keepalive.cc \
-      --release-authority-store /srv/bifrost/state/repository-release-authority.cc \
-      --repository-full-name "$repository_full_name" \
-      --upstream-ref "$upstream_ref" \
-      --source-revision "$source_commit" \
-      --release-authority-id "$release_authority_id" \
-      --release-authority-sha256 "$release_authority_sha256"
   fi
 }
 
@@ -355,7 +318,7 @@ case "$action:$target" in
     run_manifest_while_holding_authority_locks "$manifest" restart
     exit $?
     ;;
-  deploy:voidbot|deploy:epiphany|deploy:epiphany-capstone-17|deploy:odin|deploy:codex-connector|deploy:ghostlight|deploy:heimdall|deploy:repixelizer|deploy:streampixels|deploy:bifrost-persona-feedback|deploy:gjallar)
+  deploy:voidbot|deploy:epiphany|deploy:epiphany-capstone-17|deploy:odin|deploy:codex-connector|deploy:ghostlight|deploy:heimdall|deploy:repixelizer|deploy:streampixels|deploy:gjallar)
     manifest="/srv/odin/deploy-manifests/$target"
     require_root_owned_regular_path "$manifest"
     [ -x "$manifest" ] || { echo "root actuator manifest is not executable: $manifest" >&2; exit 1; }
@@ -368,7 +331,8 @@ case "$action:$target" in
     export BIFROST_RELEASE_AUTHORITY_ID="$release_authority_id"
     export BIFROST_RELEASE_AUTHORITY_SHA256="$release_authority_sha256"
     export IDUNN_DEPLOYMENT_REQUEST_ID="$deployment_request_id"
-    export IDUNN_REQUIRES_BIFROST_AUTHORITY="$requires_bifrost_authority"
+    # Installed manifests (Epiphany's) still require this to read false.
+    export IDUNN_REQUIRES_BIFROST_AUTHORITY=false
     if [ "$manifest_takes_action" = true ]; then
       run_manifest_while_holding_authority_locks "$manifest" "$action"
       exit $?
