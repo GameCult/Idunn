@@ -11952,10 +11952,13 @@ Content-Le".to_vec()), |_| {}),
         driver.rollback(&candidate, &digest('a'), &receipt, &Unmetered)?;
         assert_eq!(logged(&calls, "systemctl reload"), 2, "the rollback did not reload");
         assert_eq!(fs::read(&driver.binding.config_path)?, incumbent);
+        // The incumbent still routes: its endpoint's firewall allow stays.
+        assert_eq!(logged(&calls, "ufw delete"), 0, "the rollback withdrew a live endpoint");
         driver.install(&candidate, &digest('a'), &receipt, true, &Unmetered)?;
         driver.withdraw_candidate_membership(&receipt, &Unmetered)?;
         assert_eq!(logged(&calls, "systemctl reload"), 4, "the withdrawal did not reload");
         assert_eq!(fs::read(&driver.binding.config_path)?, incumbent);
+        assert_eq!(logged(&calls, "ufw delete"), 0, "the withdrawal withdrew a live endpoint");
         Ok(())
     }
 
