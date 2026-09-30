@@ -18472,6 +18472,47 @@ mod tests {
             Ok(())
         }
 
+        /// The `expire` verb as the CLI parses and runs it: the options land
+        /// where they say, and it finds only a live transaction of its own
+        /// command.
+        #[test]
+        fn idunn_expire_parses_its_options_and_asks_only_about_its_own_live_transaction()
+        -> Result<()> {
+            let args = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect::<Vec<_>>();
+            assert_eq!(
+                parse(args(&["expire", "up-service", "--requested-by", "alice", "--state-store", "/s/c.cc"]).into_iter())?,
+                Command::Expire {
+                    state_store: PathBuf::from("/s/c.cc"),
+                    command_id: "up-service".into(),
+                    requested_by: "alice".into(),
+                }
+            );
+            let help = parse(args(&["expire", "up-service", "--help"]).into_iter()).unwrap_err();
+            assert!(format!("{help}").contains("idunn expire <command-id>"), "{help}");
+            assert!(parse(args(&["expire", "up-service", "--force"]).into_iter()).is_err());
+            assert!(parse(args(&["expire"]).into_iter()).is_err());
+
+            // The verb runs: a store with nothing live refuses.
+            let empty = TempDir::new()?;
+            let store = empty.path().join("control.cc").display().to_string();
+            let refused = run(args(&["expire", "up-service", "--state-store", &store]).into_iter())
+                .expect_err("expired a command with no transaction");
+            assert!(format!("{refused:#}").contains("no live transaction"), "{refused:#}");
+
+            // A finished transaction of the command is not a live one.
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed
+                .world
+                .engine
+                .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("test"))?;
+            routed.resume_until_terminal()?;
+            assert!(resident(&routed.world)?.value.is_terminal(), "the record was archived");
+            let refused = expire(&routed.world.state_store, "continuity-service", "operator")
+                .expect_err("expired a finished transaction");
+            assert!(format!("{refused:#}").contains("no live transaction"), "{refused:#}");
+            Ok(())
+        }
+
         /// Q3 at the deadline, through the Engine. A continuity whose candidate
         /// was granted a lease and never proved it held it fails as
         /// `lease-not-adopted`; one whose Ready proved it restarts the admitted
