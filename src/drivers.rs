@@ -7667,7 +7667,7 @@ fn ensure_bundle_is_reachable_by_workload(
 /// gets EACCES. A chmod by hand does not hold, because each publish writes a
 /// new file. Integrity here comes from the signatures over the records, not
 /// from the mode, so the published copy is readable.
-fn publish_projection_mode(path: &Path) -> Result<()> {
+pub(crate) fn publish_projection_mode(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

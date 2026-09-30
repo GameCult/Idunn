@@ -44,6 +44,7 @@ use crate::drivers::{
     SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
     WriteLeasePort,
 };
+use crate::incident::{CloseReason, IncidentCondition, IncidentStore, render_incidents};
 use crate::host_actuator::{
     HostActuatorAccess, HostActuatorHub, HostActuatorRunnerDriver, HostActuatorWorkloadDriver,
     HostUnobservable, IdunnHostActuatorIdentity, SharedHostActuatorHub, spawn_hub_service,
@@ -2380,6 +2381,9 @@ struct RuntimeOptions {
     source_root: PathBuf,
     staging_root: PathBuf,
     topology_store: PathBuf,
+    /// Operator incidents, published world-readable beside the topology
+    /// projection. Not part of the control store: see `incident`.
+    incident_store: PathBuf,
     odin_correlation_store: PathBuf,
     odin_trust_anchor: PathBuf,
     idunn_identity_store: PathBuf,
@@ -2405,6 +2409,7 @@ impl Default for RuntimeOptions {
             source_root: PathBuf::from("/var/lib/gamecult/idunn/sources"),
             staging_root: PathBuf::from("/var/lib/gamecult/idunn/staging"),
             topology_store: PathBuf::from("/var/lib/gamecult/idunn/topology.cc"),
+            incident_store: PathBuf::from("/var/lib/gamecult/idunn-projection/incidents.cc"),
             odin_correlation_store: PathBuf::from(
                 "/var/lib/gamecult/odin/idunn-runtime-topology.cc",
             ),
@@ -2437,6 +2442,7 @@ enum Command {
     },
     Status {
         state_store: PathBuf,
+        incident_store: PathBuf,
         command_id: Option<String>,
     },
     Cancel {
@@ -2468,8 +2474,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
         ),
         Command::Status {
             state_store,
+            incident_store,
             command_id,
-        } => status(&state_store, command_id.as_deref()),
+        } => status(&state_store, &incident_store, command_id.as_deref()),
         Command::Cancel {
             state_store,
             command_id,
@@ -2543,6 +2550,7 @@ fn parse_serve(mut args: impl Iterator<Item = String>) -> Result<Command> {
             "--source-root" => options.source_root = path_value(&mut args, &argument)?,
             "--staging-root" => options.staging_root = path_value(&mut args, &argument)?,
             "--topology-store" => options.topology_store = path_value(&mut args, &argument)?,
+            "--incident-store" => options.incident_store = path_value(&mut args, &argument)?,
             "--odin-correlation-store" => {
                 options.odin_correlation_store = path_value(&mut args, &argument)?
             }
@@ -2626,11 +2634,14 @@ fn parse_up(mut args: impl Iterator<Item = String>) -> Result<Command> {
 }
 
 fn parse_status(mut args: impl Iterator<Item = String>) -> Result<Command> {
-    let mut state_store = RuntimeOptions::default().state_store;
+    let defaults = RuntimeOptions::default();
+    let mut state_store = defaults.state_store;
+    let mut incident_store = defaults.incident_store;
     let mut command_id = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--state-store" => state_store = path_value(&mut args, &argument)?,
+            "--incident-store" => incident_store = path_value(&mut args, &argument)?,
             "--command" => command_id = Some(string_value(&mut args, &argument)?),
             "--help" | "-h" => bail!(usage()),
             _ => bail!("unknown Idunn status option {argument:?}"),
@@ -2638,6 +2649,7 @@ fn parse_status(mut args: impl Iterator<Item = String>) -> Result<Command> {
     }
     Ok(Command::Status {
         state_store,
+        incident_store,
         command_id,
     })
 }
@@ -3091,7 +3103,7 @@ impl ControlSnapshot {
     }
 }
 
-fn decode_record<T>(envelope: &CultCacheEnvelope) -> Result<T>
+pub(crate) fn decode_record<T>(envelope: &CultCacheEnvelope) -> Result<T>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
@@ -3634,7 +3646,7 @@ fn target_supervision_envelope(value: &TargetSupervision, now: u64) -> Result<Cu
     )
 }
 
-fn typed_envelope<T: Serialize>(
+pub(crate) fn typed_envelope<T: Serialize>(
     key: &str,
     record_type: &str,
     schema: &str,
@@ -3792,8 +3804,12 @@ fn state_advanced(before: &DeploymentTransaction, after: &DeploymentTransaction)
     &after != before
 }
 
-/// Says a fault once while it lasts. A scheduler tick that hits the same
+/// Says a fault once on stderr while it lasts. A scheduler tick that hits the same
 /// unreadable file every half second must not print it every half second.
+///
+/// It is a trace and owns nothing else: it is in memory, keyed by free-form
+/// strings, and an Idunn restart forgets it. Whether the operator is told
+/// belongs to the incident record (`incident`), never to this map.
 #[derive(Default)]
 struct ReportOnce {
     last: Mutex<Option<String>>,
@@ -4096,7 +4112,7 @@ fn submit(
     }
 }
 
-fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
+fn status(store_path: &Path, incident_store: &Path, command_id: Option<&str>) -> Result<()> {
     let snapshot = ControlSnapshot::read(store_path)?;
     // Commands stay resident; their finished transactions do not. Without
     // history a completed command would report as though it had never run,
@@ -4185,18 +4201,32 @@ fn status(store_path: &Path, command_id: Option<&str>) -> Result<()> {
     // What supervision holds for each target: the union of the admitted
     // generations and the metered targets, so a target that has only been
     // deployed to (no generation yet) still shows what it has used.
-    let now = now_millis()?;
-    for target in supervised_targets(&snapshot) {
-        for line in render_supervision(
+    for line in render_targets(&snapshot, incident_store, now_millis()?) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Every supervised target with its meters and its incidents. An incident
+/// store that cannot be read costs the incident lines and nothing else.
+fn render_targets(snapshot: &ControlSnapshot, incident_store: &Path, now: u64) -> Vec<String> {
+    let incidents = IncidentStore::new(incident_store).read();
+    let mut lines = Vec::new();
+    for target in supervised_targets(snapshot) {
+        lines.extend(render_supervision(
             target,
             snapshot.admitted_for(target).map(|stored| &stored.value),
             snapshot.supervision_for(target).map(|stored| &stored.value),
             now,
-        ) {
-            println!("{line}");
+        ));
+        if let Ok(records) = &incidents {
+            lines.extend(render_incidents(records, target, now));
         }
     }
-    Ok(())
+    if let Err(error) = &incidents {
+        lines.push(format!("incidents unreadable: {}", error.root_cause()));
+    }
+    lines
 }
 
 /// Every target supervision holds something for: the admitted generations
@@ -4607,6 +4637,57 @@ impl Engine {
         if let Some(message) = offered {
             eprintln!("{message}");
         }
+    }
+
+    fn incidents(&self) -> IncidentStore {
+        IncidentStore::new(&self.options.incident_store)
+    }
+
+    /// Settle the outcome of one incident operation. A failure never leaves
+    /// this function: it is traced once, under its operation, and continuity
+    /// decides exactly as it would have with a healthy store. It names the
+    /// operation and the root cause and never a path or a value. Incident
+    /// writes are never progress.
+    fn record_incident(&self, operation: &str, outcome: Result<bool>) {
+        let key = format!("incident-store:{operation}");
+        match outcome {
+            Ok(_) => self.clear_fault(&key),
+            Err(error) => self.report_once(
+                &key,
+                format!(
+                    "Idunn could not {operation} an operator incident: {}",
+                    error.root_cause()
+                ),
+            ),
+        }
+    }
+
+    /// Close every open incident whose target is no longer admitted, then
+    /// retire what has been closed past retention.
+    fn reconcile_incidents(&self, snapshot: &ControlSnapshot) {
+        let store = self.incidents();
+        let close_unadmitted = || -> Result<bool> {
+            let now = now_millis()?;
+            let mut closed = false;
+            for record in store.read()? {
+                if record.is_open()
+                    && !snapshot
+                        .admitted
+                        .iter()
+                        .any(|stored| stored.value.target == record.subject)
+                {
+                    closed |= store.close(
+                        record.condition,
+                        &record.subject,
+                        CloseReason::NoLongerAdmitted,
+                        now,
+                    )?;
+                }
+            }
+            Ok(closed)
+        };
+        self.record_incident("close", close_unadmitted());
+        self.record_incident("retire", now_millis().and_then(|now| store.retire_closed(now)));
     }
 
     fn host_access(&self) -> Result<HostActuatorAccess<'_>> {
@@ -5463,6 +5544,7 @@ impl Engine {
             .lock()
             .expect("challenge wait mutex")
             .retain(|target, wait| snapshot.target_stamp(target) == wait.stamp);
+        self.reconcile_incidents(&snapshot);
         let mut progressed = false;
         let mut admitted = snapshot.admitted.iter().collect::<Vec<_>>();
         admitted.sort_by_key(|stored| stored.value.target.as_str());
@@ -5631,6 +5713,20 @@ impl Engine {
                 }
             };
             if observation.is_some() {
+                // The admitted workload was seen running: the only evidence
+                // that ends an exhaustion incident. The restart window sliding
+                // is not health and never closes one.
+                self.record_incident(
+                    "close",
+                    now_millis().and_then(|now| {
+                        self.incidents().close(
+                            IncidentCondition::ContinuityExhausted,
+                            &current.value.target,
+                            CloseReason::Recovered,
+                            now,
+                        )
+                    }),
+                );
                 continue;
             }
             let workload_error = operational_error
@@ -5707,6 +5803,16 @@ impl Engine {
                 continue;
             }
             if supervision.restarts_exhausted(now) {
+                // The record comes first and the trace after it: the trace is
+                // this record's shadow, never its substitute.
+                self.record_incident(
+                    "open",
+                    self.incidents().open(
+                        IncidentCondition::ContinuityExhausted,
+                        &current.value.target,
+                        now,
+                    ),
+                );
                 self.report_once(
                     &continuity_key,
                     format!(
@@ -9013,7 +9119,7 @@ fn require_selector(value: &str) -> Result<()> {
     require_id(value, "deployment selector")
 }
 
-fn require_id(value: &str, label: &str) -> Result<()> {
+pub(crate) fn require_id(value: &str, label: &str) -> Result<()> {
     ensure!(
         !value.is_empty()
             && value.len() <= 256
@@ -9070,7 +9176,7 @@ fn usage() -> &'static str {
     "Idunn deployment, admission, and continuity control plane\n\n\
      idunn serve [runtime options] [--host-actuator-bind ADDR]\n\
      idunn up <service|profile:name> [--state-store PATH] [--no-wait]\n\
-     idunn status [--state-store PATH] [--command ID]\n\
+     idunn status [--state-store PATH] [--incident-store PATH] [--command ID]\n\
      idunn cancel <command-id> [--state-store PATH]\n\
      idunn validate --recipe PATH [--binding PATH]\n\n\
      Recipes describe capability and process requirements. Idunn seals exact\n\
@@ -9089,6 +9195,7 @@ mod tests {
 
     use super::*;
     use crate::drivers::{SystemdWorkloadObservation, incarnation_key};
+    use crate::incident::INCIDENT_RETENTION_MILLIS;
 
     /// Fixed clock for the signing fixture; correlations must land inside
     /// DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS of it to authenticate.
@@ -9303,6 +9410,7 @@ mod tests {
                 source_root: root.join("sources"),
                 staging_root: root.join("staging"),
                 topology_store: root.join("topology.cc"),
+                incident_store: root.join("incidents.cc"),
                 odin_correlation_store: root.join("odin-correlation.cc"),
                 odin_trust_anchor: odin_anchor,
                 idunn_identity_store: idunn,
@@ -12760,6 +12868,11 @@ mod tests {
             })
         }
 
+        fn revive(&self) {
+            self.alive
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
         fn kill(&self) {
             self.alive
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -14496,6 +14609,293 @@ mod tests {
         cleanup_evidence::owe_legacy_continuity_projection(&mut unissued);
         assert_eq!(owed(&unissued), Some(CleanupEvidence::Skipped));
         Ok(())
+    }
+
+    // ---- operator incidents ----------------------------------------------
+
+    fn incident_path(world: &EngineFixture) -> PathBuf {
+        world.root.join("incidents.cc")
+    }
+
+    fn incidents_of(world: &EngineFixture) -> Result<Vec<crate::incident::IncidentRecord>> {
+        IncidentStore::new(&incident_path(world)).read()
+    }
+
+    /// The control store never holds an incident: it would stop every older
+    /// binary that reads it.
+    fn assert_control_store_holds_no_incident(world: &EngineFixture) -> Result<()> {
+        ControlSnapshot::read(&world.state_store)?;
+        for envelope in SingleFileMessagePackBackingStore::new(&world.state_store)
+            .pull_all_read_only_snapshot()?
+        {
+            assert_ne!(envelope.r#type, "idunn.operator_incident");
+        }
+        Ok(())
+    }
+
+    /// Six restarts inside the window, the last long enough ago that its wait is
+    /// over: only the ceiling holds.
+    fn spend_the_window(world: &EngineFixture) -> Result<()> {
+        set_meters(
+            world,
+            &restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
+        )
+    }
+
+    /// One entry has left the window, and the newest restart is recent enough
+    /// that continuity is still waiting: exhaustion is over, nothing restarts.
+    fn slide_the_window(world: &EngineFixture) -> Result<()> {
+        set_meters(
+            world,
+            &restarted_ago(&[3_700_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 10_000])?,
+        )
+    }
+
+    #[test]
+    fn an_exhausted_target_opens_one_incident_across_ticks_and_restarts() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        workload.kill();
+        spend_the_window(&world)?;
+        assert!(!incident_path(&world).exists());
+
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        let opened = incidents_of(&world)?;
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].subject, "service");
+        assert_eq!(opened[0].condition, IncidentCondition::ContinuityExhausted);
+        assert!(opened[0].is_open());
+        let written = std::fs::read(incident_path(&world))?;
+
+        for _ in 0..3 {
+            assert!(!world.engine.supervise_one_admitted_generation()?);
+        }
+        // An Idunn restart forgets its in-memory trace; the durable record
+        // keeps the decision from being written again.
+        let restarted =
+            Engine::open_with_systemd_workload(world.engine.options.clone(), workload.clone())?;
+        assert!(restarted.fault_reports.lock().unwrap().is_empty());
+        assert!(!restarted.supervise_one_admitted_generation()?);
+        assert_eq!(std::fs::read(incident_path(&world))?, written);
+        assert_eq!(incidents_of(&world)?, opened);
+        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
+        assert_control_store_holds_no_incident(&world)
+    }
+
+    #[test]
+    fn an_exhaustion_incident_closes_on_observed_health_not_on_the_window() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        workload.kill();
+        spend_the_window(&world)?;
+        world.engine.supervise_one_admitted_generation()?;
+        let first = incidents_of(&world)?;
+        assert_eq!(first.len(), 1);
+
+        // The window slides while the workload is still dead: exhaustion is
+        // over, the target is not healthy, and the incident stays open.
+        slide_the_window(&world)?;
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(incidents_of(&world)?, first);
+
+        // Seen running, it closes as recovered.
+        workload.revive();
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        let closed = incidents_of(&world)?;
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].incident_key, first[0].incident_key);
+        assert!(
+            closed[0]
+                .closed_at_unix_millis
+                .is_some_and(|at| at >= closed[0].opened_at_unix_millis)
+        );
+        assert_eq!(closed[0].close_reason, Some(CloseReason::Recovered));
+
+        // A later exhaustion is a new record with a new opening time.
+        std::thread::sleep(Duration::from_millis(5));
+        workload.kill();
+        spend_the_window(&world)?;
+        world.engine.supervise_one_admitted_generation()?;
+        let again = incidents_of(&world)?;
+        assert_eq!(again.len(), 2);
+        let reopened = again
+            .iter()
+            .find(|record| record.is_open())
+            .context("no new incident")?;
+        assert!(reopened.opened_at_unix_millis > first[0].opened_at_unix_millis);
+        assert_ne!(reopened.incident_key, first[0].incident_key);
+        assert_control_store_holds_no_incident(&world)
+    }
+
+    #[test]
+    fn an_incident_whose_target_is_no_longer_admitted_closes() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        workload.kill();
+        spend_the_window(&world)?;
+        world.engine.supervise_one_admitted_generation()?;
+        assert!(incidents_of(&world)?[0].is_open());
+
+        let admitted = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("no admitted generation")?
+            .envelope
+            .clone();
+        assert!(
+            SingleFileMessagePackBackingStore::new(&world.state_store)
+                .delete_batch_if_unchanged(&[admitted])?
+        );
+        world.engine.supervise_one_admitted_generation()?;
+        let records = incidents_of(&world)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].close_reason, Some(CloseReason::NoLongerAdmitted));
+        assert_control_store_holds_no_incident(&world)
+    }
+
+    #[test]
+    fn a_tick_retires_incidents_closed_past_retention() -> Result<()> {
+        let world = EngineFixture::with_workload(SwitchWorkload::new())?;
+        let store = IncidentStore::new(&incident_path(&world));
+        let condition = IncidentCondition::ContinuityExhausted;
+        let long_ago = now_millis()? - INCIDENT_RETENTION_MILLIS - 10_000;
+        assert!(store.open(condition, "gone", long_ago)?);
+        assert!(store.close(condition, "gone", CloseReason::Recovered, long_ago + 1)?);
+        assert!(store.open(condition, "recent", now_millis()?)?);
+        assert!(store.close(condition, "recent", CloseReason::Recovered, now_millis()?)?);
+
+        world.engine.supervise_one_admitted_generation()?;
+        let live = store.read()?;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].subject, "recent");
+        assert!(world.root.join("incident-history.cc").exists());
+        Ok(())
+    }
+
+    /// The same exhaustion and recovery sequence, reduced to what continuity
+    /// decided: each tick's return, and the transactions and restart log it left.
+    fn continuity_decisions(
+        world: &EngineFixture,
+        engine: &Engine,
+        workload: &SwitchWorkload,
+    ) -> Result<Vec<(bool, usize, usize)>> {
+        let mut decided = Vec::new();
+        let tick = |decided: &mut Vec<(bool, usize, usize)>| -> Result<()> {
+            let moved = engine.supervise_one_admitted_generation()?;
+            let snapshot = ControlSnapshot::read(&world.state_store)?;
+            decided.push((
+                moved,
+                snapshot.transactions.len(),
+                snapshot.supervision_or_new("service").continuity_restarts.len(),
+            ));
+            Ok(())
+        };
+        workload.kill();
+        spend_the_window(world)?;
+        tick(&mut decided)?;
+        tick(&mut decided)?;
+        slide_the_window(world)?;
+        tick(&mut decided)?;
+        workload.revive();
+        tick(&mut decided)?;
+        workload.kill();
+        spend_the_window(world)?;
+        tick(&mut decided)?;
+        Ok(decided)
+    }
+
+    #[test]
+    fn an_unwritable_incident_store_changes_nothing_continuity_decides() -> Result<()> {
+        const CANARY: &str = "CANARY-6b1d-secret-segment";
+        let healthy_workload = SwitchWorkload::new();
+        let healthy = EngineFixture::with_workload(healthy_workload.clone())?;
+        admit_incumbent(&healthy)?;
+        let expected = continuity_decisions(&healthy, &healthy.engine, &healthy_workload)?;
+        assert!(incidents_of(&healthy)?.iter().any(|record| record.is_open()));
+
+        // Not permission-dependent: a store path beneath a regular file cannot
+        // be created for any uid, root included.
+        let broken_workload = SwitchWorkload::new();
+        let mut broken = EngineFixture::with_workload(broken_workload.clone())?;
+        admit_incumbent(&broken)?;
+        let blocker = broken.root.join(CANARY);
+        std::fs::write(&blocker, b"a file, not a directory")?;
+        let mut options = broken.engine.options.clone();
+        options.incident_store = blocker.join("incidents.cc");
+        broken.engine = Engine::open_with_systemd_workload(options, broken_workload.clone())?;
+
+        let actual = continuity_decisions(&broken, &broken.engine, &broken_workload)?;
+        assert_eq!(actual, expected, "a broken incident store changed a continuity decision");
+        assert!(!blocker.join("incidents.cc").exists());
+
+        // The fault is traced once, under its operation, and echoes no path.
+        let reports = broken.engine.fault_reports.lock().unwrap();
+        let faults = reports
+            .iter()
+            .filter(|(key, _)| key.starts_with("incident-store:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            faults.len(),
+            1,
+            "{:?}",
+            faults.iter().map(|(key, _)| key).collect::<Vec<_>>()
+        );
+        let message = faults[0].1.last.lock().unwrap().clone().context("fault cleared")?;
+        assert!(message.contains("open an operator incident"), "{message}");
+        assert!(!message.contains(CANARY), "{message}");
+        drop(reports);
+        assert_control_store_holds_no_incident(&broken)
+    }
+
+    #[test]
+    fn status_renders_incidents_and_survives_an_unreadable_store() -> Result<()> {
+        const CANARY: &str = "CANARY-90c2-secret-segment";
+        let temp = TempDir::new()?;
+        let now = now_millis()?;
+        let mut snapshot = ControlSnapshot::default();
+        let meters = TargetSupervision::new("service");
+        snapshot.targets.push(Stored {
+            envelope: target_supervision_envelope(&meters, now)?,
+            value: meters,
+        });
+
+        let readable = temp.path().join("incidents.cc");
+        IncidentStore::new(&readable).open(IncidentCondition::ContinuityExhausted, "service", now)?;
+        let lines = render_targets(&snapshot, &readable, now);
+        assert!(lines[0].starts_with("target service "), "{lines:?}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(format!("  incident continuity-exhausted opened-at {now}").as_str())
+        );
+
+        let unreadable = temp.path().join(CANARY);
+        std::fs::write(&unreadable, b"not a cultcache file")?;
+        let lines = render_targets(&snapshot, &unreadable, now);
+        assert!(lines[0].starts_with("target service "), "{lines:?}");
+        let last = lines.last().context("no lines")?;
+        assert!(last.starts_with("incidents unreadable: "), "{last}");
+        assert!(!lines.iter().any(|line| line.contains(CANARY)), "{lines:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_incident_store_is_named_by_serve_and_status() {
+        let Command::Serve(options) =
+            parse(["serve", "--incident-store", "/tmp/i.cc"].into_iter().map(str::to_owned))
+                .unwrap()
+        else {
+            panic!("expected serve")
+        };
+        assert_eq!(options.incident_store, PathBuf::from("/tmp/i.cc"));
+        let Command::Status { incident_store, .. } =
+            parse(["status", "--incident-store", "/tmp/j.cc"].into_iter().map(str::to_owned))
+                .unwrap()
+        else {
+            panic!("expected status")
+        };
+        assert_eq!(incident_store, PathBuf::from("/tmp/j.cc"));
     }
 
     #[test]

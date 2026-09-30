@@ -44,7 +44,8 @@ Idunn centralizes that lifecycle work:
 - record every deployment/restart request and result as typed state;
 - record release targets, deployment artifacts, state migrations, and rollout
   results as typed state;
-- escalate to an operator through Bifrost when human action is needed.
+- record operator incidents in its published `incidents.cc`, which Bifrost reads
+  and delivers. Idunn never waits on delivery.
 
 The desired shape is simple:
 

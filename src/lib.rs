@@ -4,4 +4,5 @@ pub mod deployment_plan;
 pub mod drivers;
 pub mod host;
 pub mod host_actuator;
+mod incident;
 pub mod provisioning;
