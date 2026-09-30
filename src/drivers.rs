@@ -9327,18 +9327,25 @@ Content-Le".to_vec()), |_| {}),
         let address = reservation.local_addr()?;
         drop(reservation);
 
+        // The listener never accepts: the kernel completes a handshake from
+        // its backlog, so the client connects as soon as it is bound. Nothing
+        // here can block on a connection that never arrives; the listener only
+        // has to outlive the connect, and gives up waiting after a bound.
+        let (connected, connect_done) = std::sync::mpsc::channel::<()>();
         let server = thread::spawn(move || -> std::io::Result<()> {
             thread::sleep(Duration::from_millis(75));
             let listener = std::net::TcpListener::bind(address)?;
-            let (_stream, _) = listener.accept()?;
+            let _ = connect_done.recv_timeout(Duration::from_secs(30));
+            drop(listener);
             Ok(())
         });
 
-        let stream = connect_route_socket(address)?;
-        drop(stream);
+        let stream = connect_route_socket(address);
+        let _ = connected.send(());
         server
             .join()
             .map_err(|_| anyhow!("route readiness test server panicked"))??;
+        drop(stream?);
         Ok(())
     }
 
