@@ -66,6 +66,13 @@ the machine has a detector with no record, and a deliverer that nothing feeds.
   clears, one closure notice follows, and only if the opening notice was sent.
   Repeated delivery attempts for either notice are idempotent at the
   recipient's end.
+- **No tick waits on a lock someone else can hold.** Soul found that any
+  local uid could freeze Idunn's scheduler tick by holding a published
+  `.lock` file. This was true for incidents during the campaign, and for
+  `topology.cc` before it. Idunn's writes in its projection directory are
+  non-blocking exchanges. The locks behind them are private to Idunn,
+  whatever the directory's default ACL says. The operator ruled on
+  2026-09-30 that the topology fix belongs to this campaign.
 - **Nothing sensitive leaves.** A notice names the target, the condition and
   the time. It never carries a binding value, a path to a secret, a token, or
   a line of configuration.
