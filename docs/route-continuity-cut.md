@@ -610,7 +610,8 @@ replacement for `idunn cancel`.
     alive, and Idunn completes or retries routing and commit.
   - Assumption Soul must falsify: the incumbent cannot write between the fence
     and the lease, so the snapshot is exact.
-  - Map pending (Imagination).
+  - Mapped: section 4, "Q3-ii cut: snapshot before Ready, roll forward after" (Imagination, 2026-09-30);
+    it establishes the assumption for Idunn-managed writers and names what breaks it (Q3-ii.2).
 
   History, the question as first put:
   The operator on the offered hold-until-next-`idunn up` option, verbatim: "I
@@ -1638,6 +1639,544 @@ admitted provider … Unrouted providers fall back to their Q1 class evidence".
   - An AwaitingReady state with no evidence resolves at its deadline.
   - An unadopted lease resolves without an operator.
   - Commit completes while Odin re-stamps every tick.
+
+### Q3-ii cut: snapshot before Ready, roll forward after
+
+Imagination, 2026-09-30. Nothing has landed. It maps the Q3-ii ruling, verbatim: "D before Ready, E after; this
+actually closes the hole, and is a nice feature for Idunn to have". Q3-i is also ruled: any issued lease counts as
+possibly written.
+
+Anchors:
+- Idunn `hands/b5` = `c06ff2b` (`src/` unless named; main's `src/` = `a96ad9d`, so B5 is the only code delta);
+- gamecult-ops `0961976`, StreamPixels `a49f7d8`, Heimdall `e8e2832`, Ghostlight and Odin working trees (recipes read only).
+
+"Probe" means one of:
+- a read-only command on Yggdrasil, 2026-09-30 about 16:00 UTC (18:00 CEST); nothing was written to the host;
+- a throwaway `postgres:16` container on Starfire, destroyed after the run.
+
+"Read" means source at those heads.
+
+#### Q3-ii.1 Body facts
+
+- **S1. Fence order (read).** The candidate starts in Starting and runs alongside the incumbent through Warming
+  (`candidate-then-promote`).
+  - Fencing (`advance_fencing` `:6712-6797`) stops the incumbent and revokes its lease. It does this **only when the
+    incumbent holds a lease** (`:6719`, `:6733-6750`). The phase then moves to Leasing (`:6796`).
+  - Leasing's first write is `LeasingEvidence::Prepared` (`:6953-6963`); under Q3-i, Prepared already counts as issued.
+  - Ready is written in AwaitingReady together with `lease_adoption`: route-proof at `:7018`, Odin-correlated at
+    `:7069`. Routing only refreshes an existing Odin receipt (`:7118`). So `ready.is_some()` is monotone inside a
+    transaction, and it is the Ready boundary.
+- **S2. An unleased incumbent is not fenced (read).** A stateful candidate replacing an incumbent without a lease
+  (for example the first deploy after a recipe declares state) leaves the incumbent running until post-commit
+  cleanup. `incumbent_was_stopped_during_fencing` (`:9058-9066`) derives "stopped" from the incumbent's lease
+  digest.
+- **S3. Candidate writers before the lease (read).**
+  - **StreamPixels** loads the application, and with it `runPostgresMigrations`, only after `waitForWriteLease`
+    (`deployment/idunn/runtime-presence.mjs:58-59`).
+  - **Heimdall** builds its app, which runs `createStore`, and then `ensureSchema`, before any lease check
+    (`src/index.ts:18`, `src/store/index.ts:16-18`). It also writes `runtime-presence-sequence` into its state root on
+    every health pulse, lease or not (`src/index.ts:115`).
+  - Recipes declare CultCache-file slots and validate that writable slots open after the lease
+    (`deployment.rs:960-969`). **Postgres is declared nowhere.** `StateRecovery` and `MigrationDeclaration` are
+    parsed and never consumed by the control plane (grep).
+- **S4. Out-of-band writers (probe).**
+  - `pg_stat_activity` on `streampixels` holds one session: pid 799973, which is unit
+    `idunn-streampixels-service-8c469c…`, the admitted Idunn workload.
+  - The `heimdall` database is held by the **legacy `heimdall.service`**, which Idunn does not manage (secret-files
+    map P8).
+  - No timer or cron touches either database.
+  - Operator scripts `apps/service/scripts/create-creator-invite.ts` and `grant-operator-role.ts` write
+    `streampixels` when an operator runs them.
+- **S5. Sizes and times (probe).**
+
+  | Store | Size | Snapshot |
+  |---|---|---|
+  | `streampixels` database | 9.0 MB | `pg_dump -Fc` 137 ms, 48 KB archive |
+  | `heimdall` database | 38 MB | `pg_dump -Fc` 1,042 ms, 13.7 MB archive |
+  | streampixels-service state root | 12 KB | |
+  | odin state root | 21 MB | |
+  | ghostlight-world-v2 state root | 204 KB | |
+  | heimdall state root | 12 KB | |
+
+  Free disk is 1.6 TB. Postgres is 16.15, on local peer auth.
+- **S6. State roots do not match their recipes (probe).**
+  - `ghostlight-world-v2/service/play-turn-v1.cc` (plus its `.lock`) is live and **undeclared** in the Ghostlight
+    recipe.
+  - Heimdall's state root holds `provider-health-identity.cc` (a private identity, mode 0600) and
+    `runtime-presence-sequence`. It does not hold its declared `heimdall.service.cc`; Heimdall is not admitted.
+  - The installed odin binding's `state_root` is `/var/lib/gamecult/odin`. The template
+    `idunn/yggdrasil/bindings/odin.toml.in` says `odin-v2`, which does not exist on the host. That is template
+    drift (ops follow-up).
+- **S7. Postgres restore mechanics (probe, container).**
+  - In-place `pg_restore --clean --if-exists --single-transaction` **leaves tables the candidate created**: the
+    probe's `sessions` table survived. An in-place restore is not exact.
+  - A side database restored with `--no-owner --role=<owner>` and swapped with two `ALTER DATABASE … RENAME` in one
+    transaction block swaps atomically and leaves no candidate residue.
+  - `RENAME` refuses while another session is connected: it waits 5 s, then fails "being accessed by other users".
+    So the swap terminates the database's sessions first.
+  - **Fingerprint.** Take the sha256 of the archive's text (`pg_restore -f -`), with `--` comments, blank lines and
+    the per-dump random `\restrict`/`\unrestrict` lines removed. It equals the same fingerprint of `pg_dump` of the
+    restored database and of the source. Changing one row changes it.
+  - Neither live database has database-level ACLs, role settings or extensions (probe). pg_hba is `local all all
+    peer`, so root reaches Postgres through `runuser -u postgres` with no secret, as the backup producer already does.
+- **S8. Supervision is blocked for a live transaction (read).**
+  - While any transaction of the target is at or past Fencing and not yet Complete, the target's supervision pass
+    skips it entirely (`:5684-5701`). That includes a running post-fencing abort, whose phase stays below Complete.
+  - After the terminal write, supervision repairs the Expected projection (`:5745`) and mints continuity (`:5987`).
+  - So a restore **inside** the abort cannot race continuity. A restore that fails and then goes terminal can: the
+    next mint restarts the incumbent on half-restored state.
+- **S9. The abort path has no deadline (read).**
+  - `resolves_by_deadline` excludes `post_fencing_abort` (`:1568-1573`), and each abort step retries every tick.
+  - `route_restoration` retries `ufw delete` forever. B5's own test `:18394` pins 20 attempts and no end.
+  - The abort order is route, lease, candidate, topology, source (`:8717-8858`). A state restore placed after the
+    route step would inherit that livelock.
+- **S10. Commit and route supervision need a promoted route (read).**
+  - `AdmittedGeneration::from_transaction` requires Committing, Ready and a routing disposition (`:2370-2418`).
+  - Route supervision bails without `RoutingEvidence::Promoted` (`:6049-6055`).
+  - Its repair `restore_admitted_membership` (`:6130`) installs from a membership digest and reloads only when the
+    fragment differs (`6ff7d5a`).
+- **S11. Continuity re-admits stored plans under current rules (read).** `parsed_inputs` runs `binding.admit`
+  (`deployment_plan.rs:634-643`). A new admission rule must therefore be compile-time only, as secret-files §2
+  already records.
+- **S12. Sandbox (read, and the installed unit probed identical).** Idunn runs as root with `ProtectSystem=full`.
+  `/var/lib/gamecult/idunn` and every target's state root are `ReadWritePaths`, so a snapshot directory under
+  Idunn's root needs no unit change.
+
+#### Q3-ii.2 The exactness assumption (question 1)
+
+The assumption is that the incumbent cannot write between the fence and the lease. It holds for Idunn-managed
+writers under three conditions. The body breaks two of them today.
+
+1. **Every live incumbent is stopped at the fence when the candidate is stateful.** Broken by S2. Fix: when
+   `expected.write_lease_required`, Fencing stops any exact incumbent, leased or not. `FencingEvidence::Revoked`
+   records `incumbent_stopped: bool`, and `incumbent_was_stopped_during_fencing` reads that field instead of
+   deriving it from the lease.
+2. **The candidate writes nothing before its lease.**
+   - This is declared and validated for CultCache slots.
+   - It is not enforced for Postgres. StreamPixels complies. Heimdall does not: its schema DDL runs at start, and its
+     sequence file is written every pulse (S3).
+   - The fence cannot cover this. It is a target-contract fault, and the fixes belong in Heimdall (follow-ups H-S1,
+     H-S2 below).
+3. **No out-of-band writer.** Today that means the legacy `heimdall.service` and hand-run StreamPixels operator
+   scripts (S4).
+
+**What breaks when it is not exact:**
+- A restore silently discards whatever an out-of-band writer committed after the snapshot.
+- If the candidate migrated before the fence, the "incumbent's state" captured is already the candidate's.
+
+**What closes it.** Condition 1 is closed in code. For conditions 2 and 3, the snapshot drivers check the no-writer
+precondition at the store. They check at snapshot start, again after the capture, and again immediately before
+Leasing writes Prepared:
+- a Postgres store requires zero sessions on its database;
+- a file store takes every captured file's `.lock` exclusively and non-blocking; a held lock means a live owner.
+
+A failed check is a typed refusal inside Snapshotting. No lease is issued, so the deadline ends it as a plain abort,
+with nothing to restore.
+
+With the current body, this refuses every Heimdall deploy until H-S1 lands. That is the correct outcome.
+
+One residual stays open: a writer that connects and disconnects between two checks goes unseen. Only Q-S3 (b) closes
+that.
+
+**Order in the phase machine after this cut:** Fencing (stop every incumbent, revoke) → **Snapshotting** (new) →
+Leasing (Prepared = issued) → AwaitingReady (Ready durable = the D/E boundary) → Routing → Committing.
+
+#### Q3-ii.3 Model page additions
+
+| Kind | What names it | Life over time | Who decides |
+|---|---|---|---|
+| **Snapshot declaration** (`[state_snapshot]` in the operator binding) | the binding's target; frozen into the plan through `binding_blob` | Changes only by an ops binding change and a new Deploy plan. An old plan without it keeps running continuity (S11) | gamecult-ops template; Idunn validates shape at parse and coverage at compile |
+| **Snapshot evidence** (transaction key 37, `state_snapshot`) | the transaction; one per Deploy past Fencing | Written once, when every store is captured and digested. Read by the restore. Terminal with its transaction | Engine (Snapshotting). Forbidden: CLI, drivers writing the record |
+| **Snapshot bytes** (`/var/lib/gamecult/idunn/snapshots/<target>/<transaction_id>/`, 0700 root) | path derived from the transaction id | Rewritten whole on a Snapshotting replay. Deleted by the transaction's own terminal cleanup step, except under a state hold, where they are deleted when the hold is released. No janitor | the transaction that owns the path |
+| **State restoration** (`PostFencingAbort.state_restoration`) | the abort | `Skipped` (no lease issued) → `Pending{deadline_at}` → `Complete{proof}` or `Failed{store, kind}` | abort path. Forbidden: supervision, CLI |
+| **State hold** (`TargetSupervision.state_hold`, supervision v2) | target | Set in the same CAS as a terminal `OperatorRequired{RestoreFailed}`. Released per Q-S4. Never set by anything else | Engine at the terminal write; release per Q-S4. Forbidden: continuity mint, which only reads it |
+| **Roll-forward record** (transaction key 38 `roll_forward` intent; completion `Admitted{recovery: RollForward}`) | the transaction | Set by the resolver after Ready. Terminal at the forced commit | deadline resolver |
+
+#### Q3-ii.4 Snapshot/restore contract (question 2)
+
+**Binding shape.** It is typed and closed; there are no command strings. Idunn accepts no imperative input: see the
+unit's own comment and `cli_exposes_only_declarative_commands`.
+
+```toml
+[state_snapshot]
+snapshot_seconds = 120   # optional; Idunn default 120. The Snapshotting deadline
+restore_seconds = 300    # optional; Idunn default 300. The abort's restore deadline
+
+[[state_snapshot.stores]]
+kind = "state-slots"     # the recipe's writable slots under workload.state_root (scope: Q-S2)
+
+[[state_snapshot.stores]]
+kind = "postgres"
+database = "streampixels"   # local socket, peer auth as OS user postgres; no URL, no credential file
+```
+
+- **Parse** (`deployment.rs`, `OperatorBinding` `:266-287`, new `StateSnapshotBinding`):
+  - duration bounds as in `DeadlineBinding` (`:734-750`);
+  - database names are identifiers;
+  - no duplicate stores;
+  - `state-slots` requires a `workload.state_root`.
+- **Compile-time coverage** goes in `compile_deployment_plan` (`deployment_plan.rs:674-722`), never in `admit()`
+  (S11):
+  - a stateful recipe with a `state-slots` store must declare writable file slots;
+  - the no-declaration case is Q-S1.
+- The durations live in the binding table and are frozen by `binding_blob`. `PhaseDeadlines` is untouched, so no
+  v3 plan changes its `plan_id`.
+
+**Where the bytes live, and who owns and prunes them.** `snapshots/<target>/<transaction_id>/` under Idunn's own
+root:
+- slot copies keep their relative path, owner and mode;
+- `postgres/<db>.dump` is 0600.
+
+The **manifest** is not a file. It is the typed snapshot evidence on the transaction:
+- per slot: relative path, size, mode, uid, gid, sha256, and whether it existed;
+- per database: archive sha256, fingerprint (S7), owner role, and the zero-session check times.
+
+Pruning:
+- the transaction deletes its own directory in a new last cleanup step, on both `PostCommitCleanup` and
+  `PostFencingAbort`;
+- under a state hold it is kept, and deleted on release.
+
+The path is derived from the transaction id, so a crash leaves nothing a later step cannot find. gamecult-ops adds
+`/var/lib/gamecult/idunn/snapshots` to the backup `EXCLUDES`. It duplicates live stores already captured, and it
+can hold state-root private identities (S6).
+
+**Budget.** The write pause (fence stop → lease) grows by the capture time. Measured today: about 0.2 s for
+streampixels-service and about 1 s for heimdall (S5). The defaults leave two orders of magnitude of headroom.
+
+**Secrets.**
+- Idunn never opens a service credential file. Postgres is reached by peer auth, so the database URL files stay
+  unread; this keeps secret-files §1 "Idunn never opens a service credential for reading".
+- `pg_dump`/`pg_restore` stderr can quote row data, and `idunn status` prints `last_error` verbatim (secret-files P7).
+  So no tool stderr enters `last_error`, `report_once` or the journal. The error carries a closed `SnapshotFault`
+  kind, the exit status, and the stderr's sha256. The full stderr goes to `snapshots/…/stderr-<step>` (0600), which
+  is pruned with the directory.
+
+**Idempotence and crash safety.**
+- **Snapshotting is repeatable while the fence holds.** A crash before the evidence write means the next tick
+  deletes the directory and captures again.
+- **Restore is decided from observable state, never from a sub-step log.**
+  - Postgres: if the live fingerprint already equals the recorded one, the store is done. This covers a crash after
+    the swap. Else, if `<db>__idunn_restore` exists and its fingerprint equals the recorded one, terminate the
+    database's sessions, swap both names in one transaction, and drop the displaced database. Else drop and recreate
+    the side database from the archive.
+  - Slots: write each one by temp file and rename in its own directory; remove a slot file that did not exist at
+    snapshot time; leave `.lock` files alone.
+  - Replaying any prefix of these steps converges.
+
+**How restore proves itself.**
+- Postgres: fingerprint equality on the side database **before** the swap, so a bad restore never swaps. After the
+  swap, the live name resolves to the side database's oid.
+- Slots: a re-walk equals the manifest byte for byte, including absences.
+- The proof digests go into `state_restoration: Complete{proof}`.
+
+**No declared snapshot:** Q-S1.
+
+#### Q3-ii.5 Phase machine (question 3)
+
+- **Snapshotting** is a new `DeploymentPhase` variant between Fencing and Leasing (`:206-216`, `Ord`-derived).
+  - `PhaseDeadline::entering` (`:913-934`) gains its arm from `snapshot_seconds`.
+  - `resolves_by_deadline` (`:1568-1573`) covers it through the existing range.
+  - It is entered only by a Deploy whose plan declares a snapshot. Continuity and stateless targets go Fencing →
+    Leasing as today.
+  - Expiry in Snapshotting → `Abort{restore: false}`. The partial directory is removed by the abort's cleanup.
+- **Restore is a step, not a phase.** `PostFencingAbort` (`:1382-1400`) gains `state_restoration` and
+  `deadline_at_unix_millis`.
+  - `begin_post_fencing_abort` (`:8694-8712`) stamps the deadline. For a restoring abort that is `restore_seconds`;
+    for any other abort it is an Idunn default of 300 s (constant).
+  - **Order becomes lease → candidate → state → route → topology → source.** Restore needs only the candidate
+    stopped and its lease revoked, and S9's livelock must not hold state hostage. "Never two writers" is about
+    lease-then-process, and that order is preserved.
+- **Every abort ends.**
+  - On the abort deadline, if `state_restoration` or any step before it is still Pending, the transaction completes
+    `FailedAfterFencing{OperatorRequired{RestoreFailed}}`. A restore that cannot even stop the candidate is a failed
+    restore.
+  - Steps after it (route, topology, source) are marked a new `CleanupEvidence::Abandoned`, reported once. The
+    transaction completes with its normal recovery.
+  - Abandoning those steps is safe because supervision owns their repair: Expected repair and demotion (`:5745`,
+    `:5943-5985`), and the admitted-route restore (`:6130`).
+  - This ends B5's `ufw delete` loop for every abort, not only D's.
+- **The Ready boundary is `transaction.ready.is_some()`** (S1). `PhaseEnd` is rebuilt as follows. The B5 table test
+  is rewritten to it.
+
+  | Command | Ready durable | Lease issued (Prepared or Granted) | End |
+  |---|---|---|---|
+  | Deploy | yes | any | `RollForward` |
+  | Deploy | no | yes | `Abort{restore: true}` (snapshot evidence required by validation) |
+  | Deploy | no | no | `Abort{restore: false}` |
+  | Continuity | any | any | `Abort{restore: false}`, as B5 |
+
+  Continuity keeps B5's arm. Its candidate is the admitted release, it restarts under the restart log, and it never
+  changes the state contract. That is a default, not a question.
+- **E replaces the abort after Ready. It is a forced commit, and it only writes the store.**
+  - The resolver persists `roll_forward = Some{cause, at}` and, if needed, `enter_phase(Committing)`.
+    `resolves_by_deadline` excludes a record with `roll_forward`, so it fires once.
+  - `advance_committing` (`:7206-7392`) with `roll_forward` set skips:
+    - the final route proof;
+    - Odin re-admission;
+    - the workload observation;
+    - lease currency.
+  - It then commits the generation from the durable evidence:
+    - Routing with no route receipt: a routed target gets a new `RoutingEvidence::Unproven{membership_sha256}`, the
+      digest of the rendered fragment. An unrouted target gets `SkippedUnrouted`.
+    - Committing with `Promoted`: kept.
+  - `Unproven` starts `route_supervision` degraded. Supervision (`:6037-6140`) accepts `Unproven`: it repairs with
+    `restore_admitted_membership`, proves, and on success rewrites the receipt to `Promoted`.
+  - A candidate that died after Ready is admitted anyway, and continuity restarts it under the restart log. That is
+    "the release supervision keeps alive", literally.
+  - **Boundedness.** The forced commit does no actuation. Every later actuation is supervision's: route repair spaced
+    by the challenge backoff up to `ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS` (`:92`) and reloading only on a fragment
+    difference; process restarts bounded by the restart log (`:69-72`). No post-fence path retries forever.
+- **D and `TargetSupervision`.**
+  - The restore runs inside the live transaction, so supervision cannot mint over it (S8).
+  - A `RestoreFailed` terminal sets `state_hold` in the **same CAS** as the completion (a three-envelope CAS like the
+    mint at `:5987-6031`).
+  - The mint path checks the hold right after `restarts_exhausted` (`:5916`) and mints nothing, with one report.
+  - Expected repair may still run; it starts no process. Deploy commands stay admissible (Q-S4).
+- **Terminal records.**
+  - `FailedAfterFencing{recovery}`, where `recovery` is one of:
+    - `RestoreIncumbent`: D restored, or no lease was issued;
+    - `RestartAdmitted`: continuity, as B5;
+    - `OperatorRequired{reason: OperatorRequiredReason::RestoreFailed{store, kind}}`: typed. B5's free string
+      `reason` has no production writer (watchdog map I5).
+  - `Admitted{generation_id, recovery: Option<TerminalRecovery>}`, with `Some(RollForward{cause})` only there.
+  - Validation (`:2040-2075`, `:2180-2205`) pins each variant to its completion.
+- **Schemas and lifts. One store-version install.**
+  - `deployment_transaction.v5` carries:
+    - the Snapshotting variant;
+    - keys 37 `state_snapshot` and 38 `roll_forward`;
+    - `FencingEvidence::Revoked.incumbent_stopped`;
+    - `PostFencingAbort.{state_restoration, deadline_at_unix_millis}`;
+    - `CleanupEvidence::Abandoned`;
+    - the completion shapes above.
+  - The v4 lift (the `read_transaction_record` pattern, `:3659-3704`):
+    - `incumbent_stopped = incumbent_lease_sha256.is_some()`;
+    - `state_restoration = Skipped`;
+    - an in-flight abort's deadline is stamped once on first sight (B5's rule for lifted phase deadlines,
+      `:8588-8596`);
+    - `Admitted.recovery = None`.
+  - History is lifted unchanged.
+  - `admitted_generation.v5` carries `RoutingEvidence::Unproven`. `target_supervision.v2` carries `state_hold`, lifted
+    as `None`.
+  - Every lifted fixture must re-encode canonically: the B2 F1 scar.
+  - An older Idunn refuses the v5 store, so rollback is the pre-install backup, as for B2.
+
+#### Q3-ii.6 What B5 keeps, changes and deletes (question 4)
+
+- **Keeps:**
+  - the resolver's shape (`resolve_phase_deadline` `:8568-8623`);
+  - `PhaseDeadline` and `enter_phase` as the only deadline writer;
+  - `idunn expire` and `idunn.expiry_request.v1`. Before Ready it now restores; after Ready it rolls forward, through
+    the same resolver;
+  - lease-adoption evidence, `lease-not-adopted`, and the continuity arms;
+  - the F16 commit fix and the reload skip.
+- **Changes:**
+  - `phase_end` (`:1583-1596`), `terminal_recovery` (`:1598-1606`) and `resolves_by_deadline` (`:1568-1573`), to the
+    table above;
+  - the resolver's match (`:8600-8620`);
+  - `incumbent_was_stopped_during_fencing` (`:9058-9066`);
+  - `post_fencing_abort_intent` (`:9081-9110`);
+  - the abort order (`:8717-8858`).
+- **Deletes (the "left running" arm):**
+  - `PhaseEnd::OperatorRequired` and its doc (`:943-945`);
+  - the `CommandKind::Deploy if issued` arm (`:1588`);
+  - the resolver's `OperatorRequired` branch (`:8610-8619`, the `deadline:<tx>` report);
+  - the "left to the operator" comment (`deployment_plan.rs:470-473`);
+  - the three `OperatorRequired` rows of `an_ended_phase_aborts_unless_a_deployment_candidate_was_issued_a_lease`
+    (`:12887-12889`); the test is rewritten to the Ready table;
+  - the string-reason test `an_operator_required_recovery_must_say_why` (`:12911-12935`), rewritten for the typed
+    reason.
+- **Recommendation: merge B5 first, after its own Soul pass. This map is a follow-on cut** (Q-S5).
+  - B5 bounds the live continuity reload loop (B2-3d F1).
+  - Its left-running arm is no worse than today's resumable-forever post-fence.
+  - D and E carry two schema bumps and a new driver, and need their own falsification.
+  - Cost of the gap: a stateful deploy that expires after a lease stays live and reported, as today. `idunn expire`
+    re-enters that arm (watchdog I6). The StreamPixels-service redeploy in the ship sequence runs under that
+    behaviour.
+
+#### Q3-ii.7 Cuts
+
+Order: SR-1 → SR-2 → SR-3 → SR-4. The build and tests run on Yggdrasil (`ygg-verify.sh`) against the single `idunn`
+crate. The build activates no new target.
+
+- **SR-1. Snapshot drivers (Idunn `drivers.rs`, `deployment.rs`).** No phase-machine change.
+  - One port: `StateSnapshotPort { capture, check_no_writer, restore, prove }`.
+  - Two implementations:
+    - `SlotSnapshotDriver`: files, with `.lock` exclusivity;
+    - `PostgresSnapshotDriver`: `runuser -u postgres` for `pg_dump -Fc`, `pg_restore`, `psql`; side database,
+      fingerprint, swap. The program paths are injectable, as the route stubs are.
+  - The binding table parse and validation.
+  - The closed `SnapshotFault` kind and the stderr quarantine.
+- **SR-2. D (Idunn `control_plane.rs`, `deployment_plan.rs`).**
+  - Deletes first: B5's arm (Q3-ii.6).
+  - Then:
+    - the Fencing change (Q3-ii.2 item 1);
+    - the Snapshotting phase;
+    - the restore step, abort deadline, reorder and `Abandoned`;
+    - the state hold;
+    - the compile-time coverage rule;
+    - all three schema bumps and lifts, including E's shapes, so the store moves once.
+- **SR-3. E (Idunn `control_plane.rs`).**
+  - the `RollForward` end and the forced commit;
+  - `Unproven` in Routing and supervision;
+  - `Admitted.recovery`.
+- **SR-4. Ops (gamecult-ops).**
+  - `[state_snapshot]` for `streampixels-service` (`state-slots` + `postgres streampixels`), `ghostlight`
+    (`state-slots`), `odin` (`state-slots`), and the Heimdall template (`state-slots` + `postgres heimdall`);
+  - the backup exclude;
+  - fixing the odin template's `state_root` drift (S6).
+- **Owning-repo follow-ups (not in this campaign's cuts):**
+  - **H-S1** Heimdall opens Postgres and runs `ensureSchema` only after its lease.
+  - **H-S2** Heimdall moves `runtime-presence-sequence` out of its state root; it is runtime identity, not state.
+  - **G-S1** Ghostlight declares `service/play-turn-v1.cc` as a slot (under Q-S2 (a)).
+  - The legacy `heimdall.service` retires before Heimdall's first Idunn deploy (secret-files Cut 5).
+
+#### Q3-ii.8 Authority map
+
+- **Owner.**
+  - The deadline resolver owns how an ended phase resolves (restore, roll forward, or plain abort).
+  - The abort path owns the restore.
+  - The Engine's Snapshotting step owns the snapshot.
+- **Inputs:**
+  - the plan's frozen binding (`[state_snapshot]`);
+  - the recipe's slots;
+  - `ready`, `leasing` and `fencing` evidence;
+  - the phase and abort deadlines;
+  - expiry requests;
+  - the stores themselves, through the port.
+- **Outputs:**
+  - snapshot evidence;
+  - `state_restoration`;
+  - the terminal completion with its recovery;
+  - `state_hold`;
+  - an admitted generation with `Unproven` routing.
+- **Derived state:**
+  - Q3-i's "possibly written" is derived from `leasing`;
+  - "stopped at fence" is derived from `incumbent_stopped` and no longer from the lease digest;
+  - the snapshot directory is cache-only, and its truth is the evidence digests;
+  - `report_once` text is notification-only.
+- **Forbidden writers:**
+  - supervision writing restore or snapshot state, or minting over a held target;
+  - the CLI writing any of it (`expire` writes only its request);
+  - drivers writing records;
+  - the backup producer restoring anything;
+  - a route or topology step deciding the recovery.
+- **Shared paths:** deadline expiry and `idunn expire` go through one resolver. Direct and Odin-correlated Ready use
+  one boundary field. D aborts and plain aborts use one abort path with one deadline rule. The forced commit and the
+  normal commit use one `from_transaction`.
+- **Deletion line:**
+  - B5's `OperatorRequired` left-running arm;
+  - lease-derived fence-stop inference;
+  - the unbounded abort step.
+
+#### Q3-ii.9 Verification
+
+Each test pins a rule. Each must be killed by the named mutation.
+
+| Test (behaviour) | Rule pinned | Mutation that must kill it |
+|---|---|---|
+| a deploy that expires before Ready restores the snapshot, and the incumbent restarts on the pre-lease bytes | D | restore marks Complete without writing; or `PhaseEnd` returns `Abort{restore: false}` |
+| continuity mints nothing while the restore is Pending | S8 | widen the supervision skip range's lower bound past the abort |
+| a failed restore is terminal `OperatorRequired{RestoreFailed}`, and supervision mints no restart | only terminal operator case; hold | drop the hold check, or set the hold outside the completion CAS |
+| a deploy that expires in Routing after Ready is admitted `Unproven`, restores nothing, and supervision later promotes it | E | Ready-side arm returns Abort |
+| an expiry in Committing rolls forward from the promoted receipt | E | forced commit rewrites the routing receipt |
+| the Ready table: (Deploy, Continuity) × ready × (no lease, Prepared, Granted) | boundary and Q3-i | treat Prepared as unissued |
+| `idunn expire` before Ready restores; after Ready it rolls forward | shared path | a separate expire branch |
+| the fence stops an unleased incumbent when the candidate is stateful | exactness 1 | revert the `:6719` condition |
+| a held slot lock, or a live Postgres session (fake runner), refuses Snapshotting with no lease issued | exactness 2/3 | skip either check, or check only at start |
+| crash replay at every snapshot and restore step converges (persist the prefix, rerun) | idempotence | the restore trusts a sub-step flag over observation |
+| the restore removes a slot file the candidate created | exact restore | copy-over only |
+| an abort whose `ufw delete` fails forever ends at its deadline: state restored first, route `Abandoned`, recovery `RestoreIncumbent` | every abort ends | route before state; or Abandoned allowed on the state step |
+| a v4 store (every fixture) lifts to v5, and supervision v1 to v2; each re-encodes canonically | schema | drop a field default |
+| a stateful Deploy with no `[state_snapshot]` is refused at compile, and continuity of an old admitted plan still runs | Q-S1 (a); S11 | put the rule in `admit()` |
+| a canary in fake `pg_restore` stderr appears in no `last_error`, report or `status` line | secrets | copy stderr into the error |
+| Postgres integration, `#[ignore]`, run on Yggdrasil against a scratch cluster or container: side-database restore drops candidate tables; fingerprint mismatch refuses the swap; the swap terminates a live session; a crash between swap and drop replays | S7 | in-place `--clean` restore |
+
+Then run `cargo mutants --in-diff`.
+
+**Only a live Yggdrasil rehearsal, with the operator present, can show:**
+- `runuser`/`pg_dump` reach the socket under the real unit sandbox;
+- the snapshot directory is written under the real `ReadWritePaths`;
+- a streampixels-service Deploy from a scratch branch whose candidate migrates and never reports Ready restores
+  `streampixels`, after which the incumbent serves again. Use a shortened `awaiting_ready_seconds` in a scratch
+  binding;
+- the measured write pause;
+- E: a Ready candidate whose stable-route proof is blocked is admitted `Unproven`, and is promoted by supervision once
+  unblocked;
+- the backup run skips `snapshots/`.
+
+#### Q3-ii.10 Subtraction ledger (estimate)
+
+| | Production | Tests |
+|---|---|---|
+| Deleted | about -40 (B5 arm, comment, lease-derived stop inference) | about -30 (rows, string-reason test) |
+| SR-1 drivers and binding | about +450 | about +300 (fake runners), +120 (ignored Postgres integration) |
+| SR-2 D, lifts, hold, abort deadline | about +450 | about +450 |
+| SR-3 E | about +180 | about +250 |
+| SR-4 ops | about +20 of binding TOML, 1 backup exclude line | none |
+
+- **Net:** about +1,050 production and +1,100 test lines in Idunn. It adds two schema bumps plus one supervision
+  bump, installed as one store move, and no new target, service or dependency (it uses the host's `pg_dump`,
+  `pg_restore` and `runuser`).
+- **What it buys:** the ruled capability, which closes Q3-ii's hole, and an end for every post-fence path, including
+  B5's abort livelock.
+- **What it retires:**
+  - the operator-only exit for stateful deploys;
+  - the `b5-operator-required-no-exit` follow-up (watchdog map).
+
+#### Q3-ii.11 Watchdog interface (question 5)
+
+The interface is a single point. The `operator-required` incident opens at the terminal CAS that writes
+`FailedAfterFencing{OperatorRequired{RestoreFailed}}` and sets `state_hold`; its subject is the transaction id, as
+the watchdog map models it. It closes when that hold is released (Q-S4). Nothing else in this cut opens or closes
+it.
+
+#### Q3-ii.12 Operator questions
+
+- **Q-S1. A stateful target whose binding declares no snapshot.**
+  - Options:
+    - (a) Refuse a new stateful Deploy plan at compile, with a typed error. Continuity of already-admitted plans is
+      unaffected.
+    - (b) Roll forward even before Ready: no D for that target.
+    - (c) Keep B5's left-running report.
+  - **Recommend (a).** D is only a guarantee if it cannot be skipped by omission. (b) quietly reopens the hole this
+    ruling closed.
+  - Depends on it: SR-2's compile rule, SR-4's binding list, and whether Heimdall can deploy before H-S1.
+- **Q-S2. What `state-slots` captures.**
+  - Options:
+    - (a) The recipe's declared writable slots only. The recipe is the authority on what is state. Undeclared files
+      in the state root are reported once and not restored.
+    - (b) The whole state-root tree.
+  - **Recommend (a).** It matches "the recipe declares; Idunn infers nothing".
+  - Under (b), Heimdall's `runtime-presence-sequence` would be restored backwards, and its presence sequence would
+    regress (S6).
+  - Cost of (a): Ghostlight must declare `play-turn-v1.cc` (G-S1). Until then, a failed Ghostlight deploy restores
+    everything but that file.
+- **Q-S3. How hard the fence holds against out-of-band writers.**
+  - Options:
+    - (a) Detect and refuse: zero sessions and free locks, checked at snapshot start, after the capture, and
+      immediately before Prepared.
+    - (b) Also block: `ALTER DATABASE … ALLOW_CONNECTIONS false` from snapshot to grant. Idunn owns the undo on
+      grant, abort and crash replay.
+  - **Recommend (a).** Today's only out-of-band writers are the legacy Heimdall unit, which retires, and hand-run
+    scripts. (b) adds a database-configuration mutation that Idunn must always undo, and a missed undo locks the
+    service out of its own database.
+  - Depends on it: SR-1's scope and the residual in Q3-ii.2.
+- **Q-S4. What releases a state hold after a failed restore.**
+  - Options:
+    - (a) A successful Deploy commit of that target, **or** `idunn release <target>`. The verb writes a typed request
+      the daemon consumes, as `idunn expire` does, after the operator has repaired the state by hand from the
+      retained snapshot.
+    - (b) A Deploy commit only.
+    - (c) The verb only.
+  - **Recommend (a).** A deploy is already an operator act that captures its own snapshot. The verb covers "I fixed
+    it by hand; bring the incumbent back" without forcing a redeploy.
+  - Depends on it: SR-2's hold, the retained snapshot's pruning, and the watchdog incident's closing event.
+- **Q-S5. Merge order.**
+  - Options:
+    - (a) Merge B5 after its Soul pass; SR-1..SR-4 follow as their own cuts.
+    - (b) Hold B5 until D and E land.
+  - **Recommend (a)**, for the reasons in Q3-ii.6. Under (a), the StreamPixels-service redeploy in the ship sequence
+    runs with B5's report-and-wait on a stateful expiry.
 
 ### Odin-authority cuts (Imagination audit, 2026-09-30)
 
