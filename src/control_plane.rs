@@ -73,9 +73,17 @@ const CONTINUITY_RESTART_BACKOFF_MILLIS: u64 = 5_000;
 /// Forward route actuations (fragment write, firewall, `nginx -t`, reload,
 /// private-mount validation) one target may perform per sliding window. A
 /// healthy target performs none; a legitimate deployment performs one or two.
-/// Survival actuations are counted against it but never refused.
+/// Only deployments count: a Survival actuation is recorded beside this
+/// ceiling, never counted against it and never refused by it, so a target
+/// whose continuity spent its restarts can still be rescued by a deploy. Each
+/// Survival path has its own bound instead: a continuity's actuations the
+/// restart log, an admitted-route repair the challenge backoff, and a
+/// deployment's rollback or withdrawal the Forward change it undoes.
 const ROUTE_ACTUATION_CEILING: usize = 12;
 const ROUTE_ACTUATION_WINDOW_MILLIS: u64 = 3_600_000;
+/// How many Survival route actuation times a target keeps, for `status`
+/// only: they are a record, not a meter, and no decision reads them.
+const ROUTE_SURVIVAL_RECORD: usize = 12;
 /// The longest wait between route challenges while proofs keep failing. The
 /// shortest is the observation max age.
 const ROUTE_CHALLENGE_BACKOFF_CAP_MILLIS: u64 = 600_000;
@@ -934,8 +942,9 @@ impl RouteSupervisionState {
 }
 
 /// What one target has been allowed to do, kept across every generation and
-/// present before the first: route actuations and continuity restarts, each a
-/// sliding log of the times they happened. Owned by the meter primitives below;
+/// present before the first: Forward route actuations and continuity restarts,
+/// each a sliding log of the times they happened, and a record of Survival
+/// route actuations. Owned by the meter primitives below;
 /// the route driver only asks, and no generation write carries it.
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(
@@ -947,7 +956,8 @@ struct TargetSupervision {
     schema_version: String,
     #[cultcache(key = 1)]
     target: String,
-    /// The newest `ROUTE_ACTUATION_CEILING` actuation times, ascending.
+    /// The newest `ROUTE_ACTUATION_CEILING` Forward actuation times,
+    /// ascending: the only entries the ceiling counts.
     #[cultcache(key = 2)]
     route_actuations: Vec<u64>,
     /// The newest `CONTINUITY_RESTART_ATTEMPTS` restart times, ascending.
@@ -958,6 +968,10 @@ struct TargetSupervision {
     continuity_deferred_until: Option<u64>,
     #[cultcache(key = 5)]
     continuity_deferral_reason: Option<String>,
+    /// The newest `ROUTE_SURVIVAL_RECORD` Survival actuation times, ascending.
+    /// Visibility only: never counted, never refused.
+    #[cultcache(key = 6)]
+    route_survivals: Vec<u64>,
 }
 
 /// The entries of a sliding log still inside `window` at `now`. An entry from
@@ -970,8 +984,8 @@ fn live_entries(log: &[u64], now: u64, window: u64) -> Vec<u64> {
         .collect()
 }
 
-/// Record `now`, keeping the newest `limit` entries. That is exact for "at most
-/// `limit` in any window", even after a forced entry pushes past the limit.
+/// Record `now`, keeping the newest `limit` entries: all a meter needs to
+/// decide "at most `limit` in any window".
 fn record_entry(log: &mut Vec<u64>, now: u64, limit: usize) {
     clamp_to(log, now);
     log.push(now);
@@ -999,14 +1013,16 @@ impl TargetSupervision {
             continuity_restarts: Vec::new(),
             continuity_deferred_until: None,
             continuity_deferral_reason: None,
+            route_survivals: Vec::new(),
         }
     }
 
-    /// Clamp both logs to `now`. Callers that decide from a log write the
+    /// Clamp every log to `now`. Callers that decide from a log write the
     /// result back when it changed.
     fn settle(&mut self, now: u64) {
         clamp_to(&mut self.route_actuations, now);
         clamp_to(&mut self.continuity_restarts, now);
+        clamp_to(&mut self.route_survivals, now);
     }
 
     fn route_used(&self, now: u64) -> usize {
@@ -1020,21 +1036,31 @@ impl TargetSupervision {
             .then(|| live[live.len() - ROUTE_ACTUATION_CEILING] + ROUTE_ACTUATION_WINDOW_MILLIS)
     }
 
-    /// Count one route actuation. Only a `Forward` change can be refused; a
-    /// `Survival` is always admitted, and counted whenever the ledger can record it.
+    /// Charge one route actuation. A `Forward` change is counted against the
+    /// ceiling and refused at it; a `Survival` is only recorded, never
+    /// counted and never refused.
     fn charge_route(&mut self, now: u64, kind: RouteActuation) -> Result<(), RouteActuationRefused> {
         self.settle(now);
-        if kind == RouteActuation::Forward
-            && let Some(reopens_at) = self.route_reopens_at(now)
-        {
-            return Err(RouteActuationRefused {
-                target: self.target.clone(),
-                used: self.route_used(now),
-                reopens_at_unix_millis: reopens_at,
-            });
+        match kind {
+            RouteActuation::Forward => {
+                if let Some(reopens_at) = self.route_reopens_at(now) {
+                    return Err(RouteActuationRefused {
+                        target: self.target.clone(),
+                        used: self.route_used(now),
+                        reopens_at_unix_millis: reopens_at,
+                    });
+                }
+                record_entry(&mut self.route_actuations, now, ROUTE_ACTUATION_CEILING);
+            }
+            RouteActuation::Survival => {
+                record_entry(&mut self.route_survivals, now, ROUTE_SURVIVAL_RECORD);
+            }
         }
-        record_entry(&mut self.route_actuations, now, ROUTE_ACTUATION_CEILING);
         Ok(())
+    }
+
+    fn survivals_in_window(&self, now: u64) -> usize {
+        live_entries(&self.route_survivals, now, ROUTE_ACTUATION_WINDOW_MILLIS).len()
     }
 
     fn restarts_used(&self, now: u64) -> usize {
@@ -1091,6 +1117,7 @@ impl TargetSupervision {
         for (log, limit, what) in [
             (&self.route_actuations, ROUTE_ACTUATION_CEILING, "route actuation"),
             (&self.continuity_restarts, CONTINUITY_RESTART_ATTEMPTS, "continuity restart"),
+            (&self.route_survivals, ROUTE_SURVIVAL_RECORD, "survival route actuation"),
         ] {
             ensure!(log.len() <= limit, "{what} log exceeds its bound");
             ensure!(
@@ -4226,12 +4253,22 @@ fn render_supervision(
     }
     if generation.is_none_or(|value| value.route_supervision.is_some())
         || !meters.route_actuations.is_empty()
+        || !meters.route_survivals.is_empty()
     {
         lines.push(format!(
             "  route actuations {}/{} in window, reopens-at {}",
             meters.route_used(now),
             ROUTE_ACTUATION_CEILING,
             at(meters.route_reopens_at(now))
+        ));
+        // A record, not a meter: only the newest are kept, so a saturated
+        // count says "at least".
+        let survivals = meters.survivals_in_window(now);
+        lines.push(format!(
+            "  route survival actuations {}{} in window (uncounted), last-at {}",
+            if survivals == ROUTE_SURVIVAL_RECORD { "at least " } else { "" },
+            survivals,
+            at(meters.route_survivals.last().copied())
         ));
     }
     lines
@@ -4368,7 +4405,7 @@ struct Engine {
 }
 
 /// The route driver's door to the actuation ceiling: every group of host
-/// mutations a driver makes for `target` is counted through here. The gate
+/// mutations a driver makes for `target` is charged through here. The gate
 /// owns which charge a request is: a driver asks for the change it is making,
 /// and the command that owns the transaction decides whether that change is
 /// deployment (`Forward`, refusable) or the continuity of the admitted
@@ -4475,20 +4512,20 @@ impl Engine {
         }
     }
 
-    /// Count one route actuation against the target's sliding ceiling, in its
-    /// `TargetSupervision`, before the driver acts. The record is created by
-    /// the first charge, so a first deployment is metered like any other. A
-    /// refused `Forward` is the typed `RouteActuationRefused`, and a `Forward`
-    /// that cannot be recorded is refused too: no charge, no actuation. A
-    /// `Survival` is never refused, so it is counted when it can be and runs
-    /// regardless when it cannot: an unwritable store must not stop a rollback,
-    /// a withdrawal or a repair.
+    /// Charge one route actuation to the target's `TargetSupervision` before
+    /// the driver acts. The record is created by the first charge, so a first
+    /// deployment is metered like any other. A `Forward` is counted against
+    /// the sliding ceiling; a refused one is the typed `RouteActuationRefused`,
+    /// and one that cannot be recorded is refused too: no charge, no
+    /// actuation. A `Survival` is never counted or refused, only recorded when
+    /// it can be, and runs regardless when it cannot: an unwritable store must
+    /// not stop a rollback, a withdrawal or a repair.
     fn charge_route_actuation(&self, target: &str, kind: RouteActuation) -> Result<()> {
         match self.record_route_actuation(target, kind) {
             Ok(charged) => charged.map_err(anyhow::Error::new),
             Err(error) if kind == RouteActuation::Survival => {
                 eprintln!(
-                    "Idunn could not count a survival route actuation of {target}; it proceeds uncounted: {error:#}"
+                    "Idunn could not record a survival route actuation of {target}; it proceeds unrecorded: {error:#}"
                 );
                 Ok(())
             }
@@ -12317,6 +12354,8 @@ mod tests {
             meters(|m| m.route_actuations = (1..=13).collect()).contains("exceeds its bound")
         );
         assert!(meters(|m| m.continuity_restarts = (1..=7).collect()).contains("exceeds its bound"));
+        assert!(meters(|m| m.route_survivals = (1..=13).collect()).contains("exceeds its bound"));
+        assert!(meters(|m| m.route_survivals = vec![9, 5]).contains("ascending"));
         assert!(meters(|m| m.continuity_deferred_until = Some(5)).contains("time or a reason"));
         assert!(meters(|m| m.continuity_deferral_reason = Some("x".into())).contains("time or a reason"));
         assert!(meters(|m| m.schema_version = "idunn.target_supervision.v0".into())
@@ -15017,22 +15056,32 @@ mod tests {
     }
 
     #[test]
-    fn a_survival_actuation_is_counted_past_the_limit_and_never_refused() -> Result<()> {
+    fn a_survival_actuation_is_recorded_but_never_counted_or_refused() -> Result<()> {
         let t = 1_000_000_000_u64;
         let mut meters = TargetSupervision::new("service");
+        // Survivals first, past the ceiling: every one is admitted and
+        // recorded, and none takes a Forward slot.
+        for offset in 0..20 {
+            meters.charge_route(t + offset, RouteActuation::Survival)?;
+        }
+        assert_eq!(meters.route_survivals.len(), ROUTE_SURVIVAL_RECORD);
+        assert_eq!(meters.route_survivals.last(), Some(&(t + 19)));
+        assert!(meters.route_actuations.is_empty());
+        // Twelve Forward changes interleaved with more Survivals: the twelve
+        // are admitted, and the thirteenth is refused with a reopen time that
+        // only the oldest Forward entry decides.
         for offset in 0..12 {
-            meters.charge_route(t + offset, RouteActuation::Forward)?;
+            meters.charge_route(t + 100 + 2 * offset, RouteActuation::Forward)?;
+            meters.charge_route(t + 101 + 2 * offset, RouteActuation::Survival)?;
         }
-        meters.charge_route(t + 20, RouteActuation::Survival)?;
-        assert_eq!(meters.route_actuations.len(), ROUTE_ACTUATION_CEILING);
-        assert_eq!(meters.route_actuations.last(), Some(&(t + 20)));
-        // The survival took a slot: the forward ceiling is still exact, and
-        // reopens when the oldest surviving entry leaves.
-        let refused = meters.charge_route(t + 21, RouteActuation::Forward).unwrap_err();
-        assert_eq!(refused.reopens_at_unix_millis, t + 1 + ROUTE_ACTUATION_WINDOW_MILLIS);
-        for _ in 0..20 {
-            meters.charge_route(t + 22, RouteActuation::Survival)?;
-        }
+        let refused = meters.charge_route(t + 200, RouteActuation::Forward).unwrap_err();
+        assert_eq!(
+            (refused.used, refused.reopens_at_unix_millis),
+            (ROUTE_ACTUATION_CEILING, t + 100 + ROUTE_ACTUATION_WINDOW_MILLIS)
+        );
+        // A full Forward ceiling still admits and records a Survival.
+        meters.charge_route(t + 201, RouteActuation::Survival)?;
+        assert_eq!(meters.route_survivals.last(), Some(&(t + 201)));
         meters.validate()?;
         Ok(())
     }
@@ -15260,6 +15309,21 @@ mod tests {
             now - 5_000 + ROUTE_ACTUATION_WINDOW_MILLIS
         )), "{lines}");
         assert!(lines.contains("route healthy consecutive-failures 0"), "{lines}");
+        assert!(
+            lines.contains("route survival actuations 0 in window (uncounted), last-at none"),
+            "{lines}"
+        );
+        meters.route_survivals = vec![now - 7_000, now - 3_000];
+        let lines = render_supervision("service", Some(&generation), Some(&meters), now).join("\n");
+        assert!(lines.contains(&format!(
+            "route survival actuations 2 in window (uncounted), last-at {}",
+            now - 3_000
+        )), "{lines}");
+        meters.route_survivals = (0..ROUTE_SURVIVAL_RECORD as u64).map(|n| now - 100 + n).collect();
+        let lines = render_supervision("service", Some(&generation), Some(&meters), now).join("\n");
+        assert!(lines.contains("route survival actuations at least 12 in window"), "{lines}");
+        // Survivals never move the ceiling's count.
+        assert!(lines.contains("route actuations 12/12 in window"), "{lines}");
 
         // A first deployment has meters and no generation: it shows them alone.
         let mut first = TargetSupervision::new("fresh");
@@ -17380,10 +17444,11 @@ mod tests {
         #[test]
         fn a_full_ledger_still_restores_the_admitted_and_incumbent_route() -> Result<()> {
             let full = ROUTE_ACTUATION_CEILING;
+            // The newest recorded Survival, or 0; the Forward ledger stays full.
             let newest = |world: &EngineFixture| -> Result<u64> {
                 let meters = meters_of(world, "service")?;
                 assert_eq!(meters.route_actuations.len(), ROUTE_ACTUATION_CEILING);
-                Ok(*meters.route_actuations.last().unwrap())
+                Ok(meters.route_survivals.last().copied().unwrap_or(0))
             };
 
             // (i) A post-fence abort withdraws the candidate's membership.
@@ -17396,7 +17461,7 @@ mod tests {
                 .begin_post_fencing_abort(&resident(&aborting.world)?, anyhow!("test"))?;
             aborting.step()?;
             assert_eq!(aborting.reloads(), 1, "the withdrawal did not run");
-            assert!(newest(&aborting.world)? > before, "the withdrawal was not counted");
+            assert!(newest(&aborting.world)? > before, "the withdrawal was not recorded");
 
             // (ii) Supervision repairs a drifted admitted fragment.
             let supervised = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
@@ -17406,11 +17471,12 @@ mod tests {
             supervised.drift()?;
             assert!(supervised.tick()?);
             assert_eq!(supervised.reloads(), reloads + 1, "the repair did not run");
-            assert!(newest(&supervised.world)? > before, "the repair was not counted");
+            assert!(newest(&supervised.world)? > before, "the repair was not recorded");
             assert!(admitted(&supervised)?.route_supervision.unwrap().degraded_since_unix_millis.is_none());
 
             // (iii) A failed proof at Routing rolls the route back, though the
-            // install that preceded it took the last free slot.
+            // install that preceded it took the last free slot. The rollback
+            // is recorded and leaves the Forward ledger exactly full.
             let failing = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
             failing.stub.set_state("active");
             failing.run_to_routing()?;
@@ -17419,7 +17485,7 @@ mod tests {
             let before = now_millis()?;
             assert!(failing.step().is_err(), "an unanswered stable route was admitted");
             assert_eq!(failing.reloads(), 2, "install then rollback");
-            assert!(newest(&failing.world)? >= before, "the rollback was not counted");
+            assert!(newest(&failing.world)? >= before, "the rollback was not recorded");
             assert!(!failing.fragment_path().exists(), "the rollback left the candidate's route");
             Ok(())
         }
@@ -17427,32 +17493,37 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn a_continuity_restart_is_never_refused_by_a_full_ledger() -> Result<()> {
-            // Warming: the preflight of a continuity runs and is counted.
+            // Warming: the preflight of a continuity runs and is recorded,
+            // and the Forward ledger is left as it was.
             let warming = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
             warming.step()?;
             assert!(warming.transaction()?.warming.is_some());
             warming.ledger(ROUTE_ACTUATION_CEILING)?;
-            let before = *meters_of(&warming.world, "service")?.route_actuations.last().unwrap();
+            let ledger = meters_of(&warming.world, "service")?.route_actuations;
             warming.step()?;
             assert!(warming.transaction()?.route_preflight.is_some(), "the preflight was refused");
-            assert!(*meters_of(&warming.world, "service")?.route_actuations.last().unwrap() > before);
+            let after = meters_of(&warming.world, "service")?;
+            assert_eq!(after.route_survivals.len(), 1, "the preflight was not recorded");
+            assert_eq!(after.route_actuations, ledger, "a survival was counted");
 
-            // Routing: its install runs and is counted.
+            // Routing: its install runs and is recorded, and not counted.
             let routing = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
             routing.stub.set_state("active");
             routing.run_to_routing()?;
             routing.ledger(ROUTE_ACTUATION_CEILING)?;
-            let before = *meters_of(&routing.world, "service")?.route_actuations.last().unwrap();
+            let ledger = meters_of(&routing.world, "service")?.route_actuations;
             routing.step()?;
             assert!(routing.reloads() >= 1, "the install did not run");
             assert!(routing.fragment_path().exists());
-            assert!(*meters_of(&routing.world, "service")?.route_actuations.last().unwrap() > before);
+            let after = meters_of(&routing.world, "service")?;
+            assert_eq!(after.route_survivals.len(), 1, "the install was not recorded");
+            assert_eq!(after.route_actuations, ledger, "a survival was counted");
             Ok(())
         }
 
         #[cfg(unix)]
         #[test]
-        fn a_survival_that_cannot_be_counted_runs_and_a_forward_is_refused() -> Result<()> {
+        fn a_survival_that_cannot_be_recorded_runs_and_a_forward_is_refused() -> Result<()> {
             let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
             let transaction = routed.transaction()?;
             let preflight = transaction.route_preflight.clone().context("no preflight")?;
@@ -17466,7 +17537,7 @@ mod tests {
                     .route
                     .context("no route binding")?,
             );
-            // The ledger cannot be read, so nothing can be counted.
+            // The ledger cannot be read, so nothing can be recorded.
             std::fs::write(&routed.world.state_store, b"unreadable")?;
             let engine = &routed.world.engine;
 
@@ -17482,7 +17553,7 @@ mod tests {
                 &preflight,
                 &engine.route_gate("service", CommandKind::Deploy),
             )?;
-            assert_eq!(routed.reloads(), 1, "the uncounted withdrawal did not run");
+            assert_eq!(routed.reloads(), 1, "the unrecorded withdrawal did not run");
             Ok(())
         }
 
@@ -17669,7 +17740,9 @@ mod tests {
             assert_eq!(state.consecutive_failures, 1);
             assert!(state.degraded_since_unix_millis.is_some());
             assert!(ControlSnapshot::read(&routed.world.state_store)?.transactions.is_empty());
-            assert_eq!(meters_of(&routed.world, "service")?.route_actuations.len(), 2);
+            let meters = meters_of(&routed.world, "service")?;
+            assert_eq!(meters.route_survivals.len(), 2);
+            assert!(meters.route_actuations.is_empty());
 
             // Tick 2: the route waits, and the dead unit is restarted from a
             // fresh read, counted in the same write that mints it.
@@ -17724,20 +17797,58 @@ mod tests {
 
         #[cfg(unix)]
         #[test]
-        fn a_candidate_whose_route_proof_fails_reloads_at_most_the_ceiling() -> Result<()> {
+        fn a_candidate_whose_route_proof_fails_reloads_at_most_twice_the_ceiling() -> Result<()> {
             let routed = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
             routed.stub.set_state("active");
             routed.run_to_routing()?;
             routed.stub.hang_up.store(true, Ordering::SeqCst);
             let mut last = None;
-            for _ in 0..30 {
+            for _ in 0..40 {
                 last = Some(routed.step().unwrap_err());
             }
-            // Every install is followed by its rollback and both are counted, so
-            // twelve reloads spend the window; the rest are refused.
-            assert_eq!(routed.reloads(), ROUTE_ACTUATION_CEILING);
+            // Every install is a counted Forward and is followed by one
+            // recorded rollback, so the rollbacks are bounded by the installs:
+            // twelve installs spend the window, each reloads twice, and every
+            // later attempt is refused before it runs anything.
+            assert_eq!(routed.reloads(), 2 * ROUTE_ACTUATION_CEILING);
+            let meters = meters_of(&routed.world, "service")?;
+            assert_eq!(meters.route_used(now_millis()?), ROUTE_ACTUATION_CEILING);
+            assert_eq!(meters.route_survivals.len(), ROUTE_SURVIVAL_RECORD);
             let last = last.unwrap();
             assert!(last.downcast_ref::<RouteActuationRefused>().is_some(), "{last:#}");
+            Ok(())
+        }
+
+        /// The rescue (ruling 3d A): a target whose continuity spent every
+        /// restart, each charging its preflight and install as Survival, is
+        /// still deployed: its route changes are the ceiling's first Forward.
+        #[cfg(unix)]
+        #[test]
+        fn a_target_that_spent_its_restarts_can_still_be_deployed() -> Result<()> {
+            let routed = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Warming)?;
+            routed.stub.set_state("active");
+            routed.step()?;
+            assert!(routed.transaction()?.warming.is_some());
+            set_meters(
+                &routed.world,
+                &restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
+            )?;
+            for _ in 0..2 * CONTINUITY_RESTART_ATTEMPTS {
+                routed.world.engine.charge_route_actuation("service", RouteActuation::Survival)?;
+            }
+            let spent = meters_of(&routed.world, "service")?;
+            assert!(spent.restarts_exhausted(now_millis()?));
+            assert_eq!(spent.route_survivals.len(), 2 * CONTINUITY_RESTART_ATTEMPTS);
+
+            // Warming's preflight and Routing's install are both admitted.
+            routed.step()?;
+            assert!(routed.transaction()?.route_preflight.is_some(), "the preflight was refused");
+            routed.run_to_routing()?;
+            routed.promote()?;
+            assert!(routed.fragment_path().exists(), "the install was refused");
+            assert!(routed.reloads() >= 1);
+            let after = meters_of(&routed.world, "service")?;
+            assert_eq!(after.route_actuations.len(), 2, "preflight and install are the Forward");
             Ok(())
         }
     }
