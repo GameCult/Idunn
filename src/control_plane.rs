@@ -18539,6 +18539,70 @@ mod tests {
             Ok(())
         }
 
+        /// The resolver reads a request as its own transaction's only: with two
+        /// live transactions, a request for the other leaves this one running.
+        #[test]
+        fn an_expiry_request_ends_only_its_own_commands_phase() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let now = now_millis()?;
+            let other = DeploymentCommand {
+                schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+                command_id: "up-other".into(),
+                kind: CommandKind::Deploy,
+                selector: "other".into(),
+                requested_by: "test".into(),
+                requested_at_unix_millis: now,
+            };
+            let sealing = DeploymentTransaction::new(&other, "other".into(), 0, None, now)?;
+            let request = ExpiryRequest {
+                schema_version: EXPIRY_REQUEST_SCHEMA.into(),
+                command_id: other.command_id.clone(),
+                requested_by: "operator".into(),
+                requested_at_unix_millis: now,
+            };
+            let store = SingleFileMessagePackBackingStore::new(&routed.world.state_store);
+            assert!(store.compare_exchange(
+                &[
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentCommand::TYPE.into(),
+                        key: other.command_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: DeploymentTransaction::TYPE.into(),
+                        key: sealing.transaction_id.clone(),
+                        current: None,
+                    },
+                    CultCacheExpectedEnvelope {
+                        r#type: ExpiryRequest::TYPE.into(),
+                        key: request.command_id.clone(),
+                        current: None,
+                    },
+                ],
+                &[
+                    command_envelope(&other, now)?,
+                    transaction_envelope(&sealing, now)?,
+                    expiry_request_envelope(&request, now)?,
+                ],
+            )?);
+            let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
+            assert_eq!(snapshot.transactions.iter().filter(|t| !t.value.is_terminal()).count(), 2);
+            let mine = snapshot
+                .transactions
+                .iter()
+                .find(|t| t.value.command_id == "continuity-service")
+                .context("no continuity")?;
+            assert_eq!(routed.world.engine.resolve_phase_deadline(mine)?, None);
+            let after = ControlSnapshot::read(&routed.world.state_store)?;
+            let unchanged = after
+                .transactions
+                .iter()
+                .find(|t| t.value.command_id == "continuity-service")
+                .context("no continuity")?;
+            assert_eq!(unchanged.envelope, mine.envelope, "another command's request ended this phase");
+            Ok(())
+        }
+
         /// Q3 at the deadline, through the Engine. A continuity whose candidate
         /// was granted a lease and never proved it held it fails as
         /// `lease-not-adopted`; one whose Ready proved it restarts the admitted
