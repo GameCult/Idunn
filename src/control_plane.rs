@@ -15334,6 +15334,13 @@ mod tests {
         // An unrouted, unmetered target shows no route line at all.
         let lines = render_supervision("plain", Some(&unrouted_generation()?), None, now).join("\n");
         assert!(!lines.contains("route actuations"), "{lines}");
+        // A generation that no longer routes, whose meters hold only survival
+        // actuations, still shows the record.
+        let mut survived = TargetSupervision::new("plain");
+        survived.route_survivals = vec![now - 1];
+        let lines =
+            render_supervision("plain", Some(&unrouted_generation()?), Some(&survived), now).join("\n");
+        assert!(lines.contains("route survival actuations 1 in window"), "{lines}");
         Ok(())
     }
 
