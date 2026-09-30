@@ -254,6 +254,21 @@ The rework is a fresh branch from `583b2a7`, not a rebase of `1786ddf`. Its map 
   - **H.** AwaitingReady and Routing keep the F16 shape. It is unreachable at today's heartbeats.
   - **I.** An `idunn expire` request written while Idunn is stopped lingers, and there is no verb to withdraw it,
     which is a downgrade hazard.
+- **B5 batch 2 (`c06ff2b..aef0da3`) and Soul pass 2 (2026-09-30): merge and install after batch 3.**
+  - A, B, E, F and J hold. Verify: 356 passed. cargo-mutants caught 14 of 14 viable mutants, and Soul's hand
+    mutants killed 16 of 20.
+  - Batch 3, in Hands: test pins for MB2 (`changes_route` swapped for "no incumbent"), ME2/ME3 (the resolver filter
+    by id length or first byte) and MJ2 (the computed backoff unpinned). `restore` withdraws the firewall rule
+    before reloading when there is no prior route, so a failing `ufw delete` no longer reloads nginx each retry.
+  - Hands corrected Self's brief: the continuity path's zero reloads came from `6ff7d5a`'s skip, not `4830af8`. The
+    narrow no-change case (`changes_route() == false`) keeps it without a write, so there is no crash window.
+  - Recorded, not in B5:
+    - **P1:** a crash between `atomic_replace` and the reload in supervision's `restore_admitted_membership`
+      (`drivers.rs:5543-5545`). Idunn has no SIGTERM handler, so a stop in that window leaves nginx on the drift
+      until something else reloads. This also exists in live `a96ad9d`. Fix with Q3-ii or a durable
+      "reload owed" marker.
+    - **The abort revokes before it stops the candidate** (`control_plane.rs:8758` before `:8783`). Q3-ii owns the
+      abort order.
 - **Q-B2-1 (a):** the continuity restart log moves into `TargetSupervision`; the restart ceiling reads the
   target's own log; the carry compensator is deleted.
 - **Q-B2-2: fail at once.** A deploy refused by the route/actuation ceiling before the fence fails immediately,
