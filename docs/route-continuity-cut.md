@@ -596,7 +596,23 @@ replacement for `idunn cancel`.
   it holds the lease while warming, and streampixels-service migrates in exactly
   that window. So any issued lease on a deploy is treated as possibly adopted.
 - **Q3-ii: after an adopted-lease deploy expires, what stops continuity from
-  restarting the incumbent on state the candidate may have migrated?** OPEN.
+  restarting the incumbent on state the candidate may have migrated?**
+  **RULED 2026-09-30: D before Ready, E after.** Operator, verbatim: "D before
+  Ready, E after; this actually closes the hole, and is a nice feature for Idunn
+  to have".
+  - **D, before the candidate reports Ready:** after the fence and before the
+    write lease is issued, Idunn snapshots the target's state through a
+    per-target snapshot/restore declared in its binding. If the deadline expires
+    before Ready, Idunn restores the snapshot and brings back the incumbent. A
+    failed restore is the only terminal `OperatorRequired`.
+  - **E, after Ready:** the candidate is known-good and may have served traffic,
+    so an expiry rolls forward. The candidate stays the release supervision keeps
+    alive, and Idunn completes or retries routing and commit.
+  - Assumption Soul must falsify: the incumbent cannot write between the fence
+    and the lease, so the snapshot is exact.
+  - Map pending (Imagination).
+
+  History, the question as first put:
   The operator on the offered hold-until-next-`idunn up` option, verbatim: "I
   don't like any of these options, unless a stateful deploy running out of time
   is an extreme edge case, in which case A". It is not extreme: the default
