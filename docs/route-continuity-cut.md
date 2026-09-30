@@ -2152,7 +2152,7 @@ it.
 
 #### Q3-ii.12 Operator questions
 
-**Rulings, operator, 2026-09-30:** "S1: Refuse / S2: Declared state / S3: Detect and refuse / S4: deploy or release". That is **Q-S1 (a), Q-S2 (a), Q-S3 (a), Q-S4 (a)**. Q-S5 was left blank and is re-asked.
+**Rulings, operator, 2026-09-30:** "S1: Refuse / S2: Declared state / S3: Detect and refuse / S4: deploy or release". That is **Q-S1 (a), Q-S2 (a), Q-S3 (a), Q-S4 (a)**. Q-S5: "B5 first", which is **(a)**: B5 merges after its Soul pass, and SR-1..SR-4 follow as their own cuts.
 
 - **Q-S1. A stateful target whose binding declares no snapshot.**
   - Options:
