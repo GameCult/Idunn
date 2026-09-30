@@ -10740,6 +10740,7 @@ mod tests {
             schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA.into()),
         };
         let snapshot = ControlSnapshot {
+            expiry_requests: Vec::new(),
             commands: Vec::new(),
             transactions: vec![
                 Stored {
@@ -11155,6 +11156,7 @@ mod tests {
         let one = DeploymentTransaction::new(&command, "ghostlight".into(), 0, None, 100)?;
         let two = DeploymentTransaction::new(&command, "ghostlight".into(), 1, None, 100)?;
         let snapshot = ControlSnapshot {
+            expiry_requests: Vec::new(),
             commands: vec![Stored {
                 envelope: command_envelope(&command, 100)?,
                 value: command,
@@ -11186,6 +11188,7 @@ mod tests {
         let unrelated =
             DeploymentTransaction::new(&unrelated_command, "huginn".into(), 0, None, 101)?;
         let snapshot = ControlSnapshot {
+            expiry_requests: Vec::new(),
             commands: Vec::new(),
             transactions: [&first, &second, &unrelated]
                 .into_iter()
@@ -12704,6 +12707,7 @@ mod tests {
         generation.odin_publisher_sequence_cursor = 88;
         let target = generation.target.clone();
         let snapshot = ControlSnapshot {
+            expiry_requests: Vec::new(),
             commands: Vec::new(),
             transactions: Vec::new(),
             admitted: vec![Stored {
