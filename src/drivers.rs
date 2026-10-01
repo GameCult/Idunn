@@ -4247,6 +4247,10 @@ impl WriteLeasePort for CultCacheWriteLeaseDriver {
 /// facts here. Service presence is absent by construction; only Odin may
 /// correlate these records with signed runtime observation into Present/Ready.
 ///
+/// The store is published 0644 and read lock-free by Odin and Idunn; its lock
+/// is Idunn's alone (`exchange_behind_private_lock`), so no other uid can hold
+/// it and stall a publish.
+///
 /// Every record is keyed by the incarnation it describes, never by the target
 /// alone. A target being replaced has two incarnations at once -- the admitted
 /// incumbent and the sealed candidate -- and both are projected side by side.
@@ -4390,22 +4394,28 @@ impl CultCacheTopologyDriver {
     /// Apply one whole-snapshot mutation with compare-and-swap. `mutate`
     /// returns `None` when the snapshot already has the shape it wants, and
     /// the replacement set otherwise; every writer below is one of these.
+    ///
+    /// Never waits: a publish is done exactly when this returns `Ok`. Only a
+    /// lost race (the store moved on) is retried at once; a held lock is an
+    /// error and a no-op, retried by the caller's own retry.
     fn mutate<F>(&self, mutate: F) -> Result<()>
     where
         F: Fn(&[CultCacheEnvelope]) -> Result<Option<Vec<CultCacheEnvelope>>>,
     {
-        if let Some(parent) = self.projection_store.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let store = SingleFileMessagePackBackingStore::new(&self.projection_store);
         for _ in 0..8 {
             let entries = self.snapshot()?;
             let Some(replacement) = mutate(&entries)? else {
                 return Ok(());
             };
-            if store.compare_exchange_snapshot(&entries, &replacement)? {
-                publish_projection_mode(&self.projection_store)?;
-                return Ok(());
+            match exchange_behind_private_lock(&self.projection_store, &entries, &replacement)? {
+                TryCompareExchangeSnapshotOutcome::Exchanged => {
+                    publish_file_mode(&self.projection_store)?;
+                    return Ok(());
+                }
+                TryCompareExchangeSnapshotOutcome::Mismatch => {}
+                TryCompareExchangeSnapshotOutcome::LockContended => {
+                    return Err(LockContended { store: "topology projection" }.into());
+                }
             }
         }
         bail!("CultCache projection changed repeatedly during publication")
@@ -5096,6 +5106,22 @@ pub enum RouteActuation {
     Forward,
     Survival,
 }
+
+/// A publish that lost to a held projection-directory lock. Transient by
+/// kind: the holder lets go, and the caller's own retry decides what a later
+/// attempt does. It names the store kind, never its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LockContended {
+    pub(crate) store: &'static str,
+}
+
+impl std::fmt::Display for LockContended {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "the {} is locked by another holder", self.store)
+    }
+}
+
+impl std::error::Error for LockContended {}
 
 /// A forward route actuation the ceiling refused. `reopens_at_unix_millis` is
 /// when the oldest counted actuation leaves the window.
@@ -7710,19 +7736,95 @@ pub(crate) fn publish_file_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The topology store is Idunn's *published* surface: every managed target
-/// reads it to verify its own Expected incarnation against the Idunn anchor.
+/// The one write primitive for a store in the projection directory: one
+/// nonblocking compare-exchange of the whole store against the snapshot it was
+/// decided on, behind a lock only Idunn can hold.
 ///
-/// Idunn runs with `UMask=027`, which is right for its private state and wrong
-/// for this one file -- it lands `0640 root:root`, and a `DynamicUser` workload
-/// gets EACCES. Integrity here comes from the signatures over the records, not
-/// from the mode, so the published copy is readable. The lock sibling too:
-/// CultCache opens it alongside the store, so a 0640 lock denies the read just
-/// as surely as a 0640 store, and it is created fresh under Idunn's umask on
-/// every publish.
-fn publish_projection_mode(path: &Path) -> Result<()> {
-    publish_file_mode(path)?;
-    publish_file_mode(&authority_lock_path(path))
+/// Readers of a published store take no lock, so nobody but Idunn needs to
+/// open its lock, and a lock another uid can open is a lock another uid can
+/// hold to stall every publish. CultCache creates a lock with mode 0666, so
+/// the directory's default ACL would decide who may (Yggdrasil's lands it
+/// 0644). This makes the lock private first, by this rule: an absent lock is
+/// created `O_EXCL` 0600; a lock that is not (a regular file, ours, 0600) is
+/// replaced by a fresh 0600 file renamed over it, because a chmod does not
+/// revoke a descriptor another uid already holds, while the rename leaves that
+/// holder only an orphaned inode. A private lock is opened as it is. No
+/// existing lock is ever chmodded. Nothing here names a path in an error.
+pub(crate) fn exchange_behind_private_lock(
+    store: &Path,
+    expected: &[CultCacheEnvelope],
+    replacements: &[CultCacheEnvelope],
+) -> Result<TryCompareExchangeSnapshotOutcome> {
+    make_lock_private(store)?;
+    SingleFileMessagePackBackingStore::new(store)
+        .try_compare_exchange_snapshot(expected, replacements)
+}
+
+#[cfg(unix)]
+fn make_lock_private(store: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let lock = authority_lock_path(store);
+    if let Some(parent) = lock.parent() {
+        fs::create_dir_all(parent).context("creating the store directory")?;
+    }
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    // The daemon is the only writer, so a lost create race is defensive only.
+    for _ in 0..3 {
+        match fs::symlink_metadata(&lock) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.uid() == euid
+                    && metadata.permissions().mode() & 0o777 == 0o600 =>
+            {
+                return Ok(());
+            }
+            Ok(_) => return replace_with_private_lock(&lock),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                match create_private_file(&lock) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error).context("creating a private store lock"),
+                }
+            }
+            Err(error) => return Err(error).context("inspecting a store lock"),
+        }
+    }
+    bail!("a store lock kept changing while it was made private")
+}
+
+#[cfg(not(unix))]
+fn make_lock_private(store: &Path) -> Result<()> {
+    let _ = store;
+    Ok(())
+}
+
+/// A new file nothing else has open, mode 0600 (the create mode is intersected
+/// with the umask and the directory's default ACL, which only narrow it).
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map(drop)
+}
+
+/// Stage a fresh private file beside `lock` and rename it over the lock.
+#[cfg(unix)]
+fn replace_with_private_lock(lock: &Path) -> Result<()> {
+    let mut staged = lock.as_os_str().to_os_string();
+    staged.push(format!(".{}", Uuid::new_v4().simple()));
+    let staged = PathBuf::from(staged);
+    create_private_file(&staged).context("staging a private store lock")?;
+    fs::rename(&staged, lock).map_err(|error| {
+        let _ = fs::remove_file(&staged);
+        anyhow::Error::new(error).context("replacing a store lock with a private one")
+    })
 }
 
 fn build_machine_id(workspace: &Path) -> Result<String> {
@@ -9670,27 +9772,335 @@ Content-Le".to_vec()), |_| {}),
         ));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn the_published_projection_is_readable_by_a_workload() {
-        use std::os::unix::fs::PermissionsExt;
+    /// A native process that is the Expected's: what `publish_observed_activation`
+    /// checks the activation against.
+    #[cfg(target_os = "linux")]
+    fn observation_of(
+        expected: &IdunnExpectedIncarnationRecord,
+        activation: &IdunnRuntimeActivationRecord,
+    ) -> WorkloadObservation {
+        let mut host = host_audit_observation(1, 1);
+        host.runtime_instance_id = activation.runtime_instance_id.clone();
+        host.executable_sha256 = expected.artifact_sha256.clone();
+        WorkloadObservation::Host(host)
+    }
 
+    #[cfg(target_os = "linux")]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().ino()
+    }
+
+    /// Idunn's `UMask=027` alone lands a file 0640: the store still has to be
+    /// published, and its lock has to stay private.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_published_store_is_readable_by_a_workload_and_its_lock_is_not() -> Result<()> {
+        use crate::incident::tests::under_service_umask;
+
+        let temp = tempfile::tempdir()?;
+        let (expected, _, _, anchor) = authenticated_warming(temp.path())?;
+        let driver = topology_driver(temp.path(), "topology");
+        under_service_umask(|| driver.publish_expected(&expected, &anchor))?;
+        assert_eq!(mode_of(&driver.projection_store), 0o644);
+        assert_eq!(mode_of(&authority_lock_path(&driver.projection_store)), 0o600);
+        Ok(())
+    }
+
+    /// The body's condition: the projection directory carries the default ACL
+    /// `u::rw g::r o::r`, under which the umask is ignored and a lock CultCache
+    /// creates lands 0644. Every writer publishes the store 0644 and leaves
+    /// the lock 0600, and another uid cannot open the lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn under_a_default_acl_the_projection_is_published_and_its_lock_is_private() -> Result<()> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use crate::incident::tests::{give_default_acl, readable_by_another_uid, under_service_umask};
+
+        let temp = tempfile::tempdir()?;
+        let (expected, activation, _, anchor) = authenticated_warming(temp.path())?;
+        let observation = observation_of(&expected, &activation);
+        let dir = temp.path().join("projection");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+        give_default_acl(&dir);
+        let driver = topology_driver(&dir, "topology");
+        let store = driver.projection_store.clone();
+        let lock = authority_lock_path(&store);
+
+        // Control: the lock CultCache would have made here. Without the ACL in
+        // force this reads 0640 and the assertions below prove nothing.
+        let control = dir.join("control.lock");
+        under_service_umask(|| {
+            OpenOptions::new().create(true).write(true).mode(0o666).open(&control)
+        })?;
+        assert_eq!(mode_of(&control), 0o644, "the default ACL is not in force");
+
+        let published = |step: &str| {
+            assert_eq!(mode_of(&store), 0o644, "the store after {step}");
+            assert_eq!(mode_of(&lock), 0o600, "the lock after {step}");
+        };
+        under_service_umask(|| driver.publish_expected(&expected, &anchor))?;
+        published("publish_expected");
+        let private_lock = inode_of(&lock);
+        under_service_umask(|| {
+            driver.publish_observed_activation(&expected, &activation, &observation)
+        })?;
+        published("publish_observed_activation");
+        under_service_umask(|| {
+            driver.demote_to_expected_only(&expected, &anchor, &activation, None)
+        })?;
+        published("demote_to_expected_only");
+        under_service_umask(|| driver.withdraw_incarnation(&expected, &anchor, None, None))?;
+        published("withdraw_incarnation");
+        assert_eq!(inode_of(&lock), private_lock, "a private lock was replaced");
+
+        // The consequence: another uid cannot open the lock, so it cannot hold
+        // it. Provable only as root with setpriv, and only if that uid can
+        // read the control file, which shows the switch itself works.
+        if readable_by_another_uid(&control) == Some(true) {
+            assert_eq!(readable_by_another_uid(&lock), Some(false));
+        } else {
+            eprintln!("UNPROVEN: no uid switch here; the lock modes above stand alone");
+        }
+        Ok(())
+    }
+
+    /// Another process holds the lock: the publish is an error and a no-op, and
+    /// it lands once the lock is free. Nothing waits (`run_while_held` counts
+    /// the opens of the lock), and the error names the store kind, not a path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_topology_publish_never_waits_on_a_held_lock_and_lands_when_freed() -> Result<()> {
+        use crate::incident::tests::{eventually, hold_lock_of, run_while_held};
+
+        let temp = tempfile::tempdir()?;
+        let (expected, activation, _, anchor) = authenticated_warming(temp.path())?;
+        let observation = observation_of(&expected, &activation);
+        let driver = topology_driver(temp.path(), "topology");
+
+        let error = run_while_held(hold_lock_of(&driver.projection_store), 1, || {
+            driver.publish_expected(&expected, &anchor)
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "the topology projection is locked by another holder");
+        assert!(!driver.projection_store.exists(), "a contended publish wrote the store");
+
+        eventually(|| driver.publish_expected(&expected, &anchor));
+        let landed = fs::read(&driver.projection_store)?;
+
+        // An existing store is unchanged by a contended write of any kind.
+        let error = run_while_held(hold_lock_of(&driver.projection_store), 1, || {
+            driver.publish_observed_activation(&expected, &activation, &observation)
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "the topology projection is locked by another holder");
+        assert_eq!(fs::read(&driver.projection_store)?, landed);
+        eventually(|| driver.publish_observed_activation(&expected, &activation, &observation));
+        assert_ne!(fs::read(&driver.projection_store)?, landed);
+        Ok(())
+    }
+
+    /// The load-bearing rule (a chmod does not revoke a holder): a wider lock
+    /// that another process already holds is replaced by a fresh private one,
+    /// so the holder keeps only an orphaned inode and cannot block a publish.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_holder_of_a_wider_lock_cannot_block_a_publish() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::incident::tests::hold_lock_of;
+
+        let temp = tempfile::tempdir()?;
+        let (expected, _, _, anchor) = authenticated_warming(temp.path())?;
+        let driver = topology_driver(temp.path(), "topology");
+        let lock = authority_lock_path(&driver.projection_store);
+        fs::write(&lock, b"")?;
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644))?;
+        let wider = inode_of(&lock);
+        let holder = hold_lock_of(&driver.projection_store);
+
+        driver.publish_expected(&expected, &anchor)?;
+        assert_eq!(mode_of(&lock), 0o600);
+        assert_ne!(inode_of(&lock), wider, "the wider lock was chmodded, not replaced");
+        assert!(holder.is_held(), "the publish ended the holder instead of outliving it");
+        assert_eq!(driver.snapshot()?.len(), 2);
+        Ok(())
+    }
+
+    /// Every lock that is not a regular file, ours, mode 0600 is replaced, and
+    /// a private one is left alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_lock_that_is_not_private_is_replaced_and_a_private_one_is_not() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir()?;
+        let (expected, activation, _, anchor) = authenticated_warming(temp.path())?;
+        let observation = observation_of(&expected, &activation);
+        let driver = topology_driver(temp.path(), "topology");
+        let lock = authority_lock_path(&driver.projection_store);
+        driver.publish_expected(&expected, &anchor)?;
+        // Each call changes the projection, so each one exchanges.
+        let toggle = || -> Result<()> {
+            if driver.projected_activation_is_present(&expected)? {
+                driver
+                    .demote_to_expected_only(&expected, &anchor, &activation, None)
+                    .map(drop)
+            } else {
+                driver
+                    .publish_observed_activation(&expected, &activation, &observation)
+                    .map(drop)
+            }
+        };
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+
+        for (shape, mode, owner) in [
+            ("0640", 0o640, None),
+            ("0666", 0o666, None),
+            ("0700", 0o700, None),
+            ("0400", 0o400, None),
+            ("0604", 0o604, None),
+            ("0600 owned by another uid", 0o600, Some(65534)),
+        ] {
+            if owner.is_some() && euid != 0 {
+                eprintln!("UNPROVEN: not root, so a lock owned by another uid cannot be made");
+                continue;
+            }
+            fs::set_permissions(&lock, fs::Permissions::from_mode(mode))?;
+            if let Some(uid) = owner {
+                std::os::unix::fs::chown(&lock, Some(uid), Some(uid))?;
+            }
+            let before = inode_of(&lock);
+            toggle()?;
+            assert_ne!(inode_of(&lock), before, "a {shape} lock was kept");
+            assert_eq!(mode_of(&lock), 0o600, "after a {shape} lock");
+            assert_eq!(fs::metadata(&lock)?.uid(), euid, "after a {shape} lock");
+        }
+
+        // A lock that is a symlink is replaced, never followed.
+        let target = temp.path().join("elsewhere");
+        fs::write(&target, b"")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        fs::remove_file(&lock)?;
+        std::os::unix::fs::symlink(&target, &lock)?;
+        toggle()?;
+        assert!(!fs::symlink_metadata(&lock)?.file_type().is_symlink());
+        assert_eq!(mode_of(&lock), 0o600);
+        assert!(target.exists());
+
+        // A private lock is opened as it is: two more exchanges, one inode.
+        let kept = inode_of(&lock);
+        toggle()?;
+        toggle()?;
+        assert_eq!(inode_of(&lock), kept);
+        Ok(())
+    }
+
+    /// A lock that cannot be inspected is an inspection error, and one that
+    /// cannot be created is a creation error: neither is mistaken for the
+    /// other, and neither is retried as if another creator had won.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_that_cannot_be_inspected_or_created_says_which() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("topology.cc");
-        std::fs::write(&path, b"x").unwrap();
-        // What Idunn's UMask=027 leaves behind.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let lock = temp.path().join("topology.cc.lock");
-        std::fs::write(&lock, b"").unwrap();
-        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o640)).unwrap();
-        publish_projection_mode(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o644,
-            "every target must be able to read the projection"
-        );
-        let lock_mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
-        assert_eq!(lock_mode, 0o644, "the lock is opened alongside the store");
+        // The lock's name is one byte past NAME_MAX: inspecting it fails with
+        // an error that is not "not found".
+        let long = temp.path().join("a".repeat(251));
+        let error = exchange_behind_private_lock(&long, &[], &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("inspecting a store lock"), "{error:#}");
+
+        // Absent, but nothing can be created beside it: procfs refuses.
+        let error = exchange_behind_private_lock(Path::new("/proc/self/idunn-store.cc"), &[], &[])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("creating a private store lock"), "{error:#}");
+    }
+
+    /// Many first publishers race to create the same lock. Whoever loses finds
+    /// a private lock and carries on: no call fails for having lost.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publishers_racing_to_create_the_lock_all_find_it_private() {
+        use std::sync::Barrier;
+
+        const PUBLISHERS: usize = 8;
+        for round in 0..100 {
+            let temp = tempfile::tempdir().unwrap();
+            let store = temp.path().join("topology.cc");
+            let start = Barrier::new(PUBLISHERS);
+            let outcomes = thread::scope(|scope| {
+                (0..PUBLISHERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            exchange_behind_private_lock(&store, &[], &[]).map(drop)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|publisher| publisher.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            for outcome in outcomes {
+                outcome.unwrap_or_else(|error| panic!("round {round}: {error:#}"));
+            }
+            assert_eq!(mode_of(&authority_lock_path(&store)), 0o600);
+        }
+    }
+
+    /// A lost race is retried at once, against the store as it now is; a race
+    /// lost every time is an error rather than a loop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lost_race_is_retried_against_the_new_store_and_never_forever() -> Result<()> {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir()?;
+        let driver = topology_driver(temp.path(), "topology");
+        let rival = |key: &str| CultCacheEnvelope {
+            key: key.into(),
+            r#type: "test.rival".into(),
+            payload: vec![0x90],
+            stored_at: "2026-01-01T00:00:00+00:00".into(),
+            schema_id: Some("test.rival.v1".into()),
+        };
+
+        // Lost once: a rival writes between the snapshot and the exchange.
+        let calls = Cell::new(0);
+        driver.mutate(|entries| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                upsert_record(&driver.projection_store, rival("first")).unwrap();
+            }
+            let mut next = entries.to_vec();
+            next.push(rival(&format!("mine-{}", calls.get())));
+            Ok(Some(next))
+        })?;
+        assert_eq!(calls.get(), 2);
+        let keys = driver.snapshot()?.into_iter().map(|e| e.key).collect::<Vec<_>>();
+        assert_eq!(keys, ["first", "mine-2"]);
+
+        // Lost every time: bounded, and the store is the rival's.
+        let calls = Cell::new(0);
+        let error = driver
+            .mutate(|entries| {
+                calls.set(calls.get() + 1);
+                upsert_record(&driver.projection_store, rival(&format!("rival-{}", calls.get()))).unwrap();
+                let mut next = entries.to_vec();
+                next.push(rival("never"));
+                Ok(Some(next))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("changed repeatedly"), "{error}");
+        assert_eq!(calls.get(), 8);
+        assert!(driver.snapshot()?.iter().all(|entry| entry.key != "never"));
+        Ok(())
     }
 
     #[cfg(unix)]

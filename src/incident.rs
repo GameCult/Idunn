@@ -20,7 +20,7 @@ use cultcache_rs::{
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::{decode_record, require_id, typed_envelope};
-use crate::drivers::publish_file_mode;
+use crate::drivers::{LockContended, exchange_behind_private_lock, publish_file_mode};
 
 const INCIDENT_SCHEMA: &str = "idunn.operator_incident.v1";
 
@@ -177,8 +177,9 @@ impl Snapshot {
 /// scheduler tick, so no write waits: each is one nonblocking compare-exchange
 /// of the whole file against the snapshot it was decided on. A lost race or a
 /// held lock is an error and a no-op, retried on a later pass. The lock beside
-/// the file is not published and is created 0600 (`secure_lock`): the readers
-/// of `incidents.cc` take no lock, so only Idunn can ever hold it.
+/// the file is not published and is Idunn's alone
+/// (`exchange_behind_private_lock`): the readers of `incidents.cc` take no
+/// lock, so only Idunn can ever hold it.
 pub(crate) struct IncidentStore {
     path: PathBuf,
 }
@@ -231,16 +232,13 @@ impl IncidentStore {
         expected: &[CultCacheEnvelope],
         replacements: &[CultCacheEnvelope],
     ) -> Result<()> {
-        secure_lock(path)?;
-        match SingleFileMessagePackBackingStore::new(path)
-            .try_compare_exchange_snapshot(expected, replacements)?
-        {
+        match exchange_behind_private_lock(path, expected, replacements)? {
             TryCompareExchangeSnapshotOutcome::Exchanged => Ok(()),
             TryCompareExchangeSnapshotOutcome::Mismatch => {
                 bail!("the incident store changed while it was being written")
             }
             TryCompareExchangeSnapshotOutcome::LockContended => {
-                bail!("the incident store is locked by another holder")
+                Err(LockContended { store: "incident store" }.into())
             }
         }
     }
@@ -335,46 +333,6 @@ impl IncidentStore {
     }
 }
 
-/// Make the lock beside `store` Idunn's alone, before CultCache opens it.
-///
-/// CultCache creates a lock with mode 0666, so the published directory decides
-/// who may open it: under Yggdrasil's default ACL (`u::rw g::r o::r`) that is
-/// 0644, and any uid could hold the lock and keep every incident from being
-/// recorded. Created here with 0600 the create mode is intersected with the
-/// ACL and still holds, and no wider file ever exists. A lock left wider by an
-/// earlier run is tightened on the descriptor just opened (a descriptor some
-/// other uid already holds is not revoked). Readers of the store take no lock,
-/// so nothing but Idunn needs to open this file.
-fn secure_lock(store: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let mut name = store
-            .file_name()
-            .context("the incident store has no file name")?
-            .to_owned();
-        name.push(".lock");
-        let lock = store.with_file_name(name);
-        if let Some(parent) = lock.parent() {
-            std::fs::create_dir_all(parent).context("creating the incident store directory")?;
-        }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock)
-            .context("opening the incident lock")?
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .context("making the incident lock private")?;
-    }
-    #[cfg(not(unix))]
-    let _ = store;
-    Ok(())
-}
-
 /// The lines `idunn status` prints for one target's incidents: each open one,
 /// and each closed one still inside retention.
 pub(crate) fn render_incidents(records: &[IncidentRecord], target: &str, now: u64) -> Vec<String> {
@@ -399,7 +357,7 @@ pub(crate) fn render_incidents(records: &[IncidentRecord], target: &str, now: u6
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
@@ -644,7 +602,7 @@ pub(crate) mod tests {
     /// Idunn runs with `UMask=027`. The umask is process-wide, so it is held
     /// only around each call and only one test at a time may hold it.
     #[cfg(target_os = "linux")]
-    fn under_service_umask<T>(write: impl FnOnce() -> T) -> T {
+    pub(crate) fn under_service_umask<T>(write: impl FnOnce() -> T) -> T {
         static UMASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _held = UMASK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: umask only swaps the process file-creation mask.
@@ -658,7 +616,7 @@ pub(crate) mod tests {
     /// `u::rw g::r o::r` that Yggdrasil's idunn-projection directory has. Under
     /// it the umask is ignored and a file created with mode 0666 lands 0644.
     #[cfg(target_os = "linux")]
-    fn give_default_acl(dir: &Path) {
+    pub(crate) fn give_default_acl(dir: &Path) {
         use std::os::unix::ffi::OsStrExt;
 
         // posix_acl_xattr: version 2, then (tag, perm, id) entries. The tags
@@ -691,7 +649,7 @@ pub(crate) mod tests {
     /// Whether uid 65534 can read `path`; `None` when the uid cannot be
     /// switched (not root, or no setpriv), which leaves the question unproven.
     #[cfg(target_os = "linux")]
-    fn readable_by_another_uid(path: &Path) -> Option<bool> {
+    pub(crate) fn readable_by_another_uid(path: &Path) -> Option<bool> {
         std::process::Command::new("setpriv")
             .args(["--reuid=65534", "--regid=65534", "--clear-groups", "cat"])
             .arg(path)
@@ -758,47 +716,154 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_lock_left_wider_by_an_earlier_run_is_tightened_before_it_is_used() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_lock_left_wider_by_an_earlier_run_is_replaced_before_it_is_used() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("incidents.cc");
         let lock = temp.path().join("incidents.cc.lock");
         std::fs::write(&lock, b"").unwrap();
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let before = std::fs::metadata(&lock).unwrap().ino();
 
         assert!(
             IncidentStore::new(&path)
                 .open(IncidentCondition::ContinuityExhausted, "service", OPENED)
                 .unwrap()
         );
-        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let after = std::fs::metadata(&lock).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        assert_ne!(after.ino(), before, "the wider lock was chmodded, not replaced");
     }
 
-    /// An exclusive lock on a store's lock file, held through another file
-    /// description. flock conflicts between descriptions, so the holder need
-    /// not be another process or another uid: the test does not depend on who
-    /// it runs as.
-    #[cfg(unix)]
-    pub(crate) struct HeldLock(#[allow(dead_code)] std::fs::File);
-
-    #[cfg(unix)]
-    pub(crate) fn hold_lock_of(store: &Path) -> HeldLock {
-        use std::os::unix::io::AsRawFd;
-
+    /// The lock beside a store, spelled independently of the code under test.
+    #[cfg(target_os = "linux")]
+    fn lock_beside(store: &Path) -> PathBuf {
         let mut name = store.file_name().unwrap().to_owned();
         name.push(".lock");
-        let file = std::fs::OpenOptions::new()
+        store.with_file_name(name)
+    }
+
+    /// An exclusive flock on a store's lock, held by a SEPARATE PROCESS
+    /// (`flock -x <lock> sleep`), so the holder shares no descriptor, thread
+    /// or address space with the code under test. A watch on the lock counts
+    /// every open of it from the moment it is held.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct HeldLock {
+        holder: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+        watch: std::os::fd::OwnedFd,
+    }
+
+    /// Hold the lock of `store`. An absent lock is created as production keeps
+    /// it (0600, ours); a lock a test put there first is held as it is, never
+    /// chmodded.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn hold_lock_of(store: &Path) -> HeldLock {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let lock = lock_beside(store);
+        std::fs::OpenOptions::new()
             .create(true)
-            .read(true)
             .write(true)
             .truncate(false)
-            .open(store.with_file_name(name))
+            .mode(0o600)
+            .open(&lock)
             .unwrap();
-        // SAFETY: flock on a descriptor this function owns.
-        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
-        HeldLock(file)
+        let mut holder = std::process::Command::new("flock")
+            .args(["--no-fork", "--exclusive"])
+            .arg(&lock)
+            .args(["sleep", "3600"])
+            .spawn()
+            .expect("flock (util-linux) must be installed to hold a lock from another process");
+
+        // Held once a nonblocking exclusive flock from here is refused.
+        let deadline = Instant::now() + STUCK_AFTER;
+        loop {
+            assert!(holder.try_wait().unwrap().is_none(), "the lock holder exited");
+            let probe = std::fs::File::open(&lock).unwrap();
+            // SAFETY: flock on a descriptor this function owns.
+            let refused = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
+            if refused {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+            drop(probe);
+            assert!(Instant::now() < deadline, "the lock was never held");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Open and close alternate, so two opens are never identical adjacent
+        // events for the kernel to coalesce into one.
+        // SAFETY: plain syscalls on descriptors and strings this function owns.
+        let watch = unsafe {
+            let fd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            let watch = OwnedFd::from_raw_fd(fd);
+            let path = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+            let wd = libc::inotify_add_watch(
+                fd,
+                path.as_ptr(),
+                libc::IN_OPEN | libc::IN_CLOSE_WRITE | libc::IN_CLOSE_NOWRITE,
+            );
+            assert!(wd >= 0, "{}", std::io::Error::last_os_error());
+            watch
+        };
+        HeldLock {
+            holder: std::sync::Arc::new(std::sync::Mutex::new(holder)),
+            watch,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HeldLock {
+        /// Whether the holder process is still running and so still holds.
+        pub(crate) fn is_held(&self) -> bool {
+            self.holder.lock().unwrap().try_wait().unwrap().is_none()
+        }
+
+        /// How many times the lock has been opened since it was held.
+        fn opens(&self) -> usize {
+            use std::os::unix::io::AsRawFd;
+
+            let mut opens = 0;
+            let mut buffer = [0u8; 4096];
+            loop {
+                // SAFETY: reads into a live buffer of the stated length.
+                let read = unsafe {
+                    libc::read(self.watch.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
+                };
+                if read <= 0 {
+                    return opens;
+                }
+                let read = usize::try_from(read).unwrap();
+                let mut at = 0;
+                // struct inotify_event: wd i32, mask u32, cookie u32, len u32, name[len].
+                while at + 16 <= read {
+                    let word = |offset: usize| {
+                        u32::from_ne_bytes(buffer[at + offset..at + offset + 4].try_into().unwrap())
+                    };
+                    if word(4) & libc::IN_OPEN != 0 {
+                        opens += 1;
+                    }
+                    at += 16 + usize::try_from(word(12)).unwrap();
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HeldLock {
+        fn drop(&mut self) {
+            let mut holder = self.holder.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = holder.kill();
+            let _ = holder.wait();
+        }
     }
 
     /// How long a test lets a held lock, or a released lock's last straggler,
@@ -806,40 +871,57 @@ pub(crate) mod tests {
     /// spends it: the code under test finishes in milliseconds, and the limit
     /// is only what stops a blocked write from hanging the suite. No
     /// assertion compares elapsed time to a bound the machine's load can move.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) const STUCK_AFTER: Duration = Duration::from_secs(30);
 
-    /// Run `work` while `held` is held, and fail if it waited on it. The holder
-    /// lets go only when `work` has returned, or after `STUCK_AFTER`: work that
-    /// waits on the lock is freed by that second release and is then seen to
-    /// have waited, so the test fails instead of hanging.
-    #[cfg(unix)]
-    pub(crate) fn run_while_held<T>(held: HeldLock, work: impl FnOnce() -> T) -> T {
+    /// Run `work` while `held` is held, and fail if it waited on it. The rule
+    /// is observed where it is decided, at the lock, not on a clock: every
+    /// exchange opens the lock exactly once, so `exchanges` is the number of
+    /// exchanges `work` makes against this lock, and a wait of any length (a
+    /// sleep and retry, a poll, a second attempt) opens it more often. A wait
+    /// that never ends is freed by the holder's release after `STUCK_AFTER`,
+    /// and is then seen to have waited, so the test fails instead of hanging.
+    /// The holder is still holding when `work` returns, and is released on the
+    /// way out.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn run_while_held<T>(
+        held: HeldLock,
+        exchanges: usize,
+        work: impl FnOnce() -> T,
+    ) -> T {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, mpsc};
 
         let (finished, work_done) = mpsc::channel::<()>();
         let gave_up = Arc::new(AtomicBool::new(false));
-        let holder = {
+        let watchdog = {
             let gave_up = Arc::clone(&gave_up);
+            let holder = Arc::clone(&held.holder);
             std::thread::spawn(move || {
                 if work_done.recv_timeout(STUCK_AFTER) == Err(mpsc::RecvTimeoutError::Timeout) {
                     gave_up.store(true, Ordering::SeqCst);
+                    let _ = holder.lock().unwrap().kill();
                 }
-                drop(held);
             })
         };
         let result = work();
+        let still_held = held.is_held();
         let _ = finished.send(());
-        holder.join().unwrap();
+        watchdog.join().unwrap();
         assert!(!gave_up.load(Ordering::SeqCst), "the work waited on a held lock");
+        assert!(still_held, "the holder let go before the work returned");
+        assert_eq!(
+            held.opens(),
+            exchanges,
+            "the work opened the held lock other than once per exchange: it waited or retried"
+        );
         result
     }
 
-    /// Retry `attempt` until it lands. A released lock can stay held for a
-    /// moment by a child another test forked while it was held.
-    #[cfg(unix)]
-    fn eventually<T>(mut attempt: impl FnMut() -> Result<T>) -> T {
+    /// Retry `attempt` until it lands. A lock just released can take a moment
+    /// to be seen free.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn eventually<T>(mut attempt: impl FnMut() -> Result<T>) -> T {
         let deadline = Instant::now() + STUCK_AFTER;
         loop {
             match attempt() {
@@ -850,7 +932,7 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn no_incident_write_waits_on_a_held_lock_and_each_lands_when_it_is_freed() {
         let temp = TempDir::new().unwrap();
@@ -863,15 +945,17 @@ pub(crate) mod tests {
         let before = std::fs::read(&path).unwrap();
         let retired = OPENED + 1 + INCIDENT_RETENTION_MILLIS + 1;
 
-        let outcomes = run_while_held(hold_lock_of(&path), || {
+        // One exchange each: open, close, and the retirement's store delete.
+        let outcomes = run_while_held(hold_lock_of(&path), 3, || {
             (
                 store.open(condition, "new", CLOSED),
                 store.close(condition, "open", CloseReason::Recovered, CLOSED),
                 store.retire_closed(retired),
             )
         });
-        for outcome in [outcomes.0, outcomes.1, outcomes.2] {
-            assert!(outcome.is_err());
+        for outcome in [outcomes.0.map(drop), outcomes.1.map(drop), outcomes.2.map(drop)] {
+            let error = outcome.unwrap_err().to_string();
+            assert_eq!(error, "the incident store is locked by another holder");
         }
         assert_eq!(std::fs::read(&path).unwrap(), before, "a contended write changed the file");
 
@@ -885,7 +969,7 @@ pub(crate) mod tests {
         assert_eq!(history.pull_all_read_only_snapshot().unwrap().len(), 1);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_held_history_lock_keeps_the_incident_where_it_is() {
         let temp = TempDir::new().unwrap();
@@ -898,7 +982,7 @@ pub(crate) mod tests {
         let before = std::fs::read(&path).unwrap();
         let retired = OPENED + 1 + INCIDENT_RETENTION_MILLIS + 1;
 
-        let outcome = run_while_held(hold_lock_of(&history), || store.retire_closed(retired));
+        let outcome = run_while_held(hold_lock_of(&history), 1, || store.retire_closed(retired));
         assert!(outcome.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(eventually(|| store.retire_closed(retired)));
