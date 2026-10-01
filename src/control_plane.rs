@@ -40,7 +40,7 @@ use crate::deployment_plan::{
 use crate::drivers::{
     ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
     GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
-    ProcessIdentity, RouteActuation, RouteActuationGate, RouteActuationRefused, RouteActuators,
+    LockContended, ProcessIdentity, RouteActuation, RouteActuationGate, RouteActuationRefused, RouteActuators,
     RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
     SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
     WriteLeasePort,
@@ -5576,7 +5576,14 @@ impl Engine {
                 // Before the fence an abort that cannot finish a step is
                 // resumable, never a post-fence abort: that path refuses a
                 // pre-fence phase, so choosing it only wedged the tick.
-                if latest.value.pre_fencing_abort.is_none() {
+                //
+                // A publish that lost to a held lock is not a failed step: the
+                // holder lets go, so the transaction stays in its phase with
+                // the error recorded and the backoff above retries it. The
+                // phase deadline, not an abort, bounds the wait.
+                if latest.value.pre_fencing_abort.is_none()
+                    && error.downcast_ref::<LockContended>().is_none()
+                {
                     self.begin_pre_fencing_abort(latest, error)?;
                 } else {
                     self.record_resumable_error(latest, &error)?;
@@ -15622,6 +15629,86 @@ mod tests {
         assert_eq!(
             resident(&world)?.value.expected_publication_sha256,
             Some(expected.canonical_sha256()?)
+        );
+        Ok(())
+    }
+
+    /// A Continuity transaction parked in Starting with nothing published yet,
+    /// plus the stored record the tick will see.
+    #[cfg(target_os = "linux")]
+    fn parked_in_starting(world: &EngineFixture) -> Result<DeploymentTransaction> {
+        let seeded = transaction_at(world, DeploymentPhase::Warming)?;
+        let stored = resident(world)?;
+        let mut starting = seeded.clone();
+        starting.phase = DeploymentPhase::Starting;
+        starting.expected_publication_sha256 = None;
+        starting.activation = None;
+        starting.workload = None;
+        starting.activation_publication_sha256 = None;
+        starting.warming = None;
+        replace_transaction(&world.state_store, &stored, &starting)?;
+        Ok(seeded)
+    }
+
+    /// A publish that lost to a held lock is transient: before the fence the
+    /// transaction stays in its phase with the error recorded, no abort is
+    /// begun, and the next tick after the release lands the publish. A
+    /// continuity restart is a Continuity transaction on this same path, so
+    /// its attempt is minted once and a contended publish spends no second one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_contended_starting_publish_is_retried_on_a_later_tick_not_aborted() -> Result<()> {
+        use crate::incident::tests::{hold_lock_of, run_while_held};
+
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let seeded = parked_in_starting(&world)?;
+        let mut meters = TargetSupervision::new("service");
+        meters.continuity_restarts = vec![now_millis()?];
+        set_meters(&world, &meters)?;
+        let store = world.engine.options.topology_store.clone();
+
+        for tick in 0..2 {
+            run_while_held(hold_lock_of(&store), 1, || world.engine.resume_one_transaction())?;
+            world.engine.resume_backoff.lock().unwrap().clear();
+            let held = resident(&world)?.value;
+            assert_eq!(held.phase, DeploymentPhase::Starting, "tick {tick}");
+            assert!(held.pre_fencing_abort.is_none(), "tick {tick}: a held lock aborted the transaction");
+            assert!(!held.is_terminal(), "tick {tick}");
+            assert_eq!(held.expected_publication_sha256, None, "tick {tick}");
+            let error = held.last_error.context("a contended publish left no last_error")?;
+            assert!(error.contains("locked by another holder"), "{error}");
+            assert!(!store.exists(), "a contended publish wrote the projection");
+        }
+
+        // Released: the next tick lands the publish and records its digest.
+        world.engine.resume_one_transaction()?;
+        let landed = resident(&world)?.value;
+        assert_eq!(landed.phase, DeploymentPhase::Starting);
+        assert!(landed.pre_fencing_abort.is_none());
+        assert_eq!(
+            landed.expected_publication_sha256,
+            Some(seeded.expected.context("seeded transaction has no Expected")?.canonical_sha256()?)
+        );
+        assert_eq!(meters_of(&world, "service")?.continuity_restarts.len(), 1);
+        Ok(())
+    }
+
+    /// Only contention is transient: a publish that fails for any other reason
+    /// still ends the transaction before the fence, as it always did.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_contention_publish_error_still_aborts_before_the_fence() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        parked_in_starting(&world)?;
+        // A directory where the store should be: the snapshot cannot be read.
+        std::fs::create_dir_all(&world.engine.options.topology_store)?;
+        world.engine.resume_one_transaction()?;
+        let after = resident(&world)?.value;
+        assert!(after.pre_fencing_abort.is_some(), "a non-contention error did not abort");
+        assert!(
+            !after.last_error.as_deref().unwrap_or_default().contains("locked by another holder"),
+            "{:?}",
+            after.last_error
         );
         Ok(())
     }

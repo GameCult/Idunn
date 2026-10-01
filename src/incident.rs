@@ -20,7 +20,7 @@ use cultcache_rs::{
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::{decode_record, require_id, typed_envelope};
-use crate::drivers::{exchange_behind_private_lock, publish_file_mode};
+use crate::drivers::{LockContended, exchange_behind_private_lock, publish_file_mode};
 
 const INCIDENT_SCHEMA: &str = "idunn.operator_incident.v1";
 
@@ -238,7 +238,7 @@ impl IncidentStore {
                 bail!("the incident store changed while it was being written")
             }
             TryCompareExchangeSnapshotOutcome::LockContended => {
-                bail!("the incident store is locked by another holder")
+                Err(LockContended { store: "incident store" }.into())
             }
         }
     }

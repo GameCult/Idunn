@@ -4414,7 +4414,7 @@ impl CultCacheTopologyDriver {
                 }
                 TryCompareExchangeSnapshotOutcome::Mismatch => {}
                 TryCompareExchangeSnapshotOutcome::LockContended => {
-                    bail!("the topology projection is locked by another holder")
+                    return Err(LockContended { store: "topology projection" }.into());
                 }
             }
         }
@@ -5106,6 +5106,22 @@ pub enum RouteActuation {
     Forward,
     Survival,
 }
+
+/// A publish that lost to a held projection-directory lock. Transient by
+/// kind: the holder lets go, and the caller's own retry decides what a later
+/// attempt does. It names the store kind, never its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LockContended {
+    pub(crate) store: &'static str,
+}
+
+impl std::fmt::Display for LockContended {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "the {} is locked by another holder", self.store)
+    }
+}
+
+impl std::error::Error for LockContended {}
 
 /// A forward route actuation the ceiling refused. `reopens_at_unix_millis` is
 /// when the oldest counted actuation leaves the window.
