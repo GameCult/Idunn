@@ -9987,6 +9987,57 @@ Content-Le".to_vec()), |_| {}),
         Ok(())
     }
 
+    /// A lock that cannot be inspected is an inspection error, and one that
+    /// cannot be created is a creation error: neither is mistaken for the
+    /// other, and neither is retried as if another creator had won.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_that_cannot_be_inspected_or_created_says_which() {
+        let temp = tempfile::tempdir().unwrap();
+        // The lock's name is one byte past NAME_MAX: inspecting it fails with
+        // an error that is not "not found".
+        let long = temp.path().join("a".repeat(251));
+        let error = exchange_behind_private_lock(&long, &[], &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("inspecting a store lock"), "{error:#}");
+
+        // Absent, but nothing can be created beside it: procfs refuses.
+        let error = exchange_behind_private_lock(Path::new("/proc/self/idunn-store.cc"), &[], &[])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("creating a private store lock"), "{error:#}");
+    }
+
+    /// Many first publishers race to create the same lock. Whoever loses finds
+    /// a private lock and carries on: no call fails for having lost.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publishers_racing_to_create_the_lock_all_find_it_private() {
+        use std::sync::Barrier;
+
+        const PUBLISHERS: usize = 8;
+        for round in 0..100 {
+            let temp = tempfile::tempdir().unwrap();
+            let store = temp.path().join("topology.cc");
+            let start = Barrier::new(PUBLISHERS);
+            let outcomes = thread::scope(|scope| {
+                (0..PUBLISHERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            exchange_behind_private_lock(&store, &[], &[]).map(drop)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|publisher| publisher.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            for outcome in outcomes {
+                outcome.unwrap_or_else(|error| panic!("round {round}: {error:#}"));
+            }
+            assert_eq!(mode_of(&authority_lock_path(&store)), 0o600);
+        }
+    }
+
     /// A lost race is retried at once, against the store as it now is; a race
     /// lost every time is an error rather than a loop.
     #[cfg(target_os = "linux")]
