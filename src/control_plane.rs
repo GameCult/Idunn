@@ -15968,10 +15968,9 @@ mod tests {
                 "the deployment was yielded: {:?}",
                 after.pre_fencing_abort
             );
-            assert!(
-                every_transaction(&world)?
-                    .iter()
-                    .all(|transaction| transaction.command_kind != CommandKind::Continuity),
+            assert_eq!(
+                continuity_mints(&world)?,
+                0,
                 "continuity minted beside a pre-fencing deployment"
             );
         }
@@ -15999,10 +15998,15 @@ mod tests {
         set_meters(world, &meters)
     }
 
+    /// Continuity transactions minted over an incumbent (the one that admitted
+    /// it was seeded over nothing).
     fn continuity_mints(world: &EngineFixture) -> Result<usize> {
         Ok(every_transaction(world)?
             .iter()
-            .filter(|transaction| transaction.command_kind == CommandKind::Continuity)
+            .filter(|transaction| {
+                transaction.command_kind == CommandKind::Continuity
+                    && transaction.incumbent_generation_id.is_some()
+            })
             .count())
     }
 
@@ -16929,16 +16933,30 @@ mod tests {
         meters.continuity_restarts = vec![now - 9_000, now - 4_000];
         meters.continuity_deferred_until = Some(now + 500);
         meters.continuity_deferral_reason = Some("projection would not demote".into());
+        meters.continuity_attempt_streak = 2;
+        meters.continuity_backoff_from_unix_millis = Some(now - 4_000);
 
         let (_, mut generation) = fixture_generation(FIXTURE_GENERATION)?;
         generation.last_error = Some("held".into());
+        generation.admitted_at_unix_millis = 1;
         let lines = render_supervision("service", Some(&generation), Some(&meters), now).join("\n");
         assert!(lines.contains(&format!("target service {}", generation.generation_id)), "{lines}");
         assert!(lines.contains("held: held"), "{lines}");
         assert!(lines.contains(&format!(
-            "continuity restarts 2/6 next-restart-at {}",
+            "continuity attempts-in-hour 2 pages-at 6 streak 2 next-attempt-at {}",
             now - 4_000 + 10_000
         )), "{lines}");
+        assert!(!lines.contains("rematerialized-at"), "{lines}");
+        meters.continuity_rematerialized_at_unix_millis = Some(now - 1_000);
+        let lines = render_supervision("service", Some(&generation), Some(&meters), now).join("
+");
+        assert!(lines.contains(&format!("continuity rematerialized-at {}", now - 1_000)), "{lines}");
+        // An anchor older than the generation is not shown as a pending wait.
+        generation.admitted_at_unix_millis = now;
+        let lines = render_supervision("service", Some(&generation), Some(&meters), now).join("
+");
+        assert!(lines.contains("streak 2 next-attempt-at none"), "{lines}");
+        generation.admitted_at_unix_millis = 1;
         assert!(lines.contains("continuity deferred until 10000500: projection would not demote"), "{lines}");
         assert!(lines.contains(&format!(
             "route actuations 12/12 in window, reopens-at {}",
