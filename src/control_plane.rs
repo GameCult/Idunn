@@ -71,6 +71,12 @@ const CONTINUITY_RESTART_WINDOW_MILLIS: u64 = 3_600_000;
 /// The base of the streak backoff: the wait after the first charged attempt;
 /// it doubles with each further one in the streak.
 const CONTINUITY_RESTART_BACKOFF_MILLIS: u64 = 5_000;
+/// The longest streak backoff between charged continuity attempts (ruling
+/// continuity-backoff-defaults).
+const CONTINUITY_BACKOFF_CEILING_MILLIS: u64 = 300_000;
+/// How long an admitted generation must have run, with no attempt failing on
+/// it, before the attempt streak resets (ruling continuity-backoff-defaults).
+const CONTINUITY_SUSTAINED_RUN_MILLIS: u64 = 600_000;
 
 /// Forward route actuations (fragment write, firewall, `nginx -t`, reload,
 /// private-mount validation) one target may perform per sliding window. A
@@ -1059,6 +1065,33 @@ struct TargetSupervision {
     /// Visibility only: never counted, never refused.
     #[cultcache(key = 6)]
     route_survivals: Vec<u64>,
+    // Keys 7-9 are absent from every record written before them; `default`
+    // decodes that as no streak, no anchor and no re-materialization.
+    /// Charged attempts since the last sustained run. Owned by continuity
+    /// supervision; it decides the next attempt's backoff step.
+    #[cultcache(key = 7, default)]
+    continuity_attempt_streak: u32,
+    /// When a dead-and-free pass began waiting out the next attempt. Owned by
+    /// continuity supervision; it decides when the wait is over. Older than
+    /// the admitted generation, it decides nothing.
+    #[cultcache(key = 8, default)]
+    continuity_backoff_from_unix_millis: Option<u64>,
+    /// When the admitted generation's one uncharged re-materialization was
+    /// minted. Owned by continuity supervision; it can only withhold a free
+    /// re-materialization, never grant one.
+    #[cultcache(key = 9, default)]
+    continuity_rematerialized_at_unix_millis: Option<u64>,
+}
+
+/// What continuity supervision does about the next attempt for a dead target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContinuityBackoff {
+    /// Mint now, carrying this streak into the attempt.
+    Due { streak: u32 },
+    /// Start the wait: write the anchor and mint nothing this pass.
+    Begin,
+    /// The wait has not run out.
+    Waiting,
 }
 
 /// The entries of a sliding log still inside `window` at `now`. An entry from
@@ -1101,7 +1134,31 @@ impl TargetSupervision {
             continuity_deferred_until: None,
             continuity_deferral_reason: None,
             route_survivals: Vec::new(),
+            continuity_attempt_streak: 0,
+            continuity_backoff_from_unix_millis: None,
+            continuity_rematerialized_at_unix_millis: None,
         }
+    }
+
+    /// Decode a stored record. Records written before keys 7-9 are the first
+    /// seven elements of the tuple and decode with those keys defaulted; the
+    /// next write stores all ten. Anything else must re-encode byte for byte.
+    fn decode(envelope: &CultCacheEnvelope) -> Result<Self> {
+        let value: Self = rmp_serde::from_slice(&envelope.payload)?;
+        let before_backoff_keys = rmp_serde::to_vec(&(
+            &value.schema_version,
+            &value.target,
+            &value.route_actuations,
+            &value.continuity_restarts,
+            &value.continuity_deferred_until,
+            &value.continuity_deferral_reason,
+            &value.route_survivals,
+        ))?;
+        ensure!(
+            rmp_serde::to_vec(&value)? == envelope.payload || before_backoff_keys == envelope.payload,
+            "Idunn control store contains a noncanonical record"
+        );
+        Ok(value)
     }
 
     /// Clamp every log to `now`. Callers that decide from a log write the
@@ -1166,11 +1223,79 @@ impl TargetSupervision {
             .is_some_and(|due| is_waiting(now, due, CONTINUITY_DEFERRAL_MILLIS))
     }
 
-    /// One restart scheduled. It ends any deferral: the projection was prepared.
-    fn record_restart(&mut self, now: u64) {
+    /// When the wait for the next charged attempt ends, from the anchor and
+    /// the streak; the one spelling `continuity_backoff` and `status` share.
+    /// An anchor older than the admitted generation decides nothing.
+    fn backoff_due(&self, admitted_at: u64) -> Option<u64> {
+        let from = self
+            .continuity_backoff_from_unix_millis
+            .filter(|&from| from >= admitted_at)?;
+        let wait = self.continuity_attempt_streak.checked_sub(1).map_or(0, |steps| {
+            backoff_wait(
+                CONTINUITY_RESTART_BACKOFF_MILLIS,
+                steps,
+                CONTINUITY_BACKOFF_CEILING_MILLIS,
+            )
+        });
+        Some(from.saturating_add(wait))
+    }
+
+    /// What to do about the next attempt for the dead admitted generation
+    /// admitted at `admitted_at`. The streak resets only after a sustained
+    /// run: the generation has lived the sustained time and no attempt has
+    /// been minted since it was admitted.
+    fn continuity_backoff(&self, now: u64, admitted_at: u64) -> ContinuityBackoff {
+        let streak = self.continuity_attempt_streak;
+        if let Some(due) = self.backoff_due(admitted_at) {
+            return if streak != 0
+                && is_waiting(now, due, CONTINUITY_BACKOFF_CEILING_MILLIS)
+            {
+                ContinuityBackoff::Waiting
+            } else {
+                ContinuityBackoff::Due { streak }
+            };
+        }
+        let sustained = self
+            .continuity_restarts
+            .last()
+            .is_none_or(|&last| admitted_at >= last)
+            && now.saturating_sub(admitted_at) >= CONTINUITY_SUSTAINED_RUN_MILLIS;
+        let streak = if sustained { 0 } else { streak };
+        if streak == 0 {
+            ContinuityBackoff::Due { streak: 0 }
+        } else {
+            ContinuityBackoff::Begin
+        }
+    }
+
+    /// One charged attempt scheduled at `streak`. It ends the wait and any
+    /// deferral: the projection was prepared.
+    fn record_restart(&mut self, now: u64, streak: u32) {
         record_entry(&mut self.continuity_restarts, now, CONTINUITY_PAGING_RESTARTS);
+        self.continuity_attempt_streak = streak.saturating_add(1);
+        self.continuity_backoff_from_unix_millis = None;
         self.continuity_deferred_until = None;
         self.continuity_deferral_reason = None;
+    }
+
+    /// The target was found dead and free: the wait for its next attempt runs from now.
+    fn begin_backoff(&mut self, now: u64) {
+        self.continuity_backoff_from_unix_millis = Some(now);
+    }
+
+    /// The one uncharged re-materialization scheduled. The log and the streak
+    /// are left alone.
+    fn record_rematerialization(&mut self, now: u64) {
+        self.continuity_rematerialized_at_unix_millis = Some(now);
+        self.continuity_backoff_from_unix_millis = None;
+        self.continuity_deferred_until = None;
+        self.continuity_deferral_reason = None;
+    }
+
+    /// Whether the generation admitted at `admitted_at` has had its free re-materialization.
+    fn rematerialization_spent(&self, admitted_at: u64) -> bool {
+        self.continuity_rematerialized_at_unix_millis
+            .is_some_and(|at| at >= admitted_at)
     }
 
     fn defer_continuity(&mut self, now: u64, reason: &str) {
@@ -1195,6 +1320,11 @@ impl TargetSupervision {
                 "{what} log is not an ascending list of times"
             );
         }
+        ensure!(
+            self.continuity_backoff_from_unix_millis != Some(0)
+                && self.continuity_rematerialized_at_unix_millis != Some(0),
+            "continuity backoff anchor or re-materialization has no time"
+        );
         ensure!(
             self.continuity_deferred_until.is_some() == self.continuity_deferral_reason.is_some(),
             "continuity deferral has a time or a reason but not both"
@@ -3034,7 +3164,7 @@ impl ControlSnapshot {
                         envelope.schema_id.as_deref() == Some(TARGET_SUPERVISION_SCHEMA),
                         "Idunn control store contains an unsupported target supervision record"
                     );
-                    let value: TargetSupervision = decode_record(&envelope)?;
+                    let value = TargetSupervision::decode(&envelope)?;
                     value.validate()?;
                     ensure!(
                         envelope.key == value.target,
@@ -3983,10 +4113,10 @@ fn read_history_transactions(state_store: &Path) -> Vec<DeploymentTransaction> {
 
 /// How long to wait after `failures` consecutive failures: one poll interval
 /// after the first, doubling each time, never past the ceiling.
-fn backoff_wait(poll_millis: u64, failures: u32) -> u64 {
-    poll_millis
+fn backoff_wait(base_millis: u64, failures: u32, ceiling_millis: u64) -> u64 {
+    base_millis
         .saturating_mul(1u64 << failures.min(20))
-        .min(RESUME_BACKOFF_CEILING_MILLIS)
+        .min(ceiling_millis)
 }
 
 /// Whether an attempt due at `not_before` must still wait at `now`. A due time
@@ -4469,10 +4599,15 @@ fn render_supervision(
         lines.push(format!("  held: {reason}"));
     }
     lines.push(format!(
-        "  continuity attempts-in-hour {} pages-at {}",
+        "  continuity attempts-in-hour {} pages-at {} streak {} next-attempt-at {}",
         meters.restarts_used(now),
         CONTINUITY_PAGING_RESTARTS,
+        meters.continuity_attempt_streak,
+        at(generation.and_then(|value| meters.backoff_due(value.admitted_at_unix_millis)))
     ));
+    if let Some(rematerialized) = meters.continuity_rematerialized_at_unix_millis {
+        lines.push(format!("  continuity rematerialized-at {rematerialized}"));
+    }
     if let (Some(until), Some(reason)) = (
         meters.continuity_deferred_until,
         &meters.continuity_deferral_reason,
@@ -5600,7 +5735,7 @@ impl Engine {
         let now = now_millis()?;
         let mut all = self.resume_backoff.lock().expect("resume backoff mutex");
         let failures = all.get(transaction_id).map_or(0, |backoff| backoff.failures);
-        let wait = backoff_wait(self.options.poll_millis, failures);
+        let wait = backoff_wait(self.options.poll_millis, failures, RESUME_BACKOFF_CEILING_MILLIS);
         all.insert(
             transaction_id.to_string(),
             ResumeBackoff {
@@ -6027,9 +6162,10 @@ impl Engine {
                 self.report_once(
                     &continuity_key,
                     format!(
-                        "Idunn has restarted admitted {} {} times inside the hour and keeps restarting it on a capped backoff: {workload_error:#}",
+                        "Idunn has restarted admitted {} {} times inside the hour and keeps restarting it on a capped backoff (streak {}): {workload_error:#}",
                         current.value.target,
                         supervision.restarts_used(now),
+                        supervision.continuity_attempt_streak,
                     ),
                 );
             } else {
@@ -6037,6 +6173,43 @@ impl Engine {
             }
             if supervision.continuity_deferred(now) {
                 continue;
+            }
+            // A unit the host lost to a reboot is re-materialized once per
+            // generation, uncharged and with no wait; the driver owns the
+            // evidence and supervision owns the budget. An unanswerable
+            // driver is not evidence of a reboot.
+            let admitted_at = current.value.admitted_at_unix_millis;
+            let rematerialize = !supervision.rematerialization_spent(admitted_at)
+                && match self.workload_for(&current.value.plan).and_then(|workload| {
+                    workload.lost_to_host_reboot(&current.value.workload, admitted_at)
+                }) {
+                    Ok(lost) => lost,
+                    Err(error) => {
+                        self.note_fault(
+                            "could not tell whether the host rebooted under",
+                            &format!("reboot:{}", current.value.target),
+                            &error,
+                        );
+                        false
+                    }
+                };
+            let mut streak = 0;
+            if !rematerialize {
+                match supervision.continuity_backoff(now, admitted_at) {
+                    ContinuityBackoff::Waiting => continue,
+                    ContinuityBackoff::Begin => {
+                        let mut began = supervision.clone();
+                        began.begin_backoff(now);
+                        self.write_target_supervision(
+                            snapshot.supervision_for(&current.value.target),
+                            &began,
+                            now,
+                        )?;
+                        progressed = true;
+                        continue;
+                    }
+                    ContinuityBackoff::Due { streak: due } => streak = due,
+                }
             }
 
             // The projected activation names an incarnation that is gone. Every
@@ -6102,10 +6275,15 @@ impl Engine {
             command.validate()?;
             let transaction =
                 DeploymentTransaction::from_continuity(&command, &current.value, now)?;
-            // The restart is counted in the same CAS that mints it, so a crash
-            // cannot schedule one the ceiling never saw.
+            // The attempt is charged, or recorded as the one re-materialization,
+            // in the same CAS that mints it, so a crash cannot schedule one the
+            // meters never saw.
             let mut counted = supervision;
-            counted.record_restart(now);
+            if rematerialize {
+                counted.record_rematerialization(now);
+            } else {
+                counted.record_restart(now, streak);
+            }
             ensure!(
                 SingleFileMessagePackBackingStore::new(&self.options.state_store)
                     .compare_exchange(
@@ -11999,6 +12177,9 @@ mod tests {
         fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
             Ok(false)
         }
+        fn lost_to_host_reboot(&self, _: &WorkloadObservation, _: u64) -> Result<bool> {
+            Ok(false)
+        }
     }
 
     /// A Continuity transaction for an unrouted, stateless target with no
@@ -13270,18 +13451,29 @@ mod tests {
     /// `StillWorkload`'s.
     struct SwitchWorkload {
         alive: std::sync::atomic::AtomicBool,
+        rebooted: std::sync::atomic::AtomicBool,
     }
 
     impl SwitchWorkload {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 alive: std::sync::atomic::AtomicBool::new(true),
+                rebooted: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
         fn revive(&self) {
             self.alive
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.rebooted
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// The host rebooted under the unit: it is gone and the driver can tell.
+        fn reboot(&self) {
+            self.rebooted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.kill();
         }
 
         fn kill(&self) {
@@ -13341,6 +13533,9 @@ mod tests {
         }
         fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
             Ok(false)
+        }
+        fn lost_to_host_reboot(&self, _: &WorkloadObservation, _: u64) -> Result<bool> {
+            Ok(self.rebooted.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
 
@@ -13449,6 +13644,8 @@ mod tests {
         let mut meters = TargetSupervision::new("service");
         meters.continuity_restarts = ages.iter().map(|age| now - age).collect();
         meters.continuity_restarts.sort_unstable();
+        // Every logged attempt belongs to one streak.
+        meters.continuity_attempt_streak = ages.len() as u32;
         Ok(meters)
     }
 
@@ -14140,6 +14337,9 @@ mod tests {
         fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
             Ok(true)
         }
+        fn lost_to_host_reboot(&self, _: &WorkloadObservation, _: u64) -> Result<bool> {
+            Ok(false)
+        }
     }
 
     #[test]
@@ -14264,6 +14464,9 @@ mod tests {
         }
         fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
             Ok(true)
+        }
+        fn lost_to_host_reboot(&self, _: &WorkloadObservation, _: u64) -> Result<bool> {
+            Ok(false)
         }
     }
 
@@ -14450,6 +14653,9 @@ mod tests {
         fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
             Ok(true)
         }
+        fn lost_to_host_reboot(&self, _: &WorkloadObservation, _: u64) -> Result<bool> {
+            Ok(false)
+        }
     }
 
     #[test]
@@ -14521,12 +14727,17 @@ mod tests {
 
     #[test]
     fn backoff_doubles_caps_and_waits_exactly() {
-        assert_eq!(backoff_wait(500, 0), 500);
-        assert_eq!(backoff_wait(500, 1), 1000);
-        assert_eq!(backoff_wait(500, 2), 2000);
-        assert_eq!(backoff_wait(500, 3), 4000);
-        assert_eq!(backoff_wait(500, 30), RESUME_BACKOFF_CEILING_MILLIS);
-        assert_eq!(backoff_wait(u64::MAX, 5), RESUME_BACKOFF_CEILING_MILLIS);
+        let ceiling = RESUME_BACKOFF_CEILING_MILLIS;
+        assert_eq!(backoff_wait(500, 0, ceiling), 500);
+        assert_eq!(backoff_wait(500, 1, ceiling), 1000);
+        assert_eq!(backoff_wait(500, 2, ceiling), 2000);
+        assert_eq!(backoff_wait(500, 3, ceiling), 4000);
+        assert_eq!(backoff_wait(500, 30, ceiling), ceiling);
+        assert_eq!(backoff_wait(u64::MAX, 5, ceiling), ceiling);
+        // The ceiling is the caller's: continuity's is lower than the resume path's.
+        assert_eq!(backoff_wait(5_000, 5, 300_000), 160_000);
+        assert_eq!(backoff_wait(5_000, 6, 300_000), 300_000);
+        assert_eq!(backoff_wait(5_000, 20, 300_000), 300_000);
         assert!(is_waiting(9, 10, 5));
         assert!(!is_waiting(10, 10, 5));
         assert!(!is_waiting(11, 10, 5));
@@ -15121,7 +15332,8 @@ mod tests {
         spend_the_window(&world)?;
         assert!(!incident_path(&world).exists());
 
-        assert!(!world.engine.supervise_one_admitted_generation()?);
+        // The first pass over the dead target starts its wait: progress, no mint.
+        assert!(world.engine.supervise_one_admitted_generation()?);
         let opened = incidents_of(&world)?;
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].subject, "service");
@@ -15158,7 +15370,7 @@ mod tests {
         // The window slides while the workload is still dead: exhaustion is
         // over, the target is not healthy, and the incident stays open.
         slide_the_window(&world)?;
-        assert!(!world.engine.supervise_one_admitted_generation()?);
+        let _ = world.engine.supervise_one_admitted_generation()?;
         assert_eq!(incidents_of(&world)?, first);
 
         // Seen running, it closes as recovered.
@@ -15773,6 +15985,291 @@ mod tests {
         Ok(())
     }
 
+    /// The incumbent was admitted this long ago, so an anchor written "in the
+    /// past" is not older than its generation.
+    fn age_incumbent(world: &EngineFixture, millis: u64) -> Result<()> {
+        edit_incumbent(world, |generation| generation.admitted_at_unix_millis -= millis)?;
+        Ok(())
+    }
+
+    /// Put the target's backoff anchor `ago` milliseconds back.
+    fn anchor_ago(world: &EngineFixture, ago: u64) -> Result<()> {
+        let mut meters = meters_of(world, "service")?;
+        meters.continuity_backoff_from_unix_millis = Some(now_millis()? - ago);
+        set_meters(world, &meters)
+    }
+
+    fn continuity_mints(world: &EngineFixture) -> Result<usize> {
+        Ok(every_transaction(world)?
+            .iter()
+            .filter(|transaction| transaction.command_kind == CommandKind::Continuity)
+            .count())
+    }
+
+    #[test]
+    fn continuity_keeps_restarting_past_the_paging_threshold() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        age_incumbent(&world, 500_000)?;
+        workload.kill();
+        // Six charged attempts in the hour: the incident pages, nothing stops.
+        set_meters(
+            &world,
+            &restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
+        )?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 0);
+        assert!(meters_of(&world, "service")?.continuity_backoff_from_unix_millis.is_some());
+        let opened = incidents_of(&world)?;
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].is_open());
+
+        // The streak-6 wait is 160 s.
+        anchor_ago(&world, 159_000)?;
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 0);
+        anchor_ago(&world, 160_001)?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 1);
+        let after = meters_of(&world, "service")?;
+        assert_eq!(after.continuity_restarts.len(), 6);
+        assert!(after.continuity_restarts.last().is_some_and(|&last| now_millis().unwrap() - last < 60_000));
+        assert_eq!(after.continuity_attempt_streak, 7);
+        assert_eq!(after.continuity_backoff_from_unix_millis, None);
+        assert_eq!(incidents_of(&world)?, opened);
+        Ok(())
+    }
+
+    #[test]
+    fn continuity_backoff_is_a_capped_doubling_of_the_attempt_streak() {
+        let from = 10_000_000_u64;
+        for (streak, seconds) in [
+            (1_u32, 5_u64),
+            (2, 10),
+            (3, 20),
+            (4, 40),
+            (5, 80),
+            (6, 160),
+            (7, 300),
+            (8, 300),
+            (9, 300),
+        ] {
+            let mut meters = TargetSupervision::new("service");
+            meters.continuity_attempt_streak = streak;
+            meters.continuity_backoff_from_unix_millis = Some(from);
+            // The paging log disagrees with the streak on purpose: the wait
+            // is a function of the streak, not of the window's count.
+            meters.continuity_restarts = vec![from - 10; if streak == 1 { 6 } else { 2 }];
+            let due = from + seconds * 1_000;
+            assert_eq!(meters.backoff_due(0), Some(due), "streak {streak}");
+            assert_eq!(
+                meters.continuity_backoff(due - 1, 0),
+                ContinuityBackoff::Waiting,
+                "streak {streak}"
+            );
+            assert_eq!(
+                meters.continuity_backoff(due, 0),
+                ContinuityBackoff::Due { streak },
+                "streak {streak}"
+            );
+        }
+        // No streak, no wait.
+        let mut fresh = TargetSupervision::new("service");
+        fresh.continuity_backoff_from_unix_millis = Some(from);
+        assert_eq!(fresh.continuity_backoff(from, 0), ContinuityBackoff::Due { streak: 0 });
+    }
+
+    #[test]
+    fn a_sustained_run_resets_the_streak_and_only_a_sustained_run() {
+        let now = 100_000_000_u64;
+        let mut meters = TargetSupervision::new("service");
+        meters.continuity_attempt_streak = 7;
+        meters.continuity_restarts = vec![1_000];
+        // Lived the sustained time, and no attempt since admission.
+        assert_eq!(
+            meters.continuity_backoff(now, now - CONTINUITY_SUSTAINED_RUN_MILLIS),
+            ContinuityBackoff::Due { streak: 0 }
+        );
+        // A moment short of it.
+        assert_eq!(
+            meters.continuity_backoff(now, now - CONTINUITY_SUSTAINED_RUN_MILLIS + 10_000),
+            ContinuityBackoff::Begin
+        );
+        // Attempts after admission failed on this generation: it has not run well.
+        meters.continuity_restarts = vec![now - 100_000];
+        assert_eq!(meters.continuity_backoff(now, now - 700_000), ContinuityBackoff::Begin);
+        // Never attempted over this log, long lived: reset.
+        meters.continuity_restarts = Vec::new();
+        assert_eq!(
+            meters.continuity_backoff(now, now - 700_000),
+            ContinuityBackoff::Due { streak: 0 }
+        );
+        assert_eq!(meters.continuity_backoff(now, now - 590_000), ContinuityBackoff::Begin);
+        // An anchor older than its generation decides nothing.
+        meters.continuity_backoff_from_unix_millis = Some(now - 800_000);
+        assert_eq!(meters.backoff_due(now - 700_000), None);
+        assert_eq!(
+            meters.continuity_backoff(now, now - 700_000),
+            ContinuityBackoff::Due { streak: 0 }
+        );
+        assert_eq!(meters.continuity_backoff(now, now - 590_000), ContinuityBackoff::Begin);
+        // Streak zero with no history is simply due.
+        let fresh = TargetSupervision::new("service");
+        assert_eq!(fresh.continuity_backoff(now, now - 1_000), ContinuityBackoff::Due { streak: 0 });
+    }
+
+    #[test]
+    fn a_continuity_wait_runs_from_when_the_target_was_found_dead_and_free() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        age_incumbent(&world, 500_000)?;
+        workload.kill();
+        let mut meters = restarted_ago(&[1_000_000])?;
+        meters.continuity_attempt_streak = 3;
+        set_meters(&world, &meters)?;
+
+        // The last attempt was long ago, but the wait starts now: a wait
+        // anchored on the mint would already be over.
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 0);
+        assert!(meters_of(&world, "service")?.continuity_backoff_from_unix_millis.is_some());
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 0);
+
+        // Streak 3 waits 20 s.
+        anchor_ago(&world, 19_000)?;
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        anchor_ago(&world, 20_001)?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 1);
+        assert_eq!(meters_of(&world, "service")?.continuity_attempt_streak, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_queued_deployment_freezes_in_the_gap_after_a_continuity_attempt() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        age_incumbent(&world, 500_000)?;
+        workload.kill();
+        let mut meters = restarted_ago(&[3_000_000])?;
+        meters.continuity_attempt_streak = 2;
+        set_meters(&world, &meters)?;
+        queue_declaring_redeploy(&world, "up-service-queued")?;
+
+        for _ in 0..4 {
+            let _ = world.engine.run_scheduler_tick();
+        }
+        let all = every_transaction(&world)?;
+        assert!(
+            all.iter().any(|transaction| transaction.command_id == "up-service-queued"),
+            "the queued deployment never froze"
+        );
+        assert_eq!(continuity_mints(&world)?, 0);
+        for _ in 0..3 {
+            let _ = world.engine.run_scheduler_tick();
+            assert_eq!(continuity_mints(&world)?, 0);
+            assert!(
+                every_transaction(&world)?
+                    .iter()
+                    .all(|transaction| transaction.pre_fencing_abort.is_none()),
+                "the deployment was yielded"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_unit_lost_to_a_host_reboot_is_rematerialized_once_with_no_backoff_step() -> Result<()> {
+        let fresh_world = |workload: &Arc<SwitchWorkload>| -> Result<EngineFixture> {
+            let world = EngineFixture::with_workload(workload.clone())?;
+            admit_incumbent(&world)?;
+            age_incumbent(&world, 500_000)?;
+            let mut meters = restarted_ago(&[1_000_000])?;
+            meters.continuity_attempt_streak = 3;
+            meters.continuity_backoff_from_unix_millis = Some(now_millis()?);
+            set_meters(&world, &meters)?;
+            Ok(world)
+        };
+        let workload = SwitchWorkload::new();
+        let world = fresh_world(&workload)?;
+        let before = meters_of(&world, "service")?;
+
+        // Control: dead but not rebooted, the ordinary 20 s wait holds.
+        workload.kill();
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 0);
+
+        // The host rebooted under the unit: one mint, charged to nothing.
+        workload.reboot();
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 1);
+        let after = meters_of(&world, "service")?;
+        assert_eq!(after.continuity_restarts, before.continuity_restarts);
+        assert_eq!(after.continuity_attempt_streak, 3);
+        assert!(after.continuity_rematerialized_at_unix_millis.is_some());
+        assert_eq!(after.continuity_backoff_from_unix_millis, None);
+
+        // The bound is spent: the next death of this generation waits like any other.
+        clear_live_transactions(&world)?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 0);
+        assert!(meters_of(&world, "service")?.continuity_backoff_from_unix_millis.is_some());
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 0);
+
+        // Control: a deferred projection spaces a re-materialization too.
+        let workload = SwitchWorkload::new();
+        let world = fresh_world(&workload)?;
+        let mut deferred = meters_of(&world, "service")?;
+        deferred.defer_continuity(now_millis()?, "demotion failed");
+        set_meters(&world, &deferred)?;
+        workload.reboot();
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn target_supervision_decodes_without_keys_7_to_9() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let meters = restarted_ago(&[200_000])?;
+        // A record as every one on a running host was written: seven keys.
+        let payload = rmp_serde::to_vec(&(
+            &meters.schema_version,
+            &meters.target,
+            &meters.route_actuations,
+            &meters.continuity_restarts,
+            &meters.continuity_deferred_until,
+            &meters.continuity_deferral_reason,
+            &meters.route_survivals,
+        ))?;
+        let envelope = CultCacheEnvelope {
+            key: "service".into(),
+            r#type: TargetSupervision::TYPE.into(),
+            payload,
+            stored_at: rfc3339_millis(now_millis()?)?,
+            schema_id: Some(TARGET_SUPERVISION_SCHEMA.into()),
+        };
+        SingleFileMessagePackBackingStore::new(&world.state_store).insert_entry_if_absent(envelope)?;
+        let read = meters_of(&world, "service")?;
+        assert_eq!(read.continuity_restarts, meters.continuity_restarts);
+        assert_eq!(read.continuity_attempt_streak, 0);
+        assert_eq!(read.continuity_backoff_from_unix_millis, None);
+        assert_eq!(read.continuity_rematerialized_at_unix_millis, None);
+
+        let mut anchored = TargetSupervision::new("service");
+        anchored.continuity_backoff_from_unix_millis = Some(0);
+        assert!(anchored.validate().is_err());
+        anchored.continuity_backoff_from_unix_millis = None;
+        anchored.continuity_rematerialized_at_unix_millis = Some(0);
+        assert!(anchored.validate().is_err());
+        Ok(())
+    }
+
     /// A source that resolves one fixed recipe and never freezes anything.
     struct FixedSource {
         recipe: String,
@@ -16242,6 +16739,13 @@ mod tests {
 
         // Waits set for the future are due, not stalled for the length of the step.
         assert!(!read_only.continuity_deferred(now));
+        let mut anchored = TargetSupervision::new("service");
+        anchored.continuity_attempt_streak = 7;
+        anchored.continuity_backoff_from_unix_millis = Some(t);
+        assert_eq!(anchored.continuity_backoff(now, 0), ContinuityBackoff::Due { streak: 7 });
+        anchored.continuity_attempt_streak = 1;
+        anchored.continuity_backoff_from_unix_millis = Some(now + 10_000);
+        assert_eq!(anchored.continuity_backoff(now, 0), ContinuityBackoff::Waiting);
         let route = RouteSupervisionState {
             next_challenge_at_unix_millis: Some(t),
             ..RouteSupervisionState::default()

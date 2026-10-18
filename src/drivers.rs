@@ -587,6 +587,17 @@ pub trait WorkloadPort {
     /// resumable and retried forever, which is right while a candidate can
     /// still recover and a trap once it cannot.
     fn is_permanently_stopped(&self, observation: &WorkloadObservation) -> Result<bool>;
+
+    /// True only when the host lost the workload's unit to a reboot after the
+    /// generation was admitted at `admitted_at_unix_millis`. The driver owns
+    /// the evidence; continuity supervision owns the budget it buys (one
+    /// uncharged re-materialization per generation). Every implementation
+    /// answers explicitly.
+    fn lost_to_host_reboot(
+        &self,
+        observation: &WorkloadObservation,
+        admitted_at_unix_millis: u64,
+    ) -> Result<bool>;
 }
 
 pub trait TopologyPort {
@@ -3998,6 +4009,29 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
             return Ok(true);
         };
         Ok(unit.properties.get("ActiveState").map(String::as_str) == Some("failed"))
+    }
+
+    fn lost_to_host_reboot(
+        &self,
+        observation: &WorkloadObservation,
+        admitted_at_unix_millis: u64,
+    ) -> Result<bool> {
+        let observation = observation.systemd()?;
+        if self.show_unit(&observation.unit)?.is_some() {
+            return Ok(false);
+        }
+        // A transient unit does not survive a reboot, so an absent unit is a
+        // reboot's loss only when the kernel booted after admission.
+        let stat = std::fs::read_to_string(self.proc_root.join("stat"))
+            .context("could not read the kernel boot time")?;
+        let btime = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))
+            .context("the kernel boot time is missing from stat")?
+            .trim()
+            .parse::<u64>()
+            .context("the kernel boot time is not a number")?;
+        Ok(btime.saturating_mul(1000) > admitted_at_unix_millis)
     }
 
     fn stop(&self, observation: &WorkloadObservation) -> Result<()> {
@@ -9573,6 +9607,75 @@ Content-Le".to_vec()), |_| {}),
             .is_permanently_stopped(&restarting)
             .expect_err("Restart=always incumbent must not be judged stopped");
         assert!(format!("{error:#}").contains("Restart=no"), "{error:#}");
+        Ok(())
+    }
+
+    /// Continuity's one free re-materialization rests on this: an absent unit
+    /// is a reboot's loss only when the kernel booted after admission.
+    #[cfg(unix)]
+    #[test]
+    fn lost_to_host_reboot_needs_an_absent_unit_and_a_boot_after_admission() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let systemctl = temp.path().join("systemctl");
+        let state = temp.path().join("systemctl.state");
+        std::fs::write(&systemctl, "#!/bin/sh
+cat \"$0.state\"
+exit 0
+")?;
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))?;
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&proc_root)?;
+        let driver = SystemdTransientWorkloadDriver {
+            systemctl_program: systemctl,
+            proc_root: proc_root.clone(),
+            ..Default::default()
+        };
+        let observation = audit_workload_observation("no");
+        let absent = "LoadState=not-found
+ActiveState=inactive
+SubState=dead
+";
+        let failed = "LoadState=loaded
+ActiveState=failed
+SubState=failed
+InvocationID=inv
+Description=Idunn test
+";
+        let boot = |btime: &str| -> Result<()> {
+            Ok(std::fs::write(
+                proc_root.join("stat"),
+                format!("cpu  1 2 3
+btime {btime}
+processes 9
+"),
+            )?)
+        };
+        let admitted_at = 1_700_000_000_000_u64;
+
+        std::fs::write(&state, absent)?;
+        boot("1700000001")?;
+        assert!(driver.lost_to_host_reboot(&observation, admitted_at)?);
+        boot("1700000000")?;
+        assert!(!driver.lost_to_host_reboot(&observation, admitted_at)?, "booted at admission");
+        boot("1699999999")?;
+        assert!(!driver.lost_to_host_reboot(&observation, admitted_at)?, "booted before admission");
+
+        // A unit systemd still knows died on its own, not to a reboot.
+        std::fs::write(&state, failed)?;
+        boot("1700000001")?;
+        assert!(!driver.lost_to_host_reboot(&observation, admitted_at)?);
+
+        // No boot time is not evidence either way.
+        std::fs::write(&state, absent)?;
+        std::fs::write(proc_root.join("stat"), "cpu  1 2 3
+")?;
+        assert!(driver.lost_to_host_reboot(&observation, admitted_at).is_err());
+        boot("soon")?;
+        assert!(driver.lost_to_host_reboot(&observation, admitted_at).is_err());
+        std::fs::remove_file(proc_root.join("stat"))?;
+        assert!(driver.lost_to_host_reboot(&observation, admitted_at).is_err());
         Ok(())
     }
 

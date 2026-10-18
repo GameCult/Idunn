@@ -963,6 +963,12 @@ impl WorkloadPort for HostActuatorWorkloadDriver<'_> {
         };
         Ok(!running)
     }
+
+    /// A managed host's reboot is not yet observable here: follow-up
+    /// host-actuator-reboot. Until then continuity charges its restarts.
+    fn lost_to_host_reboot(&self, _: &WorkloadObservation, _: u64) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
