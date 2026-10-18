@@ -15901,6 +15901,54 @@ mod tests {
         Ok(())
     }
 
+    /// The 2026-10-18 state: a dead incumbent that has paged, with a deployment
+    /// waiting before Fencing. Continuity never stops and never yields a
+    /// deployment (budget-never-stop, handover-phase-split), so the window
+    /// sliding must not turn the deployment into a casualty.
+    #[test]
+    fn a_deployment_before_fencing_over_a_dead_incumbent_that_paged_is_never_yielded_and_lands() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        let redeploy =
+            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        workload.kill();
+        set_meters(
+            &world,
+            &restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
+        )?;
+        world.engine.supervise_one_admitted_generation()?;
+        // The oldest leaves the window: base would now yield the deployment.
+        set_meters(
+            &world,
+            &restarted_ago(&[3_700_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
+        )?;
+        for _ in 0..3 {
+            let _ = world.engine.supervise_one_admitted_generation()?;
+            let after = resident(&world)?.value;
+            assert_eq!(after.transaction_id, redeploy.transaction_id);
+            assert!(
+                after.pre_fencing_abort.is_none(),
+                "the deployment was yielded: {:?}",
+                after.pre_fencing_abort
+            );
+            assert!(
+                every_transaction(&world)?
+                    .iter()
+                    .all(|transaction| transaction.command_kind != CommandKind::Continuity),
+                "continuity minted beside a pre-fencing deployment"
+            );
+        }
+        workload.revive();
+        odin_reports_ready(&world, &redeploy, seeded_sequence(Some(&incumbent)) + 1)?;
+        drive(&world, |transaction| transaction.phase == DeploymentPhase::Complete)?;
+        let landed = latest(&world)?;
+        assert_eq!(landed.transaction_id, redeploy.transaction_id);
+        assert_eq!(landed.phase, DeploymentPhase::Complete);
+        assert!(landed.pre_fencing_abort.is_none());
+        Ok(())
+    }
+
     /// A source that resolves one fixed recipe and never freezes anything.
     struct FixedSource {
         recipe: String,
