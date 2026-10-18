@@ -1211,6 +1211,17 @@ impl TargetSupervision {
             .is_some_and(|due| is_waiting(now, due, CONTINUITY_DEFERRAL_MILLIS))
     }
 
+    /// The doubling steps the next attempt waits, if it waits. A streak of `n`
+    /// waits `n - 1` steps. The generation's one re-materialization is an
+    /// attempt that failed on it though it charged no streak, so the attempt
+    /// after it waits the base step: every attempt leaves a gap.
+    fn owed_steps(&self, admitted_at: u64) -> Option<u32> {
+        match self.continuity_attempt_streak.checked_sub(1) {
+            None if self.rematerialization_spent(admitted_at) => Some(0),
+            steps => steps,
+        }
+    }
+
     /// When the wait for the next charged attempt ends, from the anchor and
     /// the streak; the one spelling `continuity_backoff` and `status` share.
     /// An anchor older than the admitted generation decides nothing.
@@ -1218,7 +1229,7 @@ impl TargetSupervision {
         let from = self
             .continuity_backoff_from_unix_millis
             .filter(|&from| from >= admitted_at)?;
-        let wait = self.continuity_attempt_streak.checked_sub(1).map_or(0, |steps| {
+        let wait = self.owed_steps(admitted_at).map_or(0, |steps| {
             backoff_wait(
                 CONTINUITY_RESTART_BACKOFF_MILLIS,
                 steps,
@@ -1237,7 +1248,7 @@ impl TargetSupervision {
     fn continuity_backoff(&self, now: u64, admitted_at: u64) -> ContinuityBackoff {
         let streak = self.continuity_attempt_streak;
         if let Some(due) = self.backoff_due(admitted_at) {
-            return if streak != 0
+            return if self.owed_steps(admitted_at).is_some()
                 && is_waiting(now, due, CONTINUITY_BACKOFF_CEILING_MILLIS)
             {
                 ContinuityBackoff::Waiting
@@ -1252,8 +1263,7 @@ impl TargetSupervision {
             .chain(&self.continuity_rematerialized_at_unix_millis)
             .all(|&last| admitted_at >= last)
             && now.saturating_sub(admitted_at) >= CONTINUITY_SUSTAINED_RUN_MILLIS;
-        let streak = if sustained { 0 } else { streak };
-        if streak == 0 {
+        if sustained || self.owed_steps(admitted_at).is_none() {
             ContinuityBackoff::Due { streak: 0 }
         } else {
             ContinuityBackoff::Begin
@@ -16455,6 +16465,20 @@ mod tests {
         // After admission: that attempt failed on this generation.
         meters.continuity_rematerialized_at_unix_millis = Some(admitted_at + 1);
         assert_eq!(meters.continuity_backoff(now, admitted_at), ContinuityBackoff::Begin);
+        // Even with no streak to step: the re-materialization is an attempt,
+        // and the next one waits the base step from its anchor.
+        meters.continuity_attempt_streak = 0;
+        meters.continuity_restarts = Vec::new();
+        assert_eq!(meters.continuity_backoff(now, admitted_at), ContinuityBackoff::Begin);
+        meters.continuity_backoff_from_unix_millis = Some(now);
+        assert_eq!(meters.backoff_due(admitted_at), Some(now + CONTINUITY_RESTART_BACKOFF_MILLIS));
+        assert_eq!(meters.continuity_backoff(now, admitted_at), ContinuityBackoff::Waiting);
+        assert_eq!(
+            meters.continuity_backoff(now + CONTINUITY_RESTART_BACKOFF_MILLIS, admitted_at),
+            ContinuityBackoff::Due { streak: 0 }
+        );
+        meters.continuity_rematerialized_at_unix_millis = None;
+        assert_eq!(meters.backoff_due(admitted_at), Some(now));
     }
 
     mod after_a_reboot {
