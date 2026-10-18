@@ -1050,6 +1050,43 @@ mod tests {
         Ok(())
     }
 
+    /// A managed host's reboot is not observable yet (follow-up
+    /// host-actuator-reboot): the driver never claims a reboot, so continuity
+    /// never grants a free re-materialization it cannot justify.
+    #[test]
+    fn a_managed_host_workload_is_never_claimed_lost_to_a_reboot() -> Result<()> {
+        let (_temp, idunn, _host) = identities()?;
+        let hub = HostActuatorHub::bind("127.0.0.1:0".parse()?)?;
+        let driver = HostActuatorWorkloadDriver {
+            access: HostActuatorAccess {
+                hub: Arc::new(Mutex::new(hub)),
+                anchors: BTreeMap::new(),
+                signer: &idunn,
+            },
+        };
+        let observation = WorkloadObservation::Host(HostWorkloadObservation {
+            host: "raven".into(),
+            actuator_identity_id: "actuator".into(),
+            process_id: 1,
+            process_creation_time: 1,
+            session_id: 1,
+            user_sid: "S-1-5-21-1-2-3-1001".into(),
+            executable: "C:/GameCult/idunn/releases/muninn/x/muninn.exe".into(),
+            executable_sha256: format!("sha256-{}", "1".repeat(64)),
+            command_line_sha256: format!("sha256-{}", "2".repeat(64)),
+            environment_names: Vec::new(),
+            environment_contract_sha256: format!("sha256-{}", "3".repeat(64)),
+            runtime_bundle: "C:/GameCult/idunn/runtime/muninn/x".into(),
+            runtime_instance_id: format!("sha256-{}", "a".repeat(64)),
+            activation_signer_identity_id: "activation".into(),
+            activation_signer_public_key: vec![1; 32],
+            exit_code: Some(1),
+        });
+        assert!(!driver.lost_to_host_reboot(&observation, 1)?);
+        assert!(!driver.lost_to_host_reboot(&observation, u64::MAX)?);
+        Ok(())
+    }
+
     /// A real hub and a real client socket on loopback: Hello attaches under
     /// the bound anchor, a wrong host is refused, a request is answered.
     #[test]
