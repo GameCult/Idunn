@@ -60,7 +60,13 @@ const ADMITTED_GENERATION_SCHEMA_V3: &str = "idunn.admitted_generation.v3";
 const ADMITTED_GENERATION_SCHEMA_V2: &str = "idunn.admitted_generation.v2";
 /// The capability whose declaration makes a target Odin-correlated.
 pub(crate) const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
-const TARGET_SUPERVISION_SCHEMA: &str = "idunn.target_supervision.v1";
+const TARGET_SUPERVISION_SCHEMA: &str = "idunn.target_supervision.v2";
+/// The seven-key layout written before continuity's streak, anchor and
+/// re-materialization bound. Read and migrated by `read_supervision_record`
+/// and `migrate_control_store_to_current_schema`; delete it, `LegacyTargetSupervisionV1`
+/// and those two arms once every store has opened under a build that
+/// migrates (the key-34 precedent's deletion line).
+const TARGET_SUPERVISION_SCHEMA_V1: &str = "idunn.target_supervision.v1";
 const EXPIRY_REQUEST_SCHEMA: &str = "idunn.expiry_request.v1";
 /// The number of charged continuity attempts inside
 /// `CONTINUITY_RESTART_WINDOW_MILLIS` at which the ContinuityExhausted incident
@@ -83,12 +89,14 @@ const CONTINUITY_SUSTAINED_RUN_MILLIS: u64 = 600_000;
 /// healthy target performs none; a legitimate deployment performs one or two.
 /// Only deployments count: a Survival actuation is recorded beside this
 /// ceiling, never counted against it and never refused by it, so a target
-/// whose continuity spent its restarts can still be rescued by a deploy.
-/// Survival is bounded elsewhere: a continuity's actuations by the restart log
-/// times what one transaction can do before its phase deadline ends it (none,
-/// over its admitted route), and an admitted-route repair by the challenge
-/// backoff. A withdrawal that keeps failing retries, reloading each time,
-/// under the resume backoff alone: the abort has no deadline. Nothing bounds
+/// that is being restarted can still be rescued by a deploy.
+/// Survival is bounded elsewhere: a continuity's actuations by the streak
+/// backoff (at most one attempt per `CONTINUITY_BACKOFF_CEILING_MILLIS` once
+/// the streak is long) times what one transaction can do before its phase
+/// deadline ends it (none, over its admitted route), and an admitted-route
+/// repair by the challenge backoff. A withdrawal that keeps failing retries,
+/// reloading each time, under the resume backoff alone: the abort has no
+/// deadline. Nothing bounds
 /// reloads across the host.
 const ROUTE_ACTUATION_CEILING: usize = 12;
 const ROUTE_ACTUATION_WINDOW_MILLIS: u64 = 3_600_000;
@@ -1041,7 +1049,7 @@ impl RouteSupervisionState {
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(
     type = "idunn.target_supervision",
-    schema = "idunn.target_supervision.v1"
+    schema = "idunn.target_supervision.v2"
 )]
 struct TargetSupervision {
     #[cultcache(key = 0)]
@@ -1065,21 +1073,22 @@ struct TargetSupervision {
     /// Visibility only: never counted, never refused.
     #[cultcache(key = 6)]
     route_survivals: Vec<u64>,
-    // Keys 7-9 are absent from every record written before them; `default`
-    // decodes that as no streak, no anchor and no re-materialization.
+    // Keys 7-9 are why this is v2: a v1 record is lifted by
+    // `LegacyTargetSupervisionV1` with no streak, no anchor and no
+    // re-materialization.
     /// Charged attempts since the last sustained run. Owned by continuity
     /// supervision; it decides the next attempt's backoff step.
-    #[cultcache(key = 7, default)]
+    #[cultcache(key = 7)]
     continuity_attempt_streak: u32,
     /// When a dead-and-free pass began waiting out the next attempt. Owned by
     /// continuity supervision; it decides when the wait is over. Older than
     /// the admitted generation, it decides nothing.
-    #[cultcache(key = 8, default)]
+    #[cultcache(key = 8)]
     continuity_backoff_from_unix_millis: Option<u64>,
     /// When the admitted generation's one uncharged re-materialization was
     /// minted. Owned by continuity supervision; it can only withhold a free
     /// re-materialization, never grant one.
-    #[cultcache(key = 9, default)]
+    #[cultcache(key = 9)]
     continuity_rematerialized_at_unix_millis: Option<u64>,
 }
 
@@ -1138,27 +1147,6 @@ impl TargetSupervision {
             continuity_backoff_from_unix_millis: None,
             continuity_rematerialized_at_unix_millis: None,
         }
-    }
-
-    /// Decode a stored record. Records written before keys 7-9 are the first
-    /// seven elements of the tuple and decode with those keys defaulted; the
-    /// next write stores all ten. Anything else must re-encode byte for byte.
-    fn decode(envelope: &CultCacheEnvelope) -> Result<Self> {
-        let value: Self = rmp_serde::from_slice(&envelope.payload)?;
-        let before_backoff_keys = rmp_serde::to_vec(&(
-            &value.schema_version,
-            &value.target,
-            &value.route_actuations,
-            &value.continuity_restarts,
-            &value.continuity_deferred_until,
-            &value.continuity_deferral_reason,
-            &value.route_survivals,
-        ))?;
-        ensure!(
-            rmp_serde::to_vec(&value)? == envelope.payload || before_backoff_keys == envelope.payload,
-            "Idunn control store contains a noncanonical record"
-        );
-        Ok(value)
     }
 
     /// Clamp every log to `now`. Callers that decide from a log write the
@@ -1242,8 +1230,10 @@ impl TargetSupervision {
 
     /// What to do about the next attempt for the dead admitted generation
     /// admitted at `admitted_at`. The streak resets only after a sustained
-    /// run: the generation has lived the sustained time and no attempt has
-    /// been minted since it was admitted.
+    /// run: the generation has lived the sustained time and no attempt, charged
+    /// or the one re-materialization, has been minted since it was admitted.
+    /// A standing anchor belongs to a death the supervision pass has seen
+    /// through; an observed-running pass clears it, so it never hides a reset.
     fn continuity_backoff(&self, now: u64, admitted_at: u64) -> ContinuityBackoff {
         let streak = self.continuity_attempt_streak;
         if let Some(due) = self.backoff_due(admitted_at) {
@@ -1258,7 +1248,9 @@ impl TargetSupervision {
         let sustained = self
             .continuity_restarts
             .last()
-            .is_none_or(|&last| admitted_at >= last)
+            .into_iter()
+            .chain(&self.continuity_rematerialized_at_unix_millis)
+            .all(|&last| admitted_at >= last)
             && now.saturating_sub(admitted_at) >= CONTINUITY_SUSTAINED_RUN_MILLIS;
         let streak = if sustained { 0 } else { streak };
         if streak == 0 {
@@ -1281,6 +1273,12 @@ impl TargetSupervision {
     /// The target was found dead and free: the wait for its next attempt runs from now.
     fn begin_backoff(&mut self, now: u64) {
         self.continuity_backoff_from_unix_millis = Some(now);
+    }
+
+    /// The admitted workload was seen running: the death the anchor waited
+    /// out is over, and the next death waits from its own discovery.
+    fn end_backoff(&mut self) {
+        self.continuity_backoff_from_unix_millis = None;
     }
 
     /// The one uncharged re-materialization scheduled. The log and the streak
@@ -3160,12 +3158,7 @@ impl ControlSnapshot {
                     snapshot.admitted.push(Stored { envelope, value });
                 }
                 TargetSupervision::TYPE => {
-                    ensure!(
-                        envelope.schema_id.as_deref() == Some(TARGET_SUPERVISION_SCHEMA),
-                        "Idunn control store contains an unsupported target supervision record"
-                    );
-                    let value = TargetSupervision::decode(&envelope)?;
-                    value.validate()?;
+                    let value = read_supervision_record(&envelope)?;
                     ensure!(
                         envelope.key == value.target,
                         "target supervision key is not its target"
@@ -3879,6 +3872,74 @@ fn read_generation_record(envelope: &CultCacheEnvelope) -> Result<AdmittedGenera
     }
 }
 
+/// The v1 target-supervision layout: the first seven keys of the current one.
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(
+    type = "idunn.target_supervision",
+    schema = "idunn.target_supervision.v1"
+)]
+struct LegacyTargetSupervisionV1 {
+    #[cultcache(key = 0)]
+    schema_version: String,
+    #[cultcache(key = 1)]
+    target: String,
+    #[cultcache(key = 2)]
+    route_actuations: Vec<u64>,
+    #[cultcache(key = 3)]
+    continuity_restarts: Vec<u64>,
+    #[cultcache(key = 4)]
+    continuity_deferred_until: Option<u64>,
+    #[cultcache(key = 5)]
+    continuity_deferral_reason: Option<String>,
+    #[cultcache(key = 6)]
+    route_survivals: Vec<u64>,
+}
+
+impl LegacyTargetSupervisionV1 {
+    /// No streak, no anchor, no re-materialization: the same defaults a fresh
+    /// record starts with.
+    fn into_current(self) -> TargetSupervision {
+        TargetSupervision {
+            schema_version: TARGET_SUPERVISION_SCHEMA.into(),
+            target: self.target,
+            route_actuations: self.route_actuations,
+            continuity_restarts: self.continuity_restarts,
+            continuity_deferred_until: self.continuity_deferred_until,
+            continuity_deferral_reason: self.continuity_deferral_reason,
+            route_survivals: self.route_survivals,
+            continuity_attempt_streak: 0,
+            continuity_backoff_from_unix_millis: None,
+            continuity_rematerialized_at_unix_millis: None,
+        }
+    }
+}
+
+/// Read one stored target supervision record, lifting a v1 record to the
+/// current shape by the same rule as `read_generation_record`. One schema id
+/// names one shape: a v1 record that carries ten keys, or a v2 record that
+/// carries seven, is refused.
+fn read_supervision_record(envelope: &CultCacheEnvelope) -> Result<TargetSupervision> {
+    let value = match envelope.schema_id.as_deref() {
+        Some(TARGET_SUPERVISION_SCHEMA) => decode_record::<TargetSupervision>(envelope)?,
+        Some(TARGET_SUPERVISION_SCHEMA_V1) => {
+            let legacy: LegacyTargetSupervisionV1 = decode_record(envelope)
+                .context("decoding a v1 target supervision record")?;
+            ensure!(
+                legacy.schema_version == TARGET_SUPERVISION_SCHEMA_V1,
+                "stored supervision schema differs from its envelope"
+            );
+            legacy.into_current()
+        }
+        _ => bail!("Idunn control store contains an unsupported target supervision record"),
+    };
+    value.validate()?;
+    ensure!(
+        envelope.key == value.target,
+        "target supervision key is not its target"
+    );
+    Ok(value)
+}
+
 /// Rewrite every older record as current, once, before the engine runs.
 ///
 /// The read path lifts older records on its own, so this is convergence rather
@@ -3907,6 +3968,8 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
                         schema,
                         Some(ADMITTED_GENERATION_SCHEMA_V2 | ADMITTED_GENERATION_SCHEMA_V3)
                     ))
+                || (envelope.r#type == TargetSupervision::TYPE
+                    && schema == Some(TARGET_SUPERVISION_SCHEMA_V1))
         })
         .collect::<Vec<_>>();
     let mut migrated = 0;
@@ -3914,6 +3977,10 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
         let (record_type, key, mut next) = if envelope.r#type == DeploymentTransaction::TYPE {
             let (key, next) = cleanup_evidence::migrate_transaction_record(&envelope)?;
             (DeploymentTransaction::TYPE, key, next)
+        } else if envelope.r#type == TargetSupervision::TYPE {
+            let value = read_supervision_record(&envelope)?;
+            let next = target_supervision_envelope(&value, now_millis()?)?;
+            (TargetSupervision::TYPE, value.target, next)
         } else {
             let value = read_generation_record(&envelope)?;
             let next = admitted_envelope(&value, value.admitted_at_unix_millis)?;
@@ -6076,6 +6143,14 @@ impl Engine {
                 }
             };
             if observation.is_some() {
+                let seen = snapshot.supervision_for(&current.value.target);
+                if let Some(stored) = seen.filter(|stored| {
+                    stored.value.continuity_backoff_from_unix_millis.is_some()
+                }) {
+                    let mut next = stored.value.clone();
+                    next.end_backoff();
+                    self.write_target_supervision(Some(stored), &next, now_millis()?)?;
+                }
                 // The admitted workload was seen running: the only evidence
                 // that ends an exhaustion incident, once the window no longer holds it.
                 // The window sliding alone is not health and never closes one.
@@ -16241,13 +16316,23 @@ mod tests {
         Ok(())
     }
 
+    fn supervision_envelope_raw(payload: Vec<u8>, schema: &str) -> Result<CultCacheEnvelope> {
+        Ok(CultCacheEnvelope {
+            key: "service".into(),
+            r#type: TargetSupervision::TYPE.into(),
+            payload,
+            stored_at: rfc3339_millis(now_millis()?)?,
+            schema_id: Some(schema.into()),
+        })
+    }
+
     #[test]
-    fn target_supervision_decodes_without_keys_7_to_9() -> Result<()> {
+    fn a_v1_target_supervision_record_is_lifted_and_migrated_once() -> Result<()> {
         let world = EngineFixture::new()?;
         let meters = restarted_ago(&[200_000])?;
-        // A record as every one on a running host was written: seven keys.
+        // A record as every one on a running host was written: seven keys, v1.
         let payload = rmp_serde::to_vec(&(
-            &meters.schema_version,
+            TARGET_SUPERVISION_SCHEMA_V1,
             &meters.target,
             &meters.route_actuations,
             &meters.continuity_restarts,
@@ -16255,19 +16340,21 @@ mod tests {
             &meters.continuity_deferral_reason,
             &meters.route_survivals,
         ))?;
-        let envelope = CultCacheEnvelope {
-            key: "service".into(),
-            r#type: TargetSupervision::TYPE.into(),
-            payload,
-            stored_at: rfc3339_millis(now_millis()?)?,
-            schema_id: Some(TARGET_SUPERVISION_SCHEMA.into()),
-        };
-        SingleFileMessagePackBackingStore::new(&world.state_store).insert_entry_if_absent(envelope)?;
+        SingleFileMessagePackBackingStore::new(&world.state_store).insert_entry_if_absent(
+            supervision_envelope_raw(payload, TARGET_SUPERVISION_SCHEMA_V1)?,
+        )?;
         let read = meters_of(&world, "service")?;
         assert_eq!(read.continuity_restarts, meters.continuity_restarts);
         assert_eq!(read.continuity_attempt_streak, 0);
         assert_eq!(read.continuity_backoff_from_unix_millis, None);
         assert_eq!(read.continuity_rematerialized_at_unix_millis, None);
+
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 1);
+        assert_eq!(migrate_control_store_to_current_schema(&world.state_store)?, 0);
+        let stored = ControlSnapshot::read(&world.state_store)?;
+        let envelope = &stored.supervision_for("service").unwrap().envelope;
+        assert_eq!(envelope.schema_id.as_deref(), Some(TARGET_SUPERVISION_SCHEMA));
+        assert_eq!(meters_of(&world, "service")?.continuity_restarts, meters.continuity_restarts);
 
         let mut anchored = TargetSupervision::new("service");
         anchored.continuity_backoff_from_unix_millis = Some(0);
@@ -16276,6 +16363,203 @@ mod tests {
         anchored.continuity_rematerialized_at_unix_millis = Some(0);
         assert!(anchored.validate().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn one_target_supervision_schema_id_names_one_shape() -> Result<()> {
+        let meters = restarted_ago(&[200_000])?;
+        let ten = rmp_serde::to_vec(&meters)?;
+        let seven = rmp_serde::to_vec(&(
+            TARGET_SUPERVISION_SCHEMA,
+            &meters.target,
+            &meters.route_actuations,
+            &meters.continuity_restarts,
+            &meters.continuity_deferred_until,
+            &meters.continuity_deferral_reason,
+            &meters.route_survivals,
+        ))?;
+        // The current id refuses the old shape and the old id refuses the new one.
+        assert!(
+            read_supervision_record(&supervision_envelope_raw(seven, TARGET_SUPERVISION_SCHEMA)?)
+                .is_err()
+        );
+        assert!(
+            read_supervision_record(&supervision_envelope_raw(
+                ten.clone(),
+                TARGET_SUPERVISION_SCHEMA_V1
+            )?)
+            .is_err()
+        );
+        assert_eq!(
+            read_supervision_record(&supervision_envelope_raw(ten, TARGET_SUPERVISION_SCHEMA)?)?,
+            meters
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn continuity_keeps_minting_at_every_streak_and_log_length() -> Result<()> {
+        // No stop at any streak, however long, with the paging log full or not.
+        let full = [3_000_000_u64, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000];
+        for streak in 1..=12_u32 {
+            for log in [&[1_000_000_u64][..], &full[..]] {
+                let workload = SwitchWorkload::new();
+                let world = EngineFixture::with_workload(workload.clone())?;
+                admit_incumbent(&world)?;
+                age_incumbent(&world, 500_000)?;
+                workload.kill();
+                let mut meters = restarted_ago(log)?;
+                meters.continuity_attempt_streak = streak;
+                set_meters(&world, &meters)?;
+                world.engine.supervise_one_admitted_generation()?;
+                assert_eq!(continuity_mints(&world)?, 0, "streak {streak}: the wait begins");
+                anchor_ago(&world, 300_001)?;
+                world.engine.supervise_one_admitted_generation()?;
+                assert_eq!(continuity_mints(&world)?, 1, "streak {streak} log {} stopped", log.len());
+                assert_eq!(meters_of(&world, "service")?.continuity_attempt_streak, streak + 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_mint_after_a_sustained_run_stores_the_reset_streak() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        age_incumbent(&world, 700_000)?;
+        workload.kill();
+        let mut meters = restarted_ago(&[3_000_000])?;
+        meters.continuity_attempt_streak = 7;
+        set_meters(&world, &meters)?;
+        // Ran 700 s since the last attempt: no wait, and the streak restarts at 1.
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 1);
+        assert_eq!(meters_of(&world, "service")?.continuity_attempt_streak, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_re_materialization_counts_as_the_last_attempt_for_the_sustained_reset() {
+        let admitted_at = 10_000_000_u64;
+        let now = admitted_at + 700_000;
+        let mut meters = TargetSupervision::new("service");
+        meters.continuity_attempt_streak = 5;
+        meters.continuity_restarts = vec![admitted_at - 1_000];
+        // Before admission: a sustained run, reset.
+        meters.continuity_rematerialized_at_unix_millis = Some(admitted_at - 1);
+        assert_eq!(
+            meters.continuity_backoff(now, admitted_at),
+            ContinuityBackoff::Due { streak: 0 }
+        );
+        // After admission: that attempt failed on this generation.
+        meters.continuity_rematerialized_at_unix_millis = Some(admitted_at + 1);
+        assert_eq!(meters.continuity_backoff(now, admitted_at), ContinuityBackoff::Begin);
+    }
+
+    mod after_a_reboot {
+        use super::*;
+
+        fn resident_continuity(world: &EngineFixture) -> Result<usize> {
+            Ok(ControlSnapshot::read(&world.state_store)?
+                .transactions
+                .iter()
+                .filter(|s| s.value.command_kind == CommandKind::Continuity)
+                .count())
+        }
+
+        /// The attempt failed and was retired: drop continuity transactions
+        /// and their commands only.
+        fn drop_continuity(world: &EngineFixture) -> Result<()> {
+            let snapshot = ControlSnapshot::read(&world.state_store)?;
+            let ids = snapshot
+                .transactions
+                .iter()
+                .filter(|s| s.value.command_kind == CommandKind::Continuity)
+                .map(|s| s.value.command_id.clone())
+                .collect::<BTreeSet<_>>();
+            let envelopes = snapshot
+                .transactions
+                .iter()
+                .filter(|s| s.value.command_kind == CommandKind::Continuity)
+                .map(|s| s.envelope.clone())
+                .chain(
+                    snapshot
+                        .commands
+                        .iter()
+                        .filter(|s| ids.contains(&s.value.command_id))
+                        .map(|s| s.envelope.clone()),
+                )
+                .collect::<Vec<_>>();
+            if !envelopes.is_empty() {
+                assert!(
+                    SingleFileMessagePackBackingStore::new(&world.state_store)
+                        .delete_batch_if_unchanged(&envelopes)?
+                );
+            }
+            Ok(())
+        }
+
+        /// (attempts minted on tick 1, on tick 2, whether the queued deploy froze by then).
+        fn gap_run(reboot: bool) -> Result<(usize, usize, bool)> {
+            let workload = SwitchWorkload::new();
+            let world = EngineFixture::with_workload(workload.clone())?;
+            admit_incumbent(&world)?;
+            age_incumbent(&world, 700_000)?;
+            if reboot {
+                workload.reboot();
+            } else {
+                workload.kill();
+            }
+            queue_declaring_redeploy(&world, "up-gap")?;
+            // One tick, in the tick's order: supervise, then freeze.
+            world.engine.supervise_one_admitted_generation()?;
+            let first = resident_continuity(&world)?;
+            world.engine.freeze_one_queued_command()?;
+            // That attempt failed and was retired.
+            drop_continuity(&world)?;
+            world.engine.supervise_one_admitted_generation()?;
+            let second = resident_continuity(&world)?;
+            world.engine.freeze_one_queued_command()?;
+            let frozen = every_transaction(&world)?.iter().any(|t| t.command_id == "up-gap");
+            Ok((first, second, frozen))
+        }
+
+        #[test]
+        fn a_failed_re_materialization_is_followed_by_a_gap_a_queued_deployment_can_take(
+        ) -> Result<()> {
+            // Control: an ordinary attempt after a sustained run leaves a gap.
+            assert_eq!(gap_run(false)?, (1, 0, true));
+            // The re-materialization is an attempt too: the next pass waits.
+            assert_eq!(gap_run(true)?, (1, 0, true));
+            Ok(())
+        }
+
+        #[test]
+        fn a_running_pass_ends_the_wait_so_a_later_death_after_a_sustained_run_resets(
+        ) -> Result<()> {
+            let workload = SwitchWorkload::new();
+            let world = EngineFixture::with_workload(workload.clone())?;
+            admit_incumbent(&world)?;
+            age_incumbent(&world, 500_000)?;
+            workload.kill();
+            let mut meters = restarted_ago(&[1_000_000])?;
+            meters.continuity_attempt_streak = 3;
+            set_meters(&world, &meters)?;
+            world.engine.supervise_one_admitted_generation()?;
+            assert!(meters_of(&world, "service")?.continuity_backoff_from_unix_millis.is_some());
+            workload.revive();
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(meters_of(&world, "service")?.continuity_backoff_from_unix_millis, None);
+
+            // It runs on for days, then dies: no wait, and the streak restarts.
+            age_incumbent(&world, 200_000)?;
+            workload.kill();
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(continuity_mints(&world)?, 1);
+            assert_eq!(meters_of(&world, "service")?.continuity_attempt_streak, 1);
+            Ok(())
+        }
     }
 
     /// A source that resolves one fixed recipe and never freezes anything.
