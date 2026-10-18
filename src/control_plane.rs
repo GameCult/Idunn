@@ -16559,8 +16559,6 @@ mod tests {
         Ok(())
     }
 
-    /// The control for the test above: the same redeploy over a dead incumbent
-    /// that is not held is yielded to continuity.
     /// `seeded` with its own Expected undeclared, so Idunn holds it.
     fn undeclared(world: &EngineFixture, seeded: &DeploymentTransaction) -> Result<DeploymentTransaction> {
         let mut bare = seeded.clone();
