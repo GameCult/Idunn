@@ -3,20 +3,17 @@
 Status: map, Imagination, 2026-10-18 (campaign `idunn-reincarnation`, session
 `idunn-reincarnation-2026-10-18`). The ends are in
 [`reincarnation-target.md`](reincarnation-target.md). Questions, rulings, the
-first cut spec and follow-ups live in Eureka's mind; this page holds what has
+cut spec and follow-ups live in Eureka's mind; this page holds what has
 no kind: body facts, the model page, the authority map's rationale and the
-cut sequence. Line numbers are at `c2477d4`.
+cut sequence. Line numbers are at `74a7008`; `src/` is byte-identical to
+`c2477d4`, so the earlier anchors still hold.
 
-In force from the mind: `idunn-reincarnation:cut_spec:cut-c1-durable-stop.r1`;
-questions `idunn-reincarnation:question:handover-pre-fencing` and
-`idunn-reincarnation:question:budget-charge`; defaulted rulings
-`stop-is-control-state`, `stop-rearms-on-window`,
-`rematerialize-once-per-admission`; follow-ups
-`ghostlight-abort-lease-before-stop`, `host-actuator-reboot`,
-`odin-route-record-stale`. Cited from `idunn-watchdog`:
-`exhaustion-close-rule-op` (an exhaustion incident closes when the target runs
-and the window no longer holds it) and `paging-conditions` (page on
-exhaustion).
+Read the in-force set with the rulings-in-force and open-follow-ups recipes
+for root `idunn-reincarnation`; the cut in flight is the specs-with-no-report
+recipe. The first spec (`cut-c1-durable-stop.r1`) was withdrawn when the
+operator ruled that continuity never stops; its replacement is cut
+`c1-never-stop`. Cited from `idunn-watchdog`: `exhaustion-close-rule-op` and
+`paging-conditions`.
 
 ## 1. Body facts
 
@@ -150,8 +147,10 @@ stopped-owner deadlock.
 **B8. Unexplained, recorded.** Idunn's record of Odin's stable route reads
 "degraded-since 11:46:31, consecutive-failures 1, next-challenge-at 11:47:01"
 about nine hours later. It has not been re-challenged since. This is follow-up
-`odin-route-record-stale`, and it blocks the recommended answer to
-`budget-charge`, which reads dependency health from this record.
+`odin-route-record-stale`. It blocks cut 3. Under `budget-never-stop`, a
+failure attributed to a declared dependency must not grow the backoff, and the
+only dependency-health record Idunn holds for Odin's stable route is this
+one.
 
 **B9. Luna's weekend commits on this path (Q5).** None of them caused the
 deadlock. The yield predicate dates from the route-continuity and watchdog
@@ -167,117 +166,208 @@ campaigns, not from the weekend. Where they touch:
 
 The target forbids building on them. Cut 1 touches none of their lines.
 
+**B10. The stop was the only door a deployment had into a crash loop.**
+Source read at `74a7008`. A queued `idunn up` becomes a transaction only in
+`freeze_command`, which refuses while any transaction for any of its targets
+`blocks_new_target_mutation` (`:5741-5747`); the command just stays queued.
+The scheduler tick runs `retire_one_terminal_transaction` (returns early when
+it retires), then `resume_one_transaction`, then
+`supervise_one_admitted_generation`, then `freeze_one_queued_command`
+(`:5414-5423`). Today's doubling wait is anchored at the previous attempt's
+**mint** (`next_restart_at`, `:1163-1170`). So once an attempt lasts longer than
+its wait, the tick after its transaction is retired mints the next attempt
+before the freeze runs, and the queued deployment never finds the target
+free. At `c2477d4` that ended when the window filled and continuity stopped.
+Delete the stop without opening another door and a crash-looping release can
+never be replaced. The door the cut uses is kubelet's own anchor
+(`docs/research/restart-budget-prior-art.md` §1.1, the exited container's
+`FinishedAt`): the wait runs from the first supervision pass that finds the
+target dead **and free**. That leaves at least one wait (5 s or more) with no
+live transaction, and the freeze runs every tick. This is reasoning over the
+source, not a probe. The cut pins it with a tick-level test.
+
+**B11. The yield cannot outlive the stop.** With the window term gone from
+`:6046`, the yield aborts every pre-fencing Deploy whenever the incumbent is
+dead (`:6045-6059`). For a crash-looping release the incumbent is always
+dead, so the deployment that would fix it is aborted at the first
+supervision pass after it is frozen. That is the 2026-10-18 failure: on that
+day the operator's `idunn up` existed to replace a release that would not
+start. Ruling `handover-phase-split` already says nothing yields before
+Fencing. So cut 1 deletes the whole yield. Continuity keeps deferring to any
+live transaction for its target (`:6033`, the `continue`). Cut 2 keeps
+the incumbent alive alongside the build. Between them, a dead incumbent stays
+down while a pre-fencing deployment over it builds. That is bounded by the
+deployment's own deadlines, and the deployment then fences it as nothing
+(B5).
+
+**B12. The doubling function already exists once.** `backoff_wait`
+(`:4000-4007`) doubles from a base up to `RESUME_BACKOFF_CEILING_MILLIS`, and
+has one caller (`back_off`, `:5621`). Continuity's wait is a second spelling
+of the same rule (`5_000 << (live.len() - 1)`, `:1169`). The cut gives
+`backoff_wait` a ceiling parameter and deletes the second spelling.
+`#[cultcache(key = N, default)]` is how an absent key decodes as its default
+(precedent `DeploymentTransaction` key 34, `:1552-1557`). New
+`TargetSupervision` keys use it, because every record on Yggdrasil predates
+them.
+
 ## 2. Model page
 
 One row per persistent kind the campaign touches.
 
 | Kind | What names it | Lifecycle | Who decides |
 |---|---|---|---|
-| Continuity budget: `TargetSupervision.continuity_restarts` (control.cc, `idunn.target_supervision.v1`) | key = target | Ascending times, at most 6, sliding 1 h window. It outlives every generation. Charged at mint today, and after `budget-charge` at outcome | Continuity supervision, in the mint CAS |
-| Continuity stop (new, cut 1: keys 7-8) | target, plus the admitted `generation_id` it names | Written when the window is spent. Cleared by the next continuity mint (an explicit resume, `stop-rearms-on-window`). Inert once another generation is admitted | Continuity supervision only (`stop-is-control-state`) |
-| Re-materialization bound (new, cut 1: key 9) | target | Set by the one uncharged re-materialization. Spent while it is not older than the admitted generation's `admitted_at` | Continuity supervision, from the workload driver's evidence |
+| Paging log: `TargetSupervision.continuity_restarts` (control.cc, `idunn.target_supervision.v1`, key 3) | key = target | The newest 6 charged attempt times, ascending, read through a sliding 1 h window. Outlives every generation. After cut 1 it is the paging threshold only (`restarts_page`): it opens and holds the ContinuityExhausted incident and is shown in status. It gates no mint, wait or yield | Continuity supervision, pushed in the mint CAS |
+| Attempt streak (new, cut 1: key 7, `default`) | target | Charged attempts since the admitted body last ran a sustained run. +1 in each charged mint CAS. Reset to 0 when the dead generation was admitted after the last charged attempt and ran ≥ 600 s before it was found dead. Saturating, and the wait is capped, so it can be unbounded | Continuity supervision only |
+| Backoff anchor (new, cut 1: key 8, `default`) | target | Written on the first pass that finds the admitted generation dead and the target free after an attempt. The next attempt is due at anchor + `backoff_wait(5 s, streak - 1, 300 s)`. Cleared by every mint. Stale, and ignored, once older than the admitted generation's `admitted_at` | Continuity supervision only |
+| Re-materialization bound (new, cut 1: key 9, `default`) | target | Set by the one attempt that is not a backoff step, when the driver reports a reboot loss. Spent while it is not older than the admitted generation's `admitted_at` | Continuity supervision, from the workload driver's evidence |
+| Projection deferral (keys 4-5) | target | Unchanged: a failed demotion defers the next mint 30 s. It spaces a re-materialization too | Continuity supervision |
 | Admitted generation (`idunn.admitted_generation`) | key = target, `generation_id` = `generation-<tx>` | Replaced atomically by every committed deployment or continuity. A dead incarnation keeps its record until replaced | The committing transaction |
-| Incident `ContinuityExhausted` (incidents.cc) | condition + subject (target) | Opened on exhaustion. Closed when the target runs and the window no longer holds it (`exhaustion-close-rule-op`). Retired after retention | Idunn's incident writer, a notification projection: never read by ownership |
-| Transaction and pre-fencing abort (`idunn.deployment_transaction.v4`, history.cc once terminal) | `tx-<uuid>` and its `command_id` (`up-…` or `continuity-…`) | Sealing … Complete. A pre-fencing abort completes `FailedBeforeFencing`, a post-fencing abort `FailedAfterFencing` with a named recovery. Retired to history | The scheduler advances it. Continuity supervision may begin a pre-fencing abort of a Deploy only while continuity is live |
+| Incident `ContinuityExhausted` (incidents.cc) | condition + subject (target) | Opened at 6 charged attempts in the hour while the target is dead and free. Closed when the target runs and the window no longer holds 6 (`exhaustion-close-rule-op`). Retired after retention. The name is the wire name and stays, though nothing is exhausted any more | Idunn's incident writer, a notification projection: never read by ownership |
+| Transaction and pre-fencing abort (`idunn.deployment_transaction.v4`, history.cc once terminal) | `tx-<uuid>` and its `command_id` (`up-…` or `continuity-…`) | Sealing … Complete. A pre-fencing abort completes `FailedBeforeFencing`, a post-fencing abort `FailedAfterFencing` with a named recovery. Retired to history | The scheduler advances it. After cut 1, continuity supervision never aborts a transaction; the transaction's own steps do |
 | Unit materialization (systemd transient unit `idunn-<target>-<hash>`) | the activation's hash | Created by Starting. Lost on a host reboot (`/run/systemd/transient`). A failed unit stays loaded; a cleanly stopped one is collected | The workload driver actuates. Whether a loss was a reboot is the driver's evidence (`WorkloadPort::lost_to_host_reboot`, cut 1) |
 
-No cell is open. The two forks are questions with recommendations, and cut 1
-does not depend on either of them.
+No cell is open. Both forks are ruled (`budget-never-stop`,
+`handover-phase-split`). The numbers that `budget-never-stop` left open are
+the defaulted ruling `continuity-backoff-defaults`.
 
 ## 3. Authority map: continuity and deployment
 
-The authority map for cut 1 is in its spec. This section is the campaign-level
-map that the spec is one step of.
+The authority map for cut 1 is in its spec. This section is the
+campaign-level map, and cut 1 is one step of it.
 
 - **Owner.** Exactly one authority actuates a target at each instant. A live
-  `DeploymentTransaction` owns the target from Fencing on. Before Fencing,
-  ownership is the open fork `handover-pre-fencing`; the recommendation is that
-  the deployment owns only its candidate and continuity owns the incumbent
-  slot. Continuity owns the admitted generation's survival, and whether it is
-  live or stopped is its own durable record.
-- **Inputs.** For continuity: the admitted generation, the workload driver's
-  observation and reboot evidence, its restart log, and the live
-  transaction's kind and phase. For a deployment: its own plan, its brake, and
-  the admitted generation at Fencing.
-- **Outputs.** Continuity: mints, charged or uncharged, a stop record, and an
-  abort of a pre-fencing deployment only while it is live (until
-  `handover-pre-fencing` removes even that). Deployment: a new admitted
+  `DeploymentTransaction` owns the target from Fencing on, and a stop-first
+  rollout owns it from Starting. Before Fencing (`handover-phase-split`), a
+  deployment owns only its private candidate, and continuity owns the
+  incumbent slot. Continuity owns the admitted generation's survival and
+  never stops. When it next acts is a function of its own record: the
+  streak, the backoff anchor and the re-materialization bound.
+- **Inputs.** For continuity: the admitted generation (id, `admitted_at`,
+  workload, plan), the workload observation and the driver's reboot
+  evidence, its own record, and whether a live transaction blocks the
+  target. After cut 3 it also reads Idunn's dependency-health observation.
+  For a deployment: its own plan, its brake, and at Fencing whatever
+  generation is admitted at that moment (cut 2).
+- **Outputs.** Continuity: mints, either charged or the one re-materialization;
+  backoff anchors; deferrals; and, as notifications only, the
+  ContinuityExhausted incident and its once-report. Deployment: a new admitted
   generation, or an abort that names its recovery.
-- **Derived state.** `restarts_exhausted(now)` is derived and is no longer an
-  ownership input. The ContinuityExhausted incident and the "free for a
-  deployment" report are notifications. `idunn status` is display.
-- **Forbidden writers.** The sliding window may not decide a yield. The
-  incident store may not decide ownership. No deployment path writes
-  continuity's stop. Continuity never aborts a deployment that it has stopped
-  in front of. A window slide never resumes continuity while any transaction
-  owns the target.
-- **Shared paths.** Crash restart, reboot re-materialization and resume all
-  mint through the one mint CAS (`:6158-6183`). Deployments, whether operator
-  or scheduled, go through `advance_transaction`.
-- **Deletion line.** The window term in the yield (`:6046`) dies first.
-  Under `handover-pre-fencing` = phase-split, the whole yield
-  (`:6033-6061`) and the blocker gate on continuity die in cut 2.
+- **Derived state.** `restarts_page(now)` (6 charged attempts in the hour) is
+  derived from the paging log and is notification-only: incident open and
+  close, and status. The next attempt's due time is derived from the
+  anchor and the streak. The incident and `idunn status` are projections.
+- **Forbidden writers.** The paging window gates no mint, no wait and no
+  yield. Continuity supervision never aborts a deployment:
+  `begin_pre_fencing_abort` has no caller in it. No deployment path writes
+  continuity's fields. The incident store decides nothing. No stopped state
+  exists: no field, and no branch that ends a pass because a count is
+  reached.
+- **Shared paths.** A crash restart, a restart after a sustained run, and a
+  reboot re-materialization all mint through the one CAS (`:6158-6183`). The
+  dead-and-free pass is the only writer of the backoff anchor. Every
+  deployment, operator or scheduled, enters through `freeze_command` and
+  advances through `advance_transaction`.
+- **Deletion line.** Cut 1 deletes the yield (`:6034-6059`), the
+  exhaustion `continue` and its "free for a deployment" text (`:6062-6085`),
+  and the mint-anchored wait (`:1160-1184`). Cut 2 deletes the blocker
+  `continue` for a pre-fencing deployment (`:6033`), so continuity restarts
+  alongside the build, and the "incumbent changed after transaction
+  creation" refusal at Fencing (`:7556-7569`).
 
-Demotions, named: `restarts_exhausted` is no longer an owner of the handover.
-It is derived from the log and feeds the stop write, the incident and status.
-The ContinuityExhausted incident is no longer read as "stopped". It is derived
-from exhaustion.
+Demotions, named: `restarts_exhausted` is no longer an owner of anything. It
+is renamed `restarts_page`, and it opens and holds the incident. The
+ContinuityExhausted incident was never read as "stopped", and there is now no
+stopped state for it to stand for. The "free for a deployment" report is
+deleted: every target is free for a deployment between attempts (B10).
 
 ## 4. Rationale
 
 The fault is a split brain, not a missing rule. Continuity's "I have stopped"
-was written in two places, a durable incident and a log message. Neither was
-the place the ownership decision read; the yield re-derived "stopped" from a
-clock. Each answer was right at the moment it was computed, and they disagreed
-as soon as the clock moved. The tempting patch, not yielding if an exhaustion
-incident is open, would make a projection store decide ownership and add a
-second reader of a record whose writes "never wait" and may fail. The coherent
-cut moves "stopped" into the record the decision reads (control.cc, beside the
-log it summarises), deletes the clock from the decision, and binds the stop to
-the generation, so a new admission ends it without another writer.
+was written in two places, a durable incident and a log message, and neither
+was what the ownership decision read: the yield re-derived "stopped" from a
+clock. The withdrawn first spec moved "stopped" into control state. The
+operator's ruling is better, and it is also smaller: there is no stopped
+state. The window it was derived from becomes a pager. Every case the stop
+existed for is then handled by an owner that already exists. A broken release
+is replaced by a deployment, which gets in through the gap after each
+attempt (B10) and is never yielded (B11). A host-dependency outage costs one
+attempt every five minutes or so, and pages.
 
-The reboot invariant needs the evidence of what happened, not a guess.
-"Unit absent" alone is not a reboot: a cleanly stopped transient unit is
-collected too. "Host booted after admission" alone is not a loss: the unit
-might have been started this boot. The systemd driver owns both facts (a
-`systemctl show` of nothing, and `/proc/stat` btime), so it answers one
-question, `lost_to_host_reboot`, and supervision keeps the budget. The bound,
-once per admission, keeps a reboot loop finite without inventing a boot
-ledger. It compares two wall clocks (Idunn's admission time and the kernel's
-boot time). Admission happens at least one full transaction, tens of seconds,
-after boot, so skew of a few seconds cannot misclassify it.
+Why the wait is anchored at "found dead and free" rather than at the mint:
+the anchor is the door. A mint-anchored wait can be swallowed by a long
+attempt, and then no tick ever sees the target free (B10). Kubelet anchors
+CrashLoopBackOff on `FinishedAt` for the same reason, so this is the
+established spelling, not a new one. A streak is stored, not recomputed from
+the paging log. The log holds only six entries and slides by the hour, while
+the streak must outlive both. Reading the backoff from the window count was
+today's spelling, and it is exactly the mutant the cut's tests must kill.
 
-What cut 1 deliberately does not fix: dependency failures still charge
-(`budget-charge`), a live continuity still kills a pre-fencing deployment
-(`handover-pre-fencing`), and a dead generation is still supervised every tick
-(cut 4). Replayed against 2026-10-18 with only cut 1: the reboot
-re-materialization at 11:46 is free, the next five attempts are charged and
-fail on the nginx outage, and the stop is recorded at about 11:53. The
-operator's `idunn up` at 20:24 is then not aborted at 20:46. It proceeds over
-the absent incumbent and admits the new release. Without that deployment,
-continuity resumes explicitly each hour, as it did, under
-`stop-rearms-on-window`.
+The reset, "admitted after the last charged attempt and ran at least 600 s
+before it was found dead", needs no new writer. Supervision observes the
+admitted generation on every pass, so the first pass that finds it dead is
+within one poll of the death. A death hidden behind a live transaction or an
+unobservable host overstates the run, and so resets early. That is the safe
+side, because it shortens one wait.
+
+The reboot invariant needs evidence of what happened, not a guess. "Unit
+absent" alone is not a reboot, because a cleanly stopped transient unit is
+collected too. "Host booted after admission" alone is not a loss, because
+the unit might have been started this boot. The systemd driver owns both
+facts (a `systemctl show` that returns nothing, and the `/proc/stat` btime).
+So it answers one question, `lost_to_host_reboot`, and supervision keeps the
+budget. The once-per-admission bound is still needed under never-stop. A
+failing re-materialization leaves the same admitted generation, unit absent,
+booted after admission. Without the bound it would repeat with no step, no
+wait and no page, every tick. The clock comparison is safe: admission
+happens at least one full transaction, tens of seconds, after boot.
+
+What cut 1 deliberately does not fix. A dependency failure still grows the
+streak (cut 3). A dead incumbent stays down while a pre-fencing deployment
+builds over it (cut 2). A dead generation is still route-supervised and
+topology-refreshed every tick (cut 4). Paging residual: the cap gives 3600 /
+(300 + D) attempts an hour, where D is the attempt's duration, so a crash
+loop whose attempts last longer than 300 s settles under 6 an hour. Its
+incident opens in the first hour's burst and stays open while the release
+never runs, but a release that runs for one pass after each restart can see
+it close and not reopen. That is the operator's threshold, applied as ruled.
+It is recorded here, not changed.
+
+Replayed against 2026-10-18 with only cut 1. The reboot loss at 11:46 is
+re-materialized at once, with no step. It fails on the nginx outage. The
+next attempt resets the streak, because the generation had run for hours,
+and then waits 5, 10, 20, 40, 80, 160 s, and 300 s after that. The incident
+opens within the first hour and stays open (the release never runs), so the
+operator is paged during the outage, not at 20:24. The `idunn up` at 20:24
+freezes in the next gap. Continuity defers to it, nothing aborts it, and it
+fences the absent incumbent as nothing and admits the new release.
 
 ## 5. Cut sequence
 
-1. **c1-durable-stop**: spec
-   `idunn-reincarnation:cut_spec:cut-c1-durable-stop.r1`. Depends on
-   nothing.
-2. **Handover before Fencing**: waits on `handover-pre-fencing`. With
-   phase-split it deletes the yield and the blocker gate on continuity, admits
-   one continuity and one pre-fencing deployment per target, and makes the
-   deployment rebase its incumbent at Fencing (`:7556`).
-3. **Budget measures the body**: waits on `budget-charge` and on follow-up
-   `odin-route-record-stale`. It moves the charge from the mint to the
-   terminal outcome, classified against Idunn's own dependency observation.
+1. **c1-never-stop**: spec in the mind (specs-with-no-report recipe). Depends
+   on nothing.
+2. **Handover before Fencing** (`handover-phase-split`): continuity
+   restarts the incumbent while a pre-fencing deployment builds. This deletes
+   the blocker `continue` for a pre-fencing Deploy, and lets one continuity and
+   one pre-fencing deployment coexist per target, which touches
+   `blocks_new_target_mutation`, `freeze_command` and candidate ports. The
+   deployment takes the target at Fencing over whatever is admitted
+   (`exact_incumbent`, `:7556`). Entering Fencing needs a hand-off with a
+   live continuity transaction, decided as data rather than by tick order.
+   Waits on cut 1, because it rewrites the same block.
+3. **Dependency failures do not grow the backoff**
+   (`budget-never-stop`): an attempt that failed because of a declared
+   dependency (Odin's stable route, the target's own stable route
+   listener), as Idunn itself observed it, leaves the streak unchanged.
+   Waits on follow-up `odin-route-record-stale`, because the record it
+   would read is not trustworthy, and on cut 1.
 4. **A dead generation is not supervised as alive** (target invariant 5):
-   observe the workload before route supervision and topology refresh, so that
-   a dead admitted generation gets no topology authentication and no
+   observe the workload before route supervision and topology refresh, so
+   that a dead admitted generation gets no topology authentication and no
    lease-exactness challenge. Its non-binding correlation is reported once,
-   not every tick. It waits on cut 1, because it rewrites the same function.
+   not every tick. Waits on cut 1, because it rewrites the same function.
 5. **Closing proof on Yggdrasil**: an operator-approved install of the merged
-   cuts. streampixels-service survives the install, and an `idunn status`
-   check is made before and after. It waits on 1-4.
+   cuts. streampixels-service survives the install, and `idunn status` is
+   checked before and after. Waits on 1-4.
 
 Ops, out of scope: nginx boot order (`gamecult-ops`), and retention of the
 roughly 130 dead transient units.

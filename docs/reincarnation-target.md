@@ -45,12 +45,15 @@ What Idunn did:
    dependency, such as nginx, the stable route's listener or Odin, never
    charges a target's restart budget. A dependency outage can never exhaust
    the budget of every target behind it.
-3. **Exactly one authority owns a target's actuation at every instant, and
-   the handover is explicit.** When continuity stops, it records that it has
-   stopped, and from then on deployment owns the target. A deployment never
-   yields to a continuity owner that has stopped. A deployment whose incumbent
-   is absent replaces it, with nothing to fence. There is no reachable state
-   in which continuity waits for a deployment while that deployment waits for
+3. **Exactly one authority owns each slot at every instant, and nothing
+   waits on an owner that has stopped.** Continuity never stops (operator,
+   2026-10-18: capped backoff, and the 6 per hour count only pages). It never
+   aborts a deployment. Before Fencing a deployment owns only its candidate,
+   and continuity owns the incumbent slot. At Fencing the deployment takes the
+   target and fences whatever is admitted then; an absent incumbent fences as
+   nothing. Every continuity attempt leaves a free gap in which a queued
+   deployment can be admitted. There is no reachable state in which
+   continuity waits for a deployment while that deployment waits for
    continuity. A negative test proves it.
 4. **Continuity is daemon survival; deployment is change** (`F:\Projects\CLAUDE.md`).
    Restarting the admitted installed body never needs a deployment and is
