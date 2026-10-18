@@ -62,15 +62,14 @@ const ADMITTED_GENERATION_SCHEMA_V2: &str = "idunn.admitted_generation.v2";
 pub(crate) const ODIN_RENDEZVOUS_CAPABILITY: &str = "odin.verse-rendezvous";
 const TARGET_SUPERVISION_SCHEMA: &str = "idunn.target_supervision.v1";
 const EXPIRY_REQUEST_SCHEMA: &str = "idunn.expiry_request.v1";
-/// How many times continuity will restart one target inside one window before
-/// it concludes the target itself is the problem. More than one because a
-/// start can fail for a passing reason -- a port still held, a peer not yet up
-/// -- and bounded because each attempt holds the target against any
-/// deployment. Counted per target, so a restart that succeeds and dies again
-/// does not start the count over.
-const CONTINUITY_RESTART_ATTEMPTS: usize = 6;
+/// The number of charged continuity attempts inside
+/// `CONTINUITY_RESTART_WINDOW_MILLIS` at which the ContinuityExhausted incident
+/// opens and is held. It gates no actuation: continuity never stops
+/// (ruling budget-never-stop).
+const CONTINUITY_PAGING_RESTARTS: usize = 6;
 const CONTINUITY_RESTART_WINDOW_MILLIS: u64 = 3_600_000;
-/// The wait after the first restart in a window; it doubles with each further one.
+/// The base of the streak backoff: the wait after the first charged attempt;
+/// it doubles with each further one in the streak.
 const CONTINUITY_RESTART_BACKOFF_MILLIS: u64 = 5_000;
 
 /// Forward route actuations (fragment write, firewall, `nginx -t`, reload,
@@ -1047,7 +1046,8 @@ struct TargetSupervision {
     /// ascending: the only entries the ceiling counts.
     #[cultcache(key = 2)]
     route_actuations: Vec<u64>,
-    /// The newest `CONTINUITY_RESTART_ATTEMPTS` restart times, ascending.
+    /// The newest `CONTINUITY_PAGING_RESTARTS` restart times, ascending: the
+    /// paging threshold's log.
     #[cultcache(key = 3)]
     continuity_restarts: Vec<u64>,
     /// A restart whose projection could not be prepared waits until this time.
@@ -1154,38 +1154,21 @@ impl TargetSupervision {
         live_entries(&self.continuity_restarts, now, CONTINUITY_RESTART_WINDOW_MILLIS).len()
     }
 
-    fn restarts_exhausted(&self, now: u64) -> bool {
-        self.restarts_used(now) >= CONTINUITY_RESTART_ATTEMPTS
+    /// The paging threshold of the ContinuityExhausted incident; it gates no actuation.
+    fn restarts_page(&self, now: u64) -> bool {
+        self.restarts_used(now) >= CONTINUITY_PAGING_RESTARTS
     }
 
-    /// The next restart is due one doubling wait after the last, from the
-    /// number of restarts still inside the window.
-    fn next_restart_at(&self, now: u64) -> Option<u64> {
-        let live = live_entries(&self.continuity_restarts, now, CONTINUITY_RESTART_WINDOW_MILLIS);
-        if live.is_empty() {
-            return None;
-        }
-        let last = *self.continuity_restarts.last()?;
-        Some(last.saturating_add(CONTINUITY_RESTART_BACKOFF_MILLIS << (live.len() - 1)))
-    }
-
-    /// Whether continuity must still wait: the doubling wait after the last
-    /// restart, or the deferral after a projection that would not demote.
-    fn continuity_is_waiting(&self, now: u64) -> bool {
-        self.next_restart_at(now).is_some_and(|due| {
-            is_waiting(
-                now,
-                due,
-                CONTINUITY_RESTART_BACKOFF_MILLIS << (CONTINUITY_RESTART_ATTEMPTS - 1),
-            )
-        }) || self
-            .continuity_deferred_until
+    /// Whether continuity must still wait out the deferral after a projection
+    /// that would not demote.
+    fn continuity_deferred(&self, now: u64) -> bool {
+        self.continuity_deferred_until
             .is_some_and(|due| is_waiting(now, due, CONTINUITY_DEFERRAL_MILLIS))
     }
 
     /// One restart scheduled. It ends any deferral: the projection was prepared.
     fn record_restart(&mut self, now: u64) {
-        record_entry(&mut self.continuity_restarts, now, CONTINUITY_RESTART_ATTEMPTS);
+        record_entry(&mut self.continuity_restarts, now, CONTINUITY_PAGING_RESTARTS);
         self.continuity_deferred_until = None;
         self.continuity_deferral_reason = None;
     }
@@ -1203,7 +1186,7 @@ impl TargetSupervision {
         require_id(&self.target, "supervised target")?;
         for (log, limit, what) in [
             (&self.route_actuations, ROUTE_ACTUATION_CEILING, "route actuation"),
-            (&self.continuity_restarts, CONTINUITY_RESTART_ATTEMPTS, "continuity restart"),
+            (&self.continuity_restarts, CONTINUITY_PAGING_RESTARTS, "continuity restart"),
             (&self.route_survivals, ROUTE_SURVIVAL_RECORD, "survival route actuation"),
         ] {
             ensure!(log.len() <= limit, "{what} log exceeds its bound");
@@ -4486,10 +4469,9 @@ fn render_supervision(
         lines.push(format!("  held: {reason}"));
     }
     lines.push(format!(
-        "  continuity restarts {}/{} next-restart-at {}",
+        "  continuity attempts-in-hour {} pages-at {}",
         meters.restarts_used(now),
-        CONTINUITY_RESTART_ATTEMPTS,
-        at(meters.next_restart_at(now))
+        CONTINUITY_PAGING_RESTARTS,
     ));
     if let (Some(until), Some(reason)) = (
         meters.continuity_deferred_until,
@@ -5972,7 +5954,7 @@ impl Engine {
                         // same incident.
                         if snapshot
                             .supervision_or_new(&current.value.target)
-                            .restarts_exhausted(now)
+                            .restarts_page(now)
                         {
                             return Ok(false);
                         }
@@ -5993,8 +5975,7 @@ impl Engine {
             // continuity minted over it copies the undeclared Expected, is
             // held at once, and owns the target forever, so the declaring
             // redeploy that would clear the hold could never freeze. The dead
-            // held target stays down and free. Nothing yields to it either:
-            // there is no continuity to yield to.
+            // held target stays down and free.
             if current.value.readiness().is_err() {
                 self.note_fault(
                     "holds a dead admitted generation down; declare readiness in its recipe and redeploy",
@@ -6003,16 +5984,12 @@ impl Engine {
                 );
                 continue;
             }
-            // Continuity restarts a release; it cannot repair one. When the
-            // admitted release will not start, rescheduling it forever keeps
-            // the target permanently occupied -- and a target with a live
-            // transaction accepts no deployment, so the one action that could
-            // fix it is exactly the one that is locked out. Restarts are
-            // counted in the target's own log, in a sliding window, and spaced
-            // by a doubling wait. The log outlives every generation, so a
-            // release that starts, dies and starts again is bounded the same as
-            // one that never starts. Nothing here reads history: an unreadable
-            // history file must not stop crash recovery.
+            // Continuity restarts a release; it cannot repair one, and it
+            // never stops (budget-never-stop). Every charged attempt is spaced
+            // by a doubling, capped wait, so a queued deployment always gets
+            // a free gap (map B10). The log outlives every generation and only
+            // pages. Nothing here reads history: an unreadable history file
+            // must not stop crash recovery.
             let now = now_millis()?;
             let supervision = snapshot.supervision_or_new(&current.value.target);
             // A stepped-back clock leaves entries in the future. Settle them
@@ -6030,36 +6007,12 @@ impl Engine {
             }
             let continuity_key = format!("continuity:{}", current.value.target);
 
-            if let Some(blocker) = blocker {
-                // Yielding a *deployment* to continuity is right: the incumbent
-                // died, so changing it can wait. Doing the same to a continuity
-                // transaction is self-defeating -- that transaction exists to
-                // restart the very workload whose absence triggers the yield,
-                // so aborting it schedules another, which is aborted in turn.
-                // Odin sat in that loop, down, while Idunn cancelled its own
-                // recovery every few seconds.
-                // Only yield to a continuity that is still trying. Once it has
-                // given up on this release there is nothing to yield to, and
-                // the deployment is the only thing left that can fix the
-                // target -- aborting it would close the last door.
-                if blocker.value.command_kind == CommandKind::Deploy
-                    && !supervision.restarts_exhausted(now)
-                    && blocker.value.phase < DeploymentPhase::Fencing
-                    && blocker.value.pre_fencing_abort.is_none()
-                    // A held record is reported and never aborted by Idunn.
-                    && blocker.value.held_disagreement().is_none()
-                {
-                    self.begin_pre_fencing_abort(
-                        blocker,
-                        anyhow!(
-                            "admitted incumbent failed before candidate fencing; deployment yielded to continuity: {workload_error:#}"
-                        ),
-                    )?;
-                    progressed = true;
-                }
+            // Continuity defers to any live transaction for its target and
+            // never aborts one (handover-phase-split).
+            if blocker.is_some() {
                 continue;
             }
-            if supervision.restarts_exhausted(now) {
+            if supervision.restarts_page(now) {
                 // The record comes first and the trace after it: the trace is
                 // this record's shadow, never its substitute.
                 self.record_incident(
@@ -6074,18 +6027,15 @@ impl Engine {
                 self.report_once(
                     &continuity_key,
                     format!(
-                        "Idunn stopped restarting admitted {}: {} restarts inside the window. The target is free for a deployment to replace it{}: {workload_error:#}",
+                        "Idunn has restarted admitted {} {} times inside the hour and keeps restarting it on a capped backoff: {workload_error:#}",
                         current.value.target,
                         supervision.restarts_used(now),
-                        supervision.route_reopens_at(now).map_or_else(String::new, |at| format!(
-                            ", but its route ceiling refuses the route change until it reopens at unix ms {at}"
-                        )),
                     ),
                 );
-                continue;
+            } else {
+                self.clear_fault(&continuity_key);
             }
-            self.clear_fault(&continuity_key);
-            if supervision.continuity_is_waiting(now) {
+            if supervision.continuity_deferred(now) {
                 continue;
             }
 
@@ -15775,132 +15725,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn continuity_stops_when_the_targets_own_log_has_spent_the_window() -> Result<()> {
-        let workload = SwitchWorkload::new();
-        let world = EngineFixture::with_workload(workload.clone())?;
-        admit_incumbent(&world)?;
-        workload.kill();
-        // Six restarts inside the window, the last long enough ago that its
-        // doubling wait (160 s) is over: only the ceiling holds.
-        set_meters(
-            &world,
-            &restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
-        )?;
-        assert!(!world.engine.supervise_one_admitted_generation()?);
-        assert!(ControlSnapshot::read(&world.state_store)?.transactions.is_empty());
-        assert!(
-            world
-                .engine
-                .fault_reports
-                .lock()
-                .unwrap()
-                .contains_key("continuity:service"),
-            "exhaustion was not reported"
-        );
-
-        // The oldest leaves the window: five remain, so one more is allowed.
-        set_meters(
-            &world,
-            &restarted_ago(&[3_700_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
-        )?;
-        assert!(world.engine.supervise_one_admitted_generation()?);
-        assert_eq!(ControlSnapshot::read(&world.state_store)?.transactions.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn an_exhausted_target_says_when_its_route_ceiling_reopens_only_if_it_is_full() -> Result<()> {
-        let workload = SwitchWorkload::new();
-        let world = EngineFixture::with_workload(workload.clone())?;
-        admit_incumbent(&world)?;
-        workload.kill();
-        let said = || -> String {
-            world
-                .engine
-                .fault_reports
-                .lock()
-                .unwrap()
-                .get("continuity:service")
-                .and_then(|report| report.last.lock().unwrap().clone())
-                .unwrap_or_default()
-        };
-        let mut meters =
-            restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?;
-        set_meters(&world, &meters)?;
-        assert!(!world.engine.supervise_one_admitted_generation()?);
-        let open = said();
-        assert!(open.contains("free for a deployment"), "{open}");
-        assert!(!open.contains("route ceiling"), "{open}");
-
-        world.engine.clear_fault("continuity:service");
-        let now = now_millis()?;
-        meters.route_actuations = (0..ROUTE_ACTUATION_CEILING as u64).map(|n| now - 1_000 + n).collect();
-        set_meters(&world, &meters)?;
-        let reopens_at = meters.route_reopens_at(now).unwrap();
-        assert!(!world.engine.supervise_one_admitted_generation()?);
-        let full = said();
-        assert!(full.contains(&format!("reopens at unix ms {reopens_at}")), "{full}");
-        Ok(())
-    }
-
-    #[test]
-    fn continuity_restarts_are_spaced_by_a_doubling_wait_and_counted_in_the_mint() -> Result<()> {
-        let workload = SwitchWorkload::new();
-        let world = EngineFixture::with_workload(workload.clone())?;
-        admit_incumbent(&world)?;
-        workload.kill();
-        let restarts = |world: &EngineFixture| -> Result<bool> {
-            let progressed = world.engine.supervise_one_admitted_generation()?;
-            let minted = !ControlSnapshot::read(&world.state_store)?.transactions.is_empty();
-            assert_eq!(progressed, minted);
-            clear_live_transactions(world)?;
-            Ok(minted)
-        };
-
-        // The first restart is minted, and the same write counts it.
-        assert!(restarts(&world)?);
-        assert_eq!(meters_of(&world, "service")?.continuity_restarts.len(), 1);
-        // At once again: the 5 s wait has not passed.
-        assert!(!restarts(&world)?);
-        // The second wait is 10 s and the third 20 s: each is the last one doubled.
-        set_meters(&world, &restarted_ago(&[100_000, 6_000])?)?;
-        assert!(!restarts(&world)?);
-        set_meters(&world, &restarted_ago(&[100_000, 11_000])?)?;
-        assert!(restarts(&world)?);
-        assert_eq!(meters_of(&world, "service")?.continuity_restarts.len(), 3);
-        set_meters(&world, &restarted_ago(&[200_000, 100_000, 15_000])?)?;
-        assert!(!restarts(&world)?);
-        set_meters(&world, &restarted_ago(&[200_000, 100_000, 21_000])?)?;
-        assert!(restarts(&world)?);
-        Ok(())
-    }
-
-    #[test]
-    fn a_deployment_yields_to_a_restart_only_while_the_target_has_restarts_left() -> Result<()> {
-        let workload = SwitchWorkload::new();
-        let world = EngineFixture::with_workload(workload.clone())?;
-        let incumbent = admit_incumbent(&world)?;
-        let redeploy =
-            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
-        workload.kill();
-        // The target's restarts are spent: nothing is left to yield to, and
-        // aborting the deployment would close the last door.
-        set_meters(
-            &world,
-            &restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
-        )?;
-        world.engine.supervise_one_admitted_generation()?;
-        let after = resident(&world)?.value;
-        assert_eq!(after.transaction_id, redeploy.transaction_id);
-        assert!(after.pre_fencing_abort.is_none(), "yielded with no restarts left");
-
-        set_meters(&world, &restarted_ago(&[200_000])?)?;
-        world.engine.supervise_one_admitted_generation()?;
-        assert!(resident(&world)?.value.pre_fencing_abort.is_some());
-        Ok(())
-    }
-
     /// The 2026-10-18 state: a dead incumbent that has paged, with a deployment
     /// waiting before Fencing. Continuity never stops and never yields a
     /// deployment (budget-never-stop, handover-phase-split), so the window
@@ -16232,23 +16056,6 @@ mod tests {
 
     /// The control for the test above: the same redeploy over a dead incumbent
     /// that is not held is yielded to continuity.
-    #[test]
-    fn a_declaring_redeploy_still_yields_to_continuity_when_the_incumbent_is_not_held() -> Result<()> {
-        let workload = SwitchWorkload::new();
-        let world = EngineFixture::with_workload(workload.clone())?;
-        let incumbent = admit_incumbent(&world)?;
-        assert!(incumbent.readiness().is_ok());
-        let redeploy =
-            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
-        workload.kill();
-        world.engine.supervise_one_admitted_generation()?;
-        let after = resident(&world)?.value;
-        assert_eq!(after.transaction_id, redeploy.transaction_id);
-        let abort = after.pre_fencing_abort.context("the redeploy was not yielded")?;
-        assert!(abort.error.contains("yielded to continuity"), "{}", abort.error);
-        Ok(())
-    }
-
     /// `seeded` with its own Expected undeclared, so Idunn holds it.
     fn undeclared(world: &EngineFixture, seeded: &DeploymentTransaction) -> Result<DeploymentTransaction> {
         let mut bare = seeded.clone();
@@ -16417,24 +16224,24 @@ mod tests {
         let now = t - 86_400_000;
         let mut meters = TargetSupervision::new("service");
         meters.route_actuations = vec![t; ROUTE_ACTUATION_CEILING];
-        meters.continuity_restarts = vec![t; CONTINUITY_RESTART_ATTEMPTS];
+        meters.continuity_restarts = vec![t; CONTINUITY_PAGING_RESTARTS];
         meters.continuity_deferred_until = Some(t);
         meters.continuity_deferral_reason = Some("demotion failed".into());
         meters.validate()?;
 
         // Entries from the future count as now: the meters hold for one window.
         let read_only = meters.clone();
-        assert!(read_only.restarts_exhausted(now));
+        assert!(read_only.restarts_page(now));
         let refused = meters.charge_route(now, RouteActuation::Forward).unwrap_err();
         assert!(refused.reopens_at_unix_millis <= now + ROUTE_ACTUATION_WINDOW_MILLIS);
         // The clamp is written, so the window runs from the step and no longer.
         assert_eq!(meters.route_actuations, vec![now; ROUTE_ACTUATION_CEILING]);
-        assert_eq!(meters.continuity_restarts, vec![now; CONTINUITY_RESTART_ATTEMPTS]);
-        assert!(!meters.restarts_exhausted(now + CONTINUITY_RESTART_WINDOW_MILLIS));
+        assert_eq!(meters.continuity_restarts, vec![now; CONTINUITY_PAGING_RESTARTS]);
+        assert!(!meters.restarts_page(now + CONTINUITY_RESTART_WINDOW_MILLIS));
         meters.charge_route(now + ROUTE_ACTUATION_WINDOW_MILLIS, RouteActuation::Forward)?;
 
         // Waits set for the future are due, not stalled for the length of the step.
-        assert!(!read_only.continuity_is_waiting(now));
+        assert!(!read_only.continuity_deferred(now));
         let route = RouteSupervisionState {
             next_challenge_at_unix_millis: Some(t),
             ..RouteSupervisionState::default()
@@ -19035,7 +18842,7 @@ mod tests {
             // it first: the write ends the pass, and nothing is minted from
             // entries that only look recent because the clock stepped back.
             let mut restarts = TargetSupervision::new("service");
-            restarts.continuity_restarts = vec![ahead; CONTINUITY_RESTART_ATTEMPTS];
+            restarts.continuity_restarts = vec![ahead; CONTINUITY_PAGING_RESTARTS];
             set_meters(&routed.world, &restarts)?;
             routed.workload.kill();
             assert!(routed.tick()?);
@@ -19210,12 +19017,12 @@ mod tests {
                 &routed.world,
                 &restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
             )?;
-            for _ in 0..2 * CONTINUITY_RESTART_ATTEMPTS {
+            for _ in 0..2 * CONTINUITY_PAGING_RESTARTS {
                 routed.world.engine.charge_route_actuation("service", RouteActuation::Survival)?;
             }
             let spent = meters_of(&routed.world, "service")?;
-            assert!(spent.restarts_exhausted(now_millis()?));
-            assert_eq!(spent.route_survivals.len(), 2 * CONTINUITY_RESTART_ATTEMPTS);
+            assert!(spent.restarts_page(now_millis()?));
+            assert_eq!(spent.route_survivals.len(), 2 * CONTINUITY_PAGING_RESTARTS);
 
             // Warming's preflight and Routing's install are both admitted.
             routed.step()?;
