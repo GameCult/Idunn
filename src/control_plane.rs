@@ -16176,12 +16176,11 @@ mod tests {
         for _ in 0..3 {
             let _ = world.engine.run_scheduler_tick();
             assert_eq!(continuity_mints(&world)?, 0);
-            assert!(
-                every_transaction(&world)?
-                    .iter()
-                    .all(|transaction| transaction.pre_fencing_abort.is_none()),
-                "the deployment was yielded"
-            );
+            let aborts = every_transaction(&world)?
+                .into_iter()
+                .filter_map(|transaction| transaction.pre_fencing_abort)
+                .collect::<Vec<_>>();
+            assert!(aborts.is_empty(), "the deployment was aborted: {aborts:?}");
         }
         Ok(())
     }
