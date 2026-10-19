@@ -1880,12 +1880,23 @@ impl DeploymentTransaction {
         }
     }
 
+    /// The candidate's route proof has succeeded: it is Committing, or its
+    /// routing evidence is recorded and only the transition remains. It serves,
+    /// so no waiting deployment stops it (ruling c2d-yield-only-unproven-to-
+    /// movable). Derived, never stored.
+    fn serving_proven(&self) -> bool {
+        self.phase >= DeploymentPhase::Committing || self.routing.is_some()
+    }
+
     /// A continuity at or past Fencing that its deadline leaves to the operator
-    /// while its step runs. It yields to a deployment awaiting the handover
-    /// (ruling continuity-yields-to-deploy), so a waiter never ends on it.
-    /// Derived, never stored.
-    fn retries_forward(&self) -> bool {
-        self.resolves_by_deadline() && self.phase_end() == PhaseEnd::RetryForward
+    /// while its step runs, and whose candidate is still unproven: it yields to
+    /// a deployment that can take the handover (ruling continuity-yields-to-
+    /// deploy), so a waiter never ends on it. A proven continuity keeps serving
+    /// and paging and does not yield. Derived, never stored.
+    fn yields_to_a_deploy(&self) -> bool {
+        self.resolves_by_deadline()
+            && self.phase_end() == PhaseEnd::RetryForward
+            && !self.serving_proven()
     }
 
     /// What an ended post-fencing phase resolves to (Q3). A continuity at or
@@ -8546,6 +8557,17 @@ impl Engine {
         }))
     }
 
+    /// Whether a deployment awaiting the handover is free to take it: the
+    /// deployment brake has released its exact transaction, so the stop a yield
+    /// makes is followed by the deployment's own landing. A Deploy at its
+    /// Sealing tail has not passed the brake yet and is read live; one that is
+    /// still building, or whose brake cannot be read, is held. An operator's
+    /// hold is a reason to leave a serving or retrying body alone.
+    fn deploy_can_move(&self, deploy: &Stored<DeploymentTransaction>, now: u64) -> bool {
+        deploy.value.deployment_authorization.is_some()
+            || matches!(self.deployment_authorization(deploy, now), Ok(Some(_)))
+    }
+
     fn lifecycle_allows(&self, current: &Stored<DeploymentTransaction>, now: u64) -> Result<bool> {
         let plan = required(&current.value.plan, "continuity plan")?;
         let binding = plan.parsed_inputs()?.1;
@@ -8673,7 +8695,7 @@ impl Engine {
         if snapshot.transactions.iter().any(|stored| {
             stored.value.transaction_id == owner_id
                 && stored.value.leaves_to_operator(now)
-                && !stored.value.retries_forward()
+                && !stored.value.yields_to_a_deploy()
         }) {
             bail!(
                 "owner-left-to-operator: target {} is owned by {owner_id}, which Idunn has left to the operator; this deployment ends before fencing",
@@ -9740,10 +9762,12 @@ impl Engine {
             }
             PhaseEnd::RetryForward => {
                 let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-                if let Some(deploy) = snapshot
-                    .on_target(&transaction.target)
-                    .find(|other| other.value.awaits_handover())
-                {
+                let now = now_millis()?;
+                if let Some(deploy) = snapshot.on_target(&transaction.target).find(|other| {
+                    transaction.yields_to_a_deploy()
+                        && other.value.awaits_handover()
+                        && self.deploy_can_move(other, now)
+                }) {
                     self.begin_post_fencing_abort(
                         current,
                         anyhow!(
@@ -17947,7 +17971,7 @@ mod tests {
 
     /// `awaits_handover` and `yields_to_a_deploy` row by row.
     #[test]
-    fn awaits_handover_and_retries_forward_are_exact_functions_of_the_record() -> Result<()> {
+    fn awaits_handover_and_yields_to_a_deploy_are_exact_functions_of_the_record() -> Result<()> {
         let (world, _, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
         let waiting = resident_id(&world, &deploy_id)?.value;
         assert_eq!(waiting.phase, DeploymentPhase::Warming);
@@ -17980,22 +18004,29 @@ mod tests {
         sealing.phase = DeploymentPhase::Warming;
         assert!(!sealing.awaits_handover());
 
-        // A continuity retries forward from Fencing to Committing, until aborting.
+        // A continuity yields from Fencing until its route proof succeeds, and
+        // until aborting; a proven one keeps serving.
         for phase in [
             DeploymentPhase::Fencing,
             DeploymentPhase::Leasing,
             DeploymentPhase::AwaitingReady,
             DeploymentPhase::Routing,
-            DeploymentPhase::Committing,
         ] {
             continuity.phase = phase;
-            assert!(continuity.retries_forward(), "{phase:?}");
+            assert!(continuity.yields_to_a_deploy(), "{phase:?}");
+            assert!(!continuity.serving_proven(), "{phase:?}");
         }
+        continuity.phase = DeploymentPhase::Committing;
+        assert!(continuity.serving_proven() && !continuity.yields_to_a_deploy());
+        continuity.phase = DeploymentPhase::Routing;
+        continuity.routing = Some(RoutingEvidence::SkippedUnrouted);
+        assert!(continuity.serving_proven() && !continuity.yields_to_a_deploy());
+        continuity.routing = None;
         let mut deploy_record = waiting.clone();
         deploy_record.phase = DeploymentPhase::Fencing;
-        assert!(!deploy_record.retries_forward());
+        assert!(!deploy_record.yields_to_a_deploy());
         continuity.post_fencing_abort = Some(post_fencing_abort_intent(&continuity, "x"));
-        assert!(!continuity.retries_forward());
+        assert!(!continuity.yields_to_a_deploy());
         Ok(())
     }
 
@@ -18003,15 +18034,43 @@ mod tests {
     /// it keeps retrying and pages; a waiting Deploy does not stop it.
     #[test]
     fn a_committing_continuity_past_its_deadline_keeps_serving_and_pages() -> Result<()> {
-        let (world, workload, _, _, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
-        rephase(&world, &owner_id, DeploymentPhase::Committing)?;
+        let (world, workload, _, _, owner_id, incumbent) = waiter_beside_gate_waiting_continuity()?;
+        let owner = resident_id(&world, &owner_id)?.value;
+        // The continuity's incarnation already has a correlation (the
+        // incumbent's, same release): Odin re-stamps it Ready for this activation.
+        let expected = owner.expected.as_ref().context("no Expected")?;
+        let backing = SingleFileMessagePackBackingStore::new(&world.engine.options.odin_correlation_store);
+        let key = crate::drivers::incarnation_key_of(&expected.target, &expected.canonical_sha256()?);
+        let current = backing
+            .pull_all_read_only_snapshot()?
+            .into_iter()
+            .find(|entry| entry.key == key);
+        assert!(backing.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: OdinRuntimeTopologyCorrelationRecord::TYPE.into(),
+                key: key.clone(),
+                current,
+            }],
+            &[CultCacheEnvelope {
+                key,
+                r#type: OdinRuntimeTopologyCorrelationRecord::TYPE.into(),
+                payload: signed_correlation(&world, &owner, seeded_sequence(Some(&incumbent)) + 10, true)?,
+                stored_at: rfc3339_millis(now_millis()?)?,
+                schema_id: Some(cultnet_rs::ODIN_RUNTIME_TOPOLOGY_CORRELATION_SCHEMA.into()),
+            }],
+        )?);
+        let phases = drive_id(&world, &owner_id, |t| t.phase == DeploymentPhase::Committing)?;
+        let at = latest_id(&world, &owner_id)?;
+        assert_eq!(at.phase, DeploymentPhase::Committing, "{phases:?} {:?} {:?}", at.completion, at.last_error);
+        // Its Committing step now fails on every attempt: the body is gone.
+        workload.kill();
         pass_deadline_of(&world, &owner_id)?;
         let stops = stops_of(&workload);
         for _ in 0..4 {
             world.engine.resume_backoff.lock().unwrap().clear();
             waiter_then_owner(&world, "", &owner_id)?;
         }
-        let owner = resident_id(&world, &owner_id)?.value;
+        let owner = latest_id(&world, &owner_id)?;
         assert!(owner.post_fencing_abort.is_none(), "a serving continuity yielded");
         assert_eq!(owner.phase, DeploymentPhase::Committing);
         assert_eq!(operator_required(&world)?, [owner_id.as_str()]);
@@ -18026,25 +18085,25 @@ mod tests {
     #[test]
     fn a_continuity_does_not_yield_to_a_braked_deploy_and_yields_once_the_brake_releases() -> Result<()> {
         let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
-        make_stop_first(&world, &deploy_id)?;
-        let sealing = resident_id(&world, &deploy_id)?;
+        make_stop_first(&world, &deploy_id).context("A make_stop_first")?;
+        let sealing = resident_id(&world, &deploy_id).context("B sealing")?;
         let mut tail = sealing.value.clone();
         tail.deployment_authorization = None;
         replace_transaction(&world.state_store, &sealing, &tail)?;
-        assert!(resident_id(&world, &deploy_id)?.value.awaits_handover());
+        assert!(resident_id(&world, &deploy_id).context("C awaits")?.value.awaits_handover());
         pass_deadline_of(&world, &owner_id)?;
         let stops = stops_of(&workload);
         for _ in 0..4 {
             world.engine.resume_backoff.lock().unwrap().clear();
             waiter_then_owner(&world, "", &owner_id)?;
         }
-        let held = resident_id(&world, &owner_id)?.value;
+        let held = latest_id(&world, &owner_id)?;
         assert!(held.post_fencing_abort.is_none(), "the continuity yielded to a braked Deploy");
         assert_eq!(operator_required(&world)?, [owner_id.as_str()]);
         assert_eq!(stops_of(&workload), stops);
 
         // The operator releases the brake for this exact Deploy.
-        let deploy = resident_id(&world, &deploy_id)?.value;
+        let deploy = resident_id(&world, &deploy_id).context("E deploy")?.value;
         let authorization = deployment_authorization(
             &world,
             deploy.expected.as_ref().context("no Expected")?,
@@ -18069,7 +18128,7 @@ mod tests {
         )?);
         world.engine.resume_backoff.lock().unwrap().clear();
         waiter_then_owner(&world, "", &owner_id)?;
-        let yielded = resident_id(&world, &owner_id)?.value;
+        let yielded = resident_id(&world, &owner_id).context("F yielded")?.value;
         let abort = yielded.post_fencing_abort.as_ref().context("the continuity did not yield")?;
         assert!(abort.error.starts_with("continuity-yields") && abort.error.contains(&deploy_id), "{}", abort.error);
         // The yield retimed the record: the next pass closes its incident
