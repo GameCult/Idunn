@@ -13864,6 +13864,11 @@ mod tests {
         /// Whether a start launches a process (a fresh private identity)
         /// instead of refusing like `StillWorkload`.
         launches: std::sync::atomic::AtomicBool,
+        /// Files whose advisory locks stand for a process that holds a lease
+        /// for its lifetime: `stop` is what releases them.
+        holds: std::sync::Mutex<Vec<std::fs::File>>,
+        /// How many times the process was stopped.
+        stops: std::sync::atomic::AtomicUsize,
     }
 
     impl SwitchWorkload {
@@ -13874,12 +13879,32 @@ mod tests {
                 silent: std::sync::atomic::AtomicBool::new(false),
                 spared: std::sync::Mutex::new(Vec::new()),
                 launches: std::sync::atomic::AtomicBool::new(false),
+                holds: std::sync::Mutex::new(Vec::new()),
+                stops: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
         /// From now on a start launches a process distinct from every recorded one.
         fn launching(&self) {
             self.launches.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// The process takes a shared lock on `store`'s authority lock, as a
+        /// candidate holding its lifetime write lease does, until stopped.
+        #[cfg(unix)]
+        fn hold_lease_lock(&self, store: &std::path::Path) {
+            use std::os::unix::io::AsRawFd;
+            let mut lock = store.as_os_str().to_os_string();
+            lock.push(".lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(lock)
+                .unwrap();
+            // SAFETY: flock on a descriptor this function owns.
+            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) }, 0);
+            self.holds.lock().unwrap().push(file);
         }
 
         /// `kill` leaves this runtime instance running.
@@ -13995,6 +14020,8 @@ mod tests {
             Ok(prior.clone())
         }
         fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.holds.lock().unwrap().clear();
             Ok(())
         }
         fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
@@ -21878,6 +21905,34 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert!(driver.observe_empty()?, "the abort left the granted lease on disk");
             // What the next fencing does to a candidate's lease path.
             driver.revoke_exact(None)?;
+            Ok(())
+        }
+
+        /// ghostlight-abort-lease-before-stop. A candidate that holds its
+        /// lifetime write lease keeps the lease's shared lock until it is
+        /// stopped, so the abort stops it before revoking; revoking first
+        /// fails on the lock on every attempt and the abort never ends.
+        #[cfg(unix)]
+        #[test]
+        fn an_abort_stops_a_candidate_that_holds_its_lease_before_revoking_it() -> Result<()> {
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            routed.drive_until(|t| matches!(t.leasing, Some(LeasingEvidence::Granted { .. })))?;
+            let lease_path = routed.world.root.join("lease/process-write-lease.cc");
+            routed.workload.hold_lease_lock(&lease_path);
+            let driver = CultCacheWriteLeaseDriver::new("service", &lease_path);
+
+            pass_deadline(&routed.world)?;
+            routed.resume()?;
+            assert!(routed.transaction()?.post_fencing_abort.is_some(), "the deadline did not end it");
+            let stops = routed.workload.stops.load(Ordering::SeqCst);
+            let finished = routed.resume_until_terminal()?;
+            assert!(
+                matches!(finished.completion, Some(TransactionCompletion::FailedAfterFencing { .. })),
+                "{:?}",
+                finished.last_error
+            );
+            assert!(driver.observe_empty()?, "the abort left the lease on disk");
+            assert!(routed.workload.stops.load(Ordering::SeqCst) > stops, "the candidate was never stopped");
             Ok(())
         }
 
