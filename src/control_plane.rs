@@ -17779,6 +17779,8 @@ mod tests {
         let stops = stops_of(&workload);
         for _ in 0..5 {
             waiter_then_owner(&world, &deploy_id, &owner_id)?;
+            let owner = latest_id(&world, &owner_id)?;
+            assert!(owner.completion.is_none(), "(i) {:?} {:?} {:?}", owner.completion, owner.phase, owner.last_error);
         }
         assert!(resident_id(&world, &owner_id).with_context(|| "(i)")?.value.post_fencing_abort.is_none());
         let waiting = resident_id(&world, &deploy_id)?.value;
