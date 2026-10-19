@@ -16091,6 +16091,99 @@ mod tests {
         Ok(())
     }
 
+    /// The 2026-10-18 shape at the engine: a dead incumbent with a deployment
+    /// building over it. Continuity restarts the incumbent beside the build
+    /// and neither touches the other (handover-phase-split).
+    #[test]
+    fn a_dead_incumbent_is_restarted_alongside_a_deployment_that_is_building() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        age_incumbent(&world, 500_000)?;
+        let deploy =
+            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        workload.kill();
+        let stored_deploy = |world: &EngineFixture| -> Result<Stored<DeploymentTransaction>> {
+            ControlSnapshot::read(&world.state_store)?
+                .transactions
+                .into_iter()
+                .find(|stored| stored.value.transaction_id == deploy.transaction_id)
+                .context("the deployment left the live set")
+        };
+        let before = stored_deploy(&world)?;
+
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 1, "no restart beside the building deployment");
+        assert_eq!(ControlSnapshot::read(&world.state_store)?.transactions.len(), 2);
+        assert_eq!(stored_deploy(&world)?.envelope, before.envelope);
+
+        for _ in 0..2 {
+            let _ = world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(continuity_mints(&world)?, 1);
+            let after = stored_deploy(&world)?;
+            assert_eq!(after.envelope, before.envelope);
+            assert!(after.value.pre_fencing_abort.is_none());
+        }
+        Ok(())
+    }
+
+    /// A `profile:` command over two targets, one of them crash-looping with a
+    /// live continuity, freezes at once: freeze refuses only a second live
+    /// deployment of a target (follow-up profile-deploy-joint-gap).
+    #[test]
+    fn a_profile_deploy_freezes_over_a_crash_looping_target() -> Result<()> {
+        use crate::deployment_plan::tests::BINDING;
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        age_incumbent(&world, 500_000)?;
+        workload.kill();
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 1);
+        let continuity = ControlSnapshot::read(&world.state_store)?.transactions.remove(0);
+
+        let (binding_head, binding_tail) = BINDING.split_once("[route]").context("route")?;
+        let binding = format!(
+            "{binding_head}[brakes]{}",
+            binding_tail.split_once("[brakes]").context("brakes")?.1
+        );
+        std::fs::create_dir_all(world.root.join("bindings"))?;
+        for target in ["service", "other"] {
+            let paired = binding.replacen(
+                "target = \"service\"\n",
+                &format!("target = \"{target}\"\nprofiles = [\"pair\"]\n"),
+                1,
+            );
+            std::fs::write(world.root.join(format!("bindings/{target}.toml")), paired)?;
+        }
+        queue_deploy_of(&world, "up-pair", "profile:pair")?;
+        assert!(world.engine.freeze_one_queued_command()?, "the profile command stayed queued");
+
+        let live = ControlSnapshot::read(&world.state_store)?.transactions;
+        let mut frozen = live
+            .iter()
+            .filter(|stored| stored.value.command_id == "up-pair")
+            .map(|stored| (stored.value.ordinal, stored.value.target.as_str()))
+            .collect::<Vec<_>>();
+        frozen.sort();
+        assert_eq!(frozen, [(0, "other"), (1, "service")]);
+        let kept = live
+            .iter()
+            .find(|stored| stored.value.transaction_id == continuity.value.transaction_id)
+            .context("the continuity left the live set")?;
+        assert_eq!(kept.envelope, continuity.envelope);
+
+        // A live deployment of `service` still refuses a second command for it.
+        queue_deploy_of(&world, "up-service-second", "service")?;
+        assert!(!world.engine.freeze_one_queued_command()?);
+        assert!(
+            every_transaction(&world)?
+                .iter()
+                .all(|transaction| transaction.command_id != "up-service-second")
+        );
+        Ok(())
+    }
+
     /// Put the target's backoff anchor `ago` milliseconds back.
     fn anchor_ago(world: &EngineFixture, ago: u64) -> Result<()> {
         let mut meters = meters_of(world, "service")?;
@@ -16923,11 +17016,16 @@ mod tests {
         );
         std::fs::create_dir_all(world.root.join("bindings"))?;
         std::fs::write(world.root.join("bindings/service.toml"), binding)?;
+        queue_deploy_of(world, command_id, "service")
+    }
+
+    /// Queue a Deploy command for `selector`; the bindings are the caller's.
+    fn queue_deploy_of(world: &EngineFixture, command_id: &str, selector: &str) -> Result<()> {
         let command = DeploymentCommand {
             schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
             command_id: command_id.into(),
             kind: CommandKind::Deploy,
-            selector: "service".into(),
+            selector: selector.into(),
             requested_by: "operator".into(),
             requested_at_unix_millis: now_millis()?,
         };
