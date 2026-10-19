@@ -5894,11 +5894,22 @@ impl Engine {
             }
         }
         let after = ControlSnapshot::read(&self.options.state_store)?;
-        let live = after
+        let Some(live) = after
             .transactions
             .iter()
             .find(|stored| stored.value.transaction_id == current.value.transaction_id)
-            .context("transaction disappeared while checking scheduler progress")?;
+        else {
+            // The step that ends a transaction archives it inside its own
+            // write, so it is gone from the live set because it finished: that
+            // is the step's progress. Gone from both is a fault.
+            ensure!(
+                read_history_transactions(&self.options.state_store)
+                    .iter()
+                    .any(|archived| archived.transaction_id == id && archived.is_terminal()),
+                "transaction disappeared while checking scheduler progress"
+            );
+            return Ok(true);
+        };
         Ok(state_advanced(&current.value, &live.value))
     }
 
@@ -9097,10 +9108,12 @@ impl Engine {
         }
     }
 
-    /// The one phase-entry seam. Every move into the next phase is written
-    /// here, and entering the phase where the transaction takes its target
-    /// (`takes_target_at`) is decided by `take_target`: that CAS is the
-    /// handover, and nothing else writes that entry.
+    /// The seam for the forward moves that can be the handover (`transition`
+    /// and the end of Sealing). Entering the phase where the transaction takes
+    /// its target (`takes_target_at`) is decided by `take_target`: that CAS is
+    /// the handover, and nothing else writes that entry. The other writes
+    /// (Starting to Warming, completions, aborts, same-phase evidence) go to
+    /// `replace_transaction` directly because none of them enters that phase.
     fn enter(
         &self,
         current: &Stored<DeploymentTransaction>,
@@ -12605,6 +12618,27 @@ mod tests {
         })
     }
 
+    /// `binding` with its provider trust anchor and signer pointed at this
+    /// world's provider identity, enrolled on first use.
+    fn bind_provider(world: &EngineFixture, binding: &str) -> Result<String> {
+        let provider_path = world.root.join("identities/provider.cc");
+        let provider_anchor = world.root.join("identities/provider-anchor.cc");
+        let provider = if provider_path.exists() {
+            open_service_identity_at::<GameCultProviderHealthIdentity>(&provider_path)?
+        } else {
+            let provider =
+                enroll_service_identity_at::<GameCultProviderHealthIdentity>(&provider_path)?;
+            export_service_identity_trust_anchor(&provider, &provider_anchor)?;
+            provider
+        };
+        Ok(binding
+            .replace(
+                "/etc/gamecult/trust/service.cc",
+                &provider_anchor.display().to_string(),
+            )
+            .replace("service-runtime-signer", &provider.entry().identity_id))
+    }
+
     /// What makes a target Odin: it provides the rendezvous.
     fn provide_odin(expected: &mut IdunnExpectedIncarnationRecord) {
         expected.capabilities.push(cultnet_rs::IdunnExpectedCapability {
@@ -12657,32 +12691,19 @@ mod tests {
         use crate::deployment_plan::tests::{
             BINDING, RECIPE, artifact_receipt, external_input_receipt, source,
         };
-        let provider_path = world.root.join("identities/provider.cc");
-        let provider_anchor = world.root.join("identities/provider-anchor.cc");
-        let provider = if provider_path.exists() {
-            open_service_identity_at::<GameCultProviderHealthIdentity>(&provider_path)?
-        } else {
-            let provider =
-                enroll_service_identity_at::<GameCultProviderHealthIdentity>(&provider_path)?;
-            export_service_identity_trust_anchor(&provider, &provider_anchor)?;
-            provider
-        };
-
         let (binding_head, binding_tail) = BINDING
             .split_once("[route]")
             .context("binding has no route table")?;
-        let binding = format!(
-            "{binding_head}[brakes]{}",
-            binding_tail
-                .split_once("[brakes]")
-                .context("binding has no brakes table")?
-                .1
-        )
-        .replace(
-            "/etc/gamecult/trust/service.cc",
-            &provider_anchor.display().to_string(),
-        )
-        .replace("service-runtime-signer", &provider.entry().identity_id);
+        let binding = bind_provider(
+            world,
+            &format!(
+                "{binding_head}[brakes]{}",
+                binding_tail
+                    .split_once("[brakes]")
+                    .context("binding has no brakes table")?
+                    .1
+            ),
+        )?;
         let recipe = RECIPE
             .split("[[dependencies]]")
             .next()
@@ -13987,17 +14008,25 @@ mod tests {
     /// Admit a generation for "service" through the real phase machine and
     /// retire its transaction, leaving the world with an incumbent.
     fn admit_incumbent(world: &EngineFixture) -> Result<AdmittedGeneration> {
+        Ok(admit_seeded_incumbent(world)?.0)
+    }
+
+    /// `admit_incumbent`, and the transaction that was admitted.
+    fn admit_seeded_incumbent(
+        world: &EngineFixture,
+    ) -> Result<(AdmittedGeneration, DeploymentTransaction)> {
         let seeded = transaction_at(world, DeploymentPhase::Fencing)?;
         odin_reports_ready(world, &seeded, seeded_sequence(None) + 1)?;
         drive(world, |transaction| {
             transaction.phase == DeploymentPhase::Complete
         })?;
         assert!(world.engine.retire_one_terminal_transaction()?);
-        Ok(ControlSnapshot::read(&world.state_store)?
+        let admitted = ControlSnapshot::read(&world.state_store)?
             .admitted_for("service")
             .context("commit wrote no admitted generation")?
             .value
-            .clone())
+            .clone();
+        Ok((admitted, seeded))
     }
 
     #[test]
@@ -16686,6 +16715,260 @@ mod tests {
         Ok(())
     }
 
+    /// A route-less host-actuator target that rolls out stop-then-start: the
+    /// seeded systemd binding with its runner, workload and rollout swapped.
+    fn stop_first_binding(world: &EngineFixture) -> Result<String> {
+        use crate::deployment_plan::tests::BINDING;
+        const HOST: &str = r#"[runners.rust]
+driver = "host-native"
+affordances = ["source-read", "artifact-write"]
+allowed_programs = ["cargo"]
+
+[workload]
+driver = "host-actuator"
+host = "yggdrasil"
+host_trust_anchor_store = "/etc/gamecult/trust/host-actuator.cc"
+release_root = "/srv/service/releases"
+runtime_root = "/run/gamecult/idunn/service"
+state_root = "/var/lib/gamecult/service"
+
+[workload.argument_bindings]
+state_root = "/var/lib/gamecult/service"
+
+[workload.secret_files]
+GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-identity.cc"
+
+"#;
+        let (head, rest) = BINDING.split_once("[runners.rust]").context("no runner")?;
+        let (_, rest) = rest.split_once("[runtime_identity]").context("no identity")?;
+        let (identity, rest) = rest.split_once("[route]").context("no route")?;
+        let (_, brakes) = rest.split_once("[brakes]").context("no brakes")?;
+        bind_provider(
+            world,
+            &format!("{head}{HOST}[runtime_identity]{identity}[brakes]{brakes}")
+                .replace("candidate-then-promote", "stop-then-start"),
+        )
+    }
+
+    /// The seeded transaction `id`, rewritten as the Sealing transaction of a
+    /// stop-then-start target: the host-actuator plan, release and Expected,
+    /// and none of the evidence that follows Sealing.
+    fn make_stop_first(world: &EngineFixture, id: &str) -> Result<()> {
+        use crate::deployment_plan::tests::{
+            RECIPE, artifact_receipt, external_input_receipt, source,
+        };
+        let stored = resident_id(world, id)?;
+        let mut next = stored.value.clone();
+        let binding = stop_first_binding(world)?;
+        let recipe = RECIPE
+            .split("[[dependencies]]")
+            .next()
+            .context("recipe is empty")?
+            .replace("route_required = true", "route_required = false")
+            .replace(
+                r#"["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
+                r#"["GAMECULT_IDUNN_ACTIVATION_CREDENTIAL", "GAMECULT_IDUNN_RUNTIME_BUNDLE", "GAMECULT_RUNTIME_PRESENCE_IDENTITY"]"#,
+            );
+        let plan = compile_deployment_plan(
+            recipe.as_bytes(),
+            binding.as_bytes(),
+            source(&recipe),
+            &format!("service-{id}"),
+            None,
+            110,
+            &[],
+        )?;
+        let release = SealedRelease::new(
+            &plan,
+            vec![artifact_receipt()],
+            vec![external_input_receipt()],
+            120,
+        )?;
+        let mut expected = release.expected_projection(&plan)?;
+        declare_odin(&mut expected);
+        let now = now_millis()?;
+        if next.command_kind == CommandKind::Deploy {
+            next.frozen_source = Some(FrozenSourceReceipt {
+                transaction_id: id.into(),
+                plan_id: plan.plan_id.clone(),
+                snapshot_sha256: sha256_id(b"frozen source snapshot"),
+            });
+            next.deployment_authorization =
+                Some(deployment_authorization(world, &expected, id, now)?);
+        }
+        next.installed_release = Some(crate::drivers::InstalledReleaseObservation {
+            sealed_release_id: release.sealed_release_id.clone(),
+            root: PathBuf::from("/srv/service/releases/test"),
+        });
+        next.sealed_release = Some(release);
+        next.expected = Some(expected);
+        next.plan = Some(plan);
+        next.expected_publication_sha256 = None;
+        next.activation_publication_sha256 = None;
+        next.activation = None;
+        next.workload = None;
+        next.warming = None;
+        next.isolation = None;
+        next.enter_phase(DeploymentPhase::Sealing, now);
+        replace_transaction(&world.state_store, &stored, &next)
+    }
+
+    /// An admitted incumbent of `service`, and beside it a Deploy and a
+    /// Continuity (their ids, in that order), both stop-then-start at Sealing.
+    fn stop_first_world(
+        workload: Arc<dyn WorkloadPort>,
+    ) -> Result<(EngineFixture, String, String)> {
+        let world = EngineFixture::with_workload(workload)?;
+        let incumbent = admit_incumbent(&world)?;
+        let mut ids = Vec::new();
+        for kind in [CommandKind::Deploy, CommandKind::Continuity] {
+            let seeded =
+                seeded_transaction(&world, DeploymentPhase::Warming, kind, Some(&incumbent))?;
+            make_stop_first(&world, &seeded.transaction_id)?;
+            ids.push(seeded.transaction_id);
+        }
+        let continuity = ids.pop().context("no continuity")?;
+        let deploy = ids.pop().context("no deploy")?;
+        Ok((world, deploy, continuity))
+    }
+
+    /// Stop-then-start takes the target at Starting, by the same CAS as
+    /// Fencing: of two such transactions at Sealing, whichever enters Starting
+    /// first owns the target, and the other neither enters nor aborts.
+    #[test]
+    fn two_stop_then_start_transactions_never_both_enter_starting() -> Result<()> {
+        use DeploymentPhase::{Sealing, Starting};
+        for deploy_first in [true, false] {
+            let (world, deploy, continuity) = stop_first_world(Arc::new(StillWorkload))?;
+            let (first, second) = if deploy_first {
+                (deploy.clone(), continuity.clone())
+            } else {
+                (continuity.clone(), deploy.clone())
+            };
+            let stored = resident_id(&world, &first)?;
+            assert_eq!(stored.value.takes_target_at(), Starting);
+            assert!(!stored.value.owns_target());
+            world.engine.enter(&stored, entering(&stored, Starting)?)?;
+            let owner = resident_id(&world, &first)?.value;
+            assert_eq!(owner.phase, Starting);
+            assert!(owner.owns_target(), "a stop-first transaction at Starting does not own the target");
+
+            let rival = resident_id(&world, &second)?;
+            let outcome = world.engine.enter(&rival, entering(&rival, Starting)?);
+            if deploy_first {
+                let error = outcome.expect_err("a continuity entered Starting over an owner");
+                assert!(format!("{error:#}").contains("continuity superseded"), "{error:#}");
+                assert!(format!("{error:#}").contains(&deploy), "{error:#}");
+            } else {
+                outcome?;
+                let waiting = resident_id(&world, &second)?.value;
+                assert!(
+                    waiting.last_error.as_deref().is_some_and(|note| note.contains(&continuity)),
+                    "{:?}",
+                    waiting.last_error
+                );
+            }
+            // The store still reads: one owner, and the rival held at Sealing.
+            let after = ControlSnapshot::read(&world.state_store)?;
+            assert_eq!(after.transactions.iter().filter(|stored| stored.value.owns_target()).count(), 1);
+            let held = resident_id(&world, &second)?.value;
+            assert_eq!(held.phase, Sealing);
+            assert!(held.pre_fencing_abort.is_none());
+        }
+        Ok(())
+    }
+
+    /// A stop-first deployment that has entered Starting has stopped the
+    /// incumbent by design; supervision must read it as the owner and not
+    /// restart what it stopped.
+    #[test]
+    fn supervision_does_not_restart_the_incumbent_a_stop_first_owner_stopped() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let (world, deploy, _) = stop_first_world(workload.clone())?;
+        clear_other_live_transactions(&world, &deploy)?;
+        age_incumbent(&world, 500_000)?;
+        let stored = resident_id(&world, &deploy)?;
+        world.engine.enter(&stored, entering(&stored, DeploymentPhase::Starting)?)?;
+        workload.kill();
+
+        let before = incumbent_envelope(&world)?;
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 0, "supervision restarted what the owner stopped");
+        assert_eq!(incumbent_envelope(&world)?, before);
+
+        // Released, the same dead incumbent is restarted.
+        clear_other_live_transactions(&world, "")?;
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 1);
+        Ok(())
+    }
+
+    /// An owner fencing the incumbent is the only writer of it: supervision
+    /// skips the generation, so it neither refreshes it from Odin nor repairs
+    /// or retires around it.
+    #[test]
+    fn supervision_leaves_a_generation_its_owner_is_fencing_alone() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (incumbent, admitted) = admit_seeded_incumbent(&world)?;
+        let owner =
+            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        rephase(&world, &owner.transaction_id, DeploymentPhase::Fencing)?;
+        // Odin has a newer reading of the incumbent than the one it holds.
+        odin_republishes(&world, &admitted, seeded_sequence(None) + 5)?;
+
+        let before = incumbent_envelope(&world)?;
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(incumbent_envelope(&world)?, before, "supervision refreshed a generation an owner is fencing");
+
+        // The same world with no owner takes the reading, so the skip alone held it.
+        clear_other_live_transactions(&world, "")?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_ne!(incumbent_envelope(&world)?, before);
+        Ok(())
+    }
+
+    /// The step that ends a transaction archives it inside its own write. It
+    /// left the live set because it finished: progress, not a fault.
+    #[test]
+    fn the_step_that_ends_a_transaction_reports_progress_and_no_fault() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let ended = transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let id = ended.transaction_id;
+        let mut last = None;
+        for _ in 0..20 {
+            let Ok(current) = resident_id(&world, &id) else {
+                break;
+            };
+            let moved = world.engine.resume_candidate(&current)?;
+            if resident_id(&world, &id).is_err() {
+                last = Some(moved);
+                break;
+            }
+        }
+        assert_eq!(last, Some(true), "the ending step reported no progress");
+        assert!(latest_id(&world, &id)?.is_terminal());
+        assert!(world.engine.fault_reports.lock().unwrap().is_empty());
+
+        // Through the tick, the way the scheduler runs it: no fault is kept.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let ended = transaction_at(&world, DeploymentPhase::Warming)?;
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        for _ in 0..20 {
+            if resident_id(&world, &ended.transaction_id).is_err() {
+                break;
+            }
+            world.engine.resume_one_transaction()?;
+        }
+        assert!(latest_id(&world, &ended.transaction_id)?.is_terminal());
+        assert!(world.engine.fault_reports.lock().unwrap().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn the_store_holds_one_deploy_one_continuity_and_one_owner_per_target() -> Result<()> {
         let seed = |first: (CommandKind, DeploymentPhase), second: (CommandKind, DeploymentPhase)| {
@@ -16737,6 +17020,24 @@ mod tests {
         let deploy =
             seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
         let deploy_id = deploy.transaction_id.as_str();
+        // The build recorded a route preflight against the incumbent it saw.
+        let building = resident_id(&world, deploy_id)?;
+        let mut preflighted = building.value.clone();
+        preflighted.route_preflight = Some(crate::drivers::RoutePreflightReceipt {
+            route_id: "service".into(),
+            candidate_runtime_instance_id: building
+                .value
+                .activation
+                .as_ref()
+                .context("no activation")?
+                .runtime_instance_id
+                .clone(),
+            candidate_membership_sha256: sha256_id(b"membership"),
+            incumbent_runtime_instance_id: None,
+            incumbent_membership_sha256: None,
+            incumbent_configuration: None,
+        });
+        replace_transaction(&world.state_store, &building, &preflighted)?;
         workload.launching();
         workload.kill();
         assert!(world.engine.supervise_one_admitted_generation()?);
@@ -16758,6 +17059,7 @@ mod tests {
         assert_eq!(untouched.value.incumbent_generation_id, Some(incumbent.generation_id.clone()));
 
         // The deployment's next step is the rebase and nothing else.
+        assert!(untouched.value.route_preflight.is_some() && untouched.value.warming.is_some());
         world.engine.advance_transaction(&untouched)?;
         let rebased = resident_id(&world, deploy_id)?.value;
         assert_eq!(rebased.incumbent_generation_id, Some(restarted.generation_id.clone()));
