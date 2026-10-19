@@ -17679,6 +17679,7 @@ state_root = "/var/lib/gamecult/service"
 GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-identity.cc"
 
 "#;
+        let (head, rest) = BINDING.split_once("[runners.rust]").context("no runner")?;
         let (_, rest) = rest.split_once("[runtime_identity]").context("no identity")?;
         let (identity, rest) = rest.split_once("[route]").context("no route")?;
         let (_, brakes) = rest.split_once("[brakes]").context("no brakes")?;
