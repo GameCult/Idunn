@@ -13948,6 +13948,15 @@ mod tests {
             transaction.leasing = leasing.clone();
             transaction.lease_adoption = lease_adoption.clone();
             assert_eq!(transaction.phase_end(), expected, "{kind:?} {leasing:?} {lease_adoption:?}");
+            // Only a stateful deploy is left to the operator when its phase ends.
+            transaction.retime(1_000);
+            let due = transaction.phase_deadline.context("no deadline")?.deadline_at_unix_millis;
+            assert_eq!(
+                transaction.leaves_to_operator(due),
+                expected == PhaseEnd::OperatorRequired,
+                "{kind:?} {leasing:?} {lease_adoption:?}"
+            );
+            assert!(!transaction.leaves_to_operator(due - 1));
             let recovery = if kind == Continuity && lease_adoption.is_some() {
                 TerminalRecovery::RestartAdmitted
             } else {
@@ -17048,6 +17057,13 @@ mod tests {
         let records = world.engine.incidents().read()?;
         assert_eq!(records.len(), 1);
 
+        // An incident whose transaction is gone closes even while another is
+        // still left to the operator.
+        world.engine.incidents().open(IncidentCondition::OperatorRequired, "tx-vanished", now_millis()?)?;
+        resume_pass(&world)?;
+        assert_eq!(open()?, [id]);
+        let records = world.engine.incidents().read()?;
+
         // Still left to the operator: still open, and not written again.
         resume_pass(&world)?;
         assert_eq!(world.engine.incidents().read()?, records);
@@ -17064,8 +17080,8 @@ mod tests {
         resume_pass(&world)?;
         assert!(open()?.is_empty());
         let closed = world.engine.incidents().read()?;
-        assert_eq!(closed.len(), 1);
-        assert_eq!(closed[0].close_reason, Some(CloseReason::Recovered));
+        assert!(closed.iter().all(|record| record.close_reason == Some(CloseReason::Recovered)));
+        assert_eq!(closed.iter().filter(|record| record.subject == id).count(), 1);
         resume_pass(&world)?;
         assert_eq!(world.engine.incidents().read()?, closed, "a spent incident was written again");
         Ok(())
