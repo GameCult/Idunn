@@ -5133,6 +5133,10 @@ struct Engine {
     /// not be observed): no step of them runs until `retry_held_lift` decides.
     /// Process-local: a restart asks again at boot.
     lift_held: Mutex<BTreeSet<String>>,
+    /// Set when the boot lift itself failed, so no record's decision exists:
+    /// every continuity with a post-fencing abort is held until a later lift
+    /// succeeds. Process-local, like `lift_held`.
+    lift_unsettled: std::sync::atomic::AtomicBool,
     /// When each routed target's next challenge is due, held only when the
     /// stored `RouteSupervisionState` could not record the last one. The stored
     /// value owns the schedule and survives restarts; this spaces attempts
@@ -5246,6 +5250,7 @@ impl Engine {
             fault_reports: Mutex::default(),
             resume_backoff: Mutex::default(),
             lift_held: Mutex::default(),
+            lift_unsettled: std::sync::atomic::AtomicBool::new(false),
             challenge_wait: Mutex::default(),
         })
     }
@@ -5731,6 +5736,28 @@ enum LiftDecision {
 }
 
 impl Engine {
+    /// Boot's call of the lift. A lift that errs decided nothing, so boot fails
+    /// closed: every continuity abort is held, none of its steps run, until
+    /// `retry_held_lift` completes a lift.
+    fn boot_lift(&self) {
+        match self.return_wedged_continuity_aborts_forward() {
+            Ok(returned) => {
+                for transaction_id in &returned {
+                    println!(
+                        "returned continuity {transaction_id} to forward retry: its abort had not stopped its running candidate"
+                    );
+                }
+            }
+            Err(error) => {
+                self.lift_unsettled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                eprintln!(
+                    "Idunn boot could not lift wedged continuity aborts; every continuity abort is held until a lift succeeds: {error:#}"
+                );
+            }
+        }
+    }
+
     /// Once at boot: withdraw the abort of a continuity that has not stopped
     /// its running candidate, and retime the record so its phase retries
     /// forward. A pre-c2c Idunn aborted a continuity at its deadline; that
@@ -5770,6 +5797,29 @@ impl Engine {
     /// pass is spent on the record; `None` lets the pass go on.
     fn retry_held_lift(&self, current: &Stored<DeploymentTransaction>) -> Result<Option<bool>> {
         let id = current.value.transaction_id.as_str();
+        if current.value.command_kind == CommandKind::Continuity
+            && current.value.post_fencing_abort.is_some()
+            && self.lift_unsettled.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            match self.return_wedged_continuity_aborts_forward() {
+                Err(error) => {
+                    self.note_fault("holds continuity abort", id, &error);
+                    return Ok(Some(false));
+                }
+                Ok(returned) => {
+                    self.lift_unsettled
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    for transaction_id in &returned {
+                        println!(
+                            "returned continuity {transaction_id} to forward retry: its abort had not stopped its running candidate"
+                        );
+                    }
+                    if returned.iter().any(|lifted| lifted == id) {
+                        return Ok(Some(true));
+                    }
+                }
+            }
+        }
         if !self.lift_held.lock().expect("lift held mutex").contains(id) {
             return Ok(None);
         }
@@ -5983,16 +6033,7 @@ fn boot(options: RuntimeOptions) -> Result<(ProcessLock, Engine)> {
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
     let engine = Engine::open(options)?;
     engine.validate_durable_authority(&ControlSnapshot::read(&engine.options.state_store)?)?;
-    match engine.return_wedged_continuity_aborts_forward() {
-        Ok(returned) => {
-            for transaction_id in &returned {
-                println!(
-                    "returned continuity {transaction_id} to forward retry: its abort had not stopped its running candidate"
-                );
-            }
-        }
-        Err(error) => eprintln!("Idunn boot could not lift wedged continuity aborts: {error:#}"),
-    }
+    engine.boot_lift();
     match engine.reconcile_failed_continuity_projections() {
         Ok(outcome) => {
             for transaction_id in &outcome.demoted {
@@ -17976,6 +18017,42 @@ mod tests {
         }
         assert_eq!(stops_of(&workload), 0, "the running candidate was stopped");
         assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        Ok(())
+    }
+
+    /// NEGATIVE. A boot lift that errs decided nothing: no continuity abort
+    /// runs a step until a later lift succeeds, and then the running candidate
+    /// is returned forward instead of stopped.
+    #[test]
+    fn a_boot_lift_that_errs_holds_every_continuity_abort_until_a_lift_succeeds() -> Result<()> {
+        let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        braked_sealing_deploy(&world, &deploy_id)?;
+        let owner = resident_id(&world, &owner_id)?;
+        world.engine.begin_post_fencing_abort(
+            &owner,
+            anyhow!("the AwaitingReady phase passed its deadline at unix ms 2"),
+        )?;
+        // The lift's only fallible read fails: the store is unreadable at boot.
+        let intact = std::fs::read(&world.state_store)?;
+        std::fs::write(&world.state_store, b"not a control store")?;
+        world.engine.boot_lift();
+        assert!(world.engine.lift_unsettled.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::write(&world.state_store, &intact)?;
+        let stored = resident_id(&world, &owner_id)?;
+        assert!(stored.value.post_fencing_abort.is_some());
+        // Still failing: the abort is held, no step runs.
+        std::fs::write(&world.state_store, b"not a control store")?;
+        assert!(!world.engine.resume_candidate(&stored)?, "a held abort moved");
+        std::fs::write(&world.state_store, &intact)?;
+        assert_eq!(stops_of(&workload), 0);
+        // A later lift succeeds: the running candidate is returned forward.
+        for _ in 0..5 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            waiter_then_owner(&world, "", &owner_id)?;
+        }
+        assert_eq!(stops_of(&workload), 0, "the running candidate was stopped");
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        assert!(!world.engine.lift_unsettled.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
     }
 
