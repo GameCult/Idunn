@@ -1686,6 +1686,11 @@ struct DeploymentTransaction {
     lease_adoption: Option<LeaseAdoptionEvidence>,
 }
 
+/// The note a deployment keeps while another transaction owns its target.
+fn waiting_for_owner(target: &str, owner: &str) -> String {
+    format!("target {target} is owned by {owner}; this deployment fences what is admitted when it completes")
+}
+
 /// What `Engine::take_target` decided about one transaction's entry into the
 /// phase where it takes its target.
 #[derive(Debug, PartialEq, Eq)]
@@ -6738,6 +6743,11 @@ impl Engine {
         if current.value.pre_fencing_abort.is_some() && current.value.completion.is_none() {
             return self.advance_pre_fencing_abort(current);
         }
+        if current.value.phase < current.value.takes_target_at()
+            && self.settle_before_handover(current)?
+        {
+            return Ok(());
+        }
         match current.value.phase {
             DeploymentPhase::Sealing => self.advance_sealing(current),
             DeploymentPhase::Starting => self.advance_starting(current),
@@ -8988,6 +8998,92 @@ impl Engine {
         self.enter(current, next)
     }
 
+    /// Before its handover a Deploy is proven against the generation that was
+    /// admitted when the evidence was gathered. When another generation has
+    /// been admitted since (continuity restarted the incumbent), rewrite the
+    /// incumbent and drop exactly the evidence that names the old one: the
+    /// warming (its lease), the route preflight (its route) and the isolation
+    /// (its workload). A continuity is never rebased. Returns whether it wrote.
+    fn rebase_onto_admitted(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
+        let held = &current.value;
+        if held.command_kind != CommandKind::Deploy
+            || held.pre_fencing_abort.is_some()
+            || held.phase >= held.takes_target_at()
+        {
+            return Ok(false);
+        }
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let admitted = snapshot.admitted_for(&held.target);
+        let admitted_id = admitted.map(|stored| stored.value.generation_id.as_str());
+        if admitted_id == held.incumbent_generation_id.as_deref() {
+            return Ok(false);
+        }
+        self.persist_same_phase(current, |next| {
+            next.incumbent_generation_id = admitted_id.map(str::to_owned);
+            next.warming = None;
+            next.route_preflight = None;
+            next.isolation = None;
+            next.odin_publisher_sequence_cursor = next
+                .odin_publisher_sequence_cursor
+                .max(admitted.map_or(0, |stored| stored.value.odin_publisher_sequence_cursor));
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    /// What a transaction that has not yet taken its target does first, when
+    /// the world moved under it. `true` means this decided the step.
+    ///
+    /// A Deploy rebases onto the generation now admitted; in Warming, whose
+    /// steps read the incumbent an owner is fencing, it waits while another
+    /// transaction owns or drains the target. Both return Ok: a pre-fencing
+    /// error is an abort, and no deployment is aborted for continuity. A
+    /// Continuity restarts one generation and no other, so it ends itself
+    /// (through the ordinary pre-fencing abort) when its target is taken or
+    /// its generation replaced.
+    fn settle_before_handover(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
+        let held = &current.value;
+        match held.command_kind {
+            CommandKind::Deploy => {
+                if self.rebase_onto_admitted(current)? {
+                    return Ok(true);
+                }
+                if held.phase != DeploymentPhase::Warming {
+                    return Ok(false);
+                }
+                let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+                let Some(owner) = snapshot.target_owner(&held.target, Some(&held.transaction_id))
+                else {
+                    return Ok(false);
+                };
+                self.record_gate_wait(
+                    current,
+                    &waiting_for_owner(&held.target, &owner.value.transaction_id),
+                )?;
+                Ok(true)
+            }
+            CommandKind::Continuity => {
+                let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+                if let Some(owner) = snapshot.target_owner(&held.target, Some(&held.transaction_id))
+                {
+                    bail!(
+                        "continuity superseded: target {} is owned by {}",
+                        held.target,
+                        owner.value.transaction_id
+                    );
+                }
+                ensure!(
+                    snapshot
+                        .admitted_for(&held.target)
+                        .map(|stored| stored.value.generation_id.as_str())
+                        == held.incumbent_generation_id.as_deref(),
+                    "continuity superseded: the generation it restarts is no longer admitted"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// The one phase-entry seam. Every move into the next phase is written
     /// here, and entering the phase where the transaction takes its target
     /// (`takes_target_at`) is decided by `take_target`: that CAS is the
@@ -9010,12 +9106,9 @@ impl Engine {
             // Lost to a concurrent writer: the next step reads the new world.
             (Handover::Took | Handover::Lost, _) => Ok(()),
             // Wait, never abort: a pre-fencing error would end the deployment.
-            (Handover::OwnedBy(owner), CommandKind::Deploy) => self.record_gate_wait(
-                current,
-                &format!(
-                    "target {target} is owned by {owner}; this deployment fences what is admitted when it completes"
-                ),
-            ),
+            (Handover::OwnedBy(owner), CommandKind::Deploy) => {
+                self.record_gate_wait(current, &waiting_for_owner(target, &owner))
+            }
             // The next step rebases onto the generation now admitted.
             (Handover::Moved, CommandKind::Deploy) => Ok(()),
             (Handover::OwnedBy(owner), CommandKind::Continuity) => {
@@ -12863,23 +12956,47 @@ mod tests {
         }
     }
 
-    /// One engine step at a time until `stop` holds, recording each phase
-    /// entered and checking after every step that the deadline on the record
-    /// is exactly the current post-fencing phase's, and absent outside one.
+    /// The transaction wherever it now lives: live, or archived once terminal.
+    fn latest_id(world: &EngineFixture, id: &str) -> Result<DeploymentTransaction> {
+        match resident_id(world, id) {
+            Ok(stored) => Ok(stored.value),
+            Err(_) => read_history_transactions(&world.state_store)
+                .into_iter()
+                .find(|transaction| transaction.transaction_id == id)
+                .context("the transaction is in neither the live set nor history"),
+        }
+    }
+
+    /// `drive_id` for the world's only transaction.
     fn drive(
         world: &EngineFixture,
         stop: impl Fn(&DeploymentTransaction) -> bool,
     ) -> Result<Vec<DeploymentPhase>> {
+        match resident(world) {
+            Ok(sole) => drive_id(world, &sole.value.transaction_id, stop),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// One engine step of transaction `id` at a time until `stop` holds,
+    /// recording each phase entered and checking after every step that the
+    /// deadline on the record is exactly the current post-fencing phase's, and
+    /// absent outside one.
+    fn drive_id(
+        world: &EngineFixture,
+        id: &str,
+        stop: impl Fn(&DeploymentTransaction) -> bool,
+    ) -> Result<Vec<DeploymentPhase>> {
         let mut phases = Vec::new();
         for _ in 0..40 {
-            let Ok(current) = resident(world) else {
+            let Ok(current) = resident_id(world, id) else {
                 return Ok(phases);
             };
             if stop(&current.value) {
                 return Ok(phases);
             }
             world.engine.advance_transaction(&current)?;
-            let after = latest(world)?;
+            let after = latest_id(world, id)?;
             match &after.phase_deadline {
                 Some(deadline) => assert_eq!(deadline.phase, after.phase),
                 None => assert!(
@@ -16461,7 +16578,7 @@ mod tests {
         let stored = resident_id(&world, &deploy.transaction_id)?;
 
         // Same generation, new envelope: a refresh landed after the read.
-        edit_incumbent(&world, |generation| generation.odin_publisher_sequence_cursor += 1)?;
+        edit_incumbent(&world, |generation| generation.admitted_at_unix_millis += 1)?;
         assert_eq!(
             world.engine.take_target(&view, &stored, &entering(&stored, DeploymentPhase::Fencing)?)?,
             Handover::Lost
@@ -16591,6 +16708,171 @@ mod tests {
         assert!(refused((Deploy, Fencing), (Continuity, Fencing))?.contains("own the incumbent slot"));
         assert!(refused((Deploy, Warming), (Deploy, Warming))?.contains("multiple live deployments"));
         assert!(refused((Continuity, Warming), (Continuity, Warming))?.contains("multiple live continuity transactions"));
+        Ok(())
+    }
+
+    /// The continuity transaction minted over `service`, whatever its state.
+    fn the_continuity(world: &EngineFixture) -> Result<Stored<DeploymentTransaction>> {
+        ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .find(|stored| stored.value.command_kind == CommandKind::Continuity)
+            .context("no live continuity")
+    }
+
+    #[test]
+    fn a_deployment_rebases_onto_the_generation_continuity_admitted_mid_build_and_fences_it() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        age_incumbent(&world, 500_000)?;
+        let deploy =
+            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        let deploy_id = deploy.transaction_id.as_str();
+        workload.kill();
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        let continuity_id = the_continuity(&world)?.value.transaction_id;
+
+        // Continuity restarts the incumbent beside the build, to Complete.
+        workload.revive();
+        drive_id(&world, &continuity_id, |t| t.phase == DeploymentPhase::Warming)?;
+        odin_republishes(&world, &latest_id(&world, &continuity_id)?, seeded_sequence(Some(&incumbent)) + 10)?;
+        drive_id(&world, &continuity_id, |t| t.is_terminal())?;
+        let restarted = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("the restart admitted nothing")?
+            .value
+            .clone();
+        assert_ne!(restarted.generation_id, incumbent.generation_id);
+        assert_eq!(restarted.transaction_id, continuity_id);
+        let untouched = resident_id(&world, deploy_id)?;
+        assert_eq!(untouched.value.incumbent_generation_id, Some(incumbent.generation_id.clone()));
+
+        // The deployment's next step is the rebase and nothing else.
+        world.engine.advance_transaction(&untouched)?;
+        let rebased = resident_id(&world, deploy_id)?.value;
+        assert_eq!(rebased.incumbent_generation_id, Some(restarted.generation_id.clone()));
+        assert_eq!(rebased.phase, DeploymentPhase::Warming);
+        assert!(rebased.warming.is_none() && rebased.route_preflight.is_none() && rebased.isolation.is_none());
+        assert!(rebased.pre_fencing_abort.is_none());
+        assert!(rebased.odin_publisher_sequence_cursor >= restarted.odin_publisher_sequence_cursor);
+        assert_eq!(rebased.expected, untouched.value.expected);
+
+        // It then fences the generation continuity admitted, and replaces it.
+        odin_reports_ready(&world, &deploy, restarted.odin_publisher_sequence_cursor + 10)?;
+        drive_id(&world, deploy_id, |t| t.is_terminal())?;
+        let landed = latest_id(&world, deploy_id)?;
+        assert!(matches!(landed.completion, Some(TransactionCompletion::Admitted { .. })), "{landed:?}");
+        assert_eq!(landed.fencing, Some(FencingEvidence::SkippedStateless));
+        assert!(matches!(
+            landed.post_commit_cleanup.map(|cleanup| cleanup.incumbent),
+            Some(
+                IncumbentCleanupEvidence::Pending { generation_id, .. }
+                    | IncumbentCleanupEvidence::Complete { generation_id }
+            ) if generation_id == restarted.generation_id
+        ));
+        let now_admitted = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("the deployment admitted nothing")?
+            .value
+            .transaction_id
+            .clone();
+        assert_eq!(now_admitted, deploy_id);
+        Ok(())
+    }
+
+    /// Kill the Warming step with the workload: if the gate did not hold the
+    /// deployment, running the step would be a pre-fencing error and an abort.
+    #[test]
+    fn a_deployment_waits_in_warming_while_a_continuity_owns_the_target() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Leasing)?;
+        workload.kill();
+        let deploy_id = deploy.transaction_id.as_str();
+        let before = resident_id(&world, deploy_id)?;
+
+        for _ in 0..3 {
+            let stored = resident_id(&world, deploy_id)?;
+            world.engine.advance_transaction(&stored)?;
+        }
+        let waiting = resident_id(&world, deploy_id)?;
+        assert_eq!(waiting.value.phase, DeploymentPhase::Warming);
+        assert!(waiting.value.pre_fencing_abort.is_none());
+        assert_eq!(waiting.value.warming, before.value.warming);
+        assert_eq!(waiting.value.isolation, before.value.isolation);
+        assert!(
+            waiting.value.last_error.as_deref().is_some_and(|note| note.contains(&continuity.transaction_id)),
+            "{:?}",
+            waiting.value.last_error
+        );
+
+        // The build overlaps: a deployment still in Sealing is not gated.
+        rephase(&world, deploy_id, DeploymentPhase::Sealing)?;
+        let sealing = resident_id(&world, deploy_id)?;
+        world.engine.advance_transaction(&sealing)?;
+        let after = resident_id(&world, deploy_id)?.value;
+        assert!(
+            after.last_error.as_deref().is_some_and(|note| !note.contains(&continuity.transaction_id)),
+            "Sealing was held by the owner: {:?}",
+            after.last_error
+        );
+
+        // The owner completes having moved the generation: the next step is the
+        // rebase, and with the target free the deployment goes on.
+        rephase(&world, deploy_id, DeploymentPhase::Warming)?;
+        workload.revive();
+        clear_other_live_transactions(&world, deploy_id)?;
+        edit_incumbent(&world, |generation| generation.generation_id = "generation-restarted".into())?;
+        world.engine.advance_transaction(&resident_id(&world, deploy_id)?)?;
+        let rebased = resident_id(&world, deploy_id)?.value;
+        assert_eq!(rebased.incumbent_generation_id.as_deref(), Some("generation-restarted"));
+        assert!(rebased.warming.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_continuity_whose_target_was_taken_or_generation_replaced_aborts_itself_and_is_not_rebased() -> Result<()> {
+        let resume = |world: &EngineFixture, id: &str| -> Result<()> {
+            for _ in 0..12 {
+                let stored = resident_id(world, id);
+                let Ok(stored) = stored else { break };
+                world.engine.resume_candidate(&stored)?;
+                world.engine.resume_backoff.lock().unwrap().clear();
+            }
+            Ok(())
+        };
+        // Taken: the deployment owns the target; the continuity ends itself and
+        // the deployment goes on, untouched.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Fencing, DeploymentPhase::Warming)?;
+        let owner = resident_id(&world, &deploy.transaction_id)?;
+        resume(&world, &continuity.transaction_id)?;
+        let ended = latest_id(&world, &continuity.transaction_id)?;
+        assert!(
+            matches!(&ended.completion, Some(TransactionCompletion::FailedBeforeFencing { error }) if error.contains("continuity superseded")),
+            "{:?}",
+            ended.completion
+        );
+        assert_eq!(resident_id(&world, &deploy.transaction_id)?.envelope, owner.envelope);
+
+        // Replaced: the generation it restarts is gone. It is not rebased.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, incumbent) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Warming)?;
+        clear_other_live_transactions(&world, &continuity.transaction_id)?;
+        edit_incumbent(&world, |generation| generation.generation_id = "generation-elsewhere".into())?;
+        resume(&world, &continuity.transaction_id)?;
+        let ended = latest_id(&world, &continuity.transaction_id)?;
+        assert!(
+            matches!(&ended.completion, Some(TransactionCompletion::FailedBeforeFencing { error }) if error.contains("continuity superseded")),
+            "{:?}",
+            ended.completion
+        );
+        assert_eq!(ended.incumbent_generation_id, Some(incumbent.generation_id));
+        let _ = deploy;
         Ok(())
     }
 
