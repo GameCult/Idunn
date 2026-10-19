@@ -16561,7 +16561,7 @@ mod tests {
         admit_incumbent(&world)?;
         age_incumbent(&world, 100_000)?;
         workload.kill();
-        let mut meters = restarted_ago(&[1_000_000, 900_000, 800_000])?;
+        let mut meters = restarted_ago(&[1_500_000, 1_400_000, 1_300_000])?;
         meters.continuity_attempt_streak = 3;
         set_meters(&world, &meters)?;
         world.engine.supervise_one_admitted_generation()?;
@@ -17217,10 +17217,10 @@ mod tests {
         let mut anchored = TargetSupervision::new("service");
         anchored.continuity_attempt_streak = 7;
         anchored.continuity_backoff_from_unix_millis = Some(t);
-        assert_eq!(anchored.continuity_backoff(now, 0), ContinuityBackoff::Due { streak: 7 });
+        assert_eq!(anchored.continuity_backoff(now, now), ContinuityBackoff::Due { streak: 7 });
         anchored.continuity_attempt_streak = 1;
         anchored.continuity_backoff_from_unix_millis = Some(now + 10_000);
-        assert_eq!(anchored.continuity_backoff(now, 0), ContinuityBackoff::Waiting);
+        assert_eq!(anchored.continuity_backoff(now, now), ContinuityBackoff::Waiting);
         let route = RouteSupervisionState {
             next_challenge_at_unix_millis: Some(t),
             ..RouteSupervisionState::default()
