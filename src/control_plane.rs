@@ -3425,6 +3425,22 @@ impl ControlSnapshot {
             .filter(move |stored| stored.value.target == target)
     }
 
+    /// The candidate ports taken by admitted generations and by transactions
+    /// that are live or still draining; a finished one has released its port.
+    fn candidate_ports_in_use(&self) -> BTreeSet<u16> {
+        self.admitted
+            .iter()
+            .map(|stored| &stored.value.plan)
+            .chain(
+                self.transactions
+                    .iter()
+                    .filter(|stored| stored.value.is_live() || stored.value.drains_incumbent())
+                    .filter_map(|stored| stored.value.plan.as_ref()),
+            )
+            .filter_map(|plan| plan.candidate_port)
+            .collect()
+    }
+
     fn supervision_for(&self, target: &str) -> Option<&Stored<TargetSupervision>> {
         self.targets
             .iter()
@@ -8074,24 +8090,7 @@ impl Engine {
         let Some(route) = &binding.route else {
             return Ok(None);
         };
-        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-        let mut used = BTreeSet::new();
-        for plan in snapshot
-            .admitted
-            .iter()
-            .map(|stored| &stored.value.plan)
-            .chain(
-                snapshot
-                    .transactions
-                    .iter()
-                    .filter(|stored| stored.value.is_live() || stored.value.drains_incumbent())
-                    .filter_map(|stored| stored.value.plan.as_ref()),
-            )
-        {
-            if let Some(port) = plan.candidate_port {
-                used.insert(port);
-            }
-        }
+        let used = ControlSnapshot::read(&self.options.state_store)?.candidate_ports_in_use();
         (route.private_port_start..=route.private_port_end)
             .find(|port| !used.contains(port))
             .map(Some)
@@ -16954,6 +16953,86 @@ mod tests {
 
         let _ = world.engine.supervise_one_admitted_generation()?;
         assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
+        Ok(())
+    }
+
+    #[test]
+    fn a_candidate_port_is_held_by_the_admitted_a_live_and_a_draining_transaction_only() -> Result<()> {
+        use crate::deployment_plan::tests::BINDING;
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Warming)?;
+        let mut view = ControlSnapshot::read(&world.state_store)?;
+        assert!(view.candidate_ports_in_use().is_empty());
+
+        // Ports are set in memory: the fixture plans are unrouted.
+        view.admitted[0].value.plan.candidate_port = Some(18000);
+        for stored in &mut view.transactions {
+            let port = if stored.value.transaction_id == deploy.transaction_id { 18001 } else { 18002 };
+            stored.value.plan.as_mut().context("no plan")?.candidate_port = Some(port);
+        }
+        assert_eq!(view.candidate_ports_in_use(), BTreeSet::from([18000, 18001, 18002]));
+        // Complete with cleanup still pending drains: its port stays held.
+        let finished = view
+            .transactions
+            .iter_mut()
+            .find(|stored| stored.value.transaction_id == continuity.transaction_id)
+            .context("no continuity")?;
+        finished.value.phase = DeploymentPhase::Complete;
+        finished.value.post_commit_cleanup = Some(PostCommitCleanup {
+            incumbent: IncumbentCleanupEvidence::SkippedNoIncumbent,
+            source: SourceCleanupEvidence::Pending,
+        });
+        assert_eq!(view.candidate_ports_in_use(), BTreeSet::from([18000, 18001, 18002]));
+        let finished = view
+            .transactions
+            .iter_mut()
+            .find(|stored| stored.value.transaction_id == continuity.transaction_id)
+            .context("no continuity")?;
+        finished.value.post_commit_cleanup = Some(PostCommitCleanup {
+            incumbent: IncumbentCleanupEvidence::SkippedNoIncumbent,
+            source: SourceCleanupEvidence::Complete,
+        });
+        assert_eq!(view.candidate_ports_in_use(), BTreeSet::from([18000, 18001]));
+
+        // A routed binding gets the first free port of its range; an unrouted one none.
+        let routed = OperatorBinding::parse(BINDING)?;
+        assert_eq!(world.engine.select_candidate_port(&routed)?, Some(routed.route.as_ref().context("route")?.private_port_start));
+        let (head, tail) = BINDING.split_once("[route]").context("route")?;
+        let unrouted = OperatorBinding::parse(&format!("{head}[brakes]{}", tail.split_once("[brakes]").context("brakes")?.1))?;
+        assert_eq!(world.engine.select_candidate_port(&unrouted)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_deployment_before_its_handover_is_rebased() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Warming)?;
+        // Another generation is admitted under both.
+        edit_incumbent(&world, |generation| generation.generation_id = "generation-restarted".into())?;
+        let rebase = |id: &str| -> Result<bool> {
+            world.engine.rebase_onto_admitted(&resident_id(&world, id)?)
+        };
+        // A continuity restarts one generation and no other.
+        assert!(!rebase(&continuity.transaction_id)?);
+        assert_ne!(
+            resident_id(&world, &continuity.transaction_id)?.value.incumbent_generation_id.as_deref(),
+            Some("generation-restarted")
+        );
+        // A deployment already ending is left to end.
+        let ending = resident_id(&world, &deploy.transaction_id)?;
+        let mut aborting = ending.value.clone();
+        aborting.pre_fencing_abort = Some(pre_fencing_abort_intent(&aborting, "cancelled by operator"));
+        replace_transaction(&world.state_store, &ending, &aborting)?;
+        assert!(!rebase(&deploy.transaction_id)?);
+        let ending = resident_id(&world, &deploy.transaction_id)?;
+        let mut live = ending.value.clone();
+        live.pre_fencing_abort = None;
+        replace_transaction(&world.state_store, &ending, &live)?;
+        // Past its handover the incumbent is pinned, whatever is admitted.
+        rephase(&world, &deploy.transaction_id, DeploymentPhase::Fencing)?;
+        assert!(!rebase(&deploy.transaction_id)?);
         Ok(())
     }
 
