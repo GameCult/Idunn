@@ -14522,6 +14522,10 @@ mod tests {
         stops: std::sync::atomic::AtomicUsize,
         /// Runtime instances whose stop fails, whatever is asked.
         failing_stops: std::sync::Mutex<Vec<String>>,
+        /// The unit is absent or failed, which the driver reports as
+        /// permanently stopped: positive evidence of death, unlike an
+        /// observation that merely errs.
+        buried: std::sync::atomic::AtomicBool,
     }
 
     impl SwitchWorkload {
@@ -14535,7 +14539,14 @@ mod tests {
                 holds: std::sync::Mutex::new(Vec::new()),
                 stops: std::sync::atomic::AtomicUsize::new(0),
                 failing_stops: std::sync::Mutex::new(Vec::new()),
+                buried: std::sync::atomic::AtomicBool::new(false),
             })
+        }
+
+        /// The process is dead and the driver can prove it.
+        fn bury(&self) {
+            self.kill();
+            self.buried.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// From now on a start launches a process distinct from every recorded one.
@@ -14584,6 +14595,8 @@ mod tests {
         }
 
         fn revive(&self) {
+            self.buried
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             self.alive
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             self.rebooted
@@ -14695,7 +14708,7 @@ mod tests {
             Ok(())
         }
         fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
-            Ok(false)
+            Ok(self.buried.load(std::sync::atomic::Ordering::SeqCst))
         }
         fn lost_to_host_reboot(&self, _: &WorkloadObservation, _: u64) -> Result<bool> {
             Ok(self.rebooted.load(std::sync::atomic::Ordering::SeqCst))
@@ -23834,6 +23847,81 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             Ok(())
         }
 
+        /// NEGATIVE. The boot lift runs before anything it needs may answer: a
+        /// systemctl error, a host-actuator hub no actuator has reached. The
+        /// abort of a candidate it could not observe is held, not run (its first
+        /// step stops the candidate), and the lift is retried on later passes.
+        /// Once observation answers Ok the record is lifted; once it answers
+        /// dead the abort proceeds.
+        #[cfg(unix)]
+        #[test]
+        fn a_boot_lift_that_cannot_observe_holds_the_abort_and_retries() -> Result<()> {
+            for hub_unattached in [false, true] {
+                let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+                routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+                let (lease, lease_sha256) = lease_of(&routed)?;
+                routed.stub.set_state("active");
+                *routed.stub.lease.lock().unwrap() = Some(lease_sha256);
+                routed.drive_until(|t| t.phase == DeploymentPhase::Routing)?;
+                let (driver, path) = lease_driver(&routed);
+                routed.workload.hold_lease_lock(&path);
+                routed.stub.hang_up.store(true, Ordering::SeqCst);
+                wedge_abort(&routed, "the Routing phase passed its deadline at unix ms 1792324133638")?;
+                let stops = routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst);
+                let observation_fails = || {
+                    if hub_unattached {
+                        routed.workload.silence(true);
+                    } else {
+                        routed.workload.kill();
+                    }
+                };
+
+                // Boot: observation errs. Nothing is lifted and nothing stops.
+                observation_fails();
+                let returned = routed.world.engine.return_wedged_continuity_aborts_forward()?;
+                assert!(returned.is_empty(), "lifted {returned:?} it could not observe");
+                for _ in 0..5 {
+                    routed.resume()?;
+                    assert_eq!(
+                        routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst),
+                        stops,
+                        "an undecided abort stopped the candidate (hub_unattached {hub_unattached})"
+                    );
+                }
+                let held = routed.transaction()?;
+                let abort = held.post_fencing_abort.context("the abort was dropped")?;
+                assert_eq!(abort.lease_withdrawal, CleanupEvidence::Pending);
+                assert!(driver.observe_exact(&lease)?, "the lease left the disk");
+
+                // Observation answers Ok: the next pass lifts the record.
+                routed.workload.silence(false);
+                routed.workload.revive();
+                routed.resume()?;
+                let lifted = routed.transaction()?;
+                assert!(lifted.post_fencing_abort.is_none(), "a later pass did not lift the record");
+                assert_eq!(lifted.phase, DeploymentPhase::Routing);
+                assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
+            }
+
+            // Observation answers dead: the abort proceeds to its end.
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+            wedge_abort(&routed, "the AwaitingReady phase passed its deadline")?;
+            routed.workload.silence(true);
+            assert!(routed.world.engine.return_wedged_continuity_aborts_forward()?.is_empty());
+            routed.resume()?;
+            assert!(routed.transaction()?.post_fencing_abort.is_some_and(|a| a.candidate_cleanup == CleanupEvidence::Pending));
+            routed.workload.silence(false);
+            routed.workload.bury();
+            let finished = routed.resume_until_terminal()?;
+            assert!(
+                matches!(finished.completion, Some(TransactionCompletion::FailedAfterFencing { .. })),
+                "{:?}",
+                finished.completion
+            );
+            Ok(())
+        }
+
         /// NEGATIVE. The live shape of tx-4eaed669 (Odin) left to the operator
         /// at its Routing deadline, with a Deploy now awaiting the handover of
         /// its target. The continuity yields through its own abort: the lease
@@ -23899,6 +23987,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             #[derive(Clone, Copy, Debug)]
             enum Case {
                 CandidateNotRunning,
+                LeaseWithdrawalRecordedComplete,
                 LeaseWithdrawn,
                 CandidateCleaned,
                 LeaseRevokedUnderIt,
@@ -23908,6 +23997,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             }
             for case in [
                 Case::CandidateNotRunning,
+                Case::LeaseWithdrawalRecordedComplete,
                 Case::LeaseWithdrawn,
                 Case::CandidateCleaned,
                 Case::LeaseRevokedUnderIt,
@@ -23936,13 +24026,25 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 // step, or one input, away from the lift's predicate.
                 routed.resume()?;
                 match case {
-                    Case::CandidateNotRunning => routed.workload.kill(),
+                    Case::CandidateNotRunning => routed.workload.bury(),
                     Case::LeaseWithdrawn | Case::CandidateCleaned => routed.resume()?,
                     Case::LeaseRevokedUnderIt => {
                         let (lease, _) = lease_of(&routed)?;
                         lease_driver(&routed).0.revoke_exact(Some(&lease))?;
                     }
                     Case::DeployWithRunningCandidate => {}
+                    // The record says the lease was withdrawn while the candidate
+                    // still runs and the lease is still exact on disk: only the
+                    // record's own evidence keeps the lift off it.
+                    Case::LeaseWithdrawalRecordedComplete => {
+                        let stored = resident(&routed.world)?;
+                        let mut next = stored.value.clone();
+                        next.post_fencing_abort
+                            .as_mut()
+                            .context("no abort")?
+                            .lease_withdrawal = CleanupEvidence::Complete;
+                        replace_transaction(&routed.world.state_store, &stored, &next)?;
+                    }
                     // The abort of the Odin-shaped negative, begun to yield: a
                     // Deploy awaits the handover of its target.
                     Case::DeployAwaitsTheTarget => {
