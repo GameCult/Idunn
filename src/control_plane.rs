@@ -5690,10 +5690,12 @@ impl Engine {
     /// c2c-boot-returns-wedged-aborts-forward). The result is the exact inverse
     /// of `begin_post_fencing_abort`.
     ///
-    /// A continuity abort now begins only over a permanently stopped
-    /// candidate, so this predicate cannot match a new record: it is a
-    /// migration with a deletion line (follow-up c2c-delete-boot-lift). A
-    /// record it cannot decide is reported and left aborting.
+    /// A continuity abort now begins only over a permanently stopped candidate
+    /// or to yield to a deployment awaiting the handover, so this predicate
+    /// matches only aborts over a running candidate with nothing awaiting the
+    /// target, which Idunn no longer creates: it is a migration with a deletion
+    /// line (follow-up c2c-delete-boot-lift). A record it cannot decide is
+    /// reported and left aborting.
     fn return_wedged_continuity_aborts_forward(&self) -> Result<Vec<String>> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let mut returned = Vec::new();
@@ -5706,6 +5708,9 @@ impl Engine {
                 || transaction.completion.is_some()
                 || abort.candidate_cleanup != CleanupEvidence::Pending
                 || abort.lease_withdrawal == CleanupEvidence::Complete
+                || snapshot
+                    .on_target(&transaction.target)
+                    .any(|other| other.value.awaits_handover())
             {
                 continue;
             }
@@ -6082,6 +6087,11 @@ impl Engine {
     fn resume_candidate(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
         let id = current.value.transaction_id.as_str();
         if let Some(moved) = self.resolve_phase_deadline(current)? {
+            if moved {
+                // A phase-ending write is movement: the next step is not held
+                // behind the backoff a forward retry armed.
+                self.resume_backoff.lock().expect("resume backoff mutex").remove(id);
+            }
             return Ok(moved);
         }
         if self
@@ -17721,9 +17731,7 @@ mod tests {
     fn a_waiting_deployment_lands_over_a_continuity_that_retries_forward_past_its_deadline() -> Result<()> {
         let (world, workload, deploy, deploy_id, owner_id, incumbent) = waiter_beside_gate_waiting_continuity()?;
         let stops = workload.stops.load(std::sync::atomic::Ordering::SeqCst);
-        for _ in 0..2 {
-            waiter_then_owner(&world, &deploy_id, &owner_id)?;
-        }
+        waiter_then_owner(&world, &deploy_id, &owner_id)?;
         let waiter = latest_id(&world, &deploy_id)?;
         assert!(waiter.completion.is_none(), "the waiter ended: {:?}", waiter.completion);
         assert!(waiter.pre_fencing_abort.is_none());
@@ -17754,6 +17762,167 @@ mod tests {
             .clone();
         assert_eq!(admitted.transaction_id, deploy_id);
         assert_eq!(landed.fencing, Some(FencingEvidence::SkippedStateless));
+        Ok(())
+    }
+
+    fn stops_of(workload: &SwitchWorkload) -> usize {
+        workload.stops.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The yield is a function of its inputs: the deadline, the continuity's
+    /// own record, and a deployment that awaits the handover.
+    #[test]
+    fn a_continuity_that_retries_forward_yields_only_past_its_deadline_and_only_to_a_deploy_awaiting_the_handover(
+    ) -> Result<()> {
+        // (i) Before the deadline nothing yields and the Deploy waits.
+        let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        let stops = stops_of(&workload);
+        for _ in 0..5 {
+            waiter_then_owner(&world, &deploy_id, &owner_id)?;
+        }
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        let waiting = resident_id(&world, &deploy_id)?.value;
+        assert!(waiting.pre_fencing_abort.is_none() && waiting.completion.is_none());
+        assert!(waiting.last_error.as_deref().is_some_and(|note| note.contains(&owner_id)));
+        assert_eq!(stops_of(&workload), stops);
+
+        // (ii) Past the deadline, a Deploy still building awaits nothing.
+        let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        let stops = stops_of(&workload);
+        rephase(&world, &deploy_id, DeploymentPhase::Sealing)?;
+        pass_deadline_of(&world, &owner_id)?;
+        for _ in 0..4 {
+            waiter_then_owner(&world, "", &owner_id)?;
+        }
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        assert_eq!(operator_required(&world)?, [owner_id.as_str()]);
+        assert_eq!(stops_of(&workload), stops);
+
+        // (iii) A Deploy already ending before the fence awaits nothing.
+        let (world, _, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        world.engine.begin_pre_fencing_abort(&resident_id(&world, &deploy_id)?, anyhow!("refused"))?;
+        pass_deadline_of(&world, &owner_id)?;
+        waiter_then_owner(&world, "", &owner_id)?;
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+
+        // (iv) Nor does a Deploy that has ended.
+        let (world, _, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        world.engine.begin_pre_fencing_abort(&resident_id(&world, &deploy_id)?, anyhow!("refused"))?;
+        for _ in 0..12 {
+            if latest_id(&world, &deploy_id)?.completion.is_some() {
+                break;
+            }
+            world.engine.resume_backoff.lock().unwrap().clear();
+            waiter_then_owner(&world, &deploy_id, "")?;
+        }
+        assert!(latest_id(&world, &deploy_id)?.completion.is_some());
+        pass_deadline_of(&world, &owner_id)?;
+        waiter_then_owner(&world, "", &owner_id)?;
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        Ok(())
+    }
+
+    /// `awaits_handover` and `retries_forward` row by row.
+    #[test]
+    fn awaits_handover_and_retries_forward_are_exact_functions_of_the_record() -> Result<()> {
+        let (world, _, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        let waiting = resident_id(&world, &deploy_id)?.value;
+        assert_eq!(waiting.phase, DeploymentPhase::Warming);
+        assert!(waiting.awaits_handover());
+        for phase in [
+            DeploymentPhase::Sealing,
+            DeploymentPhase::Starting,
+            DeploymentPhase::Fencing,
+            DeploymentPhase::Complete,
+        ] {
+            let mut moved = waiting.clone();
+            moved.phase = phase;
+            assert!(!moved.awaits_handover(), "{phase:?}");
+        }
+        let mut ended = waiting.clone();
+        ended.completion = Some(TransactionCompletion::FailedBeforeFencing { error: "x".into() });
+        assert!(!ended.awaits_handover());
+        let mut continuity = resident_id(&world, &owner_id)?.value;
+        let mut as_continuity = waiting.clone();
+        as_continuity.command_kind = CommandKind::Continuity;
+        assert!(!as_continuity.awaits_handover());
+        world.engine.begin_pre_fencing_abort(&resident_id(&world, &deploy_id)?, anyhow!("x"))?;
+        assert!(!resident_id(&world, &deploy_id)?.value.awaits_handover());
+
+        // The stop-then-start handover is Starting: its Sealing tail awaits it.
+        let (stop_first, stop_deploy, _) = stop_first_world(Arc::new(StillWorkload))?;
+        let mut sealing = resident_id(&stop_first, &stop_deploy)?.value;
+        sealing.phase = DeploymentPhase::Sealing;
+        assert!(sealing.awaits_handover());
+        sealing.phase = DeploymentPhase::Warming;
+        assert!(!sealing.awaits_handover());
+
+        // A continuity retries forward from Fencing to Committing, until aborting.
+        for phase in [
+            DeploymentPhase::Fencing,
+            DeploymentPhase::Leasing,
+            DeploymentPhase::AwaitingReady,
+            DeploymentPhase::Routing,
+            DeploymentPhase::Committing,
+        ] {
+            continuity.phase = phase;
+            assert!(continuity.retries_forward(), "{phase:?}");
+        }
+        let mut deploy_record = waiting.clone();
+        deploy_record.phase = DeploymentPhase::Fencing;
+        assert!(!deploy_record.retries_forward());
+        continuity.post_fencing_abort = Some(post_fencing_abort_intent(&continuity, "x"));
+        assert!(!continuity.retries_forward());
+        Ok(())
+    }
+
+    /// The c2b waiter still ends on an owner that will not yield: the yield's
+    /// own abort wedged past its deadline.
+    #[test]
+    fn the_c2b_waiter_still_ends_on_an_owner_that_will_not_yield() -> Result<()> {
+        let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        workload.fail_stop_of(&runtime_instance_of(&world, &owner_id)?);
+        pass_deadline_of(&world, &owner_id)?;
+        waiter_then_owner(&world, &deploy_id, &owner_id)?;
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_some());
+        pass_deadline_of(&world, &owner_id)?;
+        for _ in 0..20 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            waiter_then_owner(&world, &deploy_id, &owner_id)?;
+        }
+        assert!(!resident_id(&world, &owner_id)?.value.is_terminal());
+        assert_ended_for_owner(&world, &deploy_id, &owner_id)
+    }
+
+    /// The yield's abort is not held behind the backoff the forward retry
+    /// armed: movement spends it.
+    #[test]
+    fn a_yield_abort_is_not_held_behind_the_forward_retry_backoff() -> Result<()> {
+        let (world, _, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        // The Deploy is still building, so the pass past the deadline retries
+        // forward and arms the continuity backoff.
+        rephase(&world, &deploy_id, DeploymentPhase::Sealing)?;
+        pass_deadline_of(&world, &owner_id)?;
+        waiter_then_owner(&world, "", &owner_id)?;
+        let armed = *world
+            .engine
+            .resume_backoff
+            .lock()
+            .unwrap()
+            .get(&owner_id)
+            .context("the unmoved step set no backoff")?;
+        assert_eq!(armed.ceiling_millis, CONTINUITY_BACKOFF_CEILING_MILLIS);
+        // It reaches the handover: the next pass yields, and the abort runs
+        // with no clearing and no fake time.
+        rephase(&world, &deploy_id, DeploymentPhase::Warming)?;
+        waiter_then_owner(&world, "", &owner_id)?;
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_some());
+        for _ in 0..3 {
+            waiter_then_owner(&world, "", &owner_id)?;
+        }
+        let done = latest_id(&world, &owner_id)?;
+        let cleaned = done.post_fencing_abort.as_ref().map(|abort| abort.candidate_cleanup);
+        assert_eq!(cleaned, Some(CleanupEvidence::Complete), "{:?}", done.last_error);
         Ok(())
     }
     // END c2d continuity-yields
@@ -23676,6 +23845,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 LeaseRevokedUnderIt,
                 DeployWithRunningCandidate,
                 CompletedRecord,
+                DeployAwaitsTheTarget,
             }
             for case in [
                 Case::CandidateNotRunning,
@@ -23684,6 +23854,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 Case::LeaseRevokedUnderIt,
                 Case::DeployWithRunningCandidate,
                 Case::CompletedRecord,
+                Case::DeployAwaitsTheTarget,
             ] {
                 let deploy = matches!(case, Case::DeployWithRunningCandidate);
                 // The cleanup comes after the lease withdrawal, so a case with
@@ -23713,11 +23884,17 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                         lease_driver(&routed).0.revoke_exact(Some(&lease))?;
                     }
                     Case::DeployWithRunningCandidate => {}
+                    // The abort of the Odin-shaped negative, begun to yield: a
+                    // Deploy awaits the handover of its target.
+                    Case::DeployAwaitsTheTarget => {
+                        seeded_transaction(&routed.world, DeploymentPhase::Warming, CommandKind::Deploy, None)?;
+                    }
                     Case::CompletedRecord => {
                         routed.resume_until_terminal()?;
                     }
                 }
-                let abort = routed.transaction().ok().and_then(|t| t.post_fencing_abort);
+                let owner_id = the_continuity(&routed.world).ok().map(|c| c.value.transaction_id);
+                let abort = the_continuity(&routed.world).ok().and_then(|c| c.value.post_fencing_abort);
                 match case {
                     Case::LeaseWithdrawn => assert_eq!(
                         abort.as_ref().map(|a| (a.lease_withdrawal, a.candidate_cleanup)),
@@ -23738,6 +23915,10 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                     after.transactions.iter().map(|t| &t.envelope).collect::<Vec<_>>(),
                     "the lift wrote a record it left"
                 );
+                if let (Case::DeployAwaitsTheTarget, Some(owner)) = (case, &owner_id) {
+                    assert!(abort.is_some(), "the lift withdrew the yield");
+                    clear_other_live_transactions(&routed.world, owner)?;
+                }
                 let finished = routed.resume_until_terminal().with_context(|| format!("{case:?}"))?;
                 assert!(
                     matches!(finished.completion, Some(TransactionCompletion::FailedAfterFencing { .. })),
