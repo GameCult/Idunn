@@ -17284,41 +17284,16 @@ mod tests {
         replace_transaction(&world.state_store, &stored, &next)
     }
 
-    /// The stop-then-start binding of `stop_first_binding`, on a systemd unit
-    /// instead of a host actuator: its Warming step observes the unit through
-    /// the world's workload port and waits for Odin's word, where the
-    /// host-actuator step of a world that serves no actuator errs at once.
-    fn stop_first_systemd_binding(world: &EngineFixture) -> Result<String> {
-        use crate::deployment_plan::tests::BINDING;
-        let (head, rest) = BINDING.split_once("[workload]").context("no workload")?;
-        let (workload, rest) = rest.split_once("[runtime_identity]").context("no identity")?;
-        let (identity, rest) = rest.split_once("[route]").context("no route")?;
-        let (_, brakes) = rest.split_once("[brakes]").context("no brakes")?;
-        bind_provider(
-            world,
-            &format!("{head}[workload]{workload}[runtime_identity]{identity}[brakes]{brakes}")
-                .replace("candidate-then-promote", "stop-then-start"),
-        )
-    }
-
     /// A stop-then-start deployment and continuity over one incumbent, on a
     /// systemd unit. The continuity is held in Warming with a started unit and
     /// the deployment, one `enter` later, waits at its Sealing tail on it.
     fn warm_stop_first_owner(
         workload: Arc<SwitchWorkload>,
     ) -> Result<(EngineFixture, String, String)> {
-        let world = EngineFixture::with_workload(workload)?;
-        let incumbent = admit_incumbent(&world)?;
-        let binding = stop_first_systemd_binding(&world)?;
-        let mut ids = Vec::new();
-        for kind in [CommandKind::Deploy, CommandKind::Continuity] {
-            let seeded =
-                seeded_transaction(&world, DeploymentPhase::Warming, kind, Some(&incumbent))?;
-            make_stop_first(&world, &seeded.transaction_id, &binding)?;
-            ids.push(seeded.transaction_id);
-        }
-        let continuity = ids.pop().context("no continuity")?;
-        let deploy = ids.pop().context("no deploy")?;
+        let (world, deploy, continuity) = stop_first_world(workload.clone())?;
+        // This world serves no host actuator: the target's host workload runs
+        // through the same port as everything else here.
+        *world.engine.host_workload.lock().unwrap() = Some(workload); // seam
         warm_stop_first(&world, &continuity)?;
         let owner = resident_id(&world, &continuity)?;
         assert_eq!(owner.value.phase, DeploymentPhase::Warming);
@@ -17706,12 +17681,13 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     /// The seeded transaction `id`, rewritten as the Sealing transaction of a
     /// stop-then-start target: the host-actuator plan, release and Expected,
     /// and none of the evidence that follows Sealing.
-    fn make_stop_first(world: &EngineFixture, id: &str, binding: &str) -> Result<()> {
+    fn make_stop_first(world: &EngineFixture, id: &str) -> Result<()> {
         use crate::deployment_plan::tests::{
             RECIPE, artifact_receipt, source,
         };
         let stored = resident_id(world, id)?;
         let mut next = stored.value.clone();
+        let binding = stop_first_binding(world)?;
         let recipe = RECIPE
             .split("[[dependencies]]")
             .next()
@@ -17780,12 +17756,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     ) -> Result<(EngineFixture, String, String)> {
         let world = EngineFixture::with_workload(workload)?;
         let incumbent = admit_incumbent(&world)?;
-        let binding = stop_first_binding(&world)?;
         let mut ids = Vec::new();
         for kind in [CommandKind::Deploy, CommandKind::Continuity] {
             let seeded =
                 seeded_transaction(&world, DeploymentPhase::Warming, kind, Some(&incumbent))?;
-            make_stop_first(&world, &seeded.transaction_id, &binding)?;
+            make_stop_first(&world, &seeded.transaction_id)?;
             ids.push(seeded.transaction_id);
         }
         let continuity = ids.pop().context("no continuity")?;
