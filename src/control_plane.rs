@@ -3408,11 +3408,21 @@ impl ControlSnapshot {
     /// incumbent slot or is still draining it. The one lookup supervision, a
     /// waiting deployment and the handover share.
     fn target_owner(&self, target: &str, except: Option<&str>) -> Option<&Stored<DeploymentTransaction>> {
-        self.transactions.iter().find(|stored| {
-            stored.value.target == target
-                && Some(stored.value.transaction_id.as_str()) != except
+        self.on_target(target).find(|stored| {
+            Some(stored.value.transaction_id.as_str()) != except
                 && (stored.value.owns_target() || stored.value.drains_incumbent())
         })
+    }
+
+    /// Every transaction of the target, in whatever state.
+    fn on_target<'a>(
+        &'a self,
+        target: &str,
+    ) -> impl Iterator<Item = &'a Stored<DeploymentTransaction>> + use<'a> {
+        let target = target.to_owned();
+        self.transactions
+            .iter()
+            .filter(move |stored| stored.value.target == target)
     }
 
     fn supervision_for(&self, target: &str) -> Option<&Stored<TargetSupervision>> {
@@ -6070,22 +6080,19 @@ impl Engine {
                     &anyhow::Error::new(disagreement),
                 );
             }
-            let on_target = || {
-                snapshot
-                    .transactions
-                    .iter()
-                    .filter(|stored| stored.value.target == current.value.target)
-            };
             // A transaction that owns the incumbent slot fences, stops or
             // replaces this generation: nothing here touches it meanwhile.
-            if on_target().any(|stored| stored.value.owns_target()) {
+            if snapshot
+                .on_target(&current.value.target)
+                .any(|stored| stored.value.owns_target())
+            {
                 continue;
             }
             // Continuity defers to an owner, a drain or its own live attempt,
             // never to a deployment that has not taken the target, and aborts
             // nothing (handover-phase-split).
             let mint_blocked = snapshot.target_owner(&current.value.target, None).is_some()
-                || on_target().any(|stored| {
+                || snapshot.on_target(&current.value.target).any(|stored| {
                     stored.value.is_live() && stored.value.command_kind == CommandKind::Continuity
                 });
             match self.supervise_admitted_route(&snapshot, current) {
@@ -9165,13 +9172,8 @@ impl Engine {
         ];
         expected.extend(
             snapshot
-                .transactions
-                .iter()
-                .filter(|stored| {
-                    stored.value.target == target
-                        && stored.value.transaction_id != id
-                        && !stored.value.is_terminal()
-                })
+                .on_target(target)
+                .filter(|stored| stored.value.transaction_id != id && !stored.value.is_terminal())
                 .map(|stored| CultCacheExpectedEnvelope {
                     r#type: DeploymentTransaction::TYPE.into(),
                     key: stored.value.transaction_id.clone(),
@@ -16415,6 +16417,8 @@ mod tests {
         assert_eq!(stored_deploy(&world)?.envelope, before.envelope);
 
         for _ in 0..2 {
+            // Due at once again (streak 0), so only the live attempt holds it back.
+            set_meters(&world, &TargetSupervision::new("service"))?;
             let _ = world.engine.supervise_one_admitted_generation()?;
             assert_eq!(continuity_mints(&world)?, 1);
             let after = stored_deploy(&world)?;
@@ -16881,6 +16885,75 @@ mod tests {
         );
         assert_eq!(ended.incumbent_generation_id, Some(incumbent.generation_id));
         let _ = deploy;
+        Ok(())
+    }
+
+    #[test]
+    fn ownership_is_read_per_target_and_names_only_a_transaction_that_holds_it() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Fencing)?;
+        let mut view = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(view.on_target("service").count(), 2);
+        assert_eq!(view.on_target("elsewhere").count(), 0);
+        // The pre-handover deployment holds nothing; the continuity holds the slot.
+        let owner = view.target_owner("service", None).context("no owner")?;
+        assert_eq!(owner.value.transaction_id, continuity.transaction_id);
+        assert!(view.target_owner("service", Some(&continuity.transaction_id)).is_none());
+        assert!(view.target_owner("elsewhere", None).is_none());
+        // The same records filed under another target are that target's.
+        for stored in &mut view.transactions {
+            stored.value.target = "elsewhere".into();
+        }
+        assert_eq!(view.on_target("service").count(), 0);
+        assert!(view.target_owner("service", None).is_none());
+        assert_eq!(view.on_target("elsewhere").count(), 2);
+        assert!(view.target_owner("elsewhere", None).is_some());
+        let _ = deploy;
+        Ok(())
+    }
+
+    /// A deployment that has committed still drains the old incumbent; the
+    /// target is not restarted over that cleanup, and is once it ends.
+    #[test]
+    fn a_target_draining_its_old_incumbent_is_not_restarted_until_the_drain_ends() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        let deploy =
+            seeded_transaction(&world, DeploymentPhase::Fencing, CommandKind::Deploy, Some(&incumbent))?;
+        odin_reports_ready(&world, &deploy, seeded_sequence(Some(&incumbent)) + 1)?;
+        drive_id(&world, &deploy.transaction_id, |t| t.phase == DeploymentPhase::Complete)?;
+        let draining = resident_id(&world, &deploy.transaction_id)?.value;
+        assert!(draining.drains_incumbent() && !draining.owns_target() && !draining.is_live());
+
+        age_incumbent(&world, 500_000)?;
+        workload.kill();
+        for _ in 0..3 {
+            let _ = world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(continuity_mints(&world)?, 0, "restarted over a draining incumbent");
+        }
+        drive_id(&world, &deploy.transaction_id, |t| t.is_terminal())?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        assert_eq!(continuity_mints(&world)?, 1);
+        Ok(())
+    }
+
+    /// A deployment that has not taken the target no longer suppresses the
+    /// repair of the admitted Expected (only the Expected, only when inexact).
+    #[test]
+    fn the_admitted_expected_is_repaired_beside_a_deployment_that_is_building() -> Result<()> {
+        let world = EngineFixture::with_workload(SwitchWorkload::new())?;
+        let incumbent = admit_incumbent(&world)?;
+        seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        let store = world.engine.options.topology_store.clone();
+        if store.exists() {
+            std::fs::remove_file(&store)?;
+        }
+        assert_eq!(projected_under(&world, &incumbent.expected)?, Vec::<String>::new());
+
+        let _ = world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(projected_under(&world, &incumbent.expected)?, expected_only());
         Ok(())
     }
 
