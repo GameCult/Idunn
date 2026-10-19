@@ -9355,8 +9355,9 @@ impl Engine {
     }
 
     /// Withdraw the candidate in the one order that never leaves two writers:
-    /// take away its route, then its write lease, then the process itself, and
-    /// only then reconcile the projection.
+    /// take away its route, then stop the process and withdraw its write lease
+    /// (the lease is lifetime-held, so the holder stops first), then clean up,
+    /// and only then reconcile the projection.
     fn advance_post_fencing_abort(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
         let abort = required(
             &current.value.post_fencing_abort,
@@ -9396,6 +9397,15 @@ impl Engine {
                 .process_write_lease
                 .context("leased target has no write-lease binding")?
                 .record_path;
+            // The candidate holds its lifetime write lease; revoking it under
+            // a live holder fails on the shared lock forever. A stopped
+            // process writes nothing, so stop first (as advance_fencing does).
+            if let Some(workload) = &current.value.workload {
+                let plan = required(&current.value.plan, "abandoned candidate plan")?;
+                self.workload_for(plan)?.stop(workload).context(
+                    "stopping the abandoned candidate before revoking its lifetime-held write lease",
+                )?;
+            }
             let driver = CultCacheWriteLeaseDriver::new(&current.value.target, lease_path);
             driver
                 .revoke_exact(Some(lease))
