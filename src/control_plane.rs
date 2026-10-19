@@ -1311,7 +1311,7 @@ impl TargetSupervision {
 
     fn defer_continuity(&mut self, now: u64, reason: &str) {
         self.continuity_deferred_until = Some(now.saturating_add(CONTINUITY_DEFERRAL_MILLIS));
-        self.continuity_deferral_reason = Some(reason.to_owned());
+        self.continuity_deferral_reason = Some(bounded_detail(reason));
     }
 
     fn validate(&self) -> Result<()> {
@@ -1856,7 +1856,7 @@ impl DeploymentTransaction {
 
     fn rejected(command: &DeploymentCommand, error: anyhow::Error, now: u64) -> Result<Self> {
         let mut transaction = Self::new(command, command.selector.clone(), 0, None, now)?;
-        let detail = truncate(&format!("{error:#}"), 2048);
+        let detail = bounded_detail(&format!("{error:#}"));
         transaction.enter_phase(DeploymentPhase::Complete, now);
         transaction.last_error = Some(detail.clone());
         transaction.pre_fencing_abort = Some(PreFencingAbort {
@@ -3043,7 +3043,7 @@ fn cancel(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
         } else {
             next.post_fencing_abort = Some(post_fencing_abort_intent(&next, &error));
         }
-        next.last_error = Some(error);
+        next.last_error = Some(bounded_detail(&error));
         next.updated_at_unix_millis = now_millis()?;
         replace_transaction(store_path, current, &next)?;
         println!("{command_id} cancellation requested; Idunn is performing exact candidate cleanup");
@@ -5621,7 +5621,7 @@ impl Engine {
     /// record's `last_error`, which status renders. Recording is best effort:
     /// a store too broken to take the note is already in stderr.
     fn note_fault(&self, what: &str, transaction_id: &str, error: &anyhow::Error) {
-        let detail = truncate(&format!("{error:#}"), 2048);
+        let detail = bounded_detail(&format!("{error:#}"));
         let offered = {
             let mut reports = self.fault_reports.lock().expect("fault report mutex");
             reports
@@ -5648,6 +5648,8 @@ impl Engine {
     /// Write `detail` as the record's `last_error`, touching nothing else and
     /// not archiving: a terminal record whose archive is the fault stays put.
     fn record_last_error(&self, transaction_id: &str, detail: &str) -> Result<()> {
+        let detail = bounded_detail(detail);
+        let detail = detail.as_str();
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let Some(stored) = snapshot
             .transactions
@@ -6330,7 +6332,7 @@ impl Engine {
                     current.value.target
                 );
                 let mut deferred = supervision.clone();
-                deferred.defer_continuity(now, &truncate(&format!("{error:#}"), 2048));
+                deferred.defer_continuity(now, &bounded_detail(&format!("{error:#}")));
                 self.write_target_supervision(
                     snapshot.supervision_for(&current.value.target),
                     &deferred,
@@ -8172,11 +8174,12 @@ impl Engine {
         current: &Stored<DeploymentTransaction>,
         detail: &str,
     ) -> Result<()> {
-        if current.value.last_error.as_deref() == Some(detail) {
+        let detail = bounded_detail(detail);
+        if current.value.last_error.as_deref() == Some(detail.as_str()) {
             return Ok(());
         }
         let mut next = current.value.clone();
-        next.last_error = Some(detail.into());
+        next.last_error = Some(detail);
         next.updated_at_unix_millis = now_millis()?;
         replace_transaction(&self.options.state_store, current, &next)
     }
@@ -9015,7 +9018,7 @@ impl Engine {
         current: &Stored<DeploymentTransaction>,
         error: &anyhow::Error,
     ) -> Result<()> {
-        let detail = truncate(&format!("{error:#}"), 2048);
+        let detail = bounded_detail(&format!("{error:#}"));
         if current.value.last_error.as_deref() == Some(detail.as_str()) {
             return Ok(());
         }
@@ -9073,7 +9076,7 @@ impl Engine {
             current.value.post_fencing_abort.is_none(),
             "post-fencing abort intent is already durable"
         );
-        let abort = post_fencing_abort_intent(&current.value, &truncate(&format!("{error:#}"), 2048));
+        let abort = post_fencing_abort_intent(&current.value, &bounded_detail(&format!("{error:#}")));
         self.persist_same_phase(current, |next| {
             next.post_fencing_abort = Some(abort);
             Ok(())
@@ -9439,7 +9442,7 @@ fn incumbent_was_stopped_during_fencing(fencing: &FencingEvidence) -> bool {
 
 fn pre_fencing_abort_intent(transaction: &DeploymentTransaction, error: &str) -> PreFencingAbort {
     PreFencingAbort {
-        error: truncate(error, 2048),
+        error: bounded_detail(error),
         candidate_cleanup: transaction.candidate_cleanup_owed(),
         topology_reconciliation: transaction.abort_topology_reconciliation(),
         source_cleanup: if transaction.command_kind == CommandKind::Deploy {
@@ -9455,7 +9458,7 @@ fn post_fencing_abort_intent(
     error: &str,
 ) -> PostFencingAbort {
     PostFencingAbort {
-        error: truncate(error, 2048),
+        error: bounded_detail(error),
         route_restoration: if transaction.route_preflight.is_some() {
             CleanupEvidence::Pending
         } else {
@@ -9728,8 +9731,34 @@ fn require_detail(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn truncate(value: &str, length: usize) -> String {
-    value.chars().take(length).collect()
+const DETAIL_LIMIT: usize = 2048;
+const DETAIL_HEAD: usize = 512;
+const DETAIL_ELISION: &str = "
+...[elided]...
+";
+const DETAIL_EMPTY: &str = "(no detail)";
+
+/// The only producer of persisted free-text details; `require_detail` is the
+/// only judge, and this output always satisfies it. NUL is dropped, empty
+/// input gets a fixed placeholder, and an over-long value keeps its head and
+/// its tail (where a build log's error is) cut on char boundaries.
+fn bounded_detail(value: &str) -> String {
+    let value = value.replace(' ', "");
+    if value.is_empty() {
+        return DETAIL_EMPTY.to_owned();
+    }
+    if value.len() <= DETAIL_LIMIT {
+        return value;
+    }
+    let mut head = DETAIL_HEAD;
+    while !value.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = value.len() - (DETAIL_LIMIT - DETAIL_HEAD - DETAIL_ELISION.len());
+    while !value.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{DETAIL_ELISION}{}", &value[..head], &value[tail..])
 }
 
 fn sha256_id(bytes: &[u8]) -> String {
@@ -16897,6 +16926,39 @@ mod tests {
         fn cleanup(&self, _: &str, _: Option<&FrozenSourceReceipt>) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn bounded_detail_output_always_satisfies_require_detail() -> Result<()> {
+        for unit in ["a", "\u{e9}", "\u{2500}", "\u{1f600}"] {
+            for bytes in [0, 1, 511, 512, 513, 2047, 2048, 2049, 2600, 9000] {
+                // A prefix of one byte offsets every multibyte char against the cuts.
+                for prefix in ["", "x", "xx", "xxx"] {
+                    let input = format!("{prefix}{}", unit.repeat(bytes / unit.len()));
+                    let output = bounded_detail(&input);
+                    require_detail(&output, "detail")?;
+                    assert!(output.len() <= 2048, "{} bytes", output.len());
+                }
+            }
+        }
+        let nul = bounded_detail("a\0b\0");
+        require_detail(&nul, "detail")?;
+        assert_eq!(nul, "ab");
+        assert_eq!(bounded_detail("\0"), bounded_detail(""));
+        require_detail(&bounded_detail(""), "detail")?;
+        let exact = "a".repeat(2048);
+        assert_eq!(bounded_detail(&exact), exact);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_detail_keeps_the_tail_of_a_long_error() {
+        let input = format!("first line\n{}\nthe last line", "\u{2500}".repeat(5000));
+        let output = bounded_detail(&input);
+        assert!(output.starts_with("first line"));
+        assert!(output.ends_with("the last line"));
+        assert!(output.contains(DETAIL_ELISION));
+        assert!(output.len() > 1024, "the budget was not used: {}", output.len());
     }
 
     #[test]
