@@ -3138,7 +3138,7 @@ fn expire(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
     ensure!(
         current.value.expirable(),
         "{}",
-        if current.value.resolves_by_deadline() {
+        if current.value.command_kind == CommandKind::Continuity && current.value.phase >= DeploymentPhase::Fencing && current.value.post_fencing_abort.is_none() {
             "a continuity past Fencing retries forward and cannot be expired; to restart it, stop its candidate unit and Idunn aborts it as dead"
         } else {
             "only a live transaction in Warming through Committing, and not already aborting, can be expired; before Warming, use idunn cancel"
