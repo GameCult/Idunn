@@ -2104,7 +2104,8 @@ impl DeploymentTransaction {
 
     /// A live deployment whose next move is the handover: not ended, not
     /// aborting, one phase short of `takes_target_at`. Derived, never stored.
-    /// Read by the continuity's yield and the boot lift.
+    /// Read by `deploy_the_continuity_yields_to`: the continuity's yield and the
+    /// boot lift.
     fn awaits_handover(&self) -> bool {
         self.command_kind == CommandKind::Deploy
             && self.completion.is_none()
@@ -5810,11 +5811,19 @@ impl Engine {
             || transaction.completion.is_some()
             || abort.candidate_cleanup != CleanupEvidence::Pending
             || abort.lease_withdrawal == CleanupEvidence::Complete
-            || snapshot
-                .on_target(&transaction.target)
-                .any(|other| other.value.awaits_handover())
         {
             return LiftDecision::KeepAborting;
+        }
+        match now_millis() {
+            Ok(now) => {
+                if self
+                    .deploy_the_continuity_yields_to(snapshot, transaction, now)
+                    .is_some()
+                {
+                    return LiftDecision::KeepAborting;
+                }
+            }
+            Err(error) => return LiftDecision::Undecided(error),
         }
         let lifted = (|| -> Result<bool> {
             let plan = required(&transaction.plan, "transaction plan")?;
@@ -8568,6 +8577,25 @@ impl Engine {
             || matches!(self.deployment_authorization(deploy, now), Ok(Some(_)))
     }
 
+    /// The deployment a continuity gives way to: one on its target that awaits
+    /// the handover and can take it, while the continuity's own candidate is
+    /// unproven (ruling c2d-yield-only-unproven-to-movable). The one test the
+    /// deadline's yield and the boot lift's abort both ask, so neither stops a
+    /// serving candidate, or one a braked Deploy cannot replace.
+    fn deploy_the_continuity_yields_to<'a>(
+        &self,
+        snapshot: &'a ControlSnapshot,
+        continuity: &DeploymentTransaction,
+        now: u64,
+    ) -> Option<&'a Stored<DeploymentTransaction>> {
+        if continuity.serving_proven() {
+            return None;
+        }
+        snapshot.on_target(&continuity.target).find(|other| {
+            other.value.awaits_handover() && self.deploy_can_move(other, now)
+        })
+    }
+
     fn lifecycle_allows(&self, current: &Stored<DeploymentTransaction>, now: u64) -> Result<bool> {
         let plan = required(&current.value.plan, "continuity plan")?;
         let binding = plan.parsed_inputs()?.1;
@@ -9763,11 +9791,11 @@ impl Engine {
             PhaseEnd::RetryForward => {
                 let snapshot = ControlSnapshot::read(&self.options.state_store)?;
                 let now = now_millis()?;
-                if let Some(deploy) = snapshot.on_target(&transaction.target).find(|other| {
-                    transaction.yields_to_a_deploy()
-                        && other.value.awaits_handover()
-                        && self.deploy_can_move(other, now)
-                }) {
+                if let Some(deploy) = transaction
+                    .yields_to_a_deploy()
+                    .then(|| self.deploy_the_continuity_yields_to(&snapshot, transaction, now))
+                    .flatten()
+                {
                     self.begin_post_fencing_abort(
                         current,
                         anyhow!(
