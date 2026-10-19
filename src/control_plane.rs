@@ -5626,6 +5626,79 @@ struct ProjectionReconciliation {
 }
 
 impl Engine {
+    /// Once at boot: withdraw the abort of a continuity that has not stopped
+    /// its running candidate, and retime the record so its phase retries
+    /// forward. A pre-c2c Idunn aborted a continuity at its deadline; that
+    /// abort stops the only running copy of the admitted body (ruling
+    /// c2c-boot-returns-wedged-aborts-forward). The result is the exact inverse
+    /// of `begin_post_fencing_abort`.
+    ///
+    /// A continuity abort now begins only over a permanently stopped
+    /// candidate, so this predicate cannot match a new record: it is a
+    /// migration with a deletion line (follow-up c2c-delete-boot-lift). A
+    /// record it cannot decide is reported and left aborting.
+    fn return_wedged_continuity_aborts_forward(&self) -> Result<Vec<String>> {
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let mut returned = Vec::new();
+        for stored in &snapshot.transactions {
+            let transaction = &stored.value;
+            let Some(abort) = &transaction.post_fencing_abort else {
+                continue;
+            };
+            if transaction.command_kind != CommandKind::Continuity
+                || transaction.completion.is_some()
+                || abort.candidate_cleanup != CleanupEvidence::Pending
+                || abort.lease_withdrawal == CleanupEvidence::Complete
+            {
+                continue;
+            }
+            let id = &transaction.transaction_id;
+            let lifted = (|| -> Result<bool> {
+                let plan = required(&transaction.plan, "transaction plan")?;
+                let expected = required(&transaction.expected, "Expected projection")?;
+                let activation = required(&transaction.activation, "activation")?;
+                let Some(workload) = &transaction.workload else {
+                    return Ok(false);
+                };
+                self.workload_for(plan)?
+                    .observe(expected, activation, workload)?;
+                if let Some(lease) = transaction
+                    .leasing
+                    .as_ref()
+                    .and_then(LeasingEvidence::issued_lease)
+                {
+                    let path = plan
+                        .parsed_inputs()?
+                        .1
+                        .process_write_lease
+                        .context("leased target has no write-lease binding")?
+                        .record_path;
+                    if !CultCacheWriteLeaseDriver::new(&transaction.target, path)
+                        .observe_exact(lease)?
+                    {
+                        return Ok(false);
+                    }
+                }
+                let now = now_millis()?;
+                let mut next = transaction.clone();
+                next.post_fencing_abort = None;
+                next.last_error = Some(abort.error.clone());
+                next.updated_at_unix_millis = now;
+                next.retime(now);
+                replace_transaction(&self.options.state_store, stored, &next)?;
+                Ok(true)
+            })();
+            match lifted {
+                Ok(true) => returned.push(id.clone()),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "Idunn could not decide whether continuity {id} may retry forward; its abort is left running: {error:#}"
+                ),
+            }
+        }
+        Ok(returned)
+    }
+
     /// Once at boot: demote the activation a failed continuity left standing,
     /// where the projection still names exactly the activation that failed
     /// transaction issued. A continuity abort before the single resolution
@@ -5739,6 +5812,16 @@ fn boot(options: RuntimeOptions) -> Result<(ProcessLock, Engine)> {
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
     let engine = Engine::open(options)?;
     engine.validate_durable_authority(&ControlSnapshot::read(&engine.options.state_store)?)?;
+    match engine.return_wedged_continuity_aborts_forward() {
+        Ok(returned) => {
+            for transaction_id in &returned {
+                println!(
+                    "returned continuity {transaction_id} to forward retry: its abort had not stopped its running candidate"
+                );
+            }
+        }
+        Err(error) => eprintln!("Idunn boot could not lift wedged continuity aborts: {error:#}"),
+    }
     match engine.reconcile_failed_continuity_projections() {
         Ok(outcome) => {
             for transaction_id in &outcome.demoted {
@@ -22362,6 +22445,18 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 Ok(())
             }
 
+            /// Scheduler passes until `done`, at most twelve.
+            #[cfg(unix)]
+            fn drive_until_resuming(&self, done: impl Fn(&DeploymentTransaction) -> bool) -> Result<()> {
+                for _ in 0..12 {
+                    if done(&self.transaction()?) {
+                        return Ok(());
+                    }
+                    self.resume()?;
+                }
+                bail!("the transaction never reached the awaited state: {:?}", self.transaction()?.last_error)
+            }
+
             fn resume_until_terminal(&self) -> Result<DeploymentTransaction> {
                 for _ in 0..12 {
                     if latest(&self.world)?.completion.is_some() {
@@ -22951,6 +23046,212 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             );
             assert!(driver.observe_empty()?, "the abort left the lease on disk");
             assert!(routed.workload.stops.load(Ordering::SeqCst) > stops, "the candidate was never stopped");
+            Ok(())
+        }
+
+        /// What a pre-c2c Idunn left when a continuity's phase passed its
+        /// deadline: the abort begun, route restoration done, the lease
+        /// withdrawal and candidate cleanup still owed, and the deadline stale.
+        #[cfg(unix)]
+        fn wedge_abort(routed: &RoutedWorld, error: &str) -> Result<()> {
+            routed
+                .world
+                .engine
+                .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("{error}"))?;
+            routed.resume()?;
+            let aborting = routed.transaction()?.post_fencing_abort.context("no abort")?;
+            assert_eq!(aborting.route_restoration, CleanupEvidence::Complete);
+            assert_eq!(aborting.candidate_cleanup, CleanupEvidence::Pending);
+            pass_deadline(&routed.world)
+        }
+
+        #[cfg(unix)]
+        fn lease_of(routed: &RoutedWorld) -> Result<(IdunnProcessWriteLeaseRecord, String)> {
+            let leasing = routed.transaction()?.leasing.context("no leasing evidence")?;
+            Ok((
+                leasing.issued_lease().context("no issued lease")?.clone(),
+                leasing.lease_sha256().context("no granted lease")?.to_owned(),
+            ))
+        }
+
+        #[cfg(unix)]
+        fn lease_driver(routed: &RoutedWorld) -> (CultCacheWriteLeaseDriver, PathBuf) {
+            let path = routed.world.root.join("lease/process-write-lease.cc");
+            (CultCacheWriteLeaseDriver::new("service", &path), path)
+        }
+
+        /// The live shape of tx-4eaed669 (Odin): Routing, lease granted and
+        /// adopted, the proof failing, the abort begun at the Routing deadline.
+        /// A pre-c2c Idunn went on to stop the candidate and the target lost
+        /// its only running copy. The boot lift returns the record to forward
+        /// retry; nothing is stopped, and the proof, once it passes, commits.
+        #[cfg(unix)]
+        #[test]
+        fn a_wedged_odin_shaped_continuity_abort_is_returned_to_forward_retry_at_boot() -> Result<()> {
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+            let (lease, lease_sha256) = lease_of(&routed)?;
+            routed.stub.set_state("active");
+            *routed.stub.lease.lock().unwrap() = Some(lease_sha256);
+            routed.drive_until(|t| t.phase == DeploymentPhase::Routing)?;
+            assert!(routed.transaction()?.lease_adoption.is_some());
+            let (driver, path) = lease_driver(&routed);
+            routed.workload.hold_lease_lock(&path);
+            routed.stub.hang_up.store(true, Ordering::SeqCst);
+            wedge_abort(
+                &routed,
+                "the Routing phase passed its deadline at unix ms 1792324133638",
+            )?;
+            let stops = routed.workload.stops.load(Ordering::SeqCst);
+
+            let lifted_at = now_millis()?;
+            let returned = routed.world.engine.return_wedged_continuity_aborts_forward()?;
+            for _ in 0..10 {
+                routed.resume()?;
+            }
+            assert_eq!(
+                routed.workload.stops.load(Ordering::SeqCst),
+                stops,
+                "the candidate was stopped"
+            );
+            let retrying = routed.transaction()?;
+            assert_eq!(returned, [retrying.transaction_id.clone()]);
+            assert!(driver.observe_exact(&lease)?, "the lease left the disk");
+            assert!(retrying.post_fencing_abort.is_none(), "the abort came back");
+            assert!(retrying.completion.is_none());
+            assert_eq!(retrying.phase, DeploymentPhase::Routing);
+            let deadline = retrying.phase_deadline.context("no deadline")?;
+            assert!(deadline.entered_at_unix_millis >= lifted_at, "the stale deadline stayed");
+            assert!(routed.world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?.is_empty());
+
+            routed.stub.hang_up.store(false, Ordering::SeqCst);
+            routed.drive_until_resuming(|t| t.phase == DeploymentPhase::Committing)?;
+            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops);
+            assert!(routed.fragment_path().exists(), "the route membership was not re-installed");
+            Ok(())
+        }
+
+        /// The live shape of tx-039b91e9 (ghostlight): AwaitingReady with the
+        /// lease granted and not adopted, aborted at the readiness deadline.
+        /// Returned to forward retry, the candidate that later answers is
+        /// adopted and the record enters Routing.
+        #[cfg(unix)]
+        #[test]
+        fn a_wedged_ghostlight_shaped_continuity_abort_is_returned_to_forward_retry_at_boot() -> Result<()> {
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+            let (lease, lease_sha256) = lease_of(&routed)?;
+            let (driver, path) = lease_driver(&routed);
+            routed.workload.hold_lease_lock(&path);
+            wedge_abort(
+                &routed,
+                "lease-not-adopted: the AwaitingReady phase passed its deadline at unix ms 1792324133638",
+            )?;
+            let stops = routed.workload.stops.load(Ordering::SeqCst);
+
+            let returned = routed.world.engine.return_wedged_continuity_aborts_forward()?;
+            for _ in 0..5 {
+                routed.resume()?;
+            }
+            let waiting = routed.transaction()?;
+            assert_eq!(returned, [waiting.transaction_id.clone()]);
+            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops, "the candidate was stopped");
+            assert!(driver.observe_exact(&lease)?, "the lease left the disk");
+            assert!(waiting.post_fencing_abort.is_none() && waiting.completion.is_none());
+            assert_eq!(waiting.phase, DeploymentPhase::AwaitingReady);
+            assert!(waiting.lease_adoption.is_none());
+
+            routed.stub.set_state("active");
+            *routed.stub.lease.lock().unwrap() = Some(lease_sha256.clone());
+            routed.drive_until_resuming(|t| t.phase == DeploymentPhase::Routing)?;
+            let adopted = routed.transaction()?;
+            assert_eq!(adopted.lease_adoption.context("no adoption recorded")?.write_lease_sha256, lease_sha256);
+            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops);
+            Ok(())
+        }
+
+        /// The lift is a function of its inputs: each case lacks one thing the
+        /// lift requires, and its abort stays and runs to its end.
+        #[cfg(unix)]
+        #[test]
+        fn the_boot_lift_leaves_every_abort_it_cannot_prove_harmless() -> Result<()> {
+            #[derive(Clone, Copy, Debug)]
+            enum Case {
+                CandidateNotRunning,
+                LeaseWithdrawn,
+                CandidateCleaned,
+                LeaseRevokedUnderIt,
+                DeployWithRunningCandidate,
+                CompletedRecord,
+            }
+            for case in [
+                Case::CandidateNotRunning,
+                Case::LeaseWithdrawn,
+                Case::CandidateCleaned,
+                Case::LeaseRevokedUnderIt,
+                Case::DeployWithRunningCandidate,
+                Case::CompletedRecord,
+            ] {
+                let deploy = matches!(case, Case::DeployWithRunningCandidate);
+                // The cleanup comes after the lease withdrawal, so a case with
+                // cleanup done and the withdrawal not is a stateless target's.
+                let stateful = !matches!(case, Case::CandidateCleaned);
+                let routed = build_routed_world(
+                    Odin::Unreachable,
+                    1,
+                    DeploymentPhase::Fencing,
+                    false,
+                    stateful,
+                    if deploy { CommandKind::Deploy } else { CommandKind::Continuity },
+                )?;
+                routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+                routed.world.engine.begin_post_fencing_abort(
+                    &resident(&routed.world)?,
+                    anyhow!("the AwaitingReady phase passed its deadline"),
+                )?;
+                // Route restoration; then each case takes the abort one real
+                // step, or one input, away from the lift's predicate.
+                routed.resume()?;
+                match case {
+                    Case::CandidateNotRunning => routed.workload.kill(),
+                    Case::LeaseWithdrawn | Case::CandidateCleaned => routed.resume()?,
+                    Case::LeaseRevokedUnderIt => {
+                        let (lease, _) = lease_of(&routed)?;
+                        lease_driver(&routed).0.revoke_exact(Some(&lease))?;
+                    }
+                    Case::DeployWithRunningCandidate => {}
+                    Case::CompletedRecord => {
+                        routed.resume_until_terminal()?;
+                    }
+                }
+                let abort = routed.transaction().ok().and_then(|t| t.post_fencing_abort);
+                match case {
+                    Case::LeaseWithdrawn => assert_eq!(
+                        abort.as_ref().map(|a| (a.lease_withdrawal, a.candidate_cleanup)),
+                        Some((CleanupEvidence::Complete, CleanupEvidence::Pending))
+                    ),
+                    Case::CandidateCleaned => assert_eq!(
+                        abort.as_ref().map(|a| (a.lease_withdrawal, a.candidate_cleanup)),
+                        Some((CleanupEvidence::Skipped, CleanupEvidence::Complete))
+                    ),
+                    _ => {}
+                }
+                let before = ControlSnapshot::read(&routed.world.state_store)?;
+                let returned = routed.world.engine.return_wedged_continuity_aborts_forward()?;
+                assert!(returned.is_empty(), "lifted {returned:?}");
+                let after = ControlSnapshot::read(&routed.world.state_store)?;
+                assert_eq!(
+                    before.transactions.iter().map(|t| &t.envelope).collect::<Vec<_>>(),
+                    after.transactions.iter().map(|t| &t.envelope).collect::<Vec<_>>(),
+                    "the lift wrote a record it left"
+                );
+                let finished = routed.resume_until_terminal().with_context(|| format!("{case:?}"))?;
+                assert!(
+                    matches!(finished.completion, Some(TransactionCompletion::FailedAfterFencing { .. })),
+                    "{:?}",
+                    finished.completion
+                );
+            }
             Ok(())
         }
 
