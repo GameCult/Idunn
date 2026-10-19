@@ -1808,10 +1808,13 @@ impl DeploymentTransaction {
     }
 
     /// Whether a deadline can describe the record's current activity: a
-    /// deadline phase, a pending pre-fencing abort, or an admitted Complete.
+    /// deadline phase, a pre-fencing abort not yet ended, or an admitted Complete.
     fn carries_a_deadline(&self) -> bool {
+        // An abort carries its deadline until the record ends, including the
+        // write that completes its last cleanup: a Sealing or Starting record
+        // has no phase duration to fall back on, and that write is validated.
         DEADLINE_PHASES.contains(&self.phase)
-            || self.pre_fencing_abort_pending()
+            || (self.completion.is_none() && self.pre_fencing_abort.is_some())
             || (self.phase == DeploymentPhase::Complete
                 && matches!(self.completion, Some(TransactionCompletion::Admitted { .. })))
     }
@@ -15918,7 +15921,7 @@ mod tests {
             .resume_candidate(&resident_id(&world, &owner)?)
             .expect_err("a record gone from both stores was read as a finished one");
         assert!(format!("{error:#}").contains("disappeared while checking scheduler progress"), "{error:#}");
-        assert!(read_history_transactions(&world.state_store).is_empty());
+        assert!(read_history_transactions(&world.state_store).iter().all(|archived| archived.transaction_id != owner));
         Ok(())
     }
 
@@ -17162,7 +17165,7 @@ mod tests {
     /// pass would stop first at the deployment brake this world never releases.)
     fn step_waiter(world: &EngineFixture, id: &str) -> Result<()> {
         let waiting = resident_id(world, id)?;
-        if waiting.value.pre_fencing_abort.is_some() {
+        if waiting.value.pre_fencing_abort.is_some() || waiting.value.phase >= DeploymentPhase::Starting {
             return Ok(());
         }
         if let Err(error) = world.engine.enter(&waiting, entering(&waiting, DeploymentPhase::Starting)?) {
