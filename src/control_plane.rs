@@ -16968,6 +16968,7 @@ mod tests {
         let mut world = sealing_world(&unrouted_recipe())?;
         world.engine.source = Arc::new(FailingSource { message: log });
         for _ in 0..8 {
+            world.engine.resume_backoff.lock().unwrap().clear();
             let _ = world.engine.run_scheduler_tick();
         }
         assert!(
