@@ -1775,17 +1775,20 @@ impl DeploymentTransaction {
                 return None;
             }
             let plan = self.plan.as_ref()?;
-            let from = match self
+            // The retire time needs the binding's drain, which the running
+            // binary re-parses and re-admits: a plan frozen by an older binary
+            // may not parse now. That must not leave a drain with no deadline,
+            // so a retire time that cannot be derived is now, and the
+            // committing duration from it bounds the drain.
+            let from = self
                 .routing
                 .as_ref()
                 .and_then(RoutingEvidence::promoted_at_unix_millis)
-            {
-                Some(promoted_at) => {
-                    route_drain_deadline(promoted_at, plan.parsed_inputs().ok()?.1.rollout.drain_seconds)
-                        .ok()?
-                }
-                None => now,
-            };
+                .and_then(|promoted_at| {
+                    let (_, binding) = plan.parsed_inputs().ok()?;
+                    route_drain_deadline(promoted_at, binding.rollout.drain_seconds).ok()
+                })
+                .unwrap_or(now);
             return Some(PhaseDeadline {
                 phase: self.phase,
                 entered_at_unix_millis: now,
