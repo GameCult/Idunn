@@ -13839,6 +13839,9 @@ mod tests {
         /// Runtime instances that stay alive when the rest are killed: a
         /// candidate building beside a dead incumbent.
         spared: std::sync::Mutex<Vec<String>>,
+        /// Whether a start launches a process (a fresh private identity)
+        /// instead of refusing like `StillWorkload`.
+        launches: std::sync::atomic::AtomicBool,
     }
 
     impl SwitchWorkload {
@@ -13848,7 +13851,13 @@ mod tests {
                 rebooted: std::sync::atomic::AtomicBool::new(false),
                 silent: std::sync::atomic::AtomicBool::new(false),
                 spared: std::sync::Mutex::new(Vec::new()),
+                launches: std::sync::atomic::AtomicBool::new(false),
             })
+        }
+
+        /// From now on a start launches a process distinct from every recorded one.
+        fn launching(&self) {
+            self.launches.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// `kill` leaves this runtime instance running.
@@ -13897,6 +13906,9 @@ mod tests {
             expected: &IdunnExpectedIncarnationRecord,
             launch: IdunnRuntimeActivationLaunch,
         ) -> Result<IdunnRuntimeActivationRecord> {
+            if self.launches.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(launch.activation().clone());
+            }
             StillWorkload.prepare_activation(plan, expected, launch)
         }
         fn start_prepared(
@@ -13907,7 +13919,25 @@ mod tests {
             expected: &IdunnExpectedIncarnationRecord,
             activation: &IdunnRuntimeActivationRecord,
         ) -> Result<WorkloadObservation> {
-            StillWorkload.start_prepared(plan, release, installed, expected, activation)
+            if !self.launches.load(std::sync::atomic::Ordering::SeqCst) {
+                return StillWorkload.start_prepared(plan, release, installed, expected, activation);
+            }
+            let mut workload = fixture_transaction(FIXTURE_TRANSACTIONS[0].1)?
+                .1
+                .workload
+                .context("recorded transaction has no workload")?;
+            match &mut workload {
+                WorkloadObservation::Systemd(observed) => {
+                    observed.runtime_instance_id = activation.runtime_instance_id.clone();
+                    observed.executable_sha256 = expected.artifact_sha256.clone();
+                    // Another UID and other namespaces than any recorded unit.
+                    observed.process_uids[0] += 1_000_000;
+                    observed.pid_namespace_id += 1_000_000;
+                    observed.mount_namespace_id += 1_000_000;
+                }
+                WorkloadObservation::Host(_) => bail!("recorded workload is not a systemd unit"),
+            }
+            Ok(workload)
         }
         fn discard_prepared(
             &self,
@@ -16704,6 +16734,7 @@ mod tests {
         let deploy =
             seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
         let deploy_id = deploy.transaction_id.as_str();
+        workload.launching();
         workload.kill();
         assert!(world.engine.supervise_one_admitted_generation()?);
         let continuity_id = the_continuity(&world)?.value.transaction_id;
