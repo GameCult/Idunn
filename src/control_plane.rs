@@ -15902,21 +15902,20 @@ mod tests {
             store: Mutex::new(None),
             armed: std::sync::atomic::AtomicBool::new(false),
         });
-        let world = EngineFixture::with_workload(workload.clone())?;
+        let (world, _deploy, owner) = stop_first_world(workload.clone())?;
+        *world.engine.host_workload.lock().unwrap() = Some(workload.clone());
         *workload.store.lock().unwrap() = Some(world.state_store.clone());
-        let incumbent = admit_incumbent(&world)?;
-        let live = seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Continuity, Some(&incumbent))?;
-        let id = live.transaction_id.as_str();
+        warm_stop_first(&world, &owner)?;
         // The Warming step waits for Odin; waiting again rewrites nothing, so
         // the step succeeds without touching the record it will find missing.
-        world.engine.resume_candidate(&resident_id(&world, id)?)?;
-        let waited = resident_id(&world, id)?.value;
-        assert!(waited.last_error.is_some(), "the Warming step did not wait: {:?} {:?}", waited.phase, waited.warming);
+        world.engine.resume_candidate(&resident_id(&world, &owner)?)?;
+        let waited = resident_id(&world, &owner)?.value;
+        assert!(waited.last_error.is_some(), "the Warming step did not wait: {:?}", waited.phase);
         workload.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         world.engine.resume_backoff.lock().unwrap().clear();
         let error = world
             .engine
-            .resume_candidate(&resident_id(&world, id)?)
+            .resume_candidate(&resident_id(&world, &owner)?)
             .expect_err("a record gone from both stores was read as a finished one");
         assert!(format!("{error:#}").contains("disappeared while checking scheduler progress"), "{error:#}");
         assert!(read_history_transactions(&world.state_store).is_empty());
@@ -17158,6 +17157,32 @@ mod tests {
         Ok(())
     }
 
+    /// What the scheduler does for a deployment waiting at its Sealing tail: it
+    /// asks to enter Starting, and a refusal ends it before fencing. (A resume
+    /// pass would stop first at the deployment brake this world never releases.)
+    fn step_waiter(world: &EngineFixture, id: &str) -> Result<()> {
+        let waiting = resident_id(world, id)?;
+        if waiting.value.pre_fencing_abort.is_some() {
+            return Ok(());
+        }
+        if let Err(error) = world.engine.enter(&waiting, entering(&waiting, DeploymentPhase::Starting)?) {
+            world.engine.begin_pre_fencing_abort(&resident_id(world, id)?, error)?;
+        }
+        Ok(())
+    }
+
+    /// Passes of the scheduler over the owner, each followed by the waiter's
+    /// own attempt to enter Starting.
+    fn run_owner_and_waiter(world: &EngineFixture, waiter: &str, passes: usize) -> Result<()> {
+        for _ in 0..passes {
+            resume_pass(world)?;
+            if resident_id(world, waiter).is_ok() {
+                step_waiter(world, waiter)?;
+            }
+        }
+        Ok(())
+    }
+
     fn operator_required(world: &EngineFixture) -> Result<Vec<String>> {
         world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired) // head-only
     }
@@ -17315,9 +17340,7 @@ mod tests {
     ) -> Result<()> {
         let (world, deploy, continuity) = warm_stop_first_owner(SwitchWorkload::new())?;
         // The gate-wait is the Warming step itself, not an error of it.
-        for _ in 0..3 {
-            resume_pass(&world)?;
-        }
+        run_owner_and_waiter(&world, &deploy, 3)?;
         let waiting = resident_id(&world, &continuity)?.value;
         assert_eq!(waiting.phase, DeploymentPhase::Warming);
         assert!(waiting.pre_fencing_abort.is_none(), "the Warming step failed: {:?}", waiting.last_error);
@@ -17329,7 +17352,7 @@ mod tests {
             if resident_id(&world, &continuity).is_err() {
                 break;
             }
-            resume_pass(&world)?;
+            run_owner_and_waiter(&world, &deploy, 1)?;
         }
         let ended = latest_id(&world, &continuity)?;
         let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
@@ -17340,12 +17363,7 @@ mod tests {
 
         // The pass that retired the owner, or the next, moves the waiter to
         // Starting; stop there, before its Starting step runs.
-        for _ in 0..3 {
-            if resident_id(&world, &deploy)?.value.phase >= DeploymentPhase::Starting {
-                break;
-            }
-            resume_pass(&world)?;
-        }
+        step_waiter(&world, &deploy)?;
         let took = resident_id(&world, &deploy)?.value;
         assert_eq!(took.phase, DeploymentPhase::Starting);
         assert!(took.owns_target() && took.pre_fencing_abort.is_none());
@@ -17363,9 +17381,7 @@ mod tests {
         world
             .engine
             .begin_pre_fencing_abort(&resident_id(&world, &owner)?, anyhow!("candidate refused"))?;
-        for _ in 0..3 {
-            resume_pass(&world)?;
-        }
+        run_owner_and_waiter(&world, &deploy, 3)?;
         // Before the abort's deadline: it waits, unpaged.
         let aborting = resident_id(&world, &owner)?.value;
         assert!(aborting.pre_fencing_abort.is_some() && !aborting.is_terminal());
@@ -17373,9 +17389,7 @@ mod tests {
         assert!(resident_id(&world, &deploy)?.value.pre_fencing_abort.is_none());
 
         age_deadline_of(&world, &owner)?;
-        for _ in 0..20 {
-            resume_pass(&world)?;
-        }
+        run_owner_and_waiter(&world, &deploy, 20)?;
         let aborting = resident_id(&world, &owner)?.value;
         assert!(!aborting.is_terminal() && aborting.owns_target(), "the owner was ended");
         assert_eq!(operator_required(&world)?, [owner.as_str()]); // head-only
