@@ -16755,7 +16755,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     /// and none of the evidence that follows Sealing.
     fn make_stop_first(world: &EngineFixture, id: &str) -> Result<()> {
         use crate::deployment_plan::tests::{
-            RECIPE, artifact_receipt, external_input_receipt, source,
+            RECIPE, artifact_receipt, source,
         };
         let stored = resident_id(world, id)?;
         let mut next = stored.value.clone();
@@ -16769,6 +16769,14 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 r#"["GAMECULT_IDUNN_CANDIDATE_BIND", "GAMECULT_IDUNN_RUNTIME_BUNDLE"]"#,
                 r#"["GAMECULT_IDUNN_ACTIVATION_CREDENTIAL", "GAMECULT_IDUNN_RUNTIME_BUNDLE", "GAMECULT_RUNTIME_PRESENCE_IDENTITY"]"#,
             );
+        // A host-native runner has no network profile to fetch an input with.
+        let (before_inputs, inputs) = recipe
+            .split_once("[[external_inputs]]")
+            .context("recipe has no external inputs")?;
+        let recipe = format!(
+            "{before_inputs}[[artifacts]]{}",
+            inputs.split_once("[[artifacts]]").context("recipe has no artifacts")?.1
+        );
         let plan = compile_deployment_plan(
             recipe.as_bytes(),
             binding.as_bytes(),
@@ -16781,7 +16789,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         let release = SealedRelease::new(
             &plan,
             vec![artifact_receipt()],
-            vec![external_input_receipt()],
+            Vec::new(),
             120,
         )?;
         let mut expected = release.expected_projection(&plan)?;
