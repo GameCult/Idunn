@@ -8,6 +8,11 @@ no kind: body facts, the model page, the authority map's rationale and the
 cut sequence. Line numbers are at `74a7008`; `src/` is byte-identical to
 `c2477d4`, so the earlier anchors still hold.
 
+Cut 2 pass, Imagination, 2026-10-19 (same campaign and session): body facts
+B13-B18, the cut-2 rows of the model page and the cut-2 parts of sections 3-5
+are anchored at `9a0a6a2`, whose `src/` is byte-identical to `ffb4293` (cut 1's
+head). The B1-B12 anchors above stay at `74a7008`.
+
 Read the in-force set with the rulings-in-force and open-follow-ups recipes
 for root `idunn-reincarnation`; the cut in flight is the specs-with-no-report
 recipe. The first spec (`cut-c1-durable-stop.r1`) was withdrawn when the
@@ -210,6 +215,82 @@ of the same rule (`5_000 << (live.len() - 1)`, `:1169`). The cut gives
 `TargetSupervision` keys use it, because every record on Yggdrasil predates
 them.
 
+**B13. Two live transactions for one target make the control store
+unreadable.** Source read at `9a0a6a2`. `ControlSnapshot::validate` refuses
+"multiple transactions claim current-incarnation authority for one target"
+over `owns_target_authority` (`:3245-3254`), and that predicate is just
+`phase != Complete` (`:1896-1898`). Every reader of the store goes through it:
+the scheduler tick, `idunn status`, cancel, expire. So if supervision minted a
+continuity beside a pre-fencing deployment today, the next read would fail
+the whole engine. Coexistence needs the identity rule changed first, and that
+is the cut's first commit.
+
+**B14. One predicate answers four questions, and the phase rule lives in
+one caller.** `blocks_new_target_mutation` (`:1903-1909`, live or post-commit
+cleanup pending) is read by the freeze busy check (`:5934-5942`), the
+supervision blocker (`:5998-6001`, a single `.find`), candidate-port
+reservation (`:7997`) and status (`:4613`). `owns_target_authority` is read by
+validation (`:3249`) and by sibling ordering inside one command (`:3384`).
+Neither looks at the phase. The only phase-aware ownership rule is inline in
+supervision (`:6002-6012`, owns from Fencing, or from Starting for
+stop-then-start). The freeze refusal is why a `profile:` command needs every
+target free in one tick (follow-up `profile-deploy-joint-gap`).
+
+**B15. What a pre-fencing deployment reads about its incumbent.** Warming's
+semantic warming check uses the incumbent's lease digest
+(`:6904-6905`, `is_semantic_warming` `:9530-9560`: Odin reports the candidate's
+one disagreement as the lease the incumbent holds). Route preflight uses the
+incumbent's route observation (`:7026-7047`). Isolation is proven against the
+incumbent's workload (`:7050-7076`). Each goes through `exact_incumbent`
+(`:7768-7781`), which bails "target incumbent changed after transaction
+creation" once a continuity commit replaced the generation. Sealing, and
+Starting for candidate-then-promote, read no incumbent. Stop-then-start's
+Starting stops it (`:6857-6863`), which is already the owner's act. The
+Sealing-to-Starting write is a `replace_transaction` at `:6806-6808`, not
+`transition` (`:8914-8927`), so the two edges at which a transaction can take
+a target are written by two different functions today.
+
+**B16. The commit already guards the incumbent; nothing guards the
+handover.** `advance_committing` expects the admitted envelope it read
+(`:7701-7702`, CAS `:7743-7764`), so a deployment can never commit over a
+generation that moved under it. Entering Fencing is an unguarded
+`replace_transaction` of the transaction alone. Continuity's mint CAS
+(`:6371-6400`) guards its command, transaction and supervision record, and no
+other transaction. The store accepts read-only expectations: an expected
+entry with no replacement only guards (CultLib
+`packages/cultcache-rs/src/lib.rs:1327-1368`). One engine holds the store
+(`ProcessLock::acquire`, `:5514`), but the CLI writes transactions too:
+`cancel` sets a pre-fencing abort on a live deployment (`:3014-3083`). So a
+handover decided by one CAS over the target's records is exact, and a tick
+order is not.
+
+**B17. What coexisting candidates share, and what they do not.** Continuity
+reuses the admitted plan, so its candidate port is the admitted generation's,
+already reserved (`:7988-7992`); a deployment picks another. Topology is keyed
+per incarnation (`:8495-8498`): a continuity publishes under the admitted key,
+a deployment under its own. No candidate holds a write lease before its own
+Leasing, which follows Fencing, so two pre-fencing candidates cannot both
+write. Route actuation by a continuity is always `Survival`, never refused
+(`:4870-4876`); a deployment's `Forward` cannot starve it. The Odin replay
+floor `max_odin_sequence` (`:3399-3435`) spans every transaction of the target
+and the admitted cursor; incumbent refresh and candidate warming already share
+it during every deployment today, so the replay check (`:9498-9501`) gains no
+new exposure. Stop-then-start is declared only by route-less host-actuator
+bindings (`deployment.rs:756-764`, `:1245-1249`), and no control-plane test
+builds one (grep `StopThenStart` in `src/control_plane.rs`: the definition
+site only). It is live on Yggdrasil: raven-muninn declares it
+(`git grep stop-then-start` in `gamecult-ops`:
+`idunn/yggdrasil/bindings/raven-muninn.toml.in`). So the Starting edge of the
+handover carries production traffic, and its engine-level proof is owed
+before the closing install (follow-up `stop-first-handover-fixture`).
+
+**B18. A pre-fencing error is an abort.** `resume_candidate` turns any `Err`
+from a pre-fencing step into `begin_pre_fencing_abort` unless it is
+`LockContended` (`:5768-5783`). So anything the cut makes a deployment wait on
+must return `Ok` (a gate wait, `record_gate_wait` `:8170-8182`), or the wait
+becomes the yield that ruling `handover-phase-split` forbids. The same path is
+how a superseded continuity ends itself, which is wanted.
+
 ## 2. Model page
 
 One row per persistent kind the campaign touches.
@@ -223,12 +304,17 @@ One row per persistent kind the campaign touches.
 | Projection deferral (keys 4-5) | target | Unchanged: a failed demotion defers the next mint 30 s. It spaces a re-materialization too | Continuity supervision |
 | Admitted generation (`idunn.admitted_generation`) | key = target, `generation_id` = `generation-<tx>` | Replaced atomically by every committed deployment or continuity. A dead incarnation keeps its record until replaced | The committing transaction |
 | Incident `ContinuityExhausted` (incidents.cc) | condition + subject (target) | Opened at 6 charged attempts in the hour while the target is dead and free. Closed when the target runs and the window no longer holds 6 (`exhaustion-close-rule-op`). Retired after retention. The name is the wire name and stays, though nothing is exhausted any more | Idunn's incident writer, a notification projection: never read by ownership |
-| Transaction and pre-fencing abort (`idunn.deployment_transaction.v4`, history.cc once terminal) | `tx-<uuid>` and its `command_id` (`up-…` or `continuity-…`) | Sealing … Complete. A pre-fencing abort completes `FailedBeforeFencing`, a post-fencing abort `FailedAfterFencing` with a named recovery. Retired to history | The scheduler advances it. After cut 1, continuity supervision never aborts a transaction; the transaction's own steps do |
+| Transaction and pre-fencing abort (`idunn.deployment_transaction.v4`, history.cc once terminal) | `tx-<uuid>` and its `command_id` (`up-…` or `continuity-…`). Keyed by transaction, so a continuity and a deployment for one target are two records with no shared key | Sealing … Complete. A pre-fencing abort completes `FailedBeforeFencing`, a post-fencing abort `FailedAfterFencing` with a named recovery. Retired to history. After cut 2, per target at any instant: at most one live Deploy, at most one live Continuity, at most one owner (validated by `ControlSnapshot::validate`, B13) | The scheduler advances it. After cut 1, continuity supervision never aborts a transaction; the transaction's own steps do. After cut 2, a continuity whose target was taken, or whose source generation was replaced, aborts itself (superseded) |
+| Target ownership (cut 2: derived, no record) | target | A transaction owns its target from `takes_target_at()` (Fencing, or Starting for stop-then-start) until Complete; a Complete transaction with pending post-commit cleanup drains it. Entered only through the handover CAS (`Engine::take_target`) | Derived from the phase. The handover CAS is the one writer of a phase entry into `takes_target_at()` |
+| `incumbent_generation_id` on a transaction (key 9, unchanged format) | the generation's id | Deploy: set at freeze; before the handover it names the generation its incumbent-relative evidence was proven against and is rebased when the admitted generation moves (clearing that evidence); pinned by the handover CAS, exact from then on. Continuity: its source generation, never rebased | Deploy: its own pre-handover rebase step and the handover CAS. Continuity: the mint |
 | Unit materialization (systemd transient unit `idunn-<target>-<hash>`) | the activation's hash | Created by Starting. Lost on a host reboot (`/run/systemd/transient`). A failed unit stays loaded; a cleanly stopped one is collected | The workload driver actuates. Whether a loss was a reboot is the driver's evidence (`WorkloadPort::lost_to_host_reboot`, cut 1) |
 
 No cell is open. Both forks are ruled (`budget-never-stop`,
 `handover-phase-split`). The numbers that `budget-never-stop` left open are
-the defaulted ruling `continuity-backoff-defaults`.
+the defaulted ruling `continuity-backoff-defaults`. Cut 2 opens one question,
+`fencing-over-owning-continuity` (does a deployment ready to fence wait for a
+continuity that already owns the target, or preempt it); the spec is written
+for the recommended answer, wait.
 
 ## 3. Authority map: continuity and deployment
 
@@ -269,10 +355,69 @@ campaign-level map, and cut 1 is one step of it.
   advances through `advance_transaction`.
 - **Deletion line.** Cut 1 deletes the yield (`:6034-6059`), the
   exhaustion `continue` and its "free for a deployment" text (`:6062-6085`),
-  and the mint-anchored wait (`:1160-1184`). Cut 2 deletes the blocker
-  `continue` for a pre-fencing deployment (`:6033`), so continuity restarts
-  alongside the build, and the "incumbent changed after transaction
-  creation" refusal at Fencing (`:7556-7569`).
+  and the mint-anchored wait (`:1160-1184`). Cut 2 (anchors at `9a0a6a2`)
+  deletes `owns_target_authority` and `blocks_new_target_mutation`
+  (`:1894-1909`), the inline phase rule and the single-blocker `.find` in
+  supervision (`:5998-6012`), the blocker `continue` (`:6229-6233`), the
+  freeze busy check (`:5934-5942`), the one-live-transaction-per-target
+  validation (`:3245-3254`), and the "target incumbent changed after
+  transaction creation" text (`:7779`).
+
+### Cut 2: the two slots and the handover
+
+Each target has one **incumbent slot**: its `AdmittedGeneration`, the body
+running it, its write lease and its stable-route membership. Each live
+transaction has its own **candidate slot**: its incarnation key, activation,
+candidate port and unit.
+
+- **Owner.** Before any transaction takes the target, continuity supervision
+  owns the incumbent slot: it alone decides to mint a restart. From the
+  handover CAS until Complete, the one transaction that took the target owns
+  it, fencing, leasing, routing and committing. Its commit hands the slot
+  back to supervision as a new generation. A transaction owns its own
+  candidate slot from mint or freeze until it is terminal. A pre-handover
+  deployment owns nothing else.
+- **The handover.** `Engine::take_target` is the only writer of a phase entry
+  into `takes_target_at()` (Fencing, or Starting for stop-then-start), for
+  both kinds. It is one CAS. It expects the transaction's own envelope, the
+  target's admitted envelope (the one `incumbent_generation_id` names, or
+  absent), and every other non-terminal transaction of the target, each
+  unchanged, and it writes only the transaction. Of two transactions
+  entering from one view, exactly one CAS succeeds. The loser's next step
+  re-reads: a deployment gate-waits for the owner, and a continuity aborts
+  itself as superseded.
+- **Inputs.** Continuity: as cut 1, plus whether any transaction owns or
+  drains the target, or a continuity is live for it (the mint gate). A
+  pre-handover deployment: its plan, its brake, and the admitted generation as
+  it is now, which it rebases onto. The handover: the target's records above.
+- **Outputs.** The handover writes the new phase. A rebase rewrites
+  `incumbent_generation_id` and clears the evidence proven against the old
+  incumbent: `warming`, `route_preflight`, `isolation`. A superseded continuity
+  writes its own pre-fencing abort.
+- **Derived state.** `owns_target()` is derived from the phase and
+  `takes_target_at()`. `drains_incumbent()` is derived from the post-commit
+  cleanup. The freeze refusal is derived from "a live Deploy for this
+  target". `incumbent_generation_id` on a pre-handover deployment is the
+  generation its evidence was proven against, not a pin.
+- **Forbidden writers.** No path enters `takes_target_at()` except
+  `take_target`. Continuity supervision aborts nothing, and mints nothing
+  while another transaction owns or drains the target or a continuity is
+  live. A deployment never aborts because another transaction owns the
+  target: it gate-waits (B18). A continuity is never rebased. Freeze reads no
+  continuity state. No new persistent record decides ownership: it is the
+  phase.
+- **Shared paths.** Candidate-then-promote's Warming-to-Fencing and
+  stop-then-start's Sealing-to-Starting go through one phase-entry seam,
+  which calls `take_target` exactly when the entered phase is
+  `takes_target_at()`. Deployments and continuities use the same CAS. A
+  single-target and a `profile:` command use the same freeze rule.
+
+Demotions, named: `incumbent_generation_id` is no longer a pin before the
+handover; it is derived from the admitted generation by the rebase.
+`blocks_new_target_mutation` is no longer an owner; it splits into
+`is_live`, `owns_target` and `drains_incumbent`, each read by the consumer
+that asks that question. The freeze busy check is no longer a
+target-ownership gate; it guards only one live deployment per target.
 
 Demotions, named: `restarts_exhausted` is no longer an owner of anything. It
 is renamed `restarts_page`, and it opens and holds the incident. The
@@ -341,19 +486,64 @@ operator is paged during the outage, not at 20:24. The `idunn up` at 20:24
 freezes in the next gap. Continuity defers to it, nothing aborts it, and it
 fences the absent incumbent as nothing and admits the new release.
 
+Why cut 2 is shaped this way. The handover is the phase, guarded by one CAS
+over the target's records, rather than a new per-target "owner" record. A
+record would be a second spelling of what the phase already says, and it
+would need its own lifecycle, crash repair and migration. A CAS that reads
+every other live transaction of the target is enough because a newly minted
+or frozen transaction starts at Sealing and cannot own anything (B16).
+The rebase clears exactly the evidence that names an incumbent (B15): warming
+names its lease, preflight its route and isolation its workload. Keeping any
+of them would let the deployment fence one generation with proofs about
+another. A deployment waits in Warming while another transaction owns the
+target, because Warming's steps read the incumbent that owner is fencing, and
+a failed pre-fencing step is an abort (B18). Sealing and Starting keep
+running, so the long part, the build, still overlaps. A continuity that loses
+the target is aborted, not parked: it restarts a generation that is about to
+be replaced, and while it lives it blocks continuity of the generation that
+replaces it.
+
+Prior art on question `fencing-over-owning-continuity` (wait for a
+continuity that already owns the target, or preempt it), from
+`docs/research/restart-budget-prior-art.md` at `74a7008`. It leans the other
+way from the recommendation, and the recommendation says why. Kubernetes'
+rolling update scales old ReplicaSets down unhealthy pods first, so that
+"unhealthy replicas will block deployment" does not happen (§1.4,
+`rolling.go`). That is preemption of a failing old replica. Nomad separates
+the two by layer: the client restarts old allocations under their own policy,
+and the server reconciler places the new ones (§2.3). Neither waits on an
+old replica's restart. But deleting a pod is the kubelet's ordinary teardown.
+In Idunn, preempting a continuity past its own Fencing means a deployment
+driving another transaction's post-fencing abort. That abort revokes a lease
+and restores a projection, and it is the path that wedged Ghostlight (B7).
+Waiting is bounded by the owner's own phase deadlines (`PhaseDeadline`,
+`:938-960`) and adds no new abort path. Recommendation: wait, at medium
+confidence. Preempt is the better answer once post-fencing aborts are known
+not to wedge, which is follow-up `ghostlight-abort-lease-before-stop`.
+
+Residuals, recorded and not fixed. A wedged post-fencing abort of a
+continuity (B7, follow-up `ghostlight-abort-lease-before-stop`) holds a
+waiting deployment as long as it holds the target. A continuity superseded
+after its mint stays charged; that lengthens one wait for a generation that
+is being replaced. Stop-then-start has no control-plane fixture (B17), so in
+cut 2 its edge is pinned structurally (one seam, one call) and by a unit test
+of the phase mapping, not by an engine run. raven-muninn uses it, so the
+engine test is owed before cut 5.
+
 ## 5. Cut sequence
 
 1. **c1-never-stop**: spec in the mind (specs-with-no-report recipe). Depends
    on nothing.
-2. **Handover before Fencing** (`handover-phase-split`): continuity
-   restarts the incumbent while a pre-fencing deployment builds. This deletes
-   the blocker `continue` for a pre-fencing Deploy, and lets one continuity and
-   one pre-fencing deployment coexist per target, which touches
-   `blocks_new_target_mutation`, `freeze_command` and candidate ports. The
-   deployment takes the target at Fencing over whatever is admitted
-   (`exact_incumbent`, `:7556`). Entering Fencing needs a hand-off with a
-   live continuity transaction, decided as data rather than by tick order.
-   Waits on cut 1, because it rewrites the same block.
+2. **c2-phase-split** (`handover-phase-split`): spec
+   `cut-c2-phase-split.r1` in the mind, branch `idunn/reincarnation-c2` from
+   `9a0a6a2`. Continuity restarts the incumbent while a pre-fencing
+   deployment builds. The ownership predicates split (B13, B14). The handover
+   is one CAS at `takes_target_at()`. A pre-handover deployment rebases onto
+   whatever is admitted, and a superseded continuity aborts itself. Freeze
+   refuses only a second live deployment for a target, which dissolves
+   follow-up `profile-deploy-joint-gap`. It folds in the test-only follow-up
+   `c1-sustained-reset-test-reach`. Open question:
+   `fencing-over-owning-continuity`. Depends on cut 1 (merged at `1da150a`).
 3. **Dependency failures do not grow the backoff**
    (`budget-never-stop`): an attempt that failed because of a declared
    dependency (Odin's stable route, the target's own stable route
@@ -367,7 +557,8 @@ fences the absent incumbent as nothing and admits the new release.
    not every tick. Waits on cut 1, because it rewrites the same function.
 5. **Closing proof on Yggdrasil**: an operator-approved install of the merged
    cuts. streampixels-service survives the install, and `idunn status` is
-   checked before and after. Waits on 1-4.
+   checked before and after. Waits on 1-4 and on follow-up
+   `stop-first-handover-fixture` (raven-muninn is stop-then-start, B17).
 
 Ops, out of scope: nginx boot order (`gamecult-ops`), and retention of the
 roughly 130 dead transient units.
