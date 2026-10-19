@@ -23834,6 +23834,76 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             Ok(())
         }
 
+        /// NEGATIVE. The live shape of tx-4eaed669 (Odin) left to the operator
+        /// at its Routing deadline, with a Deploy now awaiting the handover of
+        /// its target. The continuity yields through its own abort: the lease
+        /// leaves the disk only after the stop, the target is free, and the
+        /// Deploy, unended, fences a path that is already empty.
+        #[cfg(unix)]
+        #[test]
+        fn an_odin_shaped_continuity_left_to_the_operator_yields_its_lease_to_a_waiting_deploy() -> Result<()> {
+            let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
+            routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+            let (lease, lease_sha256) = lease_of(&routed)?;
+            routed.stub.set_state("active");
+            *routed.stub.lease.lock().unwrap() = Some(lease_sha256);
+            routed.drive_until(|t| t.phase == DeploymentPhase::Routing)?;
+            assert!(routed.transaction()?.lease_adoption.is_some());
+            let (driver, path) = lease_driver(&routed);
+            routed.workload.hold_lease_lock(&path);
+            routed.stub.hang_up.store(true, Ordering::SeqCst);
+            let owner_id = routed.transaction()?.transaction_id;
+            pass_deadline(&routed.world)?;
+            routed.resume()?;
+            let left = routed.transaction()?;
+            assert!(left.post_fencing_abort.is_none(), "the continuity aborted with nothing awaiting the target");
+            assert_eq!(routed.world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?, [owner_id.as_str()]);
+            assert!(driver.observe_exact(&lease)?);
+
+            let deploy = seeded_transaction(&routed.world, DeploymentPhase::Warming, CommandKind::Deploy, None)?;
+            let stops = routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..12 {
+                routed.resume()?;
+                let owner = latest_id(&routed.world, &owner_id)?;
+                if owner.post_fencing_abort.is_none() {
+                    assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
+                    assert!(driver.observe_exact(&lease)?, "the lease left before the yield");
+                }
+                if owner.completion.is_some() {
+                    break;
+                }
+            }
+            let ended = latest_id(&routed.world, &owner_id)?;
+            assert!(
+                matches!(
+                    ended.completion,
+                    Some(TransactionCompletion::FailedAfterFencing { recovery: TerminalRecovery::RestartAdmitted, .. })
+                ),
+                "{:?}",
+                ended.completion
+            );
+            assert!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst) > stops);
+            assert!(!driver.observe_exact(&lease)?, "the lease stayed on disk");
+            assert!(ControlSnapshot::read(&routed.world.state_store)?.target_owner("service", None).is_none());
+            let waiting = resident_id(&routed.world, &deploy.transaction_id)?.value;
+            assert!(waiting.completion.is_none() && waiting.pre_fencing_abort.is_none());
+
+            // Its next move is the fence, over a lease path that is empty.
+            rephase(&routed.world, &deploy.transaction_id, DeploymentPhase::Fencing)?;
+            routed.world.engine.advance_transaction(&resident_id(&routed.world, &deploy.transaction_id)?)?;
+            let fenced = latest_id(&routed.world, &deploy.transaction_id)?;
+            assert!(
+                matches!(
+                    fenced.fencing,
+                    Some(FencingEvidence::Revoked { candidate_lease_path_verified_empty: true, .. })
+                ),
+                "{:?} {:?}",
+                fenced.fencing,
+                fenced.last_error
+            );
+            Ok(())
+        }
+
         /// The lift is a function of its inputs: each case lacks one thing the
         /// lift requires, and its abort stays and runs to its end.
         #[cfg(unix)]
