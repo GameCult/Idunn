@@ -15897,7 +15897,8 @@ mod tests {
         // The Warming step waits for Odin; waiting again rewrites nothing, so
         // the step succeeds without touching the record it will find missing.
         world.engine.resume_candidate(&resident_id(&world, id)?)?;
-        assert!(resident_id(&world, id)?.value.last_error.is_some(), "the Warming step did not wait");
+        let waited = resident_id(&world, id)?.value;
+        assert!(waited.last_error.is_some(), "the Warming step did not wait: {:?} {:?}", waited.phase, waited.warming);
         workload.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         world.engine.resume_backoff.lock().unwrap().clear();
         let error = world
@@ -17276,15 +17277,13 @@ mod tests {
     /// host-actuator step of a world that serves no actuator errs at once.
     fn stop_first_systemd_binding(world: &EngineFixture) -> Result<String> {
         use crate::deployment_plan::tests::BINDING;
-        let host_runner = "[runners.rust]\ndriver = \"host-native\"\naffordances = [\"source-read\", \"artifact-write\"]\nallowed_programs = [\"cargo\"]\n\n";
-        let (head, rest) = BINDING.split_once("[runners.rust]").context("no runner")?;
-        let (_, rest) = rest.split_once("[workload]").context("no workload")?;
+        let (head, rest) = BINDING.split_once("[workload]").context("no workload")?;
         let (workload, rest) = rest.split_once("[runtime_identity]").context("no identity")?;
         let (identity, rest) = rest.split_once("[route]").context("no route")?;
         let (_, brakes) = rest.split_once("[brakes]").context("no brakes")?;
         bind_provider(
             world,
-            &format!("{head}{host_runner}[workload]{workload}[runtime_identity]{identity}[brakes]{brakes}")
+            &format!("{head}[workload]{workload}[runtime_identity]{identity}[brakes]{brakes}")
                 .replace("candidate-then-promote", "stop-then-start"),
         )
     }
@@ -17680,7 +17679,6 @@ state_root = "/var/lib/gamecult/service"
 GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-identity.cc"
 
 "#;
-        let (head, rest) = BINDING.split_once("[runners.rust]").context("no runner")?;
         let (_, rest) = rest.split_once("[runtime_identity]").context("no identity")?;
         let (identity, rest) = rest.split_once("[route]").context("no route")?;
         let (_, brakes) = rest.split_once("[brakes]").context("no brakes")?;
