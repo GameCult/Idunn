@@ -5880,6 +5880,8 @@ impl Engine {
     fn resume_one_transaction(&self) -> Result<bool> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let mut progressed = self.retire_spent_expiry_requests(&snapshot)?;
+        // Incident writes are never progress.
+        self.close_spent_operator_incidents(&snapshot, now_millis()?);
         let mut candidates = snapshot
             .transactions
             .iter()
@@ -8406,9 +8408,19 @@ impl Engine {
     }
 
     /// Idunn has run out of ways to end this record. It stays owned and its
-    /// step keeps retrying; the operator is told.
+    /// step keeps retrying; the operator is told. The incident comes first and
+    /// the trace second, and only for a record that is left to the operator
+    /// (an operator's expiry of a stateful deploy is reported, not paged).
     fn leave_to_operator(&self, transaction: &DeploymentTransaction, cause: &str) {
         let id = &transaction.transaction_id;
+        let now = now_millis();
+        if now.as_ref().is_ok_and(|now| transaction.leaves_to_operator(*now)) {
+            self.record_incident(
+                "open",
+                id,
+                now.and_then(|now| self.incidents().open(IncidentCondition::OperatorRequired, id, now)),
+            );
+        }
         self.report_once(
             &format!("deadline:{id}"),
             format!("Idunn leaves {id} to the operator: {cause}; it keeps retrying the step"),
@@ -9436,6 +9448,24 @@ impl Engine {
                 Ok(None)
             }
         }
+    }
+
+    /// Close the operator-required incident of every transaction that is no
+    /// longer left to the operator: it ended, or its step went on. A
+    /// transaction that is still left keeps its incident open.
+    fn close_spent_operator_incidents(&self, snapshot: &ControlSnapshot, now: u64) {
+        let store = self.incidents();
+        let close = || -> Result<()> {
+            for subject in store.open_subjects(IncidentCondition::OperatorRequired)? {
+                if !snapshot.transactions.iter().any(|stored| {
+                    stored.value.transaction_id == subject && stored.value.leaves_to_operator(now)
+                }) {
+                    store.close(IncidentCondition::OperatorRequired, &subject, CloseReason::Recovered, now)?;
+                }
+            }
+            Ok(())
+        };
+        self.record_incident("close", "*", close());
     }
 
     /// Delete expiry requests whose command has no phase left to end: it was
@@ -14219,6 +14249,11 @@ mod tests {
             self.holds.lock().unwrap().push(file);
         }
 
+        /// Every stop works again.
+        fn mend_stops(&self) {
+            self.failing_stops.lock().unwrap().clear();
+        }
+
         /// From now on stopping this runtime instance fails.
         fn fail_stop_of(&self, runtime_instance_id: &str) {
             self.failing_stops.lock().unwrap().push(runtime_instance_id.to_owned());
@@ -16964,7 +16999,9 @@ mod tests {
             .engine
             .begin_post_fencing_abort(&resident_id(&world, owner_id)?, anyhow!("candidate refused"))?;
 
-        // Before the deadline the deployment waits on a bounded owner.
+        // Before the deadline the deployment waits on a bounded owner, and no
+        // one is paged.
+        assert!(world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?.is_empty());
         for _ in 0..3 {
             resume_pass(&world)?;
         }
@@ -16980,12 +17017,57 @@ mod tests {
         let owner = resident_id(&world, owner_id)?.value;
         assert!(!owner.is_terminal() && owner.post_fencing_abort.is_some(), "the owner was ended");
         assert!(owner.owns_target());
+        // Exactly one incident, however many passes ran.
+        assert_eq!(
+            world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?,
+            [owner_id]
+        );
         let ended = latest_id(&world, deploy_id)?;
         let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
             bail!("the waiting deployment did not end: {:?} {:?}", ended.phase, ended.last_error);
         };
         assert!(error.contains("owner-left-to-operator") && error.contains(owner_id), "{error}");
         assert!(ended.fencing.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn an_operator_required_incident_closes_when_its_transaction_ends() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
+        let id = seeded.transaction_id.as_str();
+        workload.fail_stop_of(&runtime_instance_of(&world, id)?);
+        world.engine.begin_post_fencing_abort(&resident_id(&world, id)?, anyhow!("candidate refused"))?;
+        pass_deadline_of(&world, id)?;
+        let open = || world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired);
+        for _ in 0..4 {
+            resume_pass(&world)?;
+        }
+        assert_eq!(open()?, [id]);
+        let records = world.engine.incidents().read()?;
+        assert_eq!(records.len(), 1);
+
+        // Still left to the operator: still open, and not written again.
+        resume_pass(&world)?;
+        assert_eq!(world.engine.incidents().read()?, records);
+
+        // The step succeeds and the transaction ends; the next pass closes it.
+        workload.mend_stops();
+        for _ in 0..12 {
+            if resident_id(&world, id).is_err() {
+                break;
+            }
+            resume_pass(&world)?;
+        }
+        assert!(latest_id(&world, id)?.is_terminal());
+        resume_pass(&world)?;
+        assert!(open()?.is_empty());
+        let closed = world.engine.incidents().read()?;
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].close_reason, Some(CloseReason::Recovered));
+        resume_pass(&world)?;
+        assert_eq!(world.engine.incidents().read()?, closed, "a spent incident was written again");
         Ok(())
     }
 
@@ -17037,6 +17119,10 @@ mod tests {
             resume_pass(&world)?;
         }
         assert!(!resident_id(&world, drainer_id)?.value.is_terminal(), "the drain was ended");
+        assert_eq!(
+            world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?,
+            [drainer_id]
+        );
         let ended = latest_id(&world, waiter_id)?;
         let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
             bail!("the waiting deployment did not end: {:?} {:?}", ended.phase, ended.last_error);
