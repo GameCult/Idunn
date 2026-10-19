@@ -17780,7 +17780,7 @@ mod tests {
         for _ in 0..5 {
             waiter_then_owner(&world, &deploy_id, &owner_id)?;
         }
-        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        assert!(resident_id(&world, &owner_id).with_context(|| "(i)")?.value.post_fencing_abort.is_none());
         let waiting = resident_id(&world, &deploy_id)?.value;
         assert!(waiting.pre_fencing_abort.is_none() && waiting.completion.is_none());
         assert!(waiting.last_error.as_deref().is_some_and(|note| note.contains(&owner_id)));
@@ -17794,7 +17794,7 @@ mod tests {
         for _ in 0..4 {
             waiter_then_owner(&world, "", &owner_id)?;
         }
-        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        assert!(resident_id(&world, &owner_id).with_context(|| "(ii)")?.value.post_fencing_abort.is_none());
         assert_eq!(operator_required(&world)?, [owner_id.as_str()]);
         assert_eq!(stops_of(&workload), stops);
 
@@ -17803,7 +17803,7 @@ mod tests {
         world.engine.begin_pre_fencing_abort(&resident_id(&world, &deploy_id)?, anyhow!("refused"))?;
         pass_deadline_of(&world, &owner_id)?;
         waiter_then_owner(&world, "", &owner_id)?;
-        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        assert!(resident_id(&world, &owner_id).with_context(|| "(iii)")?.value.post_fencing_abort.is_none());
 
         // (iv) Nor does a Deploy that has ended.
         let (world, _, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
@@ -17818,7 +17818,7 @@ mod tests {
         assert!(latest_id(&world, &deploy_id)?.completion.is_some());
         pass_deadline_of(&world, &owner_id)?;
         waiter_then_owner(&world, "", &owner_id)?;
-        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        assert!(resident_id(&world, &owner_id).with_context(|| "(iv)")?.value.post_fencing_abort.is_none());
         Ok(())
     }
 
