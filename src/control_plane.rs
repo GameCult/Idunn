@@ -1243,10 +1243,20 @@ impl TargetSupervision {
     /// admitted at `admitted_at`. The streak resets only after a sustained
     /// run: the generation has lived the sustained time and no attempt, charged
     /// or the one re-materialization, has been minted since it was admitted.
-    /// A standing anchor belongs to a death the supervision pass has seen
-    /// through; an observed-running pass clears it, so it never hides a reset.
+    /// That rule decides first: a sustained death never began a wait, so a
+    /// standing anchor, however it came to stand, has no say in it.
     fn continuity_backoff(&self, now: u64, admitted_at: u64) -> ContinuityBackoff {
         let streak = self.continuity_attempt_streak;
+        let sustained = self
+            .continuity_restarts
+            .last()
+            .into_iter()
+            .chain(&self.continuity_rematerialized_at_unix_millis)
+            .all(|&last| admitted_at >= last)
+            && now.saturating_sub(admitted_at) >= CONTINUITY_SUSTAINED_RUN_MILLIS;
+        if sustained {
+            return ContinuityBackoff::Due { streak: 0 };
+        }
         if let Some(due) = self.backoff_due(admitted_at) {
             return if self.owed_steps(admitted_at).is_some()
                 && is_waiting(now, due, CONTINUITY_BACKOFF_CEILING_MILLIS)
@@ -1256,14 +1266,7 @@ impl TargetSupervision {
                 ContinuityBackoff::Due { streak }
             };
         }
-        let sustained = self
-            .continuity_restarts
-            .last()
-            .into_iter()
-            .chain(&self.continuity_rematerialized_at_unix_millis)
-            .all(|&last| admitted_at >= last)
-            && now.saturating_sub(admitted_at) >= CONTINUITY_SUSTAINED_RUN_MILLIS;
-        if sustained || self.owed_steps(admitted_at).is_none() {
+        if self.owed_steps(admitted_at).is_none() {
             ContinuityBackoff::Due { streak: 0 }
         } else {
             ContinuityBackoff::Begin
@@ -3169,10 +3172,6 @@ impl ControlSnapshot {
                 }
                 TargetSupervision::TYPE => {
                     let value = read_supervision_record(&envelope)?;
-                    ensure!(
-                        envelope.key == value.target,
-                        "target supervision key is not its target"
-                    );
                     snapshot.targets.push(Stored { envelope, value });
                 }
                 ExpiryRequest::TYPE => {
@@ -5517,7 +5516,7 @@ fn boot(options: RuntimeOptions) -> Result<(ProcessLock, Engine)> {
         .context("migrating Idunn control records to the current schema")?;
     if migrated > 0 {
         println!(
-            "migrated {migrated} control record(s) to {DEPLOYMENT_TRANSACTION_SCHEMA} / {ADMITTED_GENERATION_SCHEMA}"
+            "migrated {migrated} control record(s) to {DEPLOYMENT_TRANSACTION_SCHEMA} / {ADMITTED_GENERATION_SCHEMA} / {TARGET_SUPERVISION_SCHEMA}"
         );
     }
     ControlSnapshot::read(&options.state_store).context("validating all Idunn records")?;
@@ -13537,6 +13536,7 @@ mod tests {
     struct SwitchWorkload {
         alive: std::sync::atomic::AtomicBool,
         rebooted: std::sync::atomic::AtomicBool,
+        silent: std::sync::atomic::AtomicBool,
     }
 
     impl SwitchWorkload {
@@ -13544,7 +13544,15 @@ mod tests {
             Arc::new(Self {
                 alive: std::sync::atomic::AtomicBool::new(true),
                 rebooted: std::sync::atomic::AtomicBool::new(false),
+                silent: std::sync::atomic::AtomicBool::new(false),
             })
+        }
+
+        /// The host cannot be asked: observing fails as `HostUnobservable`
+        /// whatever the workload is doing.
+        fn silence(&self, silent: bool) {
+            self.silent
+                .store(silent, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn revive(&self) {
@@ -13607,6 +13615,13 @@ mod tests {
             _: &IdunnRuntimeActivationRecord,
             prior: &WorkloadObservation,
         ) -> Result<WorkloadObservation> {
+            if self.silent.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(HostUnobservable {
+                    host: "test-host".into(),
+                    reason: "the actuator is between sessions".into(),
+                }
+                .into());
+            }
             ensure!(
                 self.alive.load(std::sync::atomic::Ordering::SeqCst),
                 "the workload is gone"
@@ -16481,6 +16496,128 @@ mod tests {
         assert_eq!(meters.backoff_due(admitted_at), Some(now));
     }
 
+    #[test]
+    fn continuity_mints_at_the_largest_streaks_and_stores_them_saturating() -> Result<()> {
+        // One test at u32::MAX kills every monotone stop gate (`streak >= N`).
+        let full = [3_000_000_u64, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000];
+        for streak in [13_u32, 64, u32::MAX - 1, u32::MAX] {
+            let workload = SwitchWorkload::new();
+            let world = EngineFixture::with_workload(workload.clone())?;
+            admit_incumbent(&world)?;
+            age_incumbent(&world, 500_000)?;
+            workload.kill();
+            let mut meters = restarted_ago(&full)?;
+            meters.continuity_attempt_streak = streak;
+            set_meters(&world, &meters)?;
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(continuity_mints(&world)?, 0, "streak {streak}: the wait begins");
+            anchor_ago(&world, 299_000)?;
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(continuity_mints(&world)?, 0, "streak {streak}: the cap is 300 s");
+            anchor_ago(&world, 300_001)?;
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(continuity_mints(&world)?, 1, "streak {streak} stopped");
+            assert_eq!(
+                meters_of(&world, "service")?.continuity_attempt_streak,
+                streak.saturating_add(1)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_brief_run_does_not_reset_the_streak() -> Result<()> {
+        // A crash loop seen running for one poll after each start still waits
+        // by streak; only a sustained run resets.
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        age_incumbent(&world, 100_000)?;
+        workload.kill();
+        let mut meters = restarted_ago(&[1_000_000, 900_000, 800_000])?;
+        meters.continuity_attempt_streak = 3;
+        set_meters(&world, &meters)?;
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 0);
+        workload.revive();
+        world.engine.supervise_one_admitted_generation()?;
+        workload.kill();
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 0, "a brief run reset the wait to nothing");
+        anchor_ago(&world, 19_000)?;
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 0, "streak 3 waits 20 s");
+        anchor_ago(&world, 20_001)?;
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 1);
+        assert_eq!(meters_of(&world, "service")?.continuity_attempt_streak, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sustained_run_no_pass_observed_still_resets_past_a_standing_anchor() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        admit_incumbent(&world)?;
+        age_incumbent(&world, 100_000)?;
+        workload.kill();
+        let mut meters = restarted_ago(&[1_000_000, 900_000, 800_000])?;
+        meters.continuity_attempt_streak = 3;
+        set_meters(&world, &meters)?;
+        world.engine.supervise_one_admitted_generation()?;
+        let anchor = meters_of(&world, "service")?.continuity_backoff_from_unix_millis;
+        assert!(anchor.is_some());
+        // It comes back on its own and runs 700 s while every pass is silence.
+        workload.revive();
+        workload.silence(true);
+        age_incumbent(&world, 700_000)?;
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(
+            meters_of(&world, "service")?.continuity_backoff_from_unix_millis,
+            anchor,
+            "a silent pass wrote the record"
+        );
+        // Then it dies: the old anchor has no say, no wait, the streak restarts.
+        workload.kill();
+        workload.silence(false);
+        world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 1);
+        assert_eq!(meters_of(&world, "service")?.continuity_attempt_streak, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn owed_steps_counts_the_re_materialization_only_for_its_own_generation() {
+        let admitted_at = 10_000_000_u64;
+        let mut meters = TargetSupervision::new("service");
+        assert_eq!(meters.owed_steps(admitted_at), None);
+        meters.continuity_rematerialized_at_unix_millis = Some(admitted_at - 1);
+        assert_eq!(meters.owed_steps(admitted_at), None, "an earlier generation's remat is spent");
+        meters.continuity_rematerialized_at_unix_millis = Some(admitted_at);
+        assert_eq!(meters.owed_steps(admitted_at), Some(0));
+        meters.continuity_attempt_streak = 3;
+        assert_eq!(meters.owed_steps(admitted_at), Some(2));
+    }
+
+    #[test]
+    fn a_v1_supervision_record_whose_inner_schema_differs_is_refused() -> Result<()> {
+        let meters = restarted_ago(&[200_000])?;
+        let payload = rmp_serde::to_vec(&(
+            "idunn.some_other_schema",
+            &meters.target,
+            &meters.route_actuations,
+            &meters.continuity_restarts,
+            &meters.continuity_deferred_until,
+            &meters.continuity_deferral_reason,
+            &meters.route_survivals,
+        ))?;
+        assert!(
+            read_supervision_record(&supervision_envelope_raw(payload, TARGET_SUPERVISION_SCHEMA_V1)?)
+                .is_err()
+        );
+        Ok(())
+    }
+
     mod after_a_reboot {
         use super::*;
 
@@ -16582,6 +16719,30 @@ mod tests {
             world.engine.supervise_one_admitted_generation()?;
             assert_eq!(continuity_mints(&world)?, 1);
             assert_eq!(meters_of(&world, "service")?.continuity_attempt_streak, 1);
+            Ok(())
+        }
+
+        #[test]
+        fn a_running_pass_keeps_the_re_materialization_so_the_next_death_still_waits() -> Result<()> {
+            let workload = SwitchWorkload::new();
+            let world = EngineFixture::with_workload(workload.clone())?;
+            admit_incumbent(&world)?;
+            age_incumbent(&world, 700_000)?;
+            workload.reboot();
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(resident_continuity(&world)?, 1);
+            drop_continuity(&world)?;
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(resident_continuity(&world)?, 0, "the gap");
+            // Seen running, then dead again: the failed attempt still counts.
+            workload.revive();
+            world.engine.supervise_one_admitted_generation()?;
+            workload.kill();
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(resident_continuity(&world)?, 0, "no gap after the failed attempt");
+            anchor_ago(&world, 5_001)?;
+            world.engine.supervise_one_admitted_generation()?;
+            assert_eq!(resident_continuity(&world)?, 1);
             Ok(())
         }
     }
