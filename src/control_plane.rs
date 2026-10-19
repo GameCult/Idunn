@@ -9750,14 +9750,10 @@ fn bounded_detail(value: &str) -> String {
     if value.len() <= DETAIL_LIMIT {
         return value;
     }
-    let mut head = DETAIL_HEAD;
-    while !value.is_char_boundary(head) {
-        head -= 1;
-    }
-    let mut tail = value.len() - (DETAIL_LIMIT - DETAIL_HEAD - DETAIL_ELISION.len());
-    while !value.is_char_boundary(tail) {
-        tail += 1;
-    }
+    let head = value.floor_char_boundary(DETAIL_HEAD);
+    let tail = value.ceil_char_boundary(
+        value.len() - (DETAIL_LIMIT - DETAIL_HEAD - DETAIL_ELISION.len()),
+    );
     format!("{}{DETAIL_ELISION}{}", &value[..head], &value[tail..])
 }
 
