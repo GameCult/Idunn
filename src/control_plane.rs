@@ -13417,12 +13417,24 @@ mod tests {
     }
 
     #[test]
-    fn a_drain_is_timed_to_its_retire_time_plus_committing() -> Result<()> {
+    fn a_drain_whose_stored_plan_no_longer_parses_is_still_bounded() -> Result<()> {
+        let (mut draining, promoted_at) = promoted_draining_record()?;
+        let committing = u64::from(draining.plan.as_ref().unwrap().phase_deadlines().committing_seconds) * 1000;
+        // A binding the running binary refuses: the drain seconds cannot be read.
+        draining.plan.as_mut().unwrap().binding_blob = b"not an operator binding".to_vec();
+        assert!(draining.plan.as_ref().unwrap().parsed_inputs().is_err());
+        draining.retime(promoted_at + 1);
+        let deadline = draining.phase_deadline.context("an unparsable plan left the drain with no deadline")?;
+        assert_eq!(deadline.deadline_at_unix_millis, promoted_at + 1 + committing);
+        assert!(!draining.leaves_to_operator(deadline.deadline_at_unix_millis - 1));
+        assert!(draining.leaves_to_operator(deadline.deadline_at_unix_millis));
+        Ok(())
+    }
+
+    /// A Complete record draining its incumbent, whose route was promoted at
+    /// the returned time.
+    fn promoted_draining_record() -> Result<(DeploymentTransaction, u64)> {
         let (_, mut draining) = fixture_transaction(FIXTURE_TRANSACTIONS[4].1)?;
-        let plan = draining.plan.clone().unwrap();
-        let drain = u64::from(plan.parsed_inputs()?.1.rollout.drain_seconds) * 1000;
-        let committing = u64::from(plan.phase_deadlines().committing_seconds) * 1000;
-        assert!(drain > 0 && committing > 0, "the fixture must make both terms matter");
         draining.phase = DeploymentPhase::Complete;
         draining.completion = Some(TransactionCompletion::Admitted {
             generation_id: "generation-new".into(),
@@ -13441,6 +13453,16 @@ mod tests {
             }
             other => bail!("the fixture is not promoted: {other:?}"),
         }
+        Ok((draining, promoted_at))
+    }
+
+    #[test]
+    fn a_drain_is_timed_to_its_retire_time_plus_committing() -> Result<()> {
+        let (mut draining, promoted_at) = promoted_draining_record()?;
+        let plan = draining.plan.clone().unwrap();
+        let drain = u64::from(plan.parsed_inputs()?.1.rollout.drain_seconds) * 1000;
+        let committing = u64::from(plan.phase_deadlines().committing_seconds) * 1000;
+        assert!(drain > 0 && committing > 0, "the fixture must make both terms matter");
 
         // Before the retire time: the retire time plus the committing duration.
         draining.retime(promoted_at + 1);
@@ -15789,6 +15811,104 @@ mod tests {
         Ok(())
     }
 
+    /// A workload port whose observation deletes every live transaction from
+    /// the control store once armed: the step ends, and the record is simply
+    /// gone, archived nowhere.
+    struct VanishingWorkload {
+        store: Mutex<Option<PathBuf>>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl WorkloadPort for VanishingWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            StillWorkload.install(plan, release)
+        }
+        fn prepare_activation(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            launch: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            StillWorkload.prepare_activation(plan, expected, launch)
+        }
+        fn start_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &SealedRelease,
+            installed: &crate::drivers::InstalledReleaseObservation,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            StillWorkload.start_prepared(plan, release, installed, expected, activation)
+        }
+        fn discard_prepared(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            StillWorkload.discard_prepared(plan, expected, activation)
+        }
+        fn observe(
+            &self,
+            expected: &IdunnExpectedIncarnationRecord,
+            activation: &IdunnRuntimeActivationRecord,
+            prior: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                let path = self.store.lock().unwrap().clone().context("no store")?;
+                let gone = ControlSnapshot::read(&path)?
+                    .transactions
+                    .into_iter()
+                    .map(|stored| stored.envelope)
+                    .collect::<Vec<_>>();
+                assert!(SingleFileMessagePackBackingStore::new(&path).delete_batch_if_unchanged(&gone)?);
+            }
+            StillWorkload.observe(expected, activation, prior)
+        }
+        fn stop(&self, observation: &WorkloadObservation) -> Result<()> {
+            StillWorkload.stop(observation)
+        }
+        fn is_permanently_stopped(&self, observation: &WorkloadObservation) -> Result<bool> {
+            StillWorkload.is_permanently_stopped(observation)
+        }
+        fn lost_to_host_reboot(&self, observation: &WorkloadObservation, at: u64) -> Result<bool> {
+            StillWorkload.lost_to_host_reboot(observation, at)
+        }
+    }
+
+    /// The step that ends a transaction archives it in its own write, so a
+    /// record gone from the live set is finished only if history holds it. One
+    /// that vanished from both is a fault, never progress.
+    #[test]
+    fn a_transaction_gone_from_both_the_live_set_and_history_is_a_fault() -> Result<()> {
+        let workload = Arc::new(VanishingWorkload {
+            store: Mutex::new(None),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let world = EngineFixture::with_workload(workload.clone())?;
+        *workload.store.lock().unwrap() = Some(world.state_store.clone());
+        let live = transaction_at(&world, DeploymentPhase::Warming)?;
+        let id = live.transaction_id.as_str();
+        // The Warming step waits for Odin; waiting again rewrites nothing, so
+        // the step succeeds without touching the record it will find missing.
+        world.engine.resume_candidate(&resident_id(&world, id)?)?;
+        assert!(resident_id(&world, id)?.value.last_error.is_some(), "the Warming step did not wait");
+        workload.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        world.engine.resume_backoff.lock().unwrap().clear();
+        let error = world
+            .engine
+            .resume_candidate(&resident_id(&world, id)?)
+            .expect_err("a record gone from both stores was read as a finished one");
+        assert!(format!("{error:#}").contains("disappeared while checking scheduler progress"), "{error:#}");
+        assert!(read_history_transactions(&world.state_store).is_empty());
+        Ok(())
+    }
+
     // ---- fix 2: supervision owns the Expected-only precondition ----
 
     #[test]
@@ -16970,6 +17090,13 @@ mod tests {
         Ok((deploy, continuity, incumbent))
     }
 
+    // BEGIN c2b-forever-wait harness
+    // The forever-waits of cut c2b, driven through the API that exists at
+    // 9ea6c71 (the base): each test ends on the waiter's own record, so at the
+    // base it fails at the waiter assertion (still waiting), never at setup.
+    // Lines ending in `head-only` read what only the cut adds (the incident
+    // store, `leaves_to_operator`); the base probe strips them.
+
     /// One scheduler pass over every live transaction, with no resume backoff
     /// standing between it and the step.
     fn resume_pass(world: &EngineFixture) -> Result<bool> {
@@ -16995,6 +17122,32 @@ mod tests {
         replace_transaction(&world.state_store, &current, &next)
     }
 
+    /// The deadline of `id`, when it has one, is already behind it. A record
+    /// that has none is left alone: at the base nothing times it, and the
+    /// scenario must still run to the waiter's assertion.
+    fn age_deadline_of(world: &EngineFixture, id: &str) -> Result<()> {
+        if resident_id(world, id)?.value.phase_deadline.is_some() {
+            pass_deadline_of(world, id)?;
+        }
+        Ok(())
+    }
+
+    /// The deployment `waiter_id` ended before fencing, with a cause naming
+    /// the owner it will not wait for.
+    fn assert_ended_for_owner(world: &EngineFixture, waiter_id: &str, owner_id: &str) -> Result<()> {
+        let ended = latest_id(world, waiter_id)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the waiting deployment did not end: {:?} {:?}", ended.phase, ended.last_error);
+        };
+        assert!(error.contains("owner-left-to-operator") && error.contains(owner_id), "{error}");
+        assert!(ended.fencing.is_none());
+        Ok(())
+    }
+
+    fn operator_required(world: &EngineFixture) -> Result<Vec<String>> {
+        world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired) // head-only
+    }
+
     /// NEGATIVE (a). A continuity that owns the target is aborting and its
     /// abort step fails on every attempt. Its deadline passes: Idunn leaves it
     /// to the operator and keeps it owned, and the deployment waiting behind it
@@ -17013,35 +17166,265 @@ mod tests {
 
         // Before the deadline the deployment waits on a bounded owner, and no
         // one is paged.
-        assert!(world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?.is_empty());
+        assert!(operator_required(&world)?.is_empty()); // head-only
         for _ in 0..3 {
             resume_pass(&world)?;
         }
         let waiting = resident_id(&world, deploy_id)?.value;
         assert!(waiting.pre_fencing_abort.is_none());
         assert!(waiting.last_error.as_deref().is_some_and(|note| note.contains(owner_id)));
-        assert!(!resident_id(&world, owner_id)?.value.leaves_to_operator(now_millis()?));
+        assert!(!resident_id(&world, owner_id)?.value.leaves_to_operator(now_millis()?)); // head-only
 
-        pass_deadline_of(&world, owner_id)?;
-        for _ in 0..10 {
+        age_deadline_of(&world, owner_id)?;
+        for _ in 0..20 {
             resume_pass(&world)?;
         }
         let owner = resident_id(&world, owner_id)?.value;
         assert!(!owner.is_terminal() && owner.post_fencing_abort.is_some(), "the owner was ended");
         assert!(owner.owns_target());
         // Exactly one incident, however many passes ran.
-        assert_eq!(
-            world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?,
-            [owner_id]
-        );
-        let ended = latest_id(&world, deploy_id)?;
-        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
-            bail!("the waiting deployment did not end: {:?} {:?}", ended.phase, ended.last_error);
+        assert_eq!(operator_required(&world)?, [owner_id]); // head-only
+        assert_ended_for_owner(&world, deploy_id, owner_id)
+    }
+
+    /// NEGATIVE (b). An admitted transaction drains its incumbent and the stop
+    /// keeps failing. A deployment waits behind it until the drain's deadline,
+    /// then ends itself; the drain stays and the target stays owned.
+    #[test]
+    fn a_waiting_deployment_ends_when_a_drain_whose_stop_keeps_failing_is_left_to_the_operator(
+    ) -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let incumbent = admit_incumbent(&world)?;
+        let drainer = seeded_transaction(&world, DeploymentPhase::Fencing, CommandKind::Deploy, Some(&incumbent))?;
+        odin_reports_ready(&world, &drainer, seeded_sequence(Some(&incumbent)) + 1)?;
+        let drainer_id = drainer.transaction_id.as_str();
+        drive_id(&world, drainer_id, |t| t.phase == DeploymentPhase::Complete)?;
+        let draining = resident_id(&world, drainer_id)?.value;
+        assert!(draining.drains_incumbent(), "the incumbent was already retired");
+        assert!(draining.phase_deadline.is_some(), "a draining record has no deadline"); // head-only
+        let Some(PostCommitCleanup { incumbent: IncumbentCleanupEvidence::Pending { workload: old, .. }, .. }) =
+            &draining.post_commit_cleanup
+        else {
+            bail!("no pending incumbent: {:?}", draining.post_commit_cleanup);
         };
-        assert!(error.contains("owner-left-to-operator") && error.contains(owner_id), "{error}");
-        assert!(ended.fencing.is_none());
+        let WorkloadObservation::Systemd(old) = old else { bail!("incumbent is not a systemd unit") };
+        workload.fail_stop_of(&old.runtime_instance_id);
+
+        let admitted = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("nothing admitted")?
+            .value
+            .clone();
+        let waiter = seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&admitted))?;
+        let waiter_id = waiter.transaction_id.as_str();
+        for _ in 0..3 {
+            resume_pass(&world)?;
+        }
+        let waiting = resident_id(&world, waiter_id)?.value;
+        assert!(waiting.pre_fencing_abort.is_none());
+        assert!(waiting.last_error.as_deref().is_some_and(|note| note.contains(drainer_id)), "{:?}", waiting.last_error);
+        assert_eq!(waiting.phase_deadline, None, "the waiter's deadline is armed under a bounded owner");
+        assert!(operator_required(&world)?.is_empty()); // head-only
+
+        age_deadline_of(&world, drainer_id)?;
+        for _ in 0..20 {
+            resume_pass(&world)?;
+        }
+        assert!(!resident_id(&world, drainer_id)?.value.is_terminal(), "the drain was ended");
+        assert_eq!(operator_required(&world)?, [drainer_id]); // head-only
+        assert_ended_for_owner(&world, waiter_id, drainer_id)
+    }
+
+    /// A stop-then-start transaction held in Warming with a started unit, as
+    /// the Starting step leaves it.
+    fn warm_stop_first(world: &EngineFixture, id: &str) -> Result<()> {
+        let stored = resident_id(world, id)?;
+        let mut next = stored.value.clone();
+        let expected = next.expected.clone().context("no Expected")?;
+        let now = now_millis()?;
+        let launch = IdunnRuntimeActivationLaunch::issue(
+            &expected,
+            runtime_instance_id(&next.transaction_id)?,
+            now,
+            &world.engine.idunn_signer,
+        )?;
+        let mut seed = Vec::new();
+        let activation = launch.write_credential(&mut seed)?;
+        let mut workload = fixture_transaction(FIXTURE_TRANSACTIONS[0].1)?
+            .1
+            .workload
+            .context("no recorded workload")?;
+        match &mut workload {
+            WorkloadObservation::Systemd(observed) => {
+                observed.runtime_instance_id = activation.runtime_instance_id.clone();
+                observed.executable_sha256 = expected.artifact_sha256.clone();
+            }
+            WorkloadObservation::Host(_) => bail!("recorded workload is not a systemd unit"),
+        }
+        next.expected_publication_sha256 = Some(expected.canonical_sha256()?);
+        next.activation_publication_sha256 = Some(activation.canonical_sha256()?);
+        next.activation = Some(activation);
+        next.workload = Some(workload);
+        next.enter_phase(DeploymentPhase::Warming, now);
+        replace_transaction(&world.state_store, &stored, &next)
+    }
+
+    /// The stop-then-start binding of `stop_first_binding`, on a systemd unit
+    /// instead of a host actuator: its Warming step observes the unit through
+    /// the world's workload port and waits for Odin's word, where the
+    /// host-actuator step of a world that serves no actuator errs at once.
+    fn stop_first_systemd_binding(world: &EngineFixture) -> Result<String> {
+        use crate::deployment_plan::tests::BINDING;
+        let host_runner = "[runners.rust]\ndriver = \"host-native\"\naffordances = [\"source-read\", \"artifact-write\"]\nallowed_programs = [\"cargo\"]\n\n";
+        let (head, rest) = BINDING.split_once("[runners.rust]").context("no runner")?;
+        let (_, rest) = rest.split_once("[workload]").context("no workload")?;
+        let (workload, rest) = rest.split_once("[runtime_identity]").context("no identity")?;
+        let (identity, rest) = rest.split_once("[route]").context("no route")?;
+        let (_, brakes) = rest.split_once("[brakes]").context("no brakes")?;
+        bind_provider(
+            world,
+            &format!("{head}{host_runner}[workload]{workload}[runtime_identity]{identity}[brakes]{brakes}")
+                .replace("candidate-then-promote", "stop-then-start"),
+        )
+    }
+
+    /// A stop-then-start deployment and continuity over one incumbent, on a
+    /// systemd unit. The continuity is held in Warming with a started unit and
+    /// the deployment, one `enter` later, waits at its Sealing tail on it.
+    fn warm_stop_first_owner(
+        workload: Arc<SwitchWorkload>,
+    ) -> Result<(EngineFixture, String, String)> {
+        let world = EngineFixture::with_workload(workload)?;
+        let incumbent = admit_incumbent(&world)?;
+        let binding = stop_first_systemd_binding(&world)?;
+        let mut ids = Vec::new();
+        for kind in [CommandKind::Deploy, CommandKind::Continuity] {
+            let seeded =
+                seeded_transaction(&world, DeploymentPhase::Warming, kind, Some(&incumbent))?;
+            make_stop_first(&world, &seeded.transaction_id, &binding)?;
+            ids.push(seeded.transaction_id);
+        }
+        let continuity = ids.pop().context("no continuity")?;
+        let deploy = ids.pop().context("no deploy")?;
+        warm_stop_first(&world, &continuity)?;
+        let owner = resident_id(&world, &continuity)?;
+        assert_eq!(owner.value.phase, DeploymentPhase::Warming);
+        assert!(owner.value.owns_target());
+        let waiting = resident_id(&world, &deploy)?;
+        world.engine.enter(&waiting, entering(&waiting, DeploymentPhase::Starting)?)?;
+        let held = resident_id(&world, &deploy)?.value;
+        assert_eq!(held.phase, DeploymentPhase::Sealing);
+        assert!(held.last_error.as_deref().is_some_and(|note| note.contains(&continuity)));
+        Ok((world, deploy, continuity))
+    }
+
+    /// NEGATIVE (c). A stop-then-start continuity takes the target at Starting
+    /// and waits in Warming for an Odin word that never comes: its step runs,
+    /// observes the unit and gate-waits. Its Warming deadline ends it, and the
+    /// deployment waiting at its Sealing tail takes the target.
+    #[test]
+    fn a_stop_first_owner_that_never_warms_ends_at_its_warming_deadline_and_the_waiter_takes_the_target(
+    ) -> Result<()> {
+        let (world, deploy, continuity) = warm_stop_first_owner(SwitchWorkload::new())?;
+        // The gate-wait is the Warming step itself, not an error of it.
+        for _ in 0..3 {
+            resume_pass(&world)?;
+        }
+        let waiting = resident_id(&world, &continuity)?.value;
+        assert_eq!(waiting.phase, DeploymentPhase::Warming);
+        assert!(waiting.pre_fencing_abort.is_none(), "the Warming step failed: {:?}", waiting.last_error);
+        assert!(waiting.last_error.is_some(), "the Warming step did not wait for Odin");
+        assert!(resident_id(&world, &deploy)?.value.last_error.as_deref().is_some_and(|n| n.contains(&continuity)));
+
+        age_deadline_of(&world, &continuity)?;
+        for _ in 0..12 {
+            if resident_id(&world, &continuity).is_err() {
+                break;
+            }
+            resume_pass(&world)?;
+        }
+        let ended = latest_id(&world, &continuity)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the owner did not end: {:?} {:?}", ended.phase, ended.last_error);
+        };
+        assert!(error.contains("Warming phase passed its deadline"), "{error}");
+        assert!(operator_required(&world)?.is_empty()); // head-only
+
+        // The pass that retired the owner, or the next, moves the waiter to
+        // Starting; stop there, before its Starting step runs.
+        for _ in 0..3 {
+            if resident_id(&world, &deploy)?.value.phase >= DeploymentPhase::Starting {
+                break;
+            }
+            resume_pass(&world)?;
+        }
+        let took = resident_id(&world, &deploy)?.value;
+        assert_eq!(took.phase, DeploymentPhase::Starting);
+        assert!(took.owns_target() && took.pre_fencing_abort.is_none());
         Ok(())
     }
+
+    /// The wedged pre-fence abort of a stop-then-start owner is paged too: the
+    /// waiter behind it ends, and one incident opens.
+    #[test]
+    fn a_waiting_deployment_ends_when_a_stop_first_owners_prefence_abort_is_left_to_the_operator(
+    ) -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let (world, deploy, owner) = warm_stop_first_owner(workload.clone())?;
+        workload.fail_stop_of(&runtime_instance_of(&world, &owner)?);
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident_id(&world, &owner)?, anyhow!("candidate refused"))?;
+        for _ in 0..3 {
+            resume_pass(&world)?;
+        }
+        // Before the abort's deadline: it waits, unpaged.
+        let aborting = resident_id(&world, &owner)?.value;
+        assert!(aborting.pre_fencing_abort.is_some() && !aborting.is_terminal());
+        assert!(operator_required(&world)?.is_empty()); // head-only
+        assert!(resident_id(&world, &deploy)?.value.pre_fencing_abort.is_none());
+
+        age_deadline_of(&world, &owner)?;
+        for _ in 0..20 {
+            resume_pass(&world)?;
+        }
+        let aborting = resident_id(&world, &owner)?.value;
+        assert!(!aborting.is_terminal() && aborting.owns_target(), "the owner was ended");
+        assert_eq!(operator_required(&world)?, [owner.as_str()]); // head-only
+        assert_ended_for_owner(&world, &deploy, &owner)
+    }
+
+    /// A waiter whose own pre-fence abort is wedged, beside an owner it will
+    /// not outlast, is paged by its own deadline: the owner's standing does not
+    /// excuse it.
+    #[test]
+    fn a_waiters_wedged_prefence_abort_is_paged_beside_a_standing_owner() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Fencing)?;
+        let (deploy_id, owner_id) = (deploy.transaction_id.as_str(), continuity.transaction_id.as_str());
+        workload.fail_stop_of(&runtime_instance_of(&world, deploy_id)?);
+        world
+            .engine
+            .begin_pre_fencing_abort(&resident_id(&world, deploy_id)?, anyhow!("candidate refused"))?;
+        for _ in 0..3 {
+            resume_pass(&world)?;
+        }
+        let aborting = resident_id(&world, deploy_id)?.value;
+        assert!(aborting.pre_fencing_abort.is_some() && !aborting.is_terminal());
+        assert!(!operator_required(&world)?.iter().any(|subject| subject == deploy_id)); // head-only
+
+        age_deadline_of(&world, deploy_id)?;
+        for _ in 0..3 {
+            resume_pass(&world)?;
+        }
+        assert!(!resident_id(&world, deploy_id)?.value.is_terminal());
+        assert!(operator_required(&world)?.iter().any(|subject| subject == deploy_id), "{owner_id}"); // head-only
+        Ok(())
+    }
+    // END c2b-forever-wait harness
 
     #[test]
     fn an_operator_required_incident_closes_when_its_transaction_ends() -> Result<()> {
@@ -17087,153 +17470,6 @@ mod tests {
         assert_eq!(closed.iter().filter(|record| record.subject == id).count(), 1);
         resume_pass(&world)?;
         assert_eq!(world.engine.incidents().read()?, closed, "a spent incident was written again");
-        Ok(())
-    }
-
-    /// NEGATIVE (b). An admitted transaction drains its incumbent and the stop
-    /// keeps failing. A deployment waits behind it until the drain's deadline,
-    /// then ends itself; the drain stays and the target stays owned.
-    #[test]
-    fn a_waiting_deployment_ends_when_a_drain_whose_stop_keeps_failing_is_left_to_the_operator(
-    ) -> Result<()> {
-        let workload = SwitchWorkload::new();
-        let world = EngineFixture::with_workload(workload.clone())?;
-        let incumbent = admit_incumbent(&world)?;
-        let drainer = seeded_transaction(&world, DeploymentPhase::Fencing, CommandKind::Deploy, Some(&incumbent))?;
-        odin_reports_ready(&world, &drainer, seeded_sequence(Some(&incumbent)) + 1)?;
-        let drainer_id = drainer.transaction_id.as_str();
-        drive_id(&world, drainer_id, |t| t.phase == DeploymentPhase::Complete)?;
-        let draining = resident_id(&world, drainer_id)?.value;
-        assert!(draining.drains_incumbent(), "the incumbent was already retired");
-        assert!(draining.phase_deadline.is_some(), "a draining record has no deadline");
-        match &draining.workload {
-            Some(WorkloadObservation::Systemd(_)) => {}
-            other => bail!("no workload: {other:?}"),
-        }
-        let Some(PostCommitCleanup { incumbent: IncumbentCleanupEvidence::Pending { workload: old, .. }, .. }) =
-            &draining.post_commit_cleanup
-        else {
-            bail!("no pending incumbent: {:?}", draining.post_commit_cleanup);
-        };
-        let WorkloadObservation::Systemd(old) = old else { bail!("incumbent is not a systemd unit") };
-        workload.fail_stop_of(&old.runtime_instance_id);
-
-        let admitted = ControlSnapshot::read(&world.state_store)?
-            .admitted_for("service")
-            .context("nothing admitted")?
-            .value
-            .clone();
-        let waiter = seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&admitted))?;
-        let waiter_id = waiter.transaction_id.as_str();
-        for _ in 0..3 {
-            resume_pass(&world)?;
-        }
-        let waiting = resident_id(&world, waiter_id)?.value;
-        assert!(waiting.pre_fencing_abort.is_none());
-        assert!(waiting.last_error.as_deref().is_some_and(|note| note.contains(drainer_id)), "{:?}", waiting.last_error);
-        assert_eq!(waiting.phase_deadline, None, "the waiter's deadline is armed under a bounded owner");
-
-        pass_deadline_of(&world, drainer_id)?;
-        for _ in 0..10 {
-            resume_pass(&world)?;
-        }
-        assert!(!resident_id(&world, drainer_id)?.value.is_terminal(), "the drain was ended");
-        assert_eq!(
-            world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?,
-            [drainer_id]
-        );
-        let ended = latest_id(&world, waiter_id)?;
-        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
-            bail!("the waiting deployment did not end: {:?} {:?}", ended.phase, ended.last_error);
-        };
-        assert!(error.contains("owner-left-to-operator") && error.contains(drainer_id), "{error}");
-        Ok(())
-    }
-
-    /// A stop-then-start transaction held in Warming with a started unit, as
-    /// the Starting step leaves it (this world serves no host actuator to
-    /// start one).
-    fn warm_stop_first(world: &EngineFixture, id: &str) -> Result<()> {
-        let stored = resident_id(world, id)?;
-        let mut next = stored.value.clone();
-        let expected = next.expected.clone().context("no Expected")?;
-        let now = now_millis()?;
-        let launch = IdunnRuntimeActivationLaunch::issue(
-            &expected,
-            runtime_instance_id(&next.transaction_id)?,
-            now,
-            &world.engine.idunn_signer,
-        )?;
-        let mut seed = Vec::new();
-        let activation = launch.write_credential(&mut seed)?;
-        let mut workload = fixture_transaction(FIXTURE_TRANSACTIONS[0].1)?
-            .1
-            .workload
-            .context("no recorded workload")?;
-        match &mut workload {
-            WorkloadObservation::Systemd(observed) => {
-                observed.runtime_instance_id = activation.runtime_instance_id.clone();
-                observed.executable_sha256 = expected.artifact_sha256.clone();
-            }
-            WorkloadObservation::Host(_) => bail!("recorded workload is not a systemd unit"),
-        }
-        next.expected_publication_sha256 = Some(expected.canonical_sha256()?);
-        next.activation_publication_sha256 = Some(activation.canonical_sha256()?);
-        next.activation = Some(activation);
-        next.workload = Some(workload);
-        next.enter_phase(DeploymentPhase::Warming, now);
-        replace_transaction(&world.state_store, &stored, &next)
-    }
-
-    /// NEGATIVE (c). A stop-then-start continuity takes the target at Starting
-    /// and waits in Warming for an Odin word that never comes. Its Warming
-    /// deadline ends it, and the deployment waiting at its Sealing tail takes
-    /// the target.
-    #[test]
-    fn a_stop_first_owner_that_never_warms_ends_at_its_warming_deadline_and_the_waiter_takes_the_target(
-    ) -> Result<()> {
-        use DeploymentPhase::{Starting, Warming};
-        let (world, deploy, continuity) = stop_first_world(SwitchWorkload::new())?;
-        warm_stop_first(&world, &continuity)?;
-        let owner = resident_id(&world, &continuity)?;
-        assert_eq!(owner.value.phase, Warming);
-        assert!(owner.value.owns_target() && owner.value.phase_deadline.is_some());
-        let waiting = resident_id(&world, &deploy)?;
-        world.engine.enter(&waiting, entering(&waiting, Starting)?)?;
-        let held = resident_id(&world, &deploy)?.value;
-        assert_eq!(held.phase, DeploymentPhase::Sealing);
-        assert!(held.last_error.as_deref().is_some_and(|note| note.contains(&continuity)));
-
-        pass_deadline_of(&world, &continuity)?;
-        world.engine.resume_candidate(&resident_id(&world, &continuity)?)?;
-        let aborting = resident_id(&world, &continuity)?.value;
-        let abort = aborting.pre_fencing_abort.clone().context("the deadline did not end Warming")?;
-        assert!(abort.error.contains("Warming phase passed its deadline"), "{}", abort.error);
-        // This world serves no host actuator, so the abandoned unit cannot be
-        // stopped here; the abort's cleanup is recorded done.
-        let mut cleaned = aborting.clone();
-        let intent = cleaned.pre_fencing_abort.as_mut().unwrap();
-        intent.candidate_cleanup = CleanupEvidence::Complete;
-        intent.topology_reconciliation = CleanupEvidence::Complete;
-        replace_transaction(&world.state_store, &resident_id(&world, &continuity)?, &cleaned)?;
-        for _ in 0..12 {
-            if resident_id(&world, &continuity).is_err() {
-                break;
-            }
-            world.engine.resume_backoff.lock().unwrap().clear();
-            world.engine.resume_candidate(&resident_id(&world, &continuity)?)?;
-        }
-        let ended = latest_id(&world, &continuity)?;
-        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
-            bail!("the owner did not end: {:?} {:?}", ended.phase, ended.last_error);
-        };
-        assert!(error.contains("Warming phase passed its deadline"), "{error}");
-
-        let waiting = resident_id(&world, &deploy)?;
-        world.engine.enter(&waiting, entering(&waiting, Starting)?)?;
-        let took = resident_id(&world, &deploy)?.value;
-        assert_eq!(took.phase, Starting);
-        assert!(took.owns_target() && took.pre_fencing_abort.is_none());
         Ok(())
     }
 
@@ -17458,13 +17694,12 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     /// The seeded transaction `id`, rewritten as the Sealing transaction of a
     /// stop-then-start target: the host-actuator plan, release and Expected,
     /// and none of the evidence that follows Sealing.
-    fn make_stop_first(world: &EngineFixture, id: &str) -> Result<()> {
+    fn make_stop_first(world: &EngineFixture, id: &str, binding: &str) -> Result<()> {
         use crate::deployment_plan::tests::{
             RECIPE, artifact_receipt, source,
         };
         let stored = resident_id(world, id)?;
         let mut next = stored.value.clone();
-        let binding = stop_first_binding(world)?;
         let recipe = RECIPE
             .split("[[dependencies]]")
             .next()
@@ -17533,11 +17768,12 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     ) -> Result<(EngineFixture, String, String)> {
         let world = EngineFixture::with_workload(workload)?;
         let incumbent = admit_incumbent(&world)?;
+        let binding = stop_first_binding(&world)?;
         let mut ids = Vec::new();
         for kind in [CommandKind::Deploy, CommandKind::Continuity] {
             let seeded =
                 seeded_transaction(&world, DeploymentPhase::Warming, kind, Some(&incumbent))?;
-            make_stop_first(&world, &seeded.transaction_id)?;
+            make_stop_first(&world, &seeded.transaction_id, &binding)?;
             ids.push(seeded.transaction_id);
         }
         let continuity = ids.pop().context("no continuity")?;
@@ -22589,6 +22825,69 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert!(held.post_fencing_abort.is_none(), "a leased deployment was aborted");
             assert_eq!(held.phase, DeploymentPhase::AwaitingReady);
             assert_eq!(held.last_error.as_deref(), Some("candidate is still warming"), "its step did not run");
+            Ok(())
+        }
+
+        /// The incident of a stateful deployment left to the operator is one
+        /// per episode. An operator's expiry before the deadline reports the
+        /// hold and pages no one; the deadline opens one incident; and the
+        /// incident closes as soon as the record is no longer left, while the
+        /// transaction goes on.
+        #[test]
+        fn a_stateful_deploys_incident_is_one_per_episode_and_follows_its_deadline() -> Result<()> {
+            let deploy =
+                build_routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false, true, CommandKind::Deploy)?;
+            deploy.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+            let held = deploy.transaction()?;
+            let id = held.transaction_id.as_str();
+            let open = || deploy.world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired);
+            let now = now_millis()?;
+            let request = ExpiryRequest {
+                schema_version: EXPIRY_REQUEST_SCHEMA.into(),
+                command_id: held.command_id.clone(),
+                requested_by: "operator".into(),
+                requested_at_unix_millis: now,
+            };
+            assert!(SingleFileMessagePackBackingStore::new(&deploy.world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: ExpiryRequest::TYPE.into(),
+                    key: request.command_id.clone(),
+                    current: None,
+                }],
+                &[expiry_request_envelope(&request, now)?],
+            )?);
+
+            // The operator asked, the deadline has not passed: nobody is paged,
+            // however many passes see the request.
+            for _ in 0..4 {
+                deploy.resume()?;
+            }
+            assert!(open()?.is_empty(), "an expiry before the deadline paged the operator");
+            assert!(deploy.world.engine.incidents().read()?.is_empty());
+            assert!(deploy.transaction()?.post_fencing_abort.is_none(), "a leased deployment was aborted");
+
+            // The deadline passes: one incident, not one per pass.
+            pass_deadline(&deploy.world)?;
+            for _ in 0..4 {
+                deploy.resume()?;
+            }
+            assert_eq!(open()?, [id]);
+            assert_eq!(deploy.world.engine.incidents().read()?.len(), 1);
+
+            // The record goes on with a deadline in the future (its step
+            // advanced): the incident closes while the transaction lives.
+            let current = resident(&deploy.world)?;
+            let mut next = current.value.clone();
+            let due = next.phase_deadline.as_mut().context("no deadline")?;
+            due.entered_at_unix_millis = now_millis()?;
+            due.deadline_at_unix_millis = due.entered_at_unix_millis + 3_600_000;
+            replace_transaction(&deploy.world.state_store, &current, &next)?;
+            deploy.resume()?;
+            assert!(!deploy.transaction()?.is_terminal());
+            assert!(open()?.is_empty(), "the incident outlived the episode");
+            let records = deploy.world.engine.incidents().read()?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].close_reason, Some(CloseReason::Recovered));
             Ok(())
         }
 
