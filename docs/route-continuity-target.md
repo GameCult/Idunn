@@ -52,12 +52,13 @@ web app and service through Idunn v2. The live evidence is on Yggdrasil:
    the admitted incarnation. The proof answers an Idunn challenge and is signed
    with the credential Idunn issued to that launch. Invariant 3 changes where the
    proof travels, not what it proves.
-5. **Every post-fencing phase ends.** Each phase after fencing has an admitted
-   deadline. When a deadline expires, Idunn resolves it: stateless targets abort
-   to the incumbent. Stateful targets get an explicit terminal record with a
-   named recovery. A granted lease that the process does not pick up within its
-   window is a named failure with an Idunn-owned recovery. It is never a silent
-   wait. Resumable-forever is gone.
+5. **Every post-fencing phase has a deadline and is never a silent wait.** A
+   deployment's stateless phase that passes its deadline aborts to its
+   incumbent. A continuity past its deadline is left to the operator
+   (operator-required incident) and retries its phase forward on a capped
+   backoff, because aborting it would stop the only running copy of the admitted
+   body (ruling post-fence-forward-retry). A stateful deployment is left to the
+   operator.
 6. **The admitted receipt describes the running incarnation.** Continuity
    commits update the admitted generation atomically, so the rollback path never
    meets drift between the receipt and the projection. Rollback demotes the exact
