@@ -35,7 +35,8 @@ use crate::deployment::{
     capability_compatible,
 };
 use crate::deployment_plan::{
-    CompiledDeploymentPlan, DependencyProviderAuthority, SealedRelease, compile_deployment_plan,
+    CompiledDeploymentPlan, DependencyProviderAuthority, PRE_FENCING_ABORT_DEADLINE_SECONDS,
+    SealedRelease, WARMING_DEADLINE_SECONDS, compile_deployment_plan,
 };
 use crate::drivers::{
     ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
@@ -925,8 +926,15 @@ impl LeaseAdoptionEvidence {
     }
 }
 
-/// When the transaction entered its current post-fencing phase and when that
-/// phase must end. Durations come from the plan's frozen `PhaseDeadlines`.
+/// The phases whose entry starts a deadline: the one spelling of it.
+const DEADLINE_PHASES: std::ops::RangeInclusive<DeploymentPhase> =
+    DeploymentPhase::Warming..=DeploymentPhase::Committing;
+
+/// What a live record is doing now and when that must end: a deadline phase
+/// from its entry, an abort from its beginning, a drain to its retire. The
+/// post-fencing durations come from the plan's frozen `PhaseDeadlines`; the
+/// rest are Idunn's. `DeploymentTransaction::deadline_for_current_activity`
+/// is the one derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PhaseDeadline {
@@ -936,7 +944,8 @@ struct PhaseDeadline {
 }
 
 impl PhaseDeadline {
-    /// `None` for a phase that has no deadline (pre-fencing and Complete).
+    /// `None` for a phase that has no deadline of its own (Sealing, Starting
+    /// and Complete).
     fn entering(
         phase: DeploymentPhase,
         plan: &CompiledDeploymentPlan,
@@ -944,6 +953,7 @@ impl PhaseDeadline {
     ) -> Option<Self> {
         let deadlines = plan.phase_deadlines();
         let seconds = match phase {
+            DeploymentPhase::Warming => WARMING_DEADLINE_SECONDS,
             DeploymentPhase::Fencing => deadlines.fencing_seconds,
             DeploymentPhase::Leasing => deadlines.leasing_seconds,
             DeploymentPhase::AwaitingReady => deadlines.awaiting_ready_seconds,
@@ -959,9 +969,12 @@ impl PhaseDeadline {
     }
 }
 
-/// How the deadline resolver ends a post-fencing phase.
+/// How the deadline resolver ends a deadline phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PhaseEnd {
+    /// Before the fence the transaction owns only its candidate: it ends
+    /// through its own pre-fencing abort.
+    AbortBeforeFencing,
     /// Abort through the post-fencing path. `lease_not_adopted` names a
     /// granted lease with no adoption evidence.
     Abort { lease_not_adopted: bool },
@@ -1720,25 +1733,112 @@ fn handover_phase(stops_incumbent_first: bool) -> DeploymentPhase {
 }
 
 impl DeploymentTransaction {
-    /// The one writer of `phase`. It stamps the update time and the phase
-    /// deadline together, so a record outside Fencing..=Committing carries no
-    /// deadline by construction. No other code assigns `phase`.
+    /// The one writer of `phase`. It stamps the update time and, through
+    /// `retime`, the deadline of what the record now does. No other code
+    /// assigns `phase`.
     fn enter_phase(&mut self, phase: DeploymentPhase, now: u64) {
         self.phase = phase;
         self.updated_at_unix_millis = now;
-        self.phase_deadline = self
-            .plan
-            .as_ref()
-            .and_then(|plan| PhaseDeadline::entering(phase, plan, now));
+        self.retime(now);
     }
 
-    /// A live transaction past the fence that is not already being aborted:
-    /// the only kind whose phase a deadline, or an operator's expiry, ends.
+    /// Whether the abort of the pre-fence path still has cleanup to do.
+    fn pre_fencing_abort_pending(&self) -> bool {
+        self.completion.is_none()
+            && self
+                .pre_fencing_abort
+                .as_ref()
+                .is_some_and(|abort| !abort.is_complete())
+    }
+
+    /// The one derivation of every duration the record is held to. (1) A
+    /// pending pre-fencing abort is timed from now by Idunn's constant. (2) A
+    /// draining Complete is timed from its incumbent's retire time (the route
+    /// promotion plus the drain, or now when nothing was promoted) for the
+    /// plan's committing duration. (3) Any other Complete has none. (4) The
+    /// rest take their phase's duration from now, so a post-fencing abort gets
+    /// the frozen duration of the phase it aborts, counted from its beginning.
+    fn deadline_for_current_activity(&self, now: u64) -> Option<PhaseDeadline> {
+        if self.pre_fencing_abort_pending() {
+            return Some(PhaseDeadline {
+                phase: self.phase,
+                entered_at_unix_millis: now,
+                deadline_at_unix_millis: now.saturating_add(
+                    u64::from(PRE_FENCING_ABORT_DEADLINE_SECONDS) * 1000,
+                ),
+            });
+        }
+        if self.phase == DeploymentPhase::Complete {
+            if !matches!(self.completion, Some(TransactionCompletion::Admitted { .. }))
+                || !self.drains_incumbent()
+            {
+                return None;
+            }
+            let plan = self.plan.as_ref()?;
+            let from = match self
+                .routing
+                .as_ref()
+                .and_then(RoutingEvidence::promoted_at_unix_millis)
+            {
+                Some(promoted_at) => {
+                    route_drain_deadline(promoted_at, plan.parsed_inputs().ok()?.1.rollout.drain_seconds)
+                        .ok()?
+                }
+                None => now,
+            };
+            return Some(PhaseDeadline {
+                phase: self.phase,
+                entered_at_unix_millis: now,
+                deadline_at_unix_millis: from
+                    .max(now)
+                    .saturating_add(u64::from(plan.phase_deadlines().committing_seconds) * 1000),
+            });
+        }
+        PhaseDeadline::entering(self.phase, self.plan.as_ref()?, now)
+    }
+
+    /// Stamp the deadline of what the record does now. The only non-test
+    /// writer that sets one: phase entry, an abort's beginning, the commit to a
+    /// draining Complete and the resolver's lift call it.
+    fn retime(&mut self, now: u64) {
+        self.phase_deadline = self.deadline_for_current_activity(now);
+    }
+
+    /// Whether a deadline can describe the record's current activity: a
+    /// deadline phase, a pending pre-fencing abort, or an admitted Complete.
+    fn carries_a_deadline(&self) -> bool {
+        DEADLINE_PHASES.contains(&self.phase)
+            || self.pre_fencing_abort_pending()
+            || (self.phase == DeploymentPhase::Complete
+                && matches!(self.completion, Some(TransactionCompletion::Admitted { .. })))
+    }
+
+    /// A live transaction in a deadline phase that is not already being
+    /// aborted: the only kind whose phase a deadline, or an operator's expiry,
+    /// ends.
     fn resolves_by_deadline(&self) -> bool {
         self.completion.is_none()
             && self.pre_fencing_abort.is_none()
             && self.post_fencing_abort.is_none()
-            && (DeploymentPhase::Fencing..=DeploymentPhase::Committing).contains(&self.phase)
+            && DEADLINE_PHASES.contains(&self.phase)
+    }
+
+    /// Whether Idunn has run out of ways to end this record and leaves it to
+    /// the operator: its deadline has passed in an abort that cannot finish, a
+    /// drain whose stop keeps failing, or a stateful deploy. Derived, never
+    /// stored. The step goes on retrying and the target stays owned.
+    fn leaves_to_operator(&self, now: u64) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        let Some(deadline) = &self.phase_deadline else {
+            return false;
+        };
+        now >= deadline.deadline_at_unix_millis
+            && (self.pre_fencing_abort.is_some()
+                || self.post_fencing_abort.is_some()
+                || self.drains_incumbent()
+                || (self.resolves_by_deadline() && self.phase_end() == PhaseEnd::OperatorRequired))
     }
 
     /// What an ended post-fencing phase resolves to (Q3). A candidate that was
@@ -1750,6 +1850,9 @@ impl DeploymentTransaction {
     /// new state contract, and restoring the incumbent over that is not
     /// Idunn's call: it is left for the operator.
     fn phase_end(&self) -> PhaseEnd {
+        if self.phase < DeploymentPhase::Fencing {
+            return PhaseEnd::AbortBeforeFencing;
+        }
         let leasing = self.leasing.as_ref();
         let granted = leasing.and_then(LeasingEvidence::lease).is_some();
         let issued = leasing.and_then(LeasingEvidence::issued_lease).is_some();
@@ -2150,11 +2253,10 @@ impl DeploymentTransaction {
         if let Some(deadline) = &self.phase_deadline {
             ensure!(
                 deadline.phase == self.phase
-                    && (DeploymentPhase::Fencing..=DeploymentPhase::Committing)
-                        .contains(&deadline.phase)
+                    && self.carries_a_deadline()
                     && deadline.entered_at_unix_millis > 0
                     && deadline.deadline_at_unix_millis > deadline.entered_at_unix_millis,
-                "phase deadline does not describe the current post-fencing phase"
+                "phase deadline does not describe the record's current activity"
             );
         }
         if let Some(adoption) = &self.lease_adoption {
@@ -3012,7 +3114,7 @@ fn expire(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
     );
     ensure!(
         current.value.resolves_by_deadline(),
-        "only a live transaction past the fence, and not already aborting, can be expired; before the fence, use idunn cancel"
+        "only a live transaction in Warming through Committing, and not already aborting, can be expired; before Warming, use idunn cancel"
     );
     let now = now_millis()?;
     let request = ExpiryRequest {
@@ -7849,6 +7951,9 @@ impl Engine {
             generation_id: generation.generation_id.clone(),
         });
         complete.post_commit_cleanup = Some(post_commit_cleanup);
+        // enter_phase ran before the cleanup was set: a draining record
+        // carries its drain's deadline.
+        complete.retime(now);
         complete.validate()?;
 
         let admitted_expected = CultCacheExpectedEnvelope {
@@ -9205,9 +9310,10 @@ impl Engine {
     /// command an operator asked to expire, is resolved as `phase_end` says.
     /// Returns `Some(moved)` when it decided the tick, `None` to run the step.
     ///
-    /// The deadline is written only by `enter_phase`, so nothing here or in a
-    /// resume path extends it. A record lifted from before deadlines existed
-    /// has none; its phase is timed once, from the first time this sees it.
+    /// Only `retime` sets a deadline (at phase entry, an abort's beginning, the
+    /// commit and this lift), so nothing in a step or a resume path extends one.
+    /// A record lifted from before deadlines existed has none; what it does is
+    /// timed once, from the first time this sees it.
     fn resolve_phase_deadline(
         &self,
         current: &Stored<DeploymentTransaction>,
@@ -9248,6 +9354,10 @@ impl Engine {
                     anyhow!("{cause}")
                 };
                 self.begin_post_fencing_abort(current, error)?;
+                Ok(Some(true))
+            }
+            PhaseEnd::AbortBeforeFencing => {
+                self.begin_pre_fencing_abort(current, anyhow!("{cause}"))?;
                 Ok(Some(true))
             }
             PhaseEnd::OperatorRequired => {
@@ -9313,8 +9423,10 @@ impl Engine {
             "pre-fencing abort intent is already durable"
         );
         let abort = pre_fencing_abort_intent(&current.value, &format!("{error:#}"));
+        let now = now_millis()?;
         self.persist_same_phase(current, |next| {
             next.pre_fencing_abort = Some(abort);
+            next.retime(now);
             Ok(())
         })
     }
@@ -9348,8 +9460,10 @@ impl Engine {
             "post-fencing abort intent is already durable"
         );
         let abort = post_fencing_abort_intent(&current.value, &truncate(&format!("{error:#}"), 2048));
+        let now = now_millis()?;
         self.persist_same_phase(current, |next| {
             next.post_fencing_abort = Some(abort);
+            next.retime(now);
             Ok(())
         })
     }
@@ -12391,11 +12505,12 @@ mod tests {
     }
 
     #[test]
-    fn phase_deadlines_follow_the_plan_and_only_cover_post_fencing_phases() -> Result<()> {
+    fn phase_deadlines_follow_the_plan_and_cover_warming_through_committing() -> Result<()> {
         let (_, generation) = fixture_generation(FIXTURE_GENERATION)?;
         let plan = &generation.plan;
         let defaults = plan.phase_deadlines();
         for (phase, seconds) in [
+            (DeploymentPhase::Warming, WARMING_DEADLINE_SECONDS),
             (DeploymentPhase::Fencing, defaults.fencing_seconds),
             (DeploymentPhase::Leasing, defaults.leasing_seconds),
             (DeploymentPhase::AwaitingReady, defaults.awaiting_ready_seconds),
@@ -12410,7 +12525,6 @@ mod tests {
         for phase in [
             DeploymentPhase::Sealing,
             DeploymentPhase::Starting,
-            DeploymentPhase::Warming,
             DeploymentPhase::Complete,
         ] {
             assert!(PhaseDeadline::entering(phase, plan, 1_000).is_none());
@@ -12467,7 +12581,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deadline_must_describe_the_current_post_fencing_phase() -> Result<()> {
+    fn a_deadline_must_describe_the_records_current_activity() -> Result<()> {
         let (_, mut transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[2].1)?;
         let plan = transaction.plan.clone().unwrap();
         let now = transaction.updated_at_unix_millis;
@@ -12482,10 +12596,25 @@ mod tests {
         backwards.phase_deadline.as_mut().unwrap().deadline_at_unix_millis = now;
         assert!(backwards.validate().is_err());
         // Entry is not ordered against the wall-clock stamp of later writes.
-        let mut entered_after_the_stamp = transaction;
+        let mut entered_after_the_stamp = transaction.clone();
         entered_after_the_stamp.phase_deadline =
             PhaseDeadline::entering(DeploymentPhase::AwaitingReady, &plan, now + 1);
         entered_after_the_stamp.validate()?;
+
+        // The activity rule: Warming carries a deadline; Sealing only while
+        // its abort is pending; Complete only once admitted.
+        let mut other = transaction.clone();
+        other.phase = DeploymentPhase::Warming;
+        assert!(other.carries_a_deadline());
+        other.phase = DeploymentPhase::Sealing;
+        assert!(!other.carries_a_deadline(), "Sealing has no activity to time");
+        other.pre_fencing_abort = Some(pre_fencing_abort_intent(&other, "refused"));
+        assert!(other.carries_a_deadline());
+        other.pre_fencing_abort = None;
+        other.phase = DeploymentPhase::Complete;
+        assert!(!other.carries_a_deadline());
+        other.completion = Some(TransactionCompletion::Admitted { generation_id: "g".into() });
+        assert!(other.carries_a_deadline());
         Ok(())
     }
 
@@ -13019,8 +13148,8 @@ mod tests {
 
     /// One engine step of transaction `id` at a time until `stop` holds,
     /// recording each phase entered and checking after every step that the
-    /// deadline on the record is exactly the current post-fencing phase's, and
-    /// absent outside one.
+    /// deadline on the record is exactly the current phase's, and absent
+    /// outside a deadline phase.
     fn drive_id(
         world: &EngineFixture,
         id: &str,
@@ -13038,10 +13167,12 @@ mod tests {
             let after = latest_id(world, id)?;
             match &after.phase_deadline {
                 Some(deadline) => assert_eq!(deadline.phase, after.phase),
+                // A waiter's Warming deadline is disarmed while another
+                // transaction owns the target.
                 None => assert!(
-                    !(DeploymentPhase::Fencing..=DeploymentPhase::Committing)
-                        .contains(&after.phase),
-                    "a post-fencing record lost its deadline"
+                    after.phase == DeploymentPhase::Warming
+                        || !DEADLINE_PHASES.contains(&after.phase),
+                    "a deadline-phase record lost its deadline"
                 ),
             }
             if phases.last() != Some(&after.phase) {
@@ -13087,15 +13218,28 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_fence_abort_runs_to_complete_without_a_deadline() -> Result<()> {
+    fn a_pre_fence_abort_is_timed_from_its_beginning_and_ends_without_a_deadline() -> Result<()> {
         let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
         transaction_at(&world, DeploymentPhase::Warming)?;
         let warming = resident(&world)?;
-        assert_eq!(warming.value.phase_deadline, None);
+        let warming_deadline = warming.value.phase_deadline.context("Warming has no deadline")?;
+        assert_eq!(
+            warming_deadline.deadline_at_unix_millis - warming_deadline.entered_at_unix_millis,
+            u64::from(WARMING_DEADLINE_SECONDS) * 1000
+        );
 
+        let before = now_millis()?;
         world
             .engine
             .begin_pre_fencing_abort(&warming, anyhow!("candidate refused"))?;
+        let aborting = latest(&world)?;
+        let deadline = aborting.phase_deadline.context("the abort has no deadline")?;
+        assert_eq!(deadline.phase, DeploymentPhase::Warming);
+        assert!(deadline.entered_at_unix_millis >= before);
+        assert_eq!(
+            deadline.deadline_at_unix_millis - deadline.entered_at_unix_millis,
+            u64::from(PRE_FENCING_ABORT_DEADLINE_SECONDS) * 1000
+        );
         drive(&world, |transaction| transaction.completion.is_some())?;
         let finished = latest(&world)?;
         assert_eq!(finished.phase, DeploymentPhase::Complete);
@@ -13136,6 +13280,96 @@ mod tests {
                 .is_none(),
             "an aborted candidate was admitted"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn an_abort_is_timed_from_its_beginning_with_its_phases_duration() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
+        odin_reports_ready(&world, &seeded, 5)?;
+        drive(&world, |transaction| {
+            transaction.phase == DeploymentPhase::Routing
+        })?;
+        // The phase's own deadline is long past when the abort begins.
+        let routing = resident(&world)?;
+        let mut stale = routing.value.clone();
+        let deadline = stale.phase_deadline.as_mut().context("Routing has no deadline")?;
+        deadline.entered_at_unix_millis = 1;
+        deadline.deadline_at_unix_millis = 2;
+        replace_transaction(&world.state_store, &routing, &stale)?;
+
+        let before = now_millis()?;
+        world
+            .engine
+            .begin_post_fencing_abort(&resident(&world)?, anyhow!("candidate refused"))?;
+        let aborting = latest(&world)?;
+        let deadline = aborting.phase_deadline.context("the abort has no deadline")?;
+        assert_eq!(deadline.phase, DeploymentPhase::Routing);
+        assert!(deadline.entered_at_unix_millis >= before);
+        let routing_millis =
+            u64::from(aborting.plan.as_ref().unwrap().phase_deadlines().routing_seconds) * 1000;
+        assert_eq!(
+            deadline.deadline_at_unix_millis - deadline.entered_at_unix_millis,
+            routing_millis
+        );
+        assert!(!aborting.leaves_to_operator(deadline.deadline_at_unix_millis - 1));
+        assert!(aborting.leaves_to_operator(deadline.deadline_at_unix_millis));
+        Ok(())
+    }
+
+    #[test]
+    fn a_drain_is_timed_to_its_retire_time_plus_committing() -> Result<()> {
+        let (_, mut draining) = fixture_transaction(FIXTURE_TRANSACTIONS[4].1)?;
+        let plan = draining.plan.clone().unwrap();
+        let drain = u64::from(plan.parsed_inputs()?.1.rollout.drain_seconds) * 1000;
+        let committing = u64::from(plan.phase_deadlines().committing_seconds) * 1000;
+        assert!(drain > 0 && committing > 0, "the fixture must make both terms matter");
+        draining.phase = DeploymentPhase::Complete;
+        draining.completion = Some(TransactionCompletion::Admitted {
+            generation_id: "generation-new".into(),
+        });
+        draining.post_commit_cleanup = Some(PostCommitCleanup {
+            incumbent: IncumbentCleanupEvidence::Pending {
+                generation_id: "generation-old".into(),
+                workload: workload(1001, 40, 50),
+            },
+            source: SourceCleanupEvidence::Complete,
+        });
+        let promoted_at = 10_000_000_u64;
+        match draining.routing.as_mut() {
+            Some(RoutingEvidence::Promoted { promoted_at_unix_millis, .. }) => {
+                *promoted_at_unix_millis = promoted_at;
+            }
+            other => bail!("the fixture is not promoted: {other:?}"),
+        }
+
+        // Before the retire time: the retire time plus the committing duration.
+        draining.retime(promoted_at + 1);
+        let deadline = draining.phase_deadline.context("a drain has no deadline")?;
+        assert_eq!(deadline.phase, DeploymentPhase::Complete);
+        assert_eq!(deadline.entered_at_unix_millis, promoted_at + 1);
+        assert_eq!(deadline.deadline_at_unix_millis, promoted_at + drain + committing);
+        assert!(!draining.leaves_to_operator(deadline.deadline_at_unix_millis - 1));
+        assert!(draining.leaves_to_operator(deadline.deadline_at_unix_millis));
+
+        // After it: the committing duration from now.
+        let late = promoted_at + drain + 5_000;
+        draining.retime(late);
+        assert_eq!(draining.phase_deadline.unwrap().deadline_at_unix_millis, late + committing);
+
+        // Nothing promoted: from now.
+        draining.routing = Some(RoutingEvidence::SkippedUnrouted);
+        draining.retime(promoted_at);
+        assert_eq!(draining.phase_deadline.unwrap().deadline_at_unix_millis, promoted_at + committing);
+
+        // A finished drain, and any other Complete, carry none.
+        draining.post_commit_cleanup = Some(PostCommitCleanup {
+            incumbent: IncumbentCleanupEvidence::Complete { generation_id: "generation-old".into() },
+            source: SourceCleanupEvidence::Complete,
+        });
+        draining.retime(promoted_at);
+        assert_eq!(draining.phase_deadline, None);
         Ok(())
     }
 
@@ -16277,6 +16511,7 @@ mod tests {
         let stored = resident(&world)?;
         let mut starting = seeded.clone();
         starting.phase = DeploymentPhase::Starting;
+        starting.phase_deadline = None;
         starting.expected_publication_sha256 = None;
         starting.activation = None;
         starting.workload = None;
@@ -16314,6 +16549,7 @@ mod tests {
         let stored = resident(world)?;
         let mut starting = seeded.clone();
         starting.phase = DeploymentPhase::Starting;
+        starting.phase_deadline = None;
         starting.expected_publication_sha256 = None;
         starting.activation = None;
         starting.workload = None;
@@ -21645,8 +21881,14 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         #[test]
         fn an_operator_expiry_ends_the_phase_through_the_resolver() -> Result<()> {
             let early = routed_world(Odin::Unreachable, 1, DeploymentPhase::Warming, false)?;
+            // Warming is a deadline phase: the operator can expire it, and
+            // the pre-fencing abort then ends it. Once aborting it cannot be
+            // expired again.
+            expire(&early.world.state_store, "continuity-service", "operator")?;
+            early.resume()?;
+            assert!(early.transaction()?.pre_fencing_abort.is_some(), "the expiry did not end Warming");
             let refused = expire(&early.world.state_store, "continuity-service", "operator")
-                .expect_err("a transaction before the fence was expired");
+                .expect_err("an aborting transaction was expired");
             assert!(format!("{refused:#}").contains("idunn cancel"), "{refused:#}");
 
             let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
