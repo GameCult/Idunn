@@ -1863,6 +1863,23 @@ impl DeploymentTransaction {
             && !(self.command_kind == CommandKind::Continuity && self.phase >= DeploymentPhase::Fencing)
     }
 
+    /// The operator's only way to restart a forward-retrying continuity, worded
+    /// from the driver its plan binds: a systemd target has a unit to stop (a
+    /// stopped transient unit is forgotten, which is permanently stopped); a
+    /// host-actuator target has no unit, only a process on the managed host
+    /// that the actuator then reports not running.
+    fn manual_exit(&self) -> &'static str {
+        match self
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.parsed_inputs().ok())
+            .map(|(_, binding)| binding.workload)
+        {
+            Some(WorkloadBinding::HostActuator(_)) => "kill its process on the managed host by hand",
+            _ => "stop its unit by hand",
+        }
+    }
+
     /// A continuity at or past Fencing that its deadline leaves to the operator
     /// while its step runs. It yields to a deployment awaiting the handover
     /// (ruling continuity-yields-to-deploy), so a waiter never ends on it.
@@ -3159,9 +3176,12 @@ fn expire(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
         current.value.expirable(),
         "{}",
         if current.value.command_kind == CommandKind::Continuity && current.value.phase >= DeploymentPhase::Fencing && current.value.post_fencing_abort.is_none() {
-            "a continuity past Fencing retries forward and cannot be expired; to restart it, stop its candidate unit and Idunn aborts it as dead"
+            format!(
+                "a continuity past Fencing retries forward and cannot be expired; to restart it, {} and Idunn aborts it as dead",
+                current.value.manual_exit()
+            )
         } else {
-            "only a live transaction in Warming through Committing, and not already aborting, can be expired; before Warming, use idunn cancel"
+            "only a live transaction in Warming through Committing, and not already aborting, can be expired; before Warming, use idunn cancel".to_owned()
         }
     );
     let now = now_millis()?;
@@ -5097,6 +5117,10 @@ struct Engine {
     /// Process-local on purpose: a restart retries at once, and no schema
     /// carries a clock that only pacing reads.
     resume_backoff: Mutex<BTreeMap<String, ResumeBackoff>>,
+    /// Continuity aborts the boot lift could not decide (their candidate could
+    /// not be observed): no step of them runs until `retry_held_lift` decides.
+    /// Process-local: a restart asks again at boot.
+    lift_held: Mutex<BTreeSet<String>>,
     /// When each routed target's next challenge is due, held only when the
     /// stored `RouteSupervisionState` could not record the last one. The stored
     /// value owns the schedule and survives restarts; this spaces attempts
@@ -5209,6 +5233,7 @@ impl Engine {
             history_report: ReportOnce::default(),
             fault_reports: Mutex::default(),
             resume_backoff: Mutex::default(),
+            lift_held: Mutex::default(),
             challenge_wait: Mutex::default(),
         })
     }
@@ -5682,6 +5707,17 @@ struct ProjectionReconciliation {
     unexplained: Vec<String>,
 }
 
+/// What the lift decided about one continuity abort.
+enum LiftDecision {
+    /// The abort was withdrawn and the record retimed.
+    Lifted,
+    /// The abort stands and runs: not a lift candidate, or its candidate is
+    /// provably dead.
+    KeepAborting,
+    /// The candidate could not be observed and is not provably dead.
+    Undecided(anyhow::Error),
+}
+
 impl Engine {
     /// Once at boot: withdraw the abort of a continuity that has not stopped
     /// its running candidate, and retime the record so its phase retries
@@ -5694,71 +5730,124 @@ impl Engine {
     /// or to yield to a deployment awaiting the handover, so this predicate
     /// matches only aborts over a running candidate with nothing awaiting the
     /// target, which Idunn no longer creates: it is a migration with a deletion
-    /// line (follow-up c2c-delete-boot-lift). A record it cannot decide is
-    /// reported and left aborting.
+    /// line (follow-up c2c-delete-boot-lift). A record whose candidate cannot
+    /// be observed is held, not aborted: `resume_candidate` runs no step of it
+    /// and asks `retry_held_lift` each pass, until observation answers (ruling
+    /// c2c-lift-defers-on-observe-error).
     fn return_wedged_continuity_aborts_forward(&self) -> Result<Vec<String>> {
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         let mut returned = Vec::new();
         for stored in &snapshot.transactions {
-            let transaction = &stored.value;
-            let Some(abort) = &transaction.post_fencing_abort else {
-                continue;
-            };
-            if transaction.command_kind != CommandKind::Continuity
-                || transaction.completion.is_some()
-                || abort.candidate_cleanup != CleanupEvidence::Pending
-                || abort.lease_withdrawal == CleanupEvidence::Complete
-                || snapshot
-                    .on_target(&transaction.target)
-                    .any(|other| other.value.awaits_handover())
-            {
-                continue;
-            }
-            let id = &transaction.transaction_id;
-            let lifted = (|| -> Result<bool> {
-                let plan = required(&transaction.plan, "transaction plan")?;
-                let expected = required(&transaction.expected, "Expected projection")?;
-                let activation = required(&transaction.activation, "activation")?;
-                let Some(workload) = &transaction.workload else {
-                    return Ok(false);
-                };
-                self.workload_for(plan)?
-                    .observe(expected, activation, workload)?;
-                if let Some(lease) = transaction
-                    .leasing
-                    .as_ref()
-                    .and_then(LeasingEvidence::issued_lease)
-                {
-                    let path = plan
-                        .parsed_inputs()?
-                        .1
-                        .process_write_lease
-                        .context("leased target has no write-lease binding")?
-                        .record_path;
-                    if !CultCacheWriteLeaseDriver::new(&transaction.target, path)
-                        .observe_exact(lease)?
-                    {
-                        return Ok(false);
-                    }
+            let id = &stored.value.transaction_id;
+            match self.consider_lifting_continuity_abort(&snapshot, stored) {
+                LiftDecision::Lifted => returned.push(id.clone()),
+                LiftDecision::KeepAborting => {}
+                LiftDecision::Undecided(error) => {
+                    eprintln!(
+                        "Idunn could not decide whether continuity {id} may retry forward; its abort is held, not run: {error:#}"
+                    );
+                    self.lift_held.lock().expect("lift held mutex").insert(id.clone());
                 }
-                let now = now_millis()?;
-                let mut next = transaction.clone();
-                next.post_fencing_abort = None;
-                next.last_error = Some(abort.error.clone());
-                next.updated_at_unix_millis = now;
-                next.retime(now);
-                replace_transaction(&self.options.state_store, stored, &next)?;
-                Ok(true)
-            })();
-            match lifted {
-                Ok(true) => returned.push(id.clone()),
-                Ok(false) => {}
-                Err(error) => eprintln!(
-                    "Idunn could not decide whether continuity {id} may retry forward; its abort is left running: {error:#}"
-                ),
             }
         }
         Ok(returned)
+    }
+
+    /// A held record's later pass: lift it, release it to its abort over
+    /// positive evidence of death, or keep holding. `Some(moved)` means the
+    /// pass is spent on the record; `None` lets the pass go on.
+    fn retry_held_lift(&self, current: &Stored<DeploymentTransaction>) -> Result<Option<bool>> {
+        let id = current.value.transaction_id.as_str();
+        if !self.lift_held.lock().expect("lift held mutex").contains(id) {
+            return Ok(None);
+        }
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        match self.consider_lifting_continuity_abort(&snapshot, current) {
+            LiftDecision::Undecided(error) => {
+                self.note_fault("holds continuity abort", id, &error);
+                Ok(Some(false))
+            }
+            LiftDecision::Lifted => {
+                self.lift_held.lock().expect("lift held mutex").remove(id);
+                self.clear_fault(id);
+                println!(
+                    "returned continuity {id} to forward retry: its abort had not stopped its running candidate"
+                );
+                Ok(Some(true))
+            }
+            LiftDecision::KeepAborting => {
+                self.lift_held.lock().expect("lift held mutex").remove(id);
+                self.clear_fault(id);
+                Ok(None)
+            }
+        }
+    }
+
+    /// The lift's predicate and write for one record. An abort proceeds only
+    /// over positive evidence that its candidate is dead; an observation that
+    /// merely errs is undecided.
+    fn consider_lifting_continuity_abort(
+        &self,
+        snapshot: &ControlSnapshot,
+        stored: &Stored<DeploymentTransaction>,
+    ) -> LiftDecision {
+        let transaction = &stored.value;
+        let Some(abort) = &transaction.post_fencing_abort else {
+            return LiftDecision::KeepAborting;
+        };
+        if transaction.command_kind != CommandKind::Continuity
+            || transaction.completion.is_some()
+            || abort.candidate_cleanup != CleanupEvidence::Pending
+            || abort.lease_withdrawal == CleanupEvidence::Complete
+            || snapshot
+                .on_target(&transaction.target)
+                .any(|other| other.value.awaits_handover())
+        {
+            return LiftDecision::KeepAborting;
+        }
+        let lifted = (|| -> Result<bool> {
+            let plan = required(&transaction.plan, "transaction plan")?;
+            let expected = required(&transaction.expected, "Expected projection")?;
+            let activation = required(&transaction.activation, "activation")?;
+            let Some(workload) = &transaction.workload else {
+                return Ok(false);
+            };
+            self.workload_for(plan)?
+                .observe(expected, activation, workload)?;
+            if let Some(lease) = transaction
+                .leasing
+                .as_ref()
+                .and_then(LeasingEvidence::issued_lease)
+            {
+                let path = plan
+                    .parsed_inputs()?
+                    .1
+                    .process_write_lease
+                    .context("leased target has no write-lease binding")?
+                    .record_path;
+                if !CultCacheWriteLeaseDriver::new(&transaction.target, path)
+                    .observe_exact(lease)?
+                {
+                    return Ok(false);
+                }
+            }
+            let now = now_millis()?;
+            let mut next = transaction.clone();
+            next.post_fencing_abort = None;
+            next.last_error = Some(abort.error.clone());
+            next.updated_at_unix_millis = now;
+            next.retime(now);
+            replace_transaction(&self.options.state_store, stored, &next)?;
+            Ok(true)
+        })();
+        match lifted {
+            Ok(true) => LiftDecision::Lifted,
+            Ok(false) => LiftDecision::KeepAborting,
+            Err(error) => match self.candidate_is_permanently_stopped(transaction) {
+                Ok(true) => LiftDecision::KeepAborting,
+                _ => LiftDecision::Undecided(error),
+            },
+        }
     }
 
     /// Once at boot: demote the activation a failed continuity left standing,
@@ -6086,6 +6175,9 @@ impl Engine {
     /// transaction would report progress every tick.
     fn resume_candidate(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
         let id = current.value.transaction_id.as_str();
+        if let Some(moved) = self.retry_held_lift(current)? {
+            return Ok(moved);
+        }
         if let Some(moved) = self.resolve_phase_deadline(current)? {
             if moved {
                 // A phase-ending write is movement: the next step is not held
@@ -9665,7 +9757,8 @@ impl Engine {
                 self.leave_to_operator(
                     transaction,
                     &format!(
-                        "{cause}; its candidate is the only running copy of the admitted body, so Idunn retries the phase forward and never stops it; to restart it, stop its unit by hand"
+                        "{cause}; its candidate is the only running copy of the admitted body, so Idunn retries the phase forward and never stops it; to restart it, {}",
+                        transaction.manual_exit()
                     ),
                 );
                 Ok(None)
@@ -16171,6 +16264,21 @@ mod tests {
         fn lost_to_host_reboot(&self, observation: &WorkloadObservation, at: u64) -> Result<bool> {
             StillWorkload.lost_to_host_reboot(observation, at)
         }
+    }
+
+    /// The operator's exit from a forward-retrying continuity is worded from
+    /// the driver the plan binds: a host-actuator target has no unit to stop.
+    #[test]
+    fn the_manual_exit_is_worded_from_the_targets_driver() -> Result<()> {
+        let (world, _deploy, host_continuity) = stop_first_world(SwitchWorkload::new())?;
+        let host = resident_id(&world, &host_continuity)?.value;
+        assert!(host.manual_exit().contains("managed host"), "{}", host.manual_exit());
+        assert!(!host.manual_exit().contains("unit"), "{}", host.manual_exit());
+        let systemd = EngineFixture::with_workload(SwitchWorkload::new())?;
+        let incumbent = admit_incumbent(&systemd)?;
+        let unit = seeded_transaction(&systemd, DeploymentPhase::Fencing, CommandKind::Continuity, Some(&incumbent))?;
+        assert!(unit.manual_exit().contains("unit"), "{}", unit.manual_exit());
+        Ok(())
     }
 
     /// The step that ends a transaction archives it in its own write, so a
@@ -24079,6 +24187,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 if let (Case::DeployAwaitsTheTarget, Some(owner)) = (case, &owner_id) {
                     assert!(abort.is_some(), "the lift withdrew the yield");
                     clear_other_live_transactions(&routed.world, owner)?;
+                }
+                if matches!(case, Case::LeaseWithdrawalRecordedComplete) {
+                    // The record's claim is made true, so the abort can finish.
+                    let (lease, _) = lease_of(&routed)?;
+                    lease_driver(&routed).0.revoke_exact(Some(&lease))?;
                 }
                 let finished = routed.resume_until_terminal().with_context(|| format!("{case:?}"))?;
                 assert!(
