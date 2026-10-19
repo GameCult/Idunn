@@ -5039,6 +5039,10 @@ struct Engine {
     docker_runner: DockerRunnerDriver,
     systemd_workload: Arc<dyn WorkloadPort>,
     host_actuators: Option<SharedHostActuatorHub>,
+    /// A test world that serves no host actuator runs a host-actuator
+    /// binding's workload through this port instead.
+    #[cfg(test)]
+    host_workload: Mutex<Option<Arc<dyn WorkloadPort>>>,
     history_report: ReportOnce,
     /// One `ReportOnce` per faulting record, so one wedged transaction says
     /// its fault once and never drowns another's.
@@ -5140,6 +5144,8 @@ impl Engine {
             docker_runner: DockerRunnerDriver::default(),
             systemd_workload,
             host_actuators,
+            #[cfg(test)]
+            host_workload: Mutex::default(),
             history_report: ReportOnce::default(),
             fault_reports: Mutex::default(),
             resume_backoff: Mutex::default(),
@@ -5375,9 +5381,15 @@ impl Engine {
         let (_, binding) = plan.parsed_inputs()?;
         Ok(match &binding.workload {
             WorkloadBinding::SystemdTransient(_) => Arc::clone(&self.systemd_workload),
-            WorkloadBinding::HostActuator(_) => Arc::new(HostActuatorWorkloadDriver {
-                access: self.host_access()?,
-            }),
+            WorkloadBinding::HostActuator(_) => {
+                #[cfg(test)]
+                if let Some(port) = self.host_workload.lock().expect("host workload mutex").clone() {
+                    return Ok(port);
+                }
+                Arc::new(HostActuatorWorkloadDriver {
+                    access: self.host_access()?,
+                })
+            }
         })
     }
 
@@ -15892,7 +15904,8 @@ mod tests {
         });
         let world = EngineFixture::with_workload(workload.clone())?;
         *workload.store.lock().unwrap() = Some(world.state_store.clone());
-        let live = transaction_at(&world, DeploymentPhase::Warming)?;
+        let incumbent = admit_incumbent(&world)?;
+        let live = seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Continuity, Some(&incumbent))?;
         let id = live.transaction_id.as_str();
         // The Warming step waits for Odin; waiting again rewrites nothing, so
         // the step succeeds without touching the record it will find missing.
