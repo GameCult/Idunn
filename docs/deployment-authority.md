@@ -305,6 +305,19 @@ continuity restart does not fetch a branch, rebuild, rerun a migration, alter
 the launch contract, or consume the deployment brake. An explicit lifecycle
 brake may suspend this actuation without changing deployment authority.
 
+Continuity never stops. Six charged attempts in an hour only open the
+ContinuityExhausted incident (a page; the wire name stays, nothing is
+exhausted) and gate no mint, wait or yield. When the next attempt is due is a
+function of continuity's own record: a stored attempt streak, a backoff anchor
+written when the pass first finds the admitted generation dead and the target
+free, and a capped doubling wait from that anchor (5 s base, 300 s cap). A run
+of 600 s or more by the admitted body resets the streak. A generation lost to a
+host reboot (the workload driver's evidence, `lost_to_host_reboot`) is
+re-materialized once per admission without charge or wait. The target is free
+for a deployment's candidate between attempts, and a deployment never yields to
+continuity before Fencing; from Fencing on (or from Starting for a stop-first
+rollout) the live transaction alone owns the target.
+
 An admitted generation keeps its Ready and latest Odin receipts as durable
 proof of the exact activation at their recorded admission times. Dependency
 selection reauthenticates those receipts at those times; continuity and route

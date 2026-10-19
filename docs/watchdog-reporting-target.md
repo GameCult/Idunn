@@ -23,9 +23,10 @@ Today nobody would hear about it. Idunn already detects several conditions an
 operator must act on, and for each one it writes a single `eprintln!` line to
 journald (`report_once`, `control_plane.rs:4599`):
 
-- A continuity restart budget is exhausted (6 per hour; `restarts_exhausted`,
-  decided at `control_plane.rs:5709`). Idunn stops restarting the target, and
-  the only trace is one log line.
+- A continuity paging threshold is reached (6 charged attempts per hour;
+  `restarts_page`, formerly `restarts_exhausted`). Continuity never stops:
+  it keeps restarting on a capped backoff, and this threshold only pages. When
+  this target was written the only trace was one log line.
 - An admitted route is degraded. It fails its stable-route challenge
   (`supervise_admitted_route`, ~5973). The degraded mark is durable, but no
   one is told.

@@ -173,6 +173,25 @@ health plus Ready correlation. It changes and observes route membership only
 afterward. Only after the proxy has adopted the candidate may Idunn clear the
 promotion fence and drain the incumbent.
 
+Ownership of a target is exclusive at each instant. A live
+`DeploymentTransaction` owns it from Fencing on (a stop-first rollout, from
+Starting); before Fencing a deployment owns only its private candidate and
+continuity owns the incumbent slot. Continuity owns the admitted generation's
+survival and never stops. There is no stopped state: six charged attempts in
+an hour (`restarts_page`) open the ContinuityExhausted incident and gate
+nothing, and no deployment path yields to continuity. When continuity next acts
+is derived only from its own record in `TargetSupervision` (schema v2, a v1
+record lifts at store open): the attempt streak, the backoff anchor (written
+by the dead-and-free pass, the only writer), and the once-per-admission
+re-materialization bound. The workload driver alone answers whether a lost unit
+was a host reboot (`WorkloadPort::lost_to_host_reboot`). Crash restart, restart
+after a sustained run and reboot re-materialization all mint through one CAS;
+continuity supervision never aborts a transaction. Operator-facing incidents
+and `idunn status` are projections that decide nothing. Cut line: cuts 2 to 4
+of `reincarnation-map.md` still owe continuity restarting alongside a
+pre-fencing build, dependency failures not growing the streak, and the
+dead-generation route refresh.
+
 The deployment brake gates changes to source, release, configuration, schema,
 unit, or authority binding. The lifecycle brake separately gates restart of an
 already-admitted incarnation. Neither target brake may gate Idunn itself or an

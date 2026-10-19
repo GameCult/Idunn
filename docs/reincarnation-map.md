@@ -371,3 +371,16 @@ fences the absent incumbent as nothing and admits the new release.
 
 Ops, out of scope: nginx boot order (`gamecult-ops`), and retention of the
 roughly 130 dead transient units.
+
+## Installed
+
+Cut 1 (`1da150a`, merge of `idunn/reincarnation` at `ffb4293`) was installed on
+Yggdrasil on 2026-10-19 at 08:34:45 UTC with the operator's OK. The binary is
+`/usr/local/bin/idunn` sha256 `f0e58308…`, built in `/srv/build/idunn-1da150a`
+(`cargo test --lib`: 414 passed). The pre-install store backup is
+`/root/idunn-store-backup-*-pre-reincarnation-c1`. Restoring it means restoring
+its stores and `idunn.running` together, because the cb60965 binary cannot read
+`idunn.target_supervision.v2`. At first open Idunn logged
+"migrated 5 control record(s) … idunn.target_supervision.v2". streampixels-service
+kept running through the restart (unit 73ca40ba, PID 968752, NRestarts 0). The
+catalog returned 200, and 4443/udp was listening.

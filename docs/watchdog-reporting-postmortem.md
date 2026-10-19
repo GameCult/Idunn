@@ -10,7 +10,8 @@ Read them with `view`; this page does not restate them.
 Idunn is now a watchdog that reaches the operator on Discord.
 
 - **Idunn** opens a durable incident at the site where a continuity budget is
-  exhausted. The incident is written to `incidents.cc`, a world-readable file
+  exhausted (since `idunn-reincarnation` cut 1 this is a paging threshold
+  only; continuity keeps restarting). The incident is written to `incidents.cc`, a world-readable file
   in its projection directory with a private 0600 lock, and closes when the
   target runs again and its restart window is no longer exhausted.
 - **Bifrost's watchdog-notice reader** runs from a one-minute timer. It sends
