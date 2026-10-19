@@ -17945,7 +17945,7 @@ mod tests {
         Ok(())
     }
 
-    /// `awaits_handover` and `retries_forward` row by row.
+    /// `awaits_handover` and `yields_to_a_deploy` row by row.
     #[test]
     fn awaits_handover_and_retries_forward_are_exact_functions_of_the_record() -> Result<()> {
         let (world, _, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
@@ -17996,6 +17996,93 @@ mod tests {
         assert!(!deploy_record.retries_forward());
         continuity.post_fencing_abort = Some(post_fencing_abort_intent(&continuity, "x"));
         assert!(!continuity.retries_forward());
+        Ok(())
+    }
+
+    /// NEGATIVE. A continuity past its route proof is serving. Past its deadline
+    /// it keeps retrying and pages; a waiting Deploy does not stop it.
+    #[test]
+    fn a_committing_continuity_past_its_deadline_keeps_serving_and_pages() -> Result<()> {
+        let (world, workload, _, _, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        rephase(&world, &owner_id, DeploymentPhase::Committing)?;
+        pass_deadline_of(&world, &owner_id)?;
+        let stops = stops_of(&workload);
+        for _ in 0..4 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            waiter_then_owner(&world, "", &owner_id)?;
+        }
+        let owner = resident_id(&world, &owner_id)?.value;
+        assert!(owner.post_fencing_abort.is_none(), "a serving continuity yielded");
+        assert_eq!(owner.phase, DeploymentPhase::Committing);
+        assert_eq!(operator_required(&world)?, [owner_id.as_str()]);
+        assert_eq!(stops_of(&workload), stops);
+        Ok(())
+    }
+
+    /// NEGATIVE. A Deploy held at its Sealing tail by the deployment brake
+    /// cannot take the handover, so a continuity does not stop its candidate
+    /// for it; once the brake releases, the continuity yields. The yield closes
+    /// the continuity's operator-required incident Recovered.
+    #[test]
+    fn a_continuity_does_not_yield_to_a_braked_deploy_and_yields_once_the_brake_releases() -> Result<()> {
+        let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        make_stop_first(&world, &deploy_id)?;
+        let sealing = resident_id(&world, &deploy_id)?;
+        let mut tail = sealing.value.clone();
+        tail.deployment_authorization = None;
+        replace_transaction(&world.state_store, &sealing, &tail)?;
+        assert!(resident_id(&world, &deploy_id)?.value.awaits_handover());
+        pass_deadline_of(&world, &owner_id)?;
+        let stops = stops_of(&workload);
+        for _ in 0..4 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            waiter_then_owner(&world, "", &owner_id)?;
+        }
+        let held = resident_id(&world, &owner_id)?.value;
+        assert!(held.post_fencing_abort.is_none(), "the continuity yielded to a braked Deploy");
+        assert_eq!(operator_required(&world)?, [owner_id.as_str()]);
+        assert_eq!(stops_of(&workload), stops);
+
+        // The operator releases the brake for this exact Deploy.
+        let deploy = resident_id(&world, &deploy_id)?.value;
+        let authorization = deployment_authorization(
+            &world,
+            deploy.expected.as_ref().context("no Expected")?,
+            &deploy_id,
+            now_millis()?,
+        )?;
+        let store = deploy.plan.as_ref().context("no plan")?.parsed_inputs()?.1.brakes.deployment_store;
+        let record: IdunnDeploymentBrakeRecord = rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
+        assert!(SingleFileMessagePackBackingStore::new(&store).compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
+                key: record.brake_id.clone(),
+                current: None,
+            }],
+            &[CultCacheEnvelope {
+                key: record.brake_id.clone(),
+                r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
+                payload: authorization.canonical_brake_bytes.clone(),
+                stored_at: rfc3339_millis(now_millis()?)?,
+                schema_id: Some(IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into()),
+            }],
+        )?);
+        world.engine.resume_backoff.lock().unwrap().clear();
+        waiter_then_owner(&world, "", &owner_id)?;
+        let yielded = resident_id(&world, &owner_id)?.value;
+        let abort = yielded.post_fencing_abort.as_ref().context("the continuity did not yield")?;
+        assert!(abort.error.starts_with("continuity-yields") && abort.error.contains(&deploy_id), "{}", abort.error);
+        // The yield retimed the record: the next pass closes its incident
+        // Recovered, and it stays closed.
+        for _ in 0..3 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            world.engine.resume_one_transaction()?;
+        }
+        assert!(operator_required(&world)?.is_empty());
+        let records = world.engine.incidents().read()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].subject, owner_id);
+        assert_eq!(records[0].close_reason, Some(CloseReason::Recovered));
         Ok(())
     }
 
@@ -18311,7 +18398,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         bind_provider(
             world,
             &format!("{head}{HOST}[runtime_identity]{identity}[brakes]{brakes}")
-                .replace("candidate-then-promote", "stop-then-start"),
+                .replace("candidate-then-promote", "stop-then-start")
+                .replace(
+                    "/var/lib/gamecult/idunn/service-deployment-brake.cc",
+                    &world.root.join("service-deployment-brake.cc").display().to_string(),
+                ),
         )
     }
 
