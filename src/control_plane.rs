@@ -17914,6 +17914,74 @@ mod tests {
         workload.stops.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// A Deploy at its Sealing tail, braked, beside a continuity: it awaits the
+    /// handover but cannot take it (the brake has not released it).
+    fn braked_sealing_deploy(world: &EngineFixture, deploy_id: &str) -> Result<()> {
+        make_stop_first(world, deploy_id)?;
+        let sealing = resident_id(world, deploy_id)?;
+        let mut tail = sealing.value.clone();
+        tail.deployment_authorization = None;
+        replace_transaction(&world.state_store, &sealing, &tail)?;
+        let tail = resident_id(world, deploy_id)?.value;
+        assert!(tail.awaits_handover());
+        assert!(!world.engine.deploy_can_move(&resident_id(world, deploy_id)?, now_millis()?));
+        Ok(())
+    }
+
+    /// NEGATIVE. The boot lift yields to a Deploy only by the continuity's own
+    /// yield test: a braked Deploy awaiting the handover is no reason to keep a
+    /// pre-c2c abort running over the only copy of the body.
+    #[test]
+    fn the_boot_lift_returns_a_running_candidate_forward_beside_a_braked_waiting_deploy() -> Result<()> {
+        let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        braked_sealing_deploy(&world, &deploy_id)?;
+        let owner = resident_id(&world, &owner_id)?;
+        world.engine.begin_post_fencing_abort(
+            &owner,
+            anyhow!("the AwaitingReady phase passed its deadline at unix ms 2"),
+        )?;
+        let returned = world.engine.return_wedged_continuity_aborts_forward()?;
+        assert_eq!(returned, vec![owner_id.clone()]);
+        for _ in 0..5 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            waiter_then_owner(&world, "", &owner_id)?;
+        }
+        assert_eq!(stops_of(&workload), 0, "the running candidate was stopped");
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_none());
+        Ok(())
+    }
+
+    /// NEGATIVE. A held record (its candidate unobservable, not provably dead)
+    /// is not released to its abort because a braked Deploy starts awaiting the
+    /// handover.
+    #[test]
+    fn a_held_continuity_abort_is_not_released_by_a_braked_waiting_deploy() -> Result<()> {
+        let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
+        rephase(&world, &deploy_id, DeploymentPhase::Sealing)?;
+        let owner = resident_id(&world, &owner_id)?;
+        world.engine.begin_post_fencing_abort(
+            &owner,
+            anyhow!("the AwaitingReady phase passed its deadline at unix ms 2"),
+        )?;
+        workload.silence(true);
+        let returned = world.engine.return_wedged_continuity_aborts_forward()?;
+        assert!(returned.is_empty());
+        assert!(world.engine.lift_held.lock().unwrap().contains(&owner_id));
+        for _ in 0..3 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            waiter_then_owner(&world, "", &owner_id)?;
+        }
+        braked_sealing_deploy(&world, &deploy_id)?;
+        for _ in 0..5 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            waiter_then_owner(&world, "", &owner_id)?;
+        }
+        assert_eq!(stops_of(&workload), 0, "the unobservable candidate was stopped");
+        assert!(resident_id(&world, &owner_id)?.value.post_fencing_abort.is_some());
+        assert!(world.engine.lift_held.lock().unwrap().contains(&owner_id));
+        Ok(())
+    }
+
     /// The yield is a function of its inputs: the deadline, the continuity's
     /// own record, and a deployment that awaits the handover.
     #[test]
