@@ -983,7 +983,9 @@ enum PhaseEnd {
     OperatorRequired,
     /// A continuity at or past Fencing: its candidate is the only running copy
     /// of the admitted body, so aborting it restores what it already runs. The
-    /// resolver leaves it to the operator and its phase step keeps running.
+    /// resolver leaves it to the operator and its phase step keeps running,
+    /// until a deployment awaits the handover, when the continuity yields
+    /// through its own post-fencing abort (ruling continuity-yields-to-deploy).
     RetryForward,
 }
 
@@ -1861,6 +1863,14 @@ impl DeploymentTransaction {
             && !(self.command_kind == CommandKind::Continuity && self.phase >= DeploymentPhase::Fencing)
     }
 
+    /// A continuity at or past Fencing that its deadline leaves to the operator
+    /// while its step runs. It yields to a deployment awaiting the handover
+    /// (ruling continuity-yields-to-deploy), so a waiter never ends on it.
+    /// Derived, never stored.
+    fn retries_forward(&self) -> bool {
+        self.resolves_by_deadline() && self.phase_end() == PhaseEnd::RetryForward
+    }
+
     /// What an ended post-fencing phase resolves to (Q3). A continuity at or
     /// past Fencing retries forward: its incumbent is the admitted generation,
     /// which supervision mints a continuity only after seeing dead, and from
@@ -2062,6 +2072,16 @@ impl DeploymentTransaction {
     /// candidate-port reservation and validation.
     fn is_live(&self) -> bool {
         self.phase != DeploymentPhase::Complete
+    }
+
+    /// A live deployment whose next move is the handover: not ended, not
+    /// aborting, one phase short of `takes_target_at`. Derived, never stored.
+    /// Read by the continuity's yield and the boot lift.
+    fn awaits_handover(&self) -> bool {
+        self.command_kind == CommandKind::Deploy
+            && self.completion.is_none()
+            && self.pre_fencing_abort.is_none()
+            && self.phase as u8 + 1 == self.takes_target_at() as u8
     }
 
     /// From the handover until Complete the transaction owns the target's
@@ -8535,9 +8555,11 @@ impl Engine {
     /// A deployment waits on the transaction that owns or drains its target.
     /// The owner bounds the wait, so the waiter's own Warming deadline is
     /// disarmed (the resolver re-arms it when the target is free). When the
-    /// owner's deadline has passed in a state Idunn will not end by itself,
-    /// the waiter ends through its own pre-fencing abort (the caller's Err
-    /// path): it never aborts the owner.
+    /// owner's deadline has passed in a state Idunn will not end by itself and
+    /// will not yield (a wedged abort or drain), the waiter ends through its own
+    /// pre-fencing abort (the caller's Err path): it never aborts the owner. A
+    /// waiter keeps waiting on an owner that retries forward, because that
+    /// owner yields to it on its next pass.
     fn wait_for_owner(
         &self,
         current: &Stored<DeploymentTransaction>,
@@ -8547,7 +8569,9 @@ impl Engine {
         let now = now_millis()?;
         let snapshot = ControlSnapshot::read(&self.options.state_store)?;
         if snapshot.transactions.iter().any(|stored| {
-            stored.value.transaction_id == owner_id && stored.value.leaves_to_operator(now)
+            stored.value.transaction_id == owner_id
+                && stored.value.leaves_to_operator(now)
+                && !stored.value.retries_forward()
         }) {
             bail!(
                 "owner-left-to-operator: target {} is owned by {owner_id}, which Idunn has left to the operator; this deployment ends before fencing",
@@ -9522,7 +9546,9 @@ impl Engine {
     /// the fence, aborted after it, or left to the operator with its step
     /// retrying (a stateful deploy, or a continuity, whose candidate is the only
     /// running copy of its body). An abort or a drain past its deadline is left
-    /// to the operator the same way.
+    /// to the operator the same way. A continuity left to the operator yields,
+    /// through its own post-fencing abort, to a deployment awaiting the
+    /// handover; it never writes the deployment.
     /// Returns `Some(moved)` when it decided the tick, `None` to run the step.
     ///
     /// Only `retime` sets a deadline (at phase entry, an abort's beginning, the
@@ -9611,6 +9637,21 @@ impl Engine {
                 Ok(None)
             }
             PhaseEnd::RetryForward => {
+                let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+                if let Some(deploy) = snapshot
+                    .on_target(&transaction.target)
+                    .find(|other| other.value.awaits_handover())
+                {
+                    self.begin_post_fencing_abort(
+                        current,
+                        anyhow!(
+                            "continuity-yields: {cause}; deployment {} awaits the handover of {}",
+                            deploy.value.transaction_id,
+                            transaction.target
+                        ),
+                    )?;
+                    return Ok(Some(true));
+                }
                 self.leave_to_operator(
                     transaction,
                     &format!(
