@@ -17643,6 +17643,80 @@ mod tests {
     }
     // END c2b-forever-wait harness
 
+    // BEGIN c2d continuity-yields
+    // A deployment waits at Warming beside a continuity that retries forward
+    // past its deadline (ruling continuity-yields-to-deploy). The pass order is
+    // the hostile one: the waiter always looks at the owner first.
+
+    /// One pass over the waiter and then the owner, never clearing the resume
+    /// backoff. A record that left the live set is skipped.
+    fn waiter_then_owner(world: &EngineFixture, waiter: &str, owner: &str) -> Result<()> {
+        for id in [waiter, owner] {
+            if let Ok(stored) = resident_id(world, id) {
+                world.engine.resume_candidate(&stored)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A continuity at Fencing driven alone to AwaitingReady, where it
+    /// gate-waits for an Odin word that never comes, beside a Deploy waiting in
+    /// Warming. Returns the world, the workload, and the two ids.
+    fn waiter_beside_gate_waiting_continuity()
+    -> Result<(EngineFixture, Arc<SwitchWorkload>, DeploymentTransaction, String, String, AdmittedGeneration)> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let (deploy, continuity, incumbent) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Fencing)?;
+        let (deploy_id, owner_id) = (deploy.transaction_id.clone(), continuity.transaction_id.clone());
+        drive_id(&world, &owner_id, |t| t.phase == DeploymentPhase::AwaitingReady)?;
+        pass_deadline_of(&world, &owner_id)?;
+        Ok((world, workload, deploy, deploy_id, owner_id, incumbent))
+    }
+
+    /// NEGATIVE. The continuity's deadline has passed and it retries forward;
+    /// the deployment waiting on it must not end, the continuity must yield.
+    #[test]
+    fn a_waiting_deployment_lands_over_a_continuity_that_retries_forward_past_its_deadline() -> Result<()> {
+        let (world, workload, deploy, deploy_id, owner_id, incumbent) = waiter_beside_gate_waiting_continuity()?;
+        let stops = workload.stops.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            waiter_then_owner(&world, &deploy_id, &owner_id)?;
+        }
+        let waiter = latest_id(&world, &deploy_id)?;
+        assert!(waiter.completion.is_none(), "the waiter ended: {:?}", waiter.completion);
+        assert!(waiter.pre_fencing_abort.is_none());
+        let owner = resident_id(&world, &owner_id)?.value;
+        let abort = owner.post_fencing_abort.as_ref().context("the continuity did not yield")?;
+        assert!(abort.error.starts_with("continuity-yields") && abort.error.contains(&deploy_id), "{}", abort.error);
+        // Nothing stopped the candidate before the yield began.
+        assert_eq!(workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
+
+        for _ in 0..8 {
+            waiter_then_owner(&world, &deploy_id, &owner_id)?;
+            world.engine.resume_backoff.lock().unwrap().clear();
+        }
+        // The yield's abort retimed the record: its incident, if one opened, closed.
+        assert!(!operator_required(&world)?.contains(&owner_id));
+        let ended = latest_id(&world, &owner_id)?;
+        assert!(matches!(ended.completion, Some(TransactionCompletion::FailedAfterFencing { .. })), "{:?}", ended.completion);
+        assert_eq!(workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops + 1);
+
+        odin_reports_ready(&world, &deploy, seeded_sequence(Some(&incumbent)) + 10)?;
+        drive_id(&world, &deploy_id, |t| t.is_terminal())?;
+        let landed = latest_id(&world, &deploy_id)?;
+        assert!(matches!(landed.completion, Some(TransactionCompletion::Admitted { .. })), "{:?}", landed.completion);
+        let admitted = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("nothing admitted")?
+            .value
+            .clone();
+        assert_eq!(admitted.transaction_id, deploy_id);
+        assert_eq!(landed.fencing, Some(FencingEvidence::SkippedStateless));
+        Ok(())
+    }
+    // END c2d continuity-yields
+
     #[test]
     fn an_operator_required_incident_closes_when_its_transaction_ends() -> Result<()> {
         let workload = SwitchWorkload::new();
@@ -22726,7 +22800,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert!(waiting.last_error.is_some());
             assert_eq!(waiting.phase_deadline, Some(deadline), "a resume moved the deadline");
 
-            let stops = routed.workload.stops.load(Ordering::SeqCst);
+            let stops = routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst);
             pass_deadline(&routed.world)?;
             for _ in 0..5 {
                 routed.resume()?;
@@ -22743,7 +22817,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 [left.transaction_id.clone()]
             );
             assert_eq!(routed.world.engine.incidents().read()?.len(), 1, "one page per episode");
-            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops, "the candidate was stopped");
+            assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops, "the candidate was stopped");
             assert!(routed.reloads() > 6, "no attempt ran after the deadline");
 
             // The proof passes: the phase moves on, and the first pass after
@@ -22758,7 +22832,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             let records = routed.world.engine.incidents().read()?;
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].close_reason, Some(CloseReason::Recovered));
-            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops);
+            assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
             Ok(())
         }
 
@@ -23335,7 +23409,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("test abort"))?;
             routed.resume()?;
             assert!(routed.transaction()?.post_fencing_abort.is_some(), "the abort did not begin");
-            let stops = routed.workload.stops.load(Ordering::SeqCst);
+            let stops = routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst);
             let finished = routed.resume_until_terminal()?;
             assert!(
                 matches!(finished.completion, Some(TransactionCompletion::FailedAfterFencing { .. })),
@@ -23343,7 +23417,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 finished.last_error
             );
             assert!(driver.observe_empty()?, "the abort left the lease on disk");
-            assert!(routed.workload.stops.load(Ordering::SeqCst) > stops, "the candidate was never stopped");
+            assert!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst) > stops, "the candidate was never stopped");
             Ok(())
         }
 
@@ -23480,7 +23554,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 &routed,
                 "the Routing phase passed its deadline at unix ms 1792324133638",
             )?;
-            let stops = routed.workload.stops.load(Ordering::SeqCst);
+            let stops = routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst);
 
             let lifted_at = now_millis()?;
             let returned = routed.world.engine.return_wedged_continuity_aborts_forward()?;
@@ -23488,7 +23562,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 routed.resume()?;
             }
             assert_eq!(
-                routed.workload.stops.load(Ordering::SeqCst),
+                routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst),
                 stops,
                 "the candidate was stopped"
             );
@@ -23504,7 +23578,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
 
             routed.stub.hang_up.store(false, Ordering::SeqCst);
             routed.drive_until_resuming(|t| t.phase == DeploymentPhase::Committing)?;
-            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops);
+            assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
             assert!(routed.fragment_path().exists(), "the route membership was not re-installed");
             Ok(())
         }
@@ -23525,7 +23599,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 &routed,
                 "lease-not-adopted: the AwaitingReady phase passed its deadline at unix ms 1792324133638",
             )?;
-            let stops = routed.workload.stops.load(Ordering::SeqCst);
+            let stops = routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst);
 
             let returned = routed.world.engine.return_wedged_continuity_aborts_forward()?;
             for _ in 0..5 {
@@ -23533,7 +23607,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             }
             let waiting = routed.transaction()?;
             assert_eq!(returned, [waiting.transaction_id.clone()]);
-            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops, "the candidate was stopped");
+            assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops, "the candidate was stopped");
             assert!(driver.observe_exact(&lease)?, "the lease left the disk");
             assert!(waiting.post_fencing_abort.is_none() && waiting.completion.is_none());
             assert_eq!(waiting.phase, DeploymentPhase::AwaitingReady);
@@ -23544,7 +23618,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             routed.drive_until_resuming(|t| t.phase == DeploymentPhase::Routing)?;
             let adopted = routed.transaction()?;
             assert_eq!(adopted.lease_adoption.context("no adoption recorded")?.write_lease_sha256, lease_sha256);
-            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops);
+            assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
             Ok(())
         }
 
