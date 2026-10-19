@@ -1244,7 +1244,9 @@ impl TargetSupervision {
     /// run: the generation has lived the sustained time and no attempt, charged
     /// or the one re-materialization, has been minted since it was admitted.
     /// That rule decides first: a sustained death never began a wait, so a
-    /// standing anchor, however it came to stand, has no say in it.
+    /// standing anchor, however it came to stand, has no say in it. A wait
+    /// already running when the generation reaches the sustained time ends
+    /// there instead: an accepted shortening, always under the cap.
     fn continuity_backoff(&self, now: u64, admitted_at: u64) -> ContinuityBackoff {
         let streak = self.continuity_attempt_streak;
         let sustained = self
@@ -5680,8 +5682,8 @@ impl Engine {
         let continuity_progress = self.supervise_one_admitted_generation()?;
         // Freezing is not gated on the others' progress: a queued command
         // whose target is free must not wait behind an unrelated target's
-        // wedge. `freeze_command` already refuses a busy target, so this is
-        // still at most one freeze per tick and never a second claimant.
+        // wedge. `freeze_command` refuses only a second live deployment of a
+        // target, and this freezes at most one command per tick.
         let froze = self.freeze_one_queued_command()?;
         Ok(transaction_progress || continuity_progress || froze)
     }
@@ -5963,8 +5965,10 @@ impl Engine {
         Ok(false)
     }
 
-    /// Freeze one queued command into its transactions. `Ok(false)` means its
-    /// target is busy and nothing was written.
+    /// Freeze one queued command into its transactions. `Ok(false)` means a
+    /// live deployment already exists for one of its targets and nothing was
+    /// written. Continuity, owners and drains never refuse a freeze: a
+    /// deployment that has not taken its target owns nothing.
     fn freeze_command(
         &self,
         snapshot: &ControlSnapshot,
@@ -6003,7 +6007,9 @@ impl Engine {
         let busy = snapshot
             .transactions
             .iter()
-            .filter(|stored| stored.value.is_live() || stored.value.drains_incumbent())
+            .filter(|stored| {
+                stored.value.command_kind == CommandKind::Deploy && stored.value.is_live()
+            })
             .map(|stored| stored.value.target.as_str())
             .collect::<BTreeSet<_>>();
         if targets.iter().any(|target| busy.contains(target.as_str())) {
@@ -6075,8 +6081,13 @@ impl Engine {
             if on_target().any(|stored| stored.value.owns_target()) {
                 continue;
             }
-            let blocked = on_target()
-                .any(|stored| stored.value.is_live() || stored.value.drains_incumbent());
+            // Continuity defers to an owner, a drain or its own live attempt,
+            // never to a deployment that has not taken the target, and aborts
+            // nothing (handover-phase-split).
+            let mint_blocked = snapshot.target_owner(&current.value.target, None).is_some()
+                || on_target().any(|stored| {
+                    stored.value.is_live() && stored.value.command_kind == CommandKind::Continuity
+                });
             match self.supervise_admitted_route(&snapshot, current) {
                 Ok(true) => {
                     progressed = true;
@@ -6121,28 +6132,26 @@ impl Engine {
             // the admitted one leaves the projection naming an incarnation that
             // no longer exists -- which the workload rightly refuses to adopt.
             // That record is published from observation once the process is up.
-            if !on_target().any(|stored| stored.value.is_live()) {
-                let repair = (|| -> Result<()> {
-                    let topology = self.topology();
-                    let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
-                    if !topology.admitted_expected_projection_is_exact(
-                        &current.value.expected,
-                        &provider_anchor,
-                    )? {
-                        ensure!(
-                            topology.publish_expected(&current.value.expected, &provider_anchor)?
-                                == current.value.expected.canonical_sha256()?,
-                            "admitted Expected projection repair differs"
-                        );
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = repair {
-                    eprintln!(
-                        "Idunn preserved admitted {} after refusing topology projection repair: {error:#}",
-                        current.value.target
+            let repair = (|| -> Result<()> {
+                let topology = self.topology();
+                let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
+                if !topology.admitted_expected_projection_is_exact(
+                    &current.value.expected,
+                    &provider_anchor,
+                )? {
+                    ensure!(
+                        topology.publish_expected(&current.value.expected, &provider_anchor)?
+                            == current.value.expected.canonical_sha256()?,
+                        "admitted Expected projection repair differs"
                     );
                 }
+                Ok(())
+            })();
+            if let Err(error) = repair {
+                eprintln!(
+                    "Idunn preserved admitted {} after refusing topology projection repair: {error:#}",
+                    current.value.target
+                );
             }
             let mut operational_error = None;
             let observation = match self.workload_for(&current.value.plan).and_then(|workload| {
@@ -6289,9 +6298,7 @@ impl Engine {
             }
             let continuity_key = format!("continuity:{}", current.value.target);
 
-            // Continuity defers to any live transaction for its target and
-            // never aborts one (handover-phase-split).
-            if blocked {
+            if mint_blocked {
                 continue;
             }
             if supervision.restarts_page(now) {
@@ -13829,6 +13836,9 @@ mod tests {
         alive: std::sync::atomic::AtomicBool,
         rebooted: std::sync::atomic::AtomicBool,
         silent: std::sync::atomic::AtomicBool,
+        /// Runtime instances that stay alive when the rest are killed: a
+        /// candidate building beside a dead incumbent.
+        spared: std::sync::Mutex<Vec<String>>,
     }
 
     impl SwitchWorkload {
@@ -13837,7 +13847,13 @@ mod tests {
                 alive: std::sync::atomic::AtomicBool::new(true),
                 rebooted: std::sync::atomic::AtomicBool::new(false),
                 silent: std::sync::atomic::AtomicBool::new(false),
+                spared: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        /// `kill` leaves this runtime instance running.
+        fn spare(&self, runtime_instance_id: &str) {
+            self.spared.lock().unwrap().push(runtime_instance_id.to_owned());
         }
 
         /// The host cannot be asked: observing fails as `HostUnobservable`
@@ -13914,8 +13930,14 @@ mod tests {
                 }
                 .into());
             }
+            let spared = match prior {
+                WorkloadObservation::Systemd(observed) => {
+                    self.spared.lock().unwrap().contains(&observed.runtime_instance_id)
+                }
+                WorkloadObservation::Host(_) => false,
+            };
             ensure!(
-                self.alive.load(std::sync::atomic::Ordering::SeqCst),
+                spared || self.alive.load(std::sync::atomic::Ordering::SeqCst),
                 "the workload is gone"
             );
             Ok(prior.clone())
@@ -16329,53 +16351,6 @@ mod tests {
         );
     }
 
-    /// The 2026-10-18 state: a dead incumbent that has paged, with a deployment
-    /// waiting before Fencing. Continuity never stops and never yields a
-    /// deployment (budget-never-stop, handover-phase-split), so the window
-    /// sliding must not turn the deployment into a casualty.
-    #[test]
-    fn a_deployment_before_fencing_over_a_dead_incumbent_that_paged_is_never_yielded_and_lands() -> Result<()> {
-        let workload = SwitchWorkload::new();
-        let world = EngineFixture::with_workload(workload.clone())?;
-        let incumbent = admit_incumbent(&world)?;
-        let redeploy =
-            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
-        workload.kill();
-        set_meters(
-            &world,
-            &restarted_ago(&[3_000_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
-        )?;
-        world.engine.supervise_one_admitted_generation()?;
-        // The oldest leaves the window: base would now yield the deployment.
-        set_meters(
-            &world,
-            &restarted_ago(&[3_700_000, 2_400_000, 1_800_000, 1_200_000, 600_000, 200_000])?,
-        )?;
-        for _ in 0..3 {
-            let _ = world.engine.supervise_one_admitted_generation()?;
-            let after = resident(&world)?.value;
-            assert_eq!(after.transaction_id, redeploy.transaction_id);
-            assert!(
-                after.pre_fencing_abort.is_none(),
-                "the deployment was yielded: {:?}",
-                after.pre_fencing_abort
-            );
-            assert_eq!(
-                continuity_mints(&world)?,
-                0,
-                "continuity minted beside a pre-fencing deployment"
-            );
-        }
-        workload.revive();
-        odin_reports_ready(&world, &redeploy, seeded_sequence(Some(&incumbent)) + 1)?;
-        drive(&world, |transaction| transaction.phase == DeploymentPhase::Complete)?;
-        let landed = latest(&world)?;
-        assert_eq!(landed.transaction_id, redeploy.transaction_id);
-        assert_eq!(landed.phase, DeploymentPhase::Complete);
-        assert!(landed.pre_fencing_abort.is_none());
-        Ok(())
-    }
-
     /// The incumbent was admitted this long ago, so an anchor written "in the
     /// past" is not older than its generation.
     fn age_incumbent(world: &EngineFixture, millis: u64) -> Result<()> {
@@ -16788,7 +16763,7 @@ mod tests {
         let workload = SwitchWorkload::new();
         let world = EngineFixture::with_workload(workload.clone())?;
         let (deploy, continuity, _) =
-            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Leasing)?;
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Fencing)?;
         workload.kill();
         let deploy_id = deploy.transaction_id.as_str();
         let before = resident_id(&world, deploy_id)?;
@@ -16838,7 +16813,9 @@ mod tests {
             for _ in 0..12 {
                 let stored = resident_id(world, id);
                 let Ok(stored) = stored else { break };
-                world.engine.resume_candidate(&stored)?;
+                // The last step archives the record, which the scheduler's own
+                // progress read reports as an error; the record is what counts.
+                let _ = world.engine.resume_candidate(&stored);
                 world.engine.resume_backoff.lock().unwrap().clear();
             }
             Ok(())
@@ -16873,6 +16850,62 @@ mod tests {
         );
         assert_eq!(ended.incumbent_generation_id, Some(incumbent.generation_id));
         let _ = deploy;
+        Ok(())
+    }
+
+    /// A dead incumbent with a deployment building beside it (its candidate
+    /// alive) whose Warming evidence is complete, and that deployment.
+    fn dead_incumbent_with_a_deployment_ready_to_fence(
+        workload: &SwitchWorkload,
+        world: &EngineFixture,
+    ) -> Result<DeploymentTransaction> {
+        let incumbent = admit_incumbent(world)?;
+        age_incumbent(world, 500_000)?;
+        let deploy =
+            seeded_transaction(world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        let candidate = deploy.activation.as_ref().context("no activation")?;
+        workload.spare(&candidate.runtime_instance_id);
+        workload.kill();
+        Ok(deploy)
+    }
+
+    #[test]
+    fn a_continuity_minted_as_a_deployment_takes_the_target_is_resolved_next_pass() -> Result<()> {
+        // (a) The deployment fences first in the tick, so supervision reads its
+        // ownership and mints nothing.
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let deploy = dead_incumbent_with_a_deployment_ready_to_fence(&workload, &world)?;
+        assert!(world.engine.run_scheduler_tick()?);
+        assert_eq!(resident_id(&world, &deploy.transaction_id)?.value.phase, DeploymentPhase::Fencing);
+        assert_eq!(continuity_mints(&world)?, 0);
+        let _ = world.engine.supervise_one_admitted_generation()?;
+        assert_eq!(continuity_mints(&world)?, 0);
+
+        // (b) Supervision minted from the older view: the continuity starts at
+        // Sealing and owns nothing, the deployment takes the target, and the
+        // continuity is superseded at its next step, never the deployment.
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let deploy = dead_incumbent_with_a_deployment_ready_to_fence(&workload, &world)?;
+        assert!(world.engine.supervise_one_admitted_generation()?);
+        let continuity_id = the_continuity(&world)?.value.transaction_id;
+        assert_eq!(resident_id(&world, &continuity_id)?.value.phase, DeploymentPhase::Sealing);
+        world.engine.advance_transaction(&resident_id(&world, &deploy.transaction_id)?)?;
+        assert_eq!(resident_id(&world, &deploy.transaction_id)?.value.phase, DeploymentPhase::Fencing);
+        for _ in 0..8 {
+            let _ = world.engine.run_scheduler_tick();
+            world.engine.resume_backoff.lock().unwrap().clear();
+            let snapshot = ControlSnapshot::read(&world.state_store)?;
+            assert!(snapshot.transactions.iter().filter(|stored| stored.value.owns_target()).count() <= 1);
+        }
+        let ended = latest_id(&world, &continuity_id)?;
+        assert!(
+            matches!(&ended.completion, Some(TransactionCompletion::FailedBeforeFencing { error }) if error.contains("continuity superseded")),
+            "{:?}",
+            ended.completion
+        );
+        assert!(latest_id(&world, &deploy.transaction_id)?.pre_fencing_abort.is_none());
         Ok(())
     }
 
@@ -16980,11 +17013,19 @@ mod tests {
             meters.continuity_backoff(now, now - CONTINUITY_SUSTAINED_RUN_MILLIS),
             ContinuityBackoff::Due { streak: 0 }
         );
-        // A moment short of it.
-        assert_eq!(
-            meters.continuity_backoff(now, now - CONTINUITY_SUSTAINED_RUN_MILLIS + 10_000),
-            ContinuityBackoff::Begin
-        );
+        // A moment short of it, down to the millisecond.
+        for short in [10_000, 1_000, 1] {
+            assert_eq!(
+                meters.continuity_backoff(now, now - CONTINUITY_SUSTAINED_RUN_MILLIS + short),
+                ContinuityBackoff::Begin,
+                "{short} ms short"
+            );
+        }
+        // The newest attempt decides, not the oldest: one before admission and
+        // one after it, on a generation that has lived long enough.
+        meters.continuity_restarts = vec![now - 800_000, now - 100_000];
+        assert_eq!(meters.continuity_backoff(now, now - 700_000), ContinuityBackoff::Begin);
+        meters.continuity_restarts = vec![1_000];
         // Attempts after admission failed on this generation: it has not run well.
         meters.continuity_restarts = vec![now - 100_000];
         assert_eq!(meters.continuity_backoff(now, now - 700_000), ContinuityBackoff::Begin);
@@ -17006,6 +17047,29 @@ mod tests {
         // Streak zero with no history is simply due.
         let fresh = TargetSupervision::new("service");
         assert_eq!(fresh.continuity_backoff(now, now - 1_000), ContinuityBackoff::Due { streak: 0 });
+    }
+
+    #[test]
+    fn a_wait_that_crosses_the_sustained_run_ends_early_and_only_by_less_than_the_cap() {
+        let admitted = 50_000_000_u64;
+        let mut meters = TargetSupervision::new("service");
+        meters.continuity_attempt_streak = 7;
+        meters.continuity_restarts = vec![admitted - 1_000];
+        // The wait began when the generation was 400 s old and runs 300 s.
+        meters.continuity_backoff_from_unix_millis = Some(admitted + 400_000);
+        assert_eq!(meters.backoff_due(admitted), Some(admitted + 700_000));
+        assert_eq!(
+            meters.continuity_backoff(admitted + CONTINUITY_SUSTAINED_RUN_MILLIS - 1, admitted),
+            ContinuityBackoff::Waiting
+        );
+        assert_eq!(
+            meters.continuity_backoff(admitted + CONTINUITY_SUSTAINED_RUN_MILLIS, admitted),
+            ContinuityBackoff::Due { streak: 0 }
+        );
+        assert!(
+            CONTINUITY_SUSTAINED_RUN_MILLIS - 400_000 < CONTINUITY_BACKOFF_CEILING_MILLIS,
+            "the shortening is under the cap"
+        );
     }
 
     #[test]
@@ -17057,10 +17121,10 @@ mod tests {
             all.iter().any(|transaction| transaction.command_id == "up-service-queued"),
             "the queued deployment never froze"
         );
-        assert_eq!(continuity_mints(&world)?, 0);
+        // Freeze needs no gap (a deployment before its handover owns nothing),
+        // and continuity may restart the incumbent beside it after its wait.
         for _ in 0..3 {
             let _ = world.engine.run_scheduler_tick();
-            assert_eq!(continuity_mints(&world)?, 0);
             let aborts = every_transaction(&world)?
                 .into_iter()
                 .filter_map(|transaction| transaction.pre_fencing_abort)
@@ -17864,10 +17928,11 @@ mod tests {
         for _ in 0..4 {
             let _ = world.engine.supervise_one_admitted_generation()?;
         }
-        let after = resident(&world)?.value;
-        assert_eq!(after.transaction_id, held.transaction_id);
+        let after = resident_id(&world, &held.transaction_id)?.value;
         assert!(after.pre_fencing_abort.is_none(), "Idunn aborted a held record");
         assert!(after.completion.is_none());
+        // Continuity restarts the declared incumbent beside it, once.
+        assert_eq!(continuity_mints(&world)?, 1);
         Ok(())
     }
 
