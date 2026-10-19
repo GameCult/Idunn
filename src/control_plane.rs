@@ -17036,6 +17036,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn the_handover_does_not_wait_on_a_finished_transaction_being_retired() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        // A committed transaction left resident, finished and not yet retired.
+        let seeded = transaction_at(&world, DeploymentPhase::Fencing)?;
+        odin_reports_ready(&world, &seeded, seeded_sequence(None) + 1)?;
+        drive(&world, |transaction| transaction.phase == DeploymentPhase::Complete)?;
+        let incumbent = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("commit wrote no admitted generation")?
+            .value
+            .clone();
+        let deploy =
+            seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        let view = ControlSnapshot::read(&world.state_store)?;
+        assert!(view.transactions.iter().any(|stored| stored.value.is_terminal()));
+
+        // It is retired between the read and the handover; that is no race.
+        assert!(world.engine.retire_one_terminal_transaction()?);
+        let stored = resident_id(&world, &deploy.transaction_id)?;
+        assert_eq!(
+            world.engine.take_target(&view, &stored, &entering(&stored, DeploymentPhase::Fencing)?)?,
+            Handover::Took
+        );
+        Ok(())
+    }
+
     /// A dead incumbent with a deployment building beside it (its candidate
     /// alive) whose Warming evidence is complete, and that deployment.
     fn dead_incumbent_with_a_deployment_ready_to_fence(
