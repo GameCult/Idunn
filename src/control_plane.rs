@@ -5112,10 +5112,25 @@ impl RouteActuationGate for EngineRouteGate<'_> {
 struct ResumeBackoff {
     failures: u32,
     not_before_unix_millis: u64,
+    /// The longest wait this backoff was armed with: the skip check reads it,
+    /// so the check and the wait cannot disagree.
+    ceiling_millis: u64,
 }
 
 /// Longest wait between attempts at a failing transaction step.
 const RESUME_BACKOFF_CEILING_MILLIS: u64 = 60_000;
+
+/// The longest wait between attempts at one transaction's step: the continuity
+/// cap for a record left to the operator, which retries on the slow cadence its
+/// page promises (ruling c2c-forward-retry-cadence), and the shorter one for
+/// every other.
+fn resume_ceiling(transaction: &DeploymentTransaction, now: u64) -> u64 {
+    if transaction.leaves_to_operator(now) {
+        CONTINUITY_BACKOFF_CEILING_MILLIS
+    } else {
+        RESUME_BACKOFF_CEILING_MILLIS
+    }
+}
 
 impl Engine {
     fn open(options: RuntimeOptions) -> Result<Self> {
@@ -6054,7 +6069,7 @@ impl Engine {
             .get(id)
             .is_some_and(|backoff| {
                 now_millis().is_ok_and(|now| {
-                    is_waiting(now, backoff.not_before_unix_millis, RESUME_BACKOFF_CEILING_MILLIS)
+                    is_waiting(now, backoff.not_before_unix_millis, backoff.ceiling_millis)
                 })
             })
         {
@@ -6064,15 +6079,29 @@ impl Engine {
             self.note_fault("holds transaction", id, &anyhow::Error::new(disagreement));
             return Ok(false);
         }
+        let left = now_millis().is_ok_and(|now| current.value.leaves_to_operator(now));
         let advanced = self.advance_transaction(current);
         if advanced.is_ok() {
-            // The step ran and succeeded: the fault, if any, has recovered, so
-            // a later failure is news. A skipped or failed attempt clears nothing.
-            self.resume_backoff
-                .lock()
-                .expect("resume backoff mutex")
-                .remove(id);
-            self.clear_fault(id);
+            // A step that returns Ok without moving a record left to the
+            // operator (a gate-wait on a silent candidate) is an attempt like
+            // a failed one: it backs off, and the fault it recorded stands.
+            let unmoved = left
+                && ControlSnapshot::read(&self.options.state_store)?
+                    .transactions
+                    .iter()
+                    .find(|stored| stored.value.transaction_id == id)
+                    .is_some_and(|live| !state_advanced(&current.value, &live.value));
+            if unmoved {
+                self.back_off(&current.value)?;
+            } else {
+                // The step ran and succeeded: the fault, if any, has recovered, so
+                // a later failure is news. A skipped or failed attempt clears nothing.
+                self.resume_backoff
+                    .lock()
+                    .expect("resume backoff mutex")
+                    .remove(id);
+                self.clear_fault(id);
+            }
         }
         if let Err(error) = advanced {
             let latest_snapshot = ControlSnapshot::read(&self.options.state_store)?;
@@ -6088,7 +6117,7 @@ impl Engine {
                     .remove(id);
                 return Ok(true);
             }
-            self.back_off(id)?;
+            self.back_off(&latest.value)?;
             if latest.value.phase < DeploymentPhase::Fencing {
                 // Before the fence an abort that cannot finish a step is
                 // resumable, never a post-fence abort: that path refuses a
@@ -6142,16 +6171,20 @@ impl Engine {
 
     /// Wait twice as long after each consecutive failure of a transaction's
     /// step, from one poll interval up to a ceiling.
-    fn back_off(&self, transaction_id: &str) -> Result<()> {
+    fn back_off(&self, transaction: &DeploymentTransaction) -> Result<()> {
         let now = now_millis()?;
+        let ceiling_millis = resume_ceiling(transaction, now);
         let mut all = self.resume_backoff.lock().expect("resume backoff mutex");
-        let failures = all.get(transaction_id).map_or(0, |backoff| backoff.failures);
-        let wait = backoff_wait(self.options.poll_millis, failures, RESUME_BACKOFF_CEILING_MILLIS);
+        let failures = all
+            .get(&transaction.transaction_id)
+            .map_or(0, |backoff| backoff.failures);
+        let wait = backoff_wait(self.options.poll_millis, failures, ceiling_millis);
         all.insert(
-            transaction_id.to_string(),
+            transaction.transaction_id.clone(),
             ResumeBackoff {
                 failures: failures.saturating_add(1),
                 not_before_unix_millis: now.saturating_add(wait),
+                ceiling_millis,
             },
         );
         Ok(())
@@ -14061,11 +14094,45 @@ mod tests {
         Ok(())
     }
 
+    /// The slow cadence belongs to a record that is left to the operator,
+    /// whichever way it came to be: it waits up to the continuity cap between
+    /// attempts from its deadline on, and up to the short cap before.
+    #[test]
+    fn a_record_left_to_the_operator_backs_off_to_the_continuity_cap() -> Result<()> {
+        let (_, mut transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[2].1)?;
+        let lease = write_lease();
+        let leased = LeasingEvidence::Granted {
+            lease_sha256: lease.canonical_sha256()?,
+            lease,
+        };
+        transaction.retime(1_000);
+        let due = transaction.phase_deadline.context("no deadline")?.deadline_at_unix_millis;
+        let mut aborting = transaction.clone();
+        aborting.post_fencing_abort = Some(post_fencing_abort_intent(&aborting, "wedged"));
+        let mut deploy = transaction.clone();
+        deploy.command_kind = CommandKind::Deploy;
+        let mut stateful = deploy.clone();
+        stateful.leasing = Some(leased);
+        let mut continuity = transaction.clone();
+        continuity.command_kind = CommandKind::Continuity;
+        for (what, record) in [
+            ("a forward-retrying continuity", &continuity),
+            ("a stateful deploy", &stateful),
+            ("a wedged abort", &aborting),
+        ] {
+            assert_eq!(resume_ceiling(record, due - 1), RESUME_BACKOFF_CEILING_MILLIS, "{what} before its deadline");
+            assert_eq!(resume_ceiling(record, due), CONTINUITY_BACKOFF_CEILING_MILLIS, "{what} at its deadline");
+        }
+        // A deploy that aborts at its deadline is not left to anyone.
+        assert_eq!(resume_ceiling(&deploy, due), RESUME_BACKOFF_CEILING_MILLIS);
+        Ok(())
+    }
+
     /// Q3 as a table: which ended phases abort, which name the unadopted
     /// lease, which are left to the operator, and which recovery the terminal
     /// record names.
     #[test]
-    fn an_ended_phase_aborts_unless_a_deployment_candidate_was_issued_a_lease() -> Result<()> {
+    fn an_ended_phase_is_resolved_by_command_kind_and_lease() -> Result<()> {
         let (_, mut transaction) = fixture_transaction(FIXTURE_TRANSACTIONS[2].1)?;
         let lease = write_lease();
         let sha256 = lease.canonical_sha256()?;
@@ -15794,6 +15861,7 @@ mod tests {
                 ResumeBackoff {
                     failures: 3,
                     not_before_unix_millis,
+                    ceiling_millis: RESUME_BACKOFF_CEILING_MILLIS,
                 },
             );
         };
@@ -23200,6 +23268,46 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 "{:?}",
                 finished.completion
             );
+            Ok(())
+        }
+
+        /// A record left to the operator whose step returns Ok without moving it
+        /// (a gate-wait on a silent candidate) is backed off like a failed
+        /// attempt, to the continuity cap: its candidate is challenged once per
+        /// backoff, not once per pass. Before its deadline every pass challenges.
+        #[test]
+        fn a_continuity_left_to_the_operator_challenges_a_silent_candidate_once_per_backoff() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
+            let engine = &routed.world.engine;
+            let id = routed.transaction()?.transaction_id;
+            let hits = || routed.stub.candidate_hits.load(Ordering::SeqCst);
+
+            let before = hits();
+            for _ in 0..3 {
+                engine.resume_one_transaction()?;
+            }
+            assert!(hits() >= before + 3, "a pass inside the deadline did not challenge");
+            assert!(engine.resume_backoff.lock().unwrap().get(&id).is_none());
+
+            pass_deadline(&routed.world)?;
+            engine.resume_one_transaction()?;
+            let first = hits();
+            assert!(first > before + 3, "the pass past the deadline did not challenge");
+            let armed = *engine.resume_backoff.lock().unwrap().get(&id).context("the unmoved step set no backoff")?;
+            assert_eq!(armed.ceiling_millis, CONTINUITY_BACKOFF_CEILING_MILLIS);
+            for _ in 0..5 {
+                engine.resume_one_transaction()?;
+            }
+            assert_eq!(hits(), first, "a wedged candidate was challenged inside its backoff");
+            assert!(routed.transaction()?.post_fencing_abort.is_none());
+
+            // The skip check reads the ceiling the backoff was armed with: a
+            // wait longer than the short cap is still a wait.
+            engine.resume_backoff.lock().unwrap().get_mut(&id).unwrap().not_before_unix_millis =
+                now_millis()? + 200_000;
+            engine.resume_one_transaction()?;
+            assert_eq!(hits(), first, "the skip check read the short cap");
             Ok(())
         }
 
