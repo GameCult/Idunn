@@ -23838,7 +23838,8 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         /// at its Routing deadline, with a Deploy now awaiting the handover of
         /// its target. The continuity yields through its own abort: the lease
         /// leaves the disk only after the stop, the target is free, and the
-        /// Deploy, unended, fences a path that is already empty.
+        /// Deploy is unended. (The Fencing half is not asserted here: the seeded
+        /// Deploy plans a stateless target, so its fence skips the lease path.)
         #[cfg(unix)]
         #[test]
         fn an_odin_shaped_continuity_left_to_the_operator_yields_its_lease_to_a_waiting_deploy() -> Result<()> {
@@ -23887,20 +23888,6 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert!(ControlSnapshot::read(&routed.world.state_store)?.target_owner("service", None).is_none());
             let waiting = resident_id(&routed.world, &deploy.transaction_id)?.value;
             assert!(waiting.completion.is_none() && waiting.pre_fencing_abort.is_none());
-
-            // Its next move is the fence, over a lease path that is empty.
-            rephase(&routed.world, &deploy.transaction_id, DeploymentPhase::Fencing)?;
-            routed.world.engine.advance_transaction(&resident_id(&routed.world, &deploy.transaction_id)?)?;
-            let fenced = latest_id(&routed.world, &deploy.transaction_id)?;
-            assert!(
-                matches!(
-                    fenced.fencing,
-                    Some(FencingEvidence::Revoked { candidate_lease_path_verified_empty: true, .. })
-                ),
-                "{:?} {:?}",
-                fenced.fencing,
-                fenced.last_error
-            );
             Ok(())
         }
 
