@@ -1686,6 +1686,20 @@ struct DeploymentTransaction {
     lease_adoption: Option<LeaseAdoptionEvidence>,
 }
 
+/// What `Engine::take_target` decided about one transaction's entry into the
+/// phase where it takes its target.
+#[derive(Debug, PartialEq, Eq)]
+enum Handover {
+    /// The CAS wrote the entry: the transaction owns the target.
+    Took,
+    /// The CAS lost to a concurrent write; nothing was written.
+    Lost,
+    /// Another transaction owns or drains the target; nothing was written.
+    OwnedBy(String),
+    /// The admitted generation is no longer the one the transaction names.
+    Moved,
+}
+
 /// The phase whose entry is the handover of a target: Starting when the rollout
 /// stops the incumbent first (it is stopped there by design), else Fencing. The
 /// one spelling of the rule; a free function so the stop-then-start arm is
@@ -3381,6 +3395,17 @@ impl ControlSnapshot {
         self.admitted
             .iter()
             .find(|stored| stored.value.target == target)
+    }
+
+    /// The transaction, other than `except`, that holds the target's
+    /// incumbent slot or is still draining it. The one lookup supervision, a
+    /// waiting deployment and the handover share.
+    fn target_owner(&self, target: &str, except: Option<&str>) -> Option<&Stored<DeploymentTransaction>> {
+        self.transactions.iter().find(|stored| {
+            stored.value.target == target
+                && Some(stored.value.transaction_id.as_str()) != except
+                && (stored.value.owns_target() || stored.value.drains_incumbent())
+        })
     }
 
     fn supervision_for(&self, target: &str) -> Option<&Stored<TargetSupervision>> {
@@ -6838,7 +6863,9 @@ impl Engine {
         })?;
         next.enter_phase(DeploymentPhase::Starting, now);
         next.last_error = None;
-        replace_transaction(&self.options.state_store, current, &next)
+        // Starting is the handover for stop-then-start, so this write goes
+        // through the seam that decides it.
+        self.enter(current, next)
     }
 
     fn advance_starting(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
@@ -7798,6 +7825,10 @@ impl Engine {
         Ok(())
     }
 
+    /// The admitted generation this transaction was proven against. A
+    /// pre-handover deployment is rebased onto the admitted generation before
+    /// any step reads its incumbent, and the handover pins it after, so a
+    /// mismatch here is a fault, not a race.
     fn exact_incumbent<'a>(
         &self,
         snapshot: &'a ControlSnapshot,
@@ -7809,7 +7840,9 @@ impl Engine {
             (Some(expected), Some(current)) if current.value.generation_id == *expected => {
                 Ok(Some(current))
             }
-            _ => bail!("target incumbent changed after transaction creation"),
+            _ => bail!(
+                "admitted generation changed under a transaction that owns the target or names it as its source"
+            ),
         }
     }
 
@@ -8949,14 +8982,108 @@ impl Engine {
         current: &Stored<DeploymentTransaction>,
         next_phase: DeploymentPhase,
     ) -> Result<()> {
-        ensure!(
-            next_phase as u8 == current.value.phase as u8 + 1,
-            "deployment phase transition is not adjacent"
-        );
         let mut next = current.value.clone();
         next.enter_phase(next_phase, now_millis()?);
         next.last_error = None;
-        replace_transaction(&self.options.state_store, current, &next)
+        self.enter(current, next)
+    }
+
+    /// The one phase-entry seam. Every move into the next phase is written
+    /// here, and entering the phase where the transaction takes its target
+    /// (`takes_target_at`) is decided by `take_target`: that CAS is the
+    /// handover, and nothing else writes that entry.
+    fn enter(
+        &self,
+        current: &Stored<DeploymentTransaction>,
+        next: DeploymentTransaction,
+    ) -> Result<()> {
+        ensure!(
+            next.phase as u8 == current.value.phase as u8 + 1,
+            "deployment phase transition is not adjacent"
+        );
+        if next.phase != next.takes_target_at() {
+            return replace_transaction(&self.options.state_store, current, &next);
+        }
+        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
+        let target = &current.value.target;
+        match (self.take_target(&snapshot, current, &next)?, current.value.command_kind) {
+            // Lost to a concurrent writer: the next step reads the new world.
+            (Handover::Took | Handover::Lost, _) => Ok(()),
+            // Wait, never abort: a pre-fencing error would end the deployment.
+            (Handover::OwnedBy(owner), CommandKind::Deploy) => self.record_gate_wait(
+                current,
+                &format!(
+                    "target {target} is owned by {owner}; this deployment fences what is admitted when it completes"
+                ),
+            ),
+            // The next step rebases onto the generation now admitted.
+            (Handover::Moved, CommandKind::Deploy) => Ok(()),
+            (Handover::OwnedBy(owner), CommandKind::Continuity) => {
+                bail!("continuity superseded: target {target} is owned by {owner}")
+            }
+            (Handover::Moved, CommandKind::Continuity) => {
+                bail!("continuity superseded: the generation it restarts is no longer admitted")
+            }
+        }
+    }
+
+    /// The handover: one CAS that writes `next` (the entry into
+    /// `takes_target_at`) only if nothing else moved. It expects the
+    /// transaction's own envelope, the target's admitted envelope as read
+    /// (or its absence), and every other non-terminal transaction of the
+    /// target as read, so of two transactions entering from one view exactly
+    /// one succeeds.
+    fn take_target(
+        &self,
+        snapshot: &ControlSnapshot,
+        current: &Stored<DeploymentTransaction>,
+        next: &DeploymentTransaction,
+    ) -> Result<Handover> {
+        let target = current.value.target.as_str();
+        let id = current.value.transaction_id.as_str();
+        if let Some(owner) = snapshot.target_owner(target, Some(id)) {
+            return Ok(Handover::OwnedBy(owner.value.transaction_id.clone()));
+        }
+        let admitted = snapshot.admitted_for(target);
+        if admitted.map(|stored| stored.value.generation_id.as_str())
+            != current.value.incumbent_generation_id.as_deref()
+        {
+            return Ok(Handover::Moved);
+        }
+        next.validate()?;
+        let mut expected = vec![
+            CultCacheExpectedEnvelope {
+                r#type: DeploymentTransaction::TYPE.into(),
+                key: id.into(),
+                current: Some(current.envelope.clone()),
+            },
+            CultCacheExpectedEnvelope {
+                r#type: AdmittedGeneration::TYPE.into(),
+                key: target.into(),
+                current: admitted.map(|stored| stored.envelope.clone()),
+            },
+        ];
+        expected.extend(
+            snapshot
+                .transactions
+                .iter()
+                .filter(|stored| {
+                    stored.value.target == target
+                        && stored.value.transaction_id != id
+                        && !stored.value.is_terminal()
+                })
+                .map(|stored| CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: stored.value.transaction_id.clone(),
+                    current: Some(stored.envelope.clone()),
+                }),
+        );
+        let took = SingleFileMessagePackBackingStore::new(&self.options.state_store)
+            .compare_exchange(
+                &expected,
+                &[transaction_envelope(next, next.updated_at_unix_millis)?],
+            )?;
+        Ok(if took { Handover::Took } else { Handover::Lost })
     }
 
     /// Every post-fencing phase ends. Before a live transaction past the
@@ -12329,10 +12456,17 @@ mod tests {
             IDUNN_DEPLOYMENT_BRAKE_SCOPE, IDUNN_DEPLOYMENT_RELEASE_PURPOSE,
             IdunnDeploymentBrakeReleasePurpose, enroll_service_identity_at,
         };
-        let signer = enroll_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(
-            &world.root.join("identities/brake-operator.cc"),
-        )?;
-        export_service_identity_trust_anchor(&signer, &world.root.join("brake-anchor.cc"))?;
+        // One operator per world, however many deployments it releases.
+        let signer_path = world.root.join("identities/brake-operator.cc");
+        let signer = if signer_path.exists() {
+            open_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(&signer_path)?
+        } else {
+            let signer =
+                enroll_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(&signer_path)?;
+            export_service_identity_trust_anchor(&signer, &world.root.join("brake-anchor.cc"))?;
+            signer
+        };
+        let authorization_id = format!("authorization-{transaction_id}");
         let mut record = IdunnDeploymentBrakeRecord {
             schema_version: IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into(),
             brake_id: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
@@ -12343,7 +12477,7 @@ mod tests {
             reason: "test rollout".into(),
             observed_at_unix_millis: now,
             expires_at_unix_millis: Some(now + 600_000),
-            authorization_id: Some("authorization-test".into()),
+            authorization_id: Some(authorization_id.clone()),
             authorization_purpose: Some(IDUNN_DEPLOYMENT_RELEASE_PURPOSE.into()),
             authorized_release_id: Some(expected.sealed_release_id.clone()),
             authorized_deployment_id: Some(transaction_id.to_owned()),
@@ -12363,7 +12497,7 @@ mod tests {
         record.validate()?;
         let canonical_brake_bytes = rmp_serde::to_vec(&record)?;
         Ok(DeploymentAuthorization {
-            authorization_id: "authorization-test".into(),
+            authorization_id,
             brake_sha256: sha256_id(&canonical_brake_bytes),
             canonical_brake_bytes,
             authorized_at_unix_millis: now,
@@ -16225,16 +16359,178 @@ mod tests {
         Ok(())
     }
 
-    /// The stored transaction `id`, moved into `phase` in place.
-    fn rephase(world: &EngineFixture, id: &str, phase: DeploymentPhase) -> Result<()> {
-        let stored = ControlSnapshot::read(&world.state_store)?
+    /// The live transaction `id`.
+    fn resident_id(world: &EngineFixture, id: &str) -> Result<Stored<DeploymentTransaction>> {
+        ControlSnapshot::read(&world.state_store)?
             .transactions
             .into_iter()
             .find(|stored| stored.value.transaction_id == id)
-            .context("no such live transaction")?;
+            .context("no such live transaction")
+    }
+
+    /// `stored` one phase on, as the seam would be asked to write it.
+    fn entering(stored: &Stored<DeploymentTransaction>, phase: DeploymentPhase) -> Result<DeploymentTransaction> {
         let mut next = stored.value.clone();
         next.enter_phase(phase, now_millis()?);
-        replace_transaction(&world.state_store, &stored, &next)
+        Ok(next)
+    }
+
+    /// Drop every live transaction but `keep`.
+    fn clear_other_live_transactions(world: &EngineFixture, keep: &str) -> Result<()> {
+        let others = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .filter(|stored| stored.value.transaction_id != keep)
+            .map(|stored| stored.envelope)
+            .collect::<Vec<_>>();
+        assert!(SingleFileMessagePackBackingStore::new(&world.state_store).delete_batch_if_unchanged(&others)?);
+        Ok(())
+    }
+
+    /// The stored transaction `id`, moved into `phase` in place.
+    fn rephase(world: &EngineFixture, id: &str, phase: DeploymentPhase) -> Result<()> {
+        let stored = resident_id(world, id)?;
+        replace_transaction(&world.state_store, &stored, &entering(&stored, phase)?)
+    }
+
+    /// A Deploy at `deploy_phase` and a Continuity at `continuity_phase`, both
+    /// over one incumbent of `service`, and that incumbent.
+    fn deploy_beside_continuity(
+        world: &EngineFixture,
+        deploy_phase: DeploymentPhase,
+        continuity_phase: DeploymentPhase,
+    ) -> Result<(DeploymentTransaction, DeploymentTransaction, AdmittedGeneration)> {
+        let incumbent = admit_incumbent(world)?;
+        let deploy =
+            seeded_transaction(world, DeploymentPhase::Warming, CommandKind::Deploy, Some(&incumbent))?;
+        let continuity = seeded_transaction(
+            world,
+            DeploymentPhase::Warming,
+            CommandKind::Continuity,
+            Some(&incumbent),
+        )?;
+        for (seeded, phase) in [(&deploy, deploy_phase), (&continuity, continuity_phase)] {
+            if phase != DeploymentPhase::Warming {
+                rephase(world, &seeded.transaction_id, phase)?;
+            }
+        }
+        Ok((deploy, continuity, incumbent))
+    }
+
+    #[test]
+    fn exactly_one_transaction_takes_a_target_from_one_view() -> Result<()> {
+        let take = |snapshot: &ControlSnapshot, world: &EngineFixture, id: &str| -> Result<Handover> {
+            let stored = resident_id(world, id)?;
+            world.engine.take_target(snapshot, &stored, &entering(&stored, DeploymentPhase::Fencing)?)
+        };
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Warming)?;
+        let view = ControlSnapshot::read(&world.state_store)?;
+
+        assert_eq!(take(&view, &world, &continuity.transaction_id)?, Handover::Took);
+        // The second claimant read the same world: its CAS loses.
+        assert_eq!(take(&view, &world, &deploy.transaction_id)?, Handover::Lost);
+        let after = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(after.transactions.iter().filter(|stored| stored.value.owns_target()).count(), 1);
+        assert_eq!(resident_id(&world, &deploy.transaction_id)?.value.phase, DeploymentPhase::Warming);
+        // A fresh view names the owner instead of racing it.
+        assert_eq!(
+            take(&after, &world, &deploy.transaction_id)?,
+            Handover::OwnedBy(continuity.transaction_id.clone())
+        );
+
+        // The reverse world: the deployment wins and the continuity loses.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Warming)?;
+        let view = ControlSnapshot::read(&world.state_store)?;
+        assert_eq!(take(&view, &world, &deploy.transaction_id)?, Handover::Took);
+        assert_eq!(take(&view, &world, &continuity.transaction_id)?, Handover::Lost);
+        Ok(())
+    }
+
+    #[test]
+    fn the_handover_loses_when_the_admitted_generation_moved_after_it_was_read() -> Result<()> {
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, _, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Warming)?;
+        // Only the continuity is a rival here; take it out of the guards' way.
+        clear_other_live_transactions(&world, &deploy.transaction_id)?;
+        let view = ControlSnapshot::read(&world.state_store)?;
+        let stored = resident_id(&world, &deploy.transaction_id)?;
+
+        // Same generation, new envelope: a refresh landed after the read.
+        edit_incumbent(&world, |generation| generation.odin_publisher_sequence_cursor += 1)?;
+        assert_eq!(
+            world.engine.take_target(&view, &stored, &entering(&stored, DeploymentPhase::Fencing)?)?,
+            Handover::Lost
+        );
+        // A view that already shows another generation is Moved, not raced.
+        let mut other = stored.clone();
+        other.value.incumbent_generation_id = Some("generation-elsewhere".into());
+        assert_eq!(
+            world.engine.take_target(
+                &ControlSnapshot::read(&world.state_store)?,
+                &other,
+                &entering(&other, DeploymentPhase::Fencing)?
+            )?,
+            Handover::Moved
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_seam_makes_a_deployment_wait_and_a_continuity_step_aside() -> Result<()> {
+        // A deployment ready to fence while a continuity owns the target waits
+        // where it is, with the owner named and no abort.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Fencing)?;
+        let stored = resident_id(&world, &deploy.transaction_id)?;
+        world.engine.enter(&stored, entering(&stored, DeploymentPhase::Fencing)?)?;
+        let waiting = resident_id(&world, &deploy.transaction_id)?.value;
+        assert_eq!(waiting.phase, DeploymentPhase::Warming);
+        assert!(waiting.pre_fencing_abort.is_none());
+        assert!(
+            waiting.last_error.as_deref().is_some_and(|note| note.contains(&continuity.transaction_id)),
+            "{:?}",
+            waiting.last_error
+        );
+        // A deployment whose generation moved is left for its rebase.
+        let world_two = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy_two, _, _) =
+            deploy_beside_continuity(&world_two, DeploymentPhase::Warming, DeploymentPhase::Warming)?;
+        clear_other_live_transactions(&world_two, &deploy_two.transaction_id)?;
+        let mut stored_two = resident_id(&world_two, &deploy_two.transaction_id)?;
+        stored_two.value.incumbent_generation_id = Some("generation-elsewhere".into());
+        let before = ControlSnapshot::read(&world_two.state_store)?.transactions[0].envelope.clone();
+        world_two.engine.enter(&stored_two, entering(&stored_two, DeploymentPhase::Fencing)?)?;
+        assert_eq!(ControlSnapshot::read(&world_two.state_store)?.transactions[0].envelope, before);
+
+        // A continuity in the same position is superseded, by either cause.
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let (deploy, continuity, _) =
+            deploy_beside_continuity(&world, DeploymentPhase::Fencing, DeploymentPhase::Warming)?;
+        let stored = resident_id(&world, &continuity.transaction_id)?;
+        let error = world
+            .engine
+            .enter(&stored, entering(&stored, DeploymentPhase::Fencing)?)
+            .expect_err("a continuity entered a target another transaction owns");
+        assert!(format!("{error:#}").contains("continuity superseded"), "{error:#}");
+        assert!(format!("{error:#}").contains(&deploy.transaction_id), "{error:#}");
+        clear_other_live_transactions(&world, &continuity.transaction_id)?;
+        let mut stored = resident_id(&world, &continuity.transaction_id)?;
+        stored.value.incumbent_generation_id = Some("generation-elsewhere".into());
+        let error = world
+            .engine
+            .enter(&stored, entering(&stored, DeploymentPhase::Fencing)?)
+            .expect_err("a continuity entered over a generation that moved");
+        assert!(format!("{error:#}").contains("continuity superseded"), "{error:#}");
+        // Phases are entered one at a time.
+        let stored = resident_id(&world, &continuity.transaction_id)?;
+        assert!(world.engine.enter(&stored, entering(&stored, DeploymentPhase::Routing)?).is_err());
+        Ok(())
     }
 
     #[test]
