@@ -981,6 +981,10 @@ enum PhaseEnd {
     /// A stateful deployment whose candidate holds an issued lease: the phase
     /// is reported and not resolved.
     OperatorRequired,
+    /// A continuity at or past Fencing: its candidate is the only running copy
+    /// of the admitted body, so aborting it restores what it already runs. The
+    /// resolver leaves it to the operator and its phase step keeps running.
+    RetryForward,
 }
 
 /// How a post-fencing failure recovers. `RestoreIncumbent` is what a
@@ -1844,17 +1848,29 @@ impl DeploymentTransaction {
             && (self.pre_fencing_abort.is_some()
                 || self.post_fencing_abort.is_some()
                 || self.drains_incumbent()
-                || (self.resolves_by_deadline() && self.phase_end() == PhaseEnd::OperatorRequired))
+                || (self.resolves_by_deadline()
+                    && matches!(self.phase_end(), PhaseEnd::OperatorRequired | PhaseEnd::RetryForward)))
     }
 
-    /// What an ended post-fencing phase resolves to (Q3). A candidate that was
-    /// never issued a write lease cannot have written, so the transaction
-    /// aborts to the incumbent through the post-fencing path, stateless or not.
-    /// A continuity always aborts: its candidate is the admitted release, and
-    /// supervision restarts that release under the continuity backoff. A
-    /// deployment whose candidate was issued a lease may have written under a
-    /// new state contract, and restoring the incumbent over that is not
-    /// Idunn's call: it is left for the operator.
+    /// Whether an operator's expiry can end this record's phase: it resolves by
+    /// deadline, and is not a continuity past Fencing, whose expiry abort would
+    /// stop the only running copy of the admitted body (ruling
+    /// c2c-expire-refuses-continuity-past-fencing).
+    fn expirable(&self) -> bool {
+        self.resolves_by_deadline()
+            && !(self.command_kind == CommandKind::Continuity && self.phase >= DeploymentPhase::Fencing)
+    }
+
+    /// What an ended post-fencing phase resolves to (Q3). A continuity at or
+    /// past Fencing retries forward: its incumbent is the admitted generation,
+    /// which supervision mints a continuity only after seeing dead, and from
+    /// Fencing the continuity owns the target, so aborting restores the body
+    /// its candidate already runs (ruling c2c-retry-decided-by-record). A
+    /// deployment whose candidate was never issued a write lease cannot have
+    /// written, so it aborts to the incumbent through the post-fencing path,
+    /// stateless or not. One whose candidate was issued a lease may have
+    /// written under a new state contract, and restoring the incumbent over
+    /// that is not Idunn's call: it is left for the operator.
     fn phase_end(&self) -> PhaseEnd {
         if self.phase < DeploymentPhase::Fencing {
             return PhaseEnd::AbortBeforeFencing;
@@ -1863,8 +1879,9 @@ impl DeploymentTransaction {
         let granted = leasing.and_then(LeasingEvidence::lease).is_some();
         let issued = leasing.and_then(LeasingEvidence::issued_lease).is_some();
         match self.command_kind {
+            CommandKind::Continuity => PhaseEnd::RetryForward,
             CommandKind::Deploy if issued => PhaseEnd::OperatorRequired,
-            _ => PhaseEnd::Abort {
+            CommandKind::Deploy => PhaseEnd::Abort {
                 lease_not_adopted: granted && self.lease_adoption.is_none(),
             },
         }
@@ -3119,8 +3136,13 @@ fn expire(store_path: &Path, command_id: &str, requested_by: &str) -> Result<()>
         "command has multiple live transactions"
     );
     ensure!(
-        current.value.resolves_by_deadline(),
-        "only a live transaction in Warming through Committing, and not already aborting, can be expired; before Warming, use idunn cancel"
+        current.value.expirable(),
+        "{}",
+        if current.value.resolves_by_deadline() {
+            "a continuity past Fencing retries forward and cannot be expired; to restart it, stop its candidate unit and Idunn aborts it as dead"
+        } else {
+            "only a live transaction in Warming through Committing, and not already aborting, can be expired; before Warming, use idunn cancel"
+        }
     );
     let now = now_millis()?;
     let request = ExpiryRequest {
@@ -9460,8 +9482,11 @@ impl Engine {
 
     /// Every live record is held to a deadline. Before a transaction runs its
     /// step, a deadline phase whose deadline has passed, or whose command an
-    /// operator asked to expire, is resolved as `phase_end` says; an abort or
-    /// a drain past its deadline is left to the operator and its step retries.
+    /// operator asked to expire, is resolved as `phase_end` says: aborted before
+    /// the fence, aborted after it, or left to the operator with its step
+    /// retrying (a stateful deploy, or a continuity, whose candidate is the only
+    /// running copy of its body). An abort or a drain past its deadline is left
+    /// to the operator the same way.
     /// Returns `Some(moved)` when it decided the tick, `None` to run the step.
     ///
     /// Only `retime` sets a deadline (at phase entry, an abort's beginning, the
@@ -9513,10 +9538,11 @@ impl Engine {
             }
             return Ok(None);
         }
-        let requested = ControlSnapshot::read(&self.options.state_store)?
-            .expiry_requests
-            .iter()
-            .any(|request| request.value.command_id == transaction.command_id);
+        let requested = transaction.expirable()
+            && ControlSnapshot::read(&self.options.state_store)?
+                .expiry_requests
+                .iter()
+                .any(|request| request.value.command_id == transaction.command_id);
         let cause = if now >= deadline.deadline_at_unix_millis {
             format!(
                 "the {:?} phase passed its deadline at unix ms {}",
@@ -9545,6 +9571,15 @@ impl Engine {
                 self.leave_to_operator(
                     transaction,
                     &format!("{cause}, and its stateful candidate was issued a write lease"),
+                );
+                Ok(None)
+            }
+            PhaseEnd::RetryForward => {
+                self.leave_to_operator(
+                    transaction,
+                    &format!(
+                        "{cause}; its candidate is the only running copy of the admitted body, so Idunn retries the phase forward and never stops it; to restart it, stop its unit by hand"
+                    ),
                 );
                 Ok(None)
             }
@@ -9578,7 +9613,7 @@ impl Engine {
             .filter(|request| {
                 !snapshot.transactions.iter().any(|stored| {
                     stored.value.command_id == request.value.command_id
-                        && stored.value.resolves_by_deadline()
+                        && stored.value.expirable()
                 })
             })
             .map(|request| request.envelope.clone())
@@ -14061,22 +14096,24 @@ mod tests {
             (Deploy, Some(prepared.clone()), None, PhaseEnd::OperatorRequired),
             (Deploy, Some(granted.clone()), None, PhaseEnd::OperatorRequired),
             (Deploy, Some(granted.clone()), adoption.clone(), PhaseEnd::OperatorRequired),
-            (Continuity, Some(LeasingEvidence::SkippedStateless), None, abort(false)),
-            (Continuity, Some(prepared), None, abort(false)),
-            (Continuity, Some(granted.clone()), None, abort(true)),
-            (Continuity, Some(granted), adoption.clone(), abort(false)),
+            (Continuity, None, None, PhaseEnd::RetryForward),
+            (Continuity, Some(LeasingEvidence::SkippedStateless), None, PhaseEnd::RetryForward),
+            (Continuity, Some(prepared), None, PhaseEnd::RetryForward),
+            (Continuity, Some(granted.clone()), None, PhaseEnd::RetryForward),
+            (Continuity, Some(granted), adoption.clone(), PhaseEnd::RetryForward),
         ];
         for (kind, leasing, lease_adoption, expected) in cases {
             transaction.command_kind = kind;
             transaction.leasing = leasing.clone();
             transaction.lease_adoption = lease_adoption.clone();
             assert_eq!(transaction.phase_end(), expected, "{kind:?} {leasing:?} {lease_adoption:?}");
-            // Only a stateful deploy is left to the operator when its phase ends.
+            // Only a stateful deploy and a continuity are left to the operator
+            // when their phase ends; the other deploys abort.
             transaction.retime(1_000);
             let due = transaction.phase_deadline.context("no deadline")?.deadline_at_unix_millis;
             assert_eq!(
                 transaction.leaves_to_operator(due),
-                expected == PhaseEnd::OperatorRequired,
+                matches!(expected, PhaseEnd::OperatorRequired | PhaseEnd::RetryForward),
                 "{kind:?} {leasing:?} {lease_adoption:?}"
             );
             assert!(!transaction.leaves_to_operator(due - 1));
@@ -22482,11 +22519,12 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
 
         /// Soul's F1 probe, committed. A continuity's route changes are
         /// Survival, so no ceiling refuses its install and rollback while its
-        /// route proof keeps failing. The Routing deadline ends it: no attempt
-        /// runs after the deadline.
+        /// route proof keeps failing. Its Routing deadline does not end it: the
+        /// continuity pages the operator and retries forward, never stopping its
+        /// candidate (ruling post-fence-forward-retry).
         #[cfg(unix)]
         #[test]
-        fn a_continuity_whose_route_proof_fails_ends_at_its_routing_deadline() -> Result<()> {
+        fn a_continuity_whose_route_proof_fails_retries_forward_past_its_routing_deadline_and_pages() -> Result<()> {
             let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
             routed.stub.set_state("active");
             routed.run_to_routing()?;
@@ -22504,36 +22542,46 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert!(waiting.last_error.is_some());
             assert_eq!(waiting.phase_deadline, Some(deadline), "a resume moved the deadline");
 
+            let stops = routed.workload.stops.load(Ordering::SeqCst);
             pass_deadline(&routed.world)?;
-            routed.resume()?;
-            let abort = routed
-                .transaction()?
-                .post_fencing_abort
-                .context("the passed deadline did not end the phase")?;
-            assert!(abort.error.contains("Routing phase passed its deadline"), "{}", abort.error);
-            assert!(!abort.error.contains("lease-not-adopted"), "{}", abort.error);
-            let finished = routed.resume_until_terminal()?;
-            assert!(
-                matches!(
-                    finished.completion,
-                    Some(TransactionCompletion::FailedAfterFencing {
-                        recovery: TerminalRecovery::RestoreIncumbent,
-                        ..
-                    })
-                ),
-                "{:?}",
-                finished.completion
+            for _ in 0..5 {
+                routed.resume()?;
+            }
+            // Past the deadline the continuity is not aborted: aborting it
+            // would stop the only running copy of the admitted body. It is left
+            // to the operator, and its Routing step keeps running.
+            let left = routed.transaction()?;
+            assert!(left.post_fencing_abort.is_none(), "the passed deadline aborted a continuity");
+            assert_eq!(left.phase, DeploymentPhase::Routing);
+            assert!(left.completion.is_none());
+            assert_eq!(
+                routed.world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?,
+                [left.transaction_id.clone()]
             );
-            // After the deadline no attempt runs; the withdrawal writes and
-            // reloads once, whatever the rolled-back disk shows.
-            assert_eq!(routed.reloads(), 7, "an attempt ran after the deadline");
+            assert_eq!(routed.world.engine.incidents().read()?.len(), 1, "one page per episode");
+            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops, "the candidate was stopped");
+            assert!(routed.reloads() > 6, "no attempt ran after the deadline");
+
+            // The proof passes: the phase moves on, and the first pass after
+            // closes the incident.
+            routed.stub.hang_up.store(false, Ordering::SeqCst);
+            routed.drive_until_resuming(|t| t.phase == DeploymentPhase::Committing)?;
+            routed.resume()?;
+            assert!(
+                routed.world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)?.is_empty(),
+                "the incident outlived the episode"
+            );
+            let records = routed.world.engine.incidents().read()?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].close_reason, Some(CloseReason::Recovered));
+            assert_eq!(routed.workload.stops.load(Ordering::SeqCst), stops);
             Ok(())
         }
 
         /// The live shape of F1. A continuity reuses the admitted Expected, so
         /// its membership is the admitted fragment already on disk: while its
         /// proof fails, the install and the rollback write nothing and reload
-        /// nothing, and neither does the withdrawal after its deadline.
+        /// nothing, and neither does its forward retry after its deadline.
         #[cfg(unix)]
         #[test]
         fn a_continuity_over_its_admitted_route_reloads_nothing_while_its_proof_fails()
@@ -22562,8 +22610,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert_eq!(routed.world.route_stubs.count(""), 0, "a failing continuity ran a host program");
 
             pass_deadline(&routed.world)?;
-            routed.resume_until_terminal()?;
-            assert_eq!(routed.world.route_stubs.count(""), 0, "its withdrawal ran a host program");
+            for _ in 0..5 {
+                routed.resume()?;
+            }
+            assert!(routed.transaction()?.post_fencing_abort.is_none(), "a passed deadline aborted it");
+            assert_eq!(routed.world.route_stubs.count(""), 0, "its retry ran a host program");
             assert_eq!(std::fs::read(routed.fragment_path())?, admitted, "the admitted route moved");
             Ok(())
         }
@@ -22689,10 +22740,10 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 .expect_err("an aborting transaction was expired");
             assert!(format!("{refused:#}").contains("idunn cancel"), "{refused:#}");
 
-            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let routed = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
             let untouched = resident(&routed.world)?.envelope;
-            expire(&routed.world.state_store, "continuity-service", "operator")?;
-            assert!(expire(&routed.world.state_store, "continuity-service", "operator").is_err());
+            expire(&routed.world.state_store, "up-service", "operator")?;
+            assert!(expire(&routed.world.state_store, "up-service", "operator").is_err());
             let snapshot = ControlSnapshot::read(&routed.world.state_store)?;
             assert_eq!(snapshot.expiry_requests.len(), 1);
             assert_eq!(resident(&routed.world)?.envelope, untouched, "the CLI wrote the transaction");
@@ -22708,6 +22759,36 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 ControlSnapshot::read(&routed.world.state_store)?.expiry_requests.is_empty(),
                 "the spent request stayed"
             );
+
+            // A continuity past Fencing retries forward: expiring it would
+            // abort the only running copy of its body. The CLI refuses, and a
+            // request a pre-c2c binary stored for one is retired as spent.
+            let continuity = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let refused = expire(&continuity.world.state_store, "continuity-service", "operator")
+                .expect_err("a continuity past Fencing was expired");
+            assert!(format!("{refused:#}").contains("retries forward"), "{refused:#}");
+            assert!(ControlSnapshot::read(&continuity.world.state_store)?.expiry_requests.is_empty());
+            let now = now_millis()?;
+            let stored = ExpiryRequest {
+                schema_version: EXPIRY_REQUEST_SCHEMA.into(),
+                command_id: "continuity-service".into(),
+                requested_by: "operator".into(),
+                requested_at_unix_millis: now,
+            };
+            assert!(SingleFileMessagePackBackingStore::new(&continuity.world.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: ExpiryRequest::TYPE.into(),
+                    key: stored.command_id.clone(),
+                    current: None,
+                }],
+                &[expiry_request_envelope(&stored, now)?],
+            )?);
+            continuity.resume()?;
+            assert!(
+                ControlSnapshot::read(&continuity.world.state_store)?.expiry_requests.is_empty(),
+                "the request for a continuity past Fencing stayed"
+            );
+            assert!(continuity.transaction()?.post_fencing_abort.is_none(), "the request aborted a continuity");
             Ok(())
         }
 
@@ -22739,7 +22820,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert!(format!("{refused:#}").contains("no live transaction"), "{refused:#}");
 
             // Another target's deployment in flight is not this command's.
-            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let routed = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
             let now = now_millis()?;
             let other = DeploymentCommand {
                 schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
@@ -22765,10 +22846,10 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 ],
                 &[command_envelope(&other, now)?, transaction_envelope(&sealing, now)?],
             )?);
-            expire(&routed.world.state_store, "continuity-service", "operator")?;
+            expire(&routed.world.state_store, "up-service", "operator")?;
             let requests = ControlSnapshot::read(&routed.world.state_store)?.expiry_requests;
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].value.command_id, "continuity-service");
+            assert_eq!(requests[0].value.command_id, "up-service");
             Ok(())
         }
 
@@ -22776,7 +22857,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         /// live transactions, a request for the other leaves this one running.
         #[test]
         fn an_expiry_request_ends_only_its_own_commands_phase() -> Result<()> {
-            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let routed = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
             let now = now_millis()?;
             let other = DeploymentCommand {
                 schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
@@ -22789,8 +22870,8 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             let sealing = DeploymentTransaction::new(&other, "other".into(), 0, None, now)?;
             // The request names a command whose id has this transaction's
             // length and first bytes, and differs only in its last.
-            let near = "continuity-servicx";
-            assert_eq!(near.len(), "continuity-service".len());
+            let near = "up-servicx";
+            assert_eq!(near.len(), "up-service".len());
             let request = ExpiryRequest {
                 schema_version: EXPIRY_REQUEST_SCHEMA.into(),
                 command_id: near.into(),
@@ -22800,11 +22881,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             // And commands whose ids are a strict prefix of this one's, and
             // extend it: a match is the whole id, in neither direction a part.
             let prefix = ExpiryRequest {
-                command_id: "continuity-servic".into(),
+                command_id: "up-servic".into(),
                 ..request.clone()
             };
             let extension = ExpiryRequest {
-                command_id: "continuity-service-2".into(),
+                command_id: "up-service-2".into(),
                 ..request.clone()
             };
             let store = SingleFileMessagePackBackingStore::new(&routed.world.state_store);
@@ -22835,24 +22916,26 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             let mine = snapshot
                 .transactions
                 .iter()
-                .find(|t| t.value.command_id == "continuity-service")
+                .find(|t| t.value.command_id == "up-service")
                 .context("no continuity")?;
             assert_eq!(routed.world.engine.resolve_phase_deadline(mine)?, None);
             let after = ControlSnapshot::read(&routed.world.state_store)?;
             let unchanged = after
                 .transactions
                 .iter()
-                .find(|t| t.value.command_id == "continuity-service")
+                .find(|t| t.value.command_id == "up-service")
                 .context("no continuity")?;
             assert_eq!(unchanged.envelope, mine.envelope, "another command's request ended this phase");
             Ok(())
         }
 
-        /// Q3 at the deadline, through the Engine. A continuity whose candidate
-        /// was granted a lease and never proved it held it fails as
-        /// `lease-not-adopted`; one whose Ready proved it restarts the admitted
-        /// release. A deployment whose candidate holds a lease is left to the
-        /// operator: nothing is aborted and its step still runs.
+        /// The deadline of a stateful target, through the Engine. A deployment
+        /// whose candidate holds a lease is left to the operator: nothing is
+        /// aborted and its step still runs. So is a continuity, adopted or not,
+        /// whose candidate is the only running copy of the admitted body. An
+        /// abort begun on a continuity directly still names its recovery: it
+        /// restarts the admitted release when its Ready proved the lease, and
+        /// restores the incumbent when it never did.
         #[test]
         fn a_stateful_deadline_resolves_by_lease_adoption() -> Result<()> {
             let granted = |routed: &RoutedWorld| -> Result<String> {
@@ -22866,13 +22949,29 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                     .to_owned())
             };
 
+            // Past its deadline a continuity is not aborted, adopted or not:
+            // its candidate is the only running copy of the admitted body. It
+            // is left to the operator and its step runs.
+            let open = |routed: &RoutedWorld| -> Result<Vec<String>> {
+                routed.world.engine.incidents().open_subjects(IncidentCondition::OperatorRequired)
+            };
             let unadopted = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
             granted(&unadopted)?;
             pass_deadline(&unadopted.world)?;
-            unadopted.resume()?;
-            let abort = unadopted.transaction()?.post_fencing_abort.context("not ended")?;
-            assert!(abort.error.starts_with("lease-not-adopted: "), "{}", abort.error);
-            assert!(abort.error.contains("AwaitingReady phase passed its deadline"), "{}", abort.error);
+            for _ in 0..3 {
+                unadopted.resume()?;
+            }
+            let held = unadopted.transaction()?;
+            assert!(held.post_fencing_abort.is_none(), "an unadopted continuity was aborted");
+            assert_eq!(held.phase, DeploymentPhase::AwaitingReady);
+            assert_eq!(held.last_error.as_deref(), Some("candidate is still warming"), "its step did not run");
+            assert_eq!(open(&unadopted)?, [held.transaction_id.clone()]);
+            // An abort begun on it directly (a candidate found dead) still
+            // restores the incumbent when the lease was never adopted.
+            unadopted
+                .world
+                .engine
+                .begin_post_fencing_abort(&resident(&unadopted.world)?, anyhow!("test abort"))?;
             let finished = unadopted.resume_until_terminal()?;
             assert!(matches!(
                 finished.completion,
@@ -22896,10 +22995,19 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert_eq!(adoption.signed_presence_sha256, evidence.canonical_sha256);
             assert_eq!(adoption.source, AdoptionSource::Direct);
             adopted.drive_until(|t| t.phase == DeploymentPhase::Routing)?;
+            adopted.stub.hang_up.store(true, Ordering::SeqCst);
             pass_deadline(&adopted.world)?;
-            adopted.resume()?;
-            let abort = adopted.transaction()?.post_fencing_abort.context("not ended")?;
-            assert!(!abort.error.contains("lease-not-adopted"), "{}", abort.error);
+            for _ in 0..3 {
+                adopted.resume()?;
+            }
+            let held = adopted.transaction()?;
+            assert!(held.post_fencing_abort.is_none(), "an adopted continuity was aborted");
+            assert_eq!(held.phase, DeploymentPhase::Routing);
+            assert_eq!(open(&adopted)?, [held.transaction_id.clone()]);
+            adopted
+                .world
+                .engine
+                .begin_post_fencing_abort(&resident(&adopted.world)?, anyhow!("test abort"))?;
             let finished = adopted.resume_until_terminal()?;
             assert!(
                 matches!(
@@ -22991,7 +23099,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         }
 
         /// B5 Soul A. The physical grant lands before `Granted` is durable. A
-        /// continuity that dies in that window and passes its deadline is
+        /// continuity that dies in that window and whose abort begins is
         /// aborted from `Prepared`; the abort still withdraws the lease on
         /// disk, so the next fencing of the target is not refused.
         #[test]
@@ -23011,9 +23119,12 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             );
             assert!(driver.observe_exact(&lease)?, "the grant is not on disk");
 
-            pass_deadline(&routed.world)?;
+            routed
+                .world
+                .engine
+                .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("test abort"))?;
             routed.resume()?;
-            assert!(routed.transaction()?.post_fencing_abort.is_some(), "the deadline did not end it");
+            assert!(routed.transaction()?.post_fencing_abort.is_some(), "the abort did not begin");
             routed.resume_until_terminal()?;
             assert!(driver.observe_empty()?, "the abort left the granted lease on disk");
             // What the next fencing does to a candidate's lease path.
@@ -23034,9 +23145,12 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             routed.workload.hold_lease_lock(&lease_path);
             let driver = CultCacheWriteLeaseDriver::new("service", &lease_path);
 
-            pass_deadline(&routed.world)?;
+            routed
+                .world
+                .engine
+                .begin_post_fencing_abort(&resident(&routed.world)?, anyhow!("test abort"))?;
             routed.resume()?;
-            assert!(routed.transaction()?.post_fencing_abort.is_some(), "the deadline did not end it");
+            assert!(routed.transaction()?.post_fencing_abort.is_some(), "the abort did not begin");
             let stops = routed.workload.stops.load(Ordering::SeqCst);
             let finished = routed.resume_until_terminal()?;
             assert!(
@@ -23046,6 +23160,46 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             );
             assert!(driver.observe_empty()?, "the abort left the lease on disk");
             assert!(routed.workload.stops.load(Ordering::SeqCst) > stops, "the candidate was never stopped");
+            Ok(())
+        }
+
+        /// The deadline's abort is a continuity's no longer, and a deployment's
+        /// still: a deployment's candidate is a new release and its incumbent
+        /// the admitted body, which an abort restores.
+        #[cfg(unix)]
+        #[test]
+        fn a_deploy_with_a_live_incumbent_still_aborts_to_it_at_its_deadline() -> Result<()> {
+            let routed = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            routed.stub.hang_up.store(true, Ordering::SeqCst);
+            routed.resume()?;
+            assert!(routed.transaction()?.post_fencing_abort.is_none(), "aborted before its deadline");
+
+            pass_deadline(&routed.world)?;
+            routed.resume()?;
+            let abort = routed
+                .transaction()?
+                .post_fencing_abort
+                .context("the passed deadline did not end a deployment")?;
+            assert!(abort.error.contains("Routing phase passed its deadline"), "{}", abort.error);
+            assert!(
+                routed.world.engine.return_wedged_continuity_aborts_forward()?.is_empty(),
+                "the boot lift took a deployment's abort"
+            );
+            assert!(routed.transaction()?.post_fencing_abort.is_some());
+            let finished = routed.resume_until_terminal()?;
+            assert!(
+                matches!(
+                    finished.completion,
+                    Some(TransactionCompletion::FailedAfterFencing {
+                        recovery: TerminalRecovery::RestoreIncumbent,
+                        ..
+                    })
+                ),
+                "{:?}",
+                finished.completion
+            );
             Ok(())
         }
 
