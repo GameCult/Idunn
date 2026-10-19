@@ -17721,7 +17721,6 @@ mod tests {
             deploy_beside_continuity(&world, DeploymentPhase::Warming, DeploymentPhase::Fencing)?;
         let (deploy_id, owner_id) = (deploy.transaction_id.clone(), continuity.transaction_id.clone());
         drive_id(&world, &owner_id, |t| t.phase == DeploymentPhase::AwaitingReady)?;
-        pass_deadline_of(&world, &owner_id)?;
         Ok((world, workload, deploy, deploy_id, owner_id, incumbent))
     }
 
@@ -17730,6 +17729,7 @@ mod tests {
     #[test]
     fn a_waiting_deployment_lands_over_a_continuity_that_retries_forward_past_its_deadline() -> Result<()> {
         let (world, workload, deploy, deploy_id, owner_id, incumbent) = waiter_beside_gate_waiting_continuity()?;
+        pass_deadline_of(&world, &owner_id)?;
         let stops = workload.stops.load(std::sync::atomic::Ordering::SeqCst);
         waiter_then_owner(&world, &deploy_id, &owner_id)?;
         let waiter = latest_id(&world, &deploy_id)?;
