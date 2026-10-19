@@ -57,7 +57,10 @@ web app and service through Idunn v2. The live evidence is on Yggdrasil:
    incumbent. A continuity past its deadline is left to the operator
    (operator-required incident) and retries its phase forward on a capped
    backoff, because aborting it would stop the only running copy of the admitted
-   body (ruling post-fence-forward-retry). A stateful deployment is left to the
+   body (ruling post-fence-forward-retry), until a deployment awaits the
+   handover of its target: then it yields through its own post-fencing abort,
+   and the deployment fences what is admitted (ruling
+   continuity-yields-to-deploy). A stateful deployment is left to the
    operator.
 6. **The admitted receipt describes the running incarnation.** Continuity
    commits update the admitted generation atomically, so the rollback path never
