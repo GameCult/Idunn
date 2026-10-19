@@ -24189,9 +24189,9 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                     clear_other_live_transactions(&routed.world, owner)?;
                 }
                 if matches!(case, Case::LeaseWithdrawalRecordedComplete) {
-                    // The record's claim is made true, so the abort can finish.
-                    let (lease, _) = lease_of(&routed)?;
-                    lease_driver(&routed).0.revoke_exact(Some(&lease))?;
+                    // An edited record, not a reachable one: the lift's refusal
+                    // is the whole claim, and its abort is not run to the end.
+                    continue;
                 }
                 let finished = routed.resume_until_terminal().with_context(|| format!("{case:?}"))?;
                 assert!(
