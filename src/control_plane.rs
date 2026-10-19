@@ -16866,6 +16866,63 @@ mod tests {
         Ok(())
     }
 
+    /// A source whose resolve step fails with a fixed message, as a build or
+    /// resolve step does when its output is a long log.
+    struct FailingSource {
+        message: String,
+    }
+
+    impl SourcePort for FailingSource {
+        fn resolve(
+            &self,
+            _: &OperatorBinding,
+            _: &str,
+            _: u64,
+        ) -> Result<crate::drivers::ResolvedSource> {
+            bail!("{}", self.message)
+        }
+
+        fn freeze(&self, _: &str, _: &CompiledDeploymentPlan) -> Result<FrozenSourceReceipt> {
+            bail!("this source freezes nothing")
+        }
+
+        fn observe_frozen(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &FrozenSourceReceipt,
+        ) -> Result<crate::drivers::FrozenSource> {
+            bail!("this source freezes nothing")
+        }
+
+        fn cleanup(&self, _: &str, _: Option<&FrozenSourceReceipt>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_sealing_failure_with_a_long_multibyte_error_aborts_and_frees_the_target() -> Result<()> {
+        // 3000 chars of 3-byte box drawing: 9000 bytes, the shape of a build log.
+        let log = format!("{}\nthe real error is here", "\u{2500}".repeat(3000));
+        let mut world = sealing_world(&unrouted_recipe())?;
+        world.engine.source = Arc::new(FailingSource { message: log });
+        for _ in 0..8 {
+            let _ = world.engine.run_scheduler_tick();
+        }
+        assert!(
+            resident(&world).is_err(),
+            "the failed transaction still owns the target"
+        );
+        let done = latest(&world)?;
+        let TransactionCompletion::FailedBeforeFencing { error } =
+            done.completion.context("the aborted transaction did not complete")?
+        else {
+            bail!("the transaction did not fail before fencing");
+        };
+        assert!(error.len() <= 2048, "{}", error.len());
+        assert!(error.ends_with("the real error is here"), "the tail was lost");
+        Ok(())
+    }
+
     #[test]
     fn admission_takes_a_recipe_that_declares_its_proof() -> Result<()> {
         let recipe = unrouted_recipe().replace(
