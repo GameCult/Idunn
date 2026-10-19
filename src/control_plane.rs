@@ -1686,6 +1686,18 @@ struct DeploymentTransaction {
     lease_adoption: Option<LeaseAdoptionEvidence>,
 }
 
+/// The phase whose entry is the handover of a target: Starting when the rollout
+/// stops the incumbent first (it is stopped there by design), else Fencing. The
+/// one spelling of the rule; a free function so the stop-then-start arm is
+/// testable without a host-actuator fixture.
+fn handover_phase(stops_incumbent_first: bool) -> DeploymentPhase {
+    if stops_incumbent_first {
+        DeploymentPhase::Starting
+    } else {
+        DeploymentPhase::Fencing
+    }
+}
+
 impl DeploymentTransaction {
     /// The one writer of `phase`. It stamps the update time and the phase
     /// deadline together, so a record outside Fencing..=Committing carries no
@@ -1891,21 +1903,36 @@ impl DeploymentTransaction {
         }
     }
 
-    /// Complete transactions retain retryable cleanup work, but admission has
-    /// already transferred current-incarnation authority to AdmittedGeneration.
-    fn owns_target_authority(&self) -> bool {
+    /// The phase whose entry is the handover: the one transaction that makes
+    /// it takes the target's incumbent slot from continuity supervision.
+    fn takes_target_at(&self) -> DeploymentPhase {
+        handover_phase(self.rollout_stops_incumbent_first())
+    }
+
+    /// Not Complete: the transaction still holds its own candidate slot.
+    /// Read by sibling order inside one command, freeze (a live Deploy
+    /// refuses a second), the mint gate (a live Continuity refuses a second),
+    /// candidate-port reservation and validation.
+    fn is_live(&self) -> bool {
         self.phase != DeploymentPhase::Complete
+    }
+
+    /// From the handover until Complete the transaction owns the target's
+    /// incumbent slot: it fences, leases, routes and commits. Derived from the
+    /// phase, never stored. Read by validation (one owner), supervision (which
+    /// defers to an owner), the handover CAS, a waiting deployment and status.
+    fn owns_target(&self) -> bool {
+        (self.takes_target_at()..DeploymentPhase::Complete).contains(&self.phase)
     }
 
     /// Admission has moved to the new generation at Complete, but an exact
     /// draining incumbent still reserves its process and candidate endpoint.
-    /// No later mutation for the same target may overlap that cleanup.
-    fn blocks_new_target_mutation(&self) -> bool {
-        self.owns_target_authority()
-            || self
-                .post_commit_cleanup
-                .as_ref()
-                .is_some_and(|cleanup| !cleanup.is_complete())
+    /// Read by the mint gate, the handover, candidate-port reservation and
+    /// status: no later mutation of the target may overlap that cleanup.
+    fn drains_incumbent(&self) -> bool {
+        self.post_commit_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| !cleanup.is_complete())
     }
 
     /// Where what this transaction has collected disagrees with what its own
@@ -3242,16 +3269,27 @@ impl ControlSnapshot {
                 "transaction kind differs from its immutable command"
             );
         }
-        let mut live_targets = BTreeSet::new();
+        // Per target: one owner of the incumbent slot, one live Deploy, one
+        // live Continuity. A continuity may sit beside a deployment that has
+        // not yet taken the target (handover-phase-split).
+        let mut owners = BTreeSet::new();
+        let mut live_deploys = BTreeSet::new();
+        let mut live_continuities = BTreeSet::new();
         for transaction in self
             .transactions
             .iter()
-            .filter(|stored| stored.value.owns_target_authority())
+            .filter(|stored| stored.value.is_live())
         {
+            let target = transaction.value.target.as_str();
             ensure!(
-                live_targets.insert(transaction.value.target.as_str()),
-                "multiple transactions claim current-incarnation authority for one target"
+                !transaction.value.owns_target() || owners.insert(target),
+                "multiple transactions own the incumbent slot of one target"
             );
+            let (seen, kind) = match transaction.value.command_kind {
+                CommandKind::Deploy => (&mut live_deploys, "deployments"),
+                CommandKind::Continuity => (&mut live_continuities, "continuity transactions"),
+            };
+            ensure!(seen.insert(target), "multiple live {kind} for one target");
             if let Some(fencing) = transaction
                 .value
                 .fencing
@@ -3381,7 +3419,7 @@ impl ControlSnapshot {
 
     fn has_earlier_authority_sibling(&self, transaction: &DeploymentTransaction) -> bool {
         self.transactions.iter().any(|stored| {
-            stored.value.owns_target_authority()
+            stored.value.is_live()
                 && stored.value.command_id == transaction.command_id
                 && stored.value.ordinal < transaction.ordinal
         })
@@ -4608,9 +4646,10 @@ fn status(
                 }
                 writeln!(
                     out,
-                    "    terminal {} owns-target {}",
+                    "    terminal {} owns-target {} drains {}",
                     transaction.is_terminal(),
-                    transaction.blocks_new_target_mutation()
+                    transaction.owns_target(),
+                    transaction.drains_incumbent()
                 )?;
             }
         }
@@ -5934,7 +5973,7 @@ impl Engine {
         let busy = snapshot
             .transactions
             .iter()
-            .filter(|stored| stored.value.blocks_new_target_mutation())
+            .filter(|stored| stored.value.is_live() || stored.value.drains_incumbent())
             .map(|stored| stored.value.target.as_str())
             .collect::<BTreeSet<_>>();
         if targets.iter().any(|target| busy.contains(target.as_str())) {
@@ -5995,23 +6034,19 @@ impl Engine {
                     &anyhow::Error::new(disagreement),
                 );
             }
-            let blocker = snapshot.transactions.iter().find(|stored| {
-                stored.value.target == current.value.target
-                    && stored.value.blocks_new_target_mutation()
-            });
-            if blocker.is_some_and(|stored| {
-                let owns_from = if stored.value.rollout_stops_incumbent_first() {
-                    // The incumbent is stopped at Starting by design; a
-                    // continuity restart in that window would fight the
-                    // candidate for the same host resources.
-                    DeploymentPhase::Starting
-                } else {
-                    DeploymentPhase::Fencing
-                };
-                stored.value.phase >= owns_from && stored.value.phase < DeploymentPhase::Complete
-            }) {
+            let on_target = || {
+                snapshot
+                    .transactions
+                    .iter()
+                    .filter(|stored| stored.value.target == current.value.target)
+            };
+            // A transaction that owns the incumbent slot fences, stops or
+            // replaces this generation: nothing here touches it meanwhile.
+            if on_target().any(|stored| stored.value.owns_target()) {
                 continue;
             }
+            let blocked = on_target()
+                .any(|stored| stored.value.is_live() || stored.value.drains_incumbent());
             match self.supervise_admitted_route(&snapshot, current) {
                 Ok(true) => {
                     progressed = true;
@@ -6056,9 +6091,7 @@ impl Engine {
             // the admitted one leaves the projection naming an incarnation that
             // no longer exists -- which the workload rightly refuses to adopt.
             // That record is published from observation once the process is up.
-            if blocker.is_none()
-                || blocker.is_some_and(|stored| stored.value.phase == DeploymentPhase::Complete)
-            {
+            if !on_target().any(|stored| stored.value.is_live()) {
                 let repair = (|| -> Result<()> {
                     let topology = self.topology();
                     let provider_anchor = self.provider_anchor_for_plan(&current.value.plan)?;
@@ -6228,7 +6261,7 @@ impl Engine {
 
             // Continuity defers to any live transaction for its target and
             // never aborts one (handover-phase-split).
-            if blocker.is_some() {
+            if blocked {
                 continue;
             }
             if supervision.restarts_page(now) {
@@ -7994,7 +8027,7 @@ impl Engine {
                 snapshot
                     .transactions
                     .iter()
-                    .filter(|stored| stored.value.blocks_new_target_mutation())
+                    .filter(|stored| stored.value.is_live() || stored.value.drains_incumbent())
                     .filter_map(|stored| stored.value.plan.as_ref()),
             )
         {
@@ -11595,8 +11628,9 @@ mod tests {
         });
 
         assert!(!transaction.is_terminal());
-        assert!(!transaction.owns_target_authority());
-        assert!(transaction.blocks_new_target_mutation());
+        assert!(!transaction.is_live());
+        assert!(!transaction.owns_target());
+        assert!(transaction.drains_incumbent());
         Ok(())
     }
 
@@ -11835,7 +11869,7 @@ mod tests {
             );
             assert_eq!(lifted.phase_deadline, None);
             assert_eq!(lifted.lease_adoption, None);
-            assert_eq!(lifted.owns_target_authority(), legacy.phase != DeploymentPhase::Complete);
+            assert_eq!(lifted.is_live(), legacy.phase != DeploymentPhase::Complete);
         }
         assert_eq!(
             phases.iter().map(|(_, phase)| *phase).collect::<Vec<_>>(),
@@ -12457,16 +12491,23 @@ mod tests {
         declare_odin(&mut expected);
 
         let now = now_millis()?;
+        // A second seeding of one kind into one world is a second command.
+        let base_id = format!(
+            "{}-service{}",
+            match kind {
+                CommandKind::Deploy => "up",
+                CommandKind::Continuity => "continuity",
+            },
+            if incumbent.is_some() { "-again" } else { "" }
+        );
+        let known = ControlSnapshot::read(&world.state_store)?.commands;
+        let command_id = (1..)
+            .map(|n| if n == 1 { base_id.clone() } else { format!("{base_id}-{n}") })
+            .find(|id| known.iter().all(|stored| stored.value.command_id != *id))
+            .context("no free command id")?;
         let command = DeploymentCommand {
             schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
-            command_id: format!(
-                "{}-service{}",
-                match kind {
-                    CommandKind::Deploy => "up",
-                    CommandKind::Continuity => "continuity",
-                },
-                if incumbent.is_some() { "-again" } else { "" }
-            ),
+            command_id,
             kind,
             selector: "service".into(),
             requested_by: "test".into(),
@@ -14220,7 +14261,7 @@ mod tests {
                 assert!(lifted.is_terminal(), "{name}: the lift reopened a finished record");
                 assert_eq!(lifted.phase, archived.phase, "{name}");
                 assert_eq!(lifted.completion, archived.completion, "{name}");
-                assert!(!lifted.owns_target_authority(), "{name}");
+                assert!(!lifted.is_live(), "{name}");
             } else {
                 assert_eq!(abort_owed(&lifted), Some(CleanupEvidence::Pending), "{name}");
                 assert!(!lifted.is_terminal(), "{name}");
@@ -16184,6 +16225,79 @@ mod tests {
         Ok(())
     }
 
+    /// The stored transaction `id`, moved into `phase` in place.
+    fn rephase(world: &EngineFixture, id: &str, phase: DeploymentPhase) -> Result<()> {
+        let stored = ControlSnapshot::read(&world.state_store)?
+            .transactions
+            .into_iter()
+            .find(|stored| stored.value.transaction_id == id)
+            .context("no such live transaction")?;
+        let mut next = stored.value.clone();
+        next.enter_phase(phase, now_millis()?);
+        replace_transaction(&world.state_store, &stored, &next)
+    }
+
+    #[test]
+    fn the_handover_phase_is_starting_only_for_stop_then_start() -> Result<()> {
+        assert_eq!(handover_phase(true), DeploymentPhase::Starting);
+        assert_eq!(handover_phase(false), DeploymentPhase::Fencing);
+
+        let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+        let mut seeded = transaction_at(&world, DeploymentPhase::Warming)?;
+        assert_eq!(seeded.takes_target_at(), DeploymentPhase::Fencing);
+        // The target is owned from the handover to Complete, and not after;
+        // it is live until Complete.
+        for (phase, owns) in [
+            (DeploymentPhase::Sealing, false),
+            (DeploymentPhase::Starting, false),
+            (DeploymentPhase::Warming, false),
+            (DeploymentPhase::Fencing, true),
+            (DeploymentPhase::Leasing, true),
+            (DeploymentPhase::AwaitingReady, true),
+            (DeploymentPhase::Routing, true),
+            (DeploymentPhase::Committing, true),
+            (DeploymentPhase::Complete, false),
+        ] {
+            seeded.phase = phase;
+            assert_eq!(seeded.owns_target(), owns, "{phase:?}");
+            assert_eq!(seeded.is_live(), phase != DeploymentPhase::Complete, "{phase:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_store_holds_one_deploy_one_continuity_and_one_owner_per_target() -> Result<()> {
+        let seed = |first: (CommandKind, DeploymentPhase), second: (CommandKind, DeploymentPhase)| {
+            let world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
+            let incumbent = admit_incumbent(&world)?;
+            for (kind, phase) in [first, second] {
+                let seeded =
+                    seeded_transaction(&world, DeploymentPhase::Warming, kind, Some(&incumbent))?;
+                if phase != DeploymentPhase::Warming {
+                    rephase(&world, &seeded.transaction_id, phase)?;
+                }
+            }
+            Ok::<_, anyhow::Error>(world)
+        };
+        use CommandKind::{Continuity, Deploy};
+        use DeploymentPhase::{Fencing, Warming};
+
+        // A pre-handover deployment beside an owning continuity, and the
+        // reverse: one owner, one of each kind.
+        for (first, second) in [((Deploy, Warming), (Continuity, Fencing)), ((Continuity, Warming), (Deploy, Fencing))] {
+            let world = seed(first, second)?;
+            assert_eq!(ControlSnapshot::read(&world.state_store)?.transactions.len(), 2);
+        }
+        let refused = |first, second| -> Result<String> {
+            let world = seed(first, second)?;
+            Ok(format!("{:#}", ControlSnapshot::read(&world.state_store).err().context("two were accepted")?))
+        };
+        assert!(refused((Deploy, Fencing), (Continuity, Fencing))?.contains("own the incumbent slot"));
+        assert!(refused((Deploy, Warming), (Deploy, Warming))?.contains("multiple live deployments"));
+        assert!(refused((Continuity, Warming), (Continuity, Warming))?.contains("multiple live continuity transactions"));
+        Ok(())
+    }
+
     /// Put the target's backoff anchor `ago` milliseconds back.
     fn anchor_ago(world: &EngineFixture, ago: u64) -> Result<()> {
         let mut meters = meters_of(world, "service")?;
@@ -17207,7 +17321,7 @@ mod tests {
         ));
         assert!(finished.is_terminal());
         // The target is released and nothing of the incumbent was touched.
-        assert!(!finished.blocks_new_target_mutation());
+        assert!(!finished.is_live() && !finished.drains_incumbent());
         assert_eq!(incumbent_envelope(&world)?, before);
         assert!(
             every_transaction(&world)?
