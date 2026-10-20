@@ -313,10 +313,36 @@ written when the pass first finds the admitted generation dead and the target
 free, and a capped doubling wait from that anchor (5 s base, 300 s cap). A run
 of 600 s or more by the admitted body resets the streak. A generation lost to a
 host reboot (the workload driver's evidence, `lost_to_host_reboot`) is
-re-materialized once per admission without charge or wait. The target is free
-for a deployment's candidate between attempts, and a deployment never yields to
-continuity before Fencing; from Fencing on (or from Starting for a stop-first
-rollout) the live transaction alone owns the target.
+re-materialized once per admission without charge or wait.
+
+Each target has two slots, the incumbent and a transaction's candidate. The
+incumbent is continuity's until a transaction takes the target, at Fencing (at
+Starting for a stop-then-start rollout), through one `take_target` CAS; of two
+transactions entering from one view exactly one succeeds. Before that, a
+deployment owns only its private candidate and the target is free for it
+between continuity attempts.
+
+Phases Warming through Committing, post-fencing aborts and drains all carry
+deadlines (the plan's frozen `PhaseDeadlines`; `WARMING_DEADLINE_SECONDS`, and
+`PRE_FENCING_ABORT_DEADLINE_SECONDS` for a pre-fencing abort). What an expired
+post-fencing deadline does depends on the owner. A deployment whose candidate
+was never issued a write lease aborts to the incumbent. One whose candidate was
+issued a lease may have written under a new state contract and is left to the
+operator. A continuity retries its phase forward on a capped backoff and never
+stops its live candidate, because that candidate is the only running copy of
+the admitted body. Both operator cases open an `operator-required` incident
+(subject: the transaction id) that closes when the record ends or its step goes
+on.
+
+The one yield: a continuity whose route proof has not succeeded gives way to a
+deployment the deployment brake has released that awaits the handover of the
+target. It begins its own post-fencing abort and the deployment fences what is
+admitted. A continuity that has proven its route is serving never yields.
+
+At boot, a lift returns to forward retry any continuity abort an older Idunn
+left over a running candidate. If the lift errs or cannot observe the
+candidate, the abort is held, not run. The lift is a migration with a deletion
+line (follow-up `c2c-delete-boot-lift`).
 
 An admitted generation keeps its Ready and latest Odin receipts as durable
 proof of the exact activation at their recorded admission times. Dependency

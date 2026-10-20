@@ -173,24 +173,40 @@ health plus Ready correlation. It changes and observes route membership only
 afterward. Only after the proxy has adopted the candidate may Idunn clear the
 promotion fence and drain the incumbent.
 
-Ownership of a target is exclusive at each instant. A live
-`DeploymentTransaction` owns it from Fencing on (a stop-first rollout, from
-Starting); before Fencing a deployment owns only its private candidate and
-continuity owns the incumbent slot. Continuity owns the admitted generation's
-survival and never stops. There is no stopped state: six charged attempts in
-an hour (`restarts_page`) open the ContinuityExhausted incident and gate
-nothing, and no deployment path yields to continuity. When continuity next acts
-is derived only from its own record in `TargetSupervision` (schema v2, a v1
-record lifts at store open): the attempt streak, the backoff anchor (written
-by the dead-and-free pass, the only writer), and the once-per-admission
-re-materialization bound. The workload driver alone answers whether a lost unit
-was a host reboot (`WorkloadPort::lost_to_host_reboot`). Crash restart, restart
-after a sustained run and reboot re-materialization all mint through one CAS;
-continuity supervision never aborts a transaction. Operator-facing incidents
-and `idunn status` are projections that decide nothing. Cut line: cuts 2 to 4
-of `reincarnation-map.md` still owe continuity restarting alongside a
-pre-fencing build, dependency failures not growing the streak, and the
-dead-generation route refresh.
+A target has two slots: the incumbent (the admitted generation) and a
+transaction's candidate. Continuity owns the incumbent slot and keeps the
+admitted generation alive; it never stops. A live `DeploymentTransaction` owns
+its private candidate before Fencing and takes the target itself at Fencing (a
+stop-then-start rollout, at Starting) through one `take_target` CAS, so of two
+transactions entering from one view exactly one succeeds. A continuity
+restart is itself a transaction and takes the target the same way.
+
+Phases from Warming through Committing carry deadlines, as do aborts and
+drains; an expired deadline never waits silently. A stateless deployment
+aborts to its incumbent. A deployment whose candidate was issued a write lease
+is left to the operator (`operator-required` incident, the second incident
+condition beside `continuity-exhausted`; its subject is the transaction id and
+it closes when the record ends or its step goes on). A continuity after
+Fencing retries its phase forward on a capped backoff and never stops its live
+candidate, since that is the only running copy of the admitted body; the
+deadline opens the same incident. The one exception is yielding: a continuity
+whose route proof has not succeeded gives way, through its own post-fencing
+abort, to a deployment the deployment brake has released and that awaits the
+handover; a continuity that has proven its route never yields. The
+`ContinuityExhausted` incident (six charged attempts in an hour,
+`restarts_page`) pages and gates nothing. When continuity next acts is derived
+only from its own record in `TargetSupervision` (schema v2): the attempt
+streak, the backoff anchor (written by the dead-and-free pass, the only
+writer), and the once-per-admission re-materialization bound. The workload
+driver alone answers whether a lost unit was a host reboot
+(`WorkloadPort::lost_to_host_reboot`). Operator-facing incidents and
+`idunn status` are projections that decide nothing. A boot lift returns a
+continuity abort left by an older Idunn, one that had not stopped its running
+candidate, to forward retry; if it cannot decide, every continuity abort is
+held until a lift succeeds. It is a migration with a deletion line (follow-up
+`c2c-delete-boot-lift`). Cut line: cuts 3 and 4 of `reincarnation-map.md`
+still owe dependency failures not growing the streak and the dead-generation
+route refresh.
 
 The deployment brake gates changes to source, release, configuration, schema,
 unit, or authority binding. The lifecycle brake separately gates restart of an

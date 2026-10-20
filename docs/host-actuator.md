@@ -97,7 +97,8 @@ Each of these was found by running the pipe against Raven, not by reading.
   bind time. `rollout.strategy = "stop-then-start"` exists for exactly a
   route-less host-actuator workload: the admitted incumbent is stopped at
   Starting, before the candidate starts, and supervision leaves the target
-  alone from Starting on. A systemd-transient workload may not declare it.
+  alone from Starting on: the transaction takes the target there (one
+  `take_target` CAS) rather than at Fencing. A systemd-transient workload may not declare it.
 - **An unobservable host is silence.** The hub returns a typed
   `HostUnobservable` for not-attached, detached, reconnected and unanswered.
   Supervision skips that tick and logs it. Before this, an Idunn restart

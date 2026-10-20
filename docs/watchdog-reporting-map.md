@@ -21,8 +21,8 @@ probes ran on Yggdrasil over `ssh ygg`, read-only, 2026-09-30 13:51-13:55 UTC
 | I2 | Continuity exhaustion (since `idunn-reincarnation` cut 1: `restarts_page`, a paging threshold only; nothing stops, and the line numbers below are pre-cut) | `:68-71` (6 restarts / 3,600,000 ms, 5 s doubling), `:1066-1072` (`restarts_used`, `restarts_exhausted`), decided `:5709-5722` under key `continuity:<target>` (`:5678`) | Exhaustion is **derived** from `TargetSupervision.continuity_restarts` (newest 6 times, sliding window). No write marks it. The fault clears (`:5723`) as soon as one entry leaves the window, so a permanently dead target leaves and re-enters exhaustion several times each hour. |
 | I3 | Route degradation | `RouteSupervisionState` `:890-942`; `record_failed_challenge` sets `degraded_since_unix_millis` on the **first** failed challenge, `record_proved_challenge` clears it; reported at `:5975` under `route:<target>` | Durable per incarnation (inside `admitted_generation.v4`); a new generation starts from `default()`. Backoff doubles from the topology max age to a cap. |
 | I4 | Other operator-facing faults | `:5645-5651` (`generation-down:<target>`, "holds a dead admitted generation down"), `:6016` (`route-record:<target>`), `note_fault` per transaction | Also stderr plus `last_error`. Not named by the target; listed so the paging-set question sees them. |
-| I5 | `OperatorRequired` on main | `TerminalRecovery::OperatorRequired` `:878-885`, validated `:1954`; constructed only in tests (`:12525`, `:12535`) | No production path produces it on main. |
-| I6 | `OperatorRequired` on B5 | `hands/b5` `resolve_phase_deadline` (diff hunk at `control_plane.rs` ~8560-8625 on the branch), `PhaseEnd::OperatorRequired` | Deadline passed on a stateful deploy with an issued lease: `report_once("deadline:<transaction_id>")`, returns `Ok(None)`, the transaction stays live. No terminal transition and no operator action that ends it were found on the branch (`idunn expire` writes `idunn.expiry_request.v1`, which re-enters the same arm). |
+| I5 | `OperatorRequired` on main (pre-cut-2 reading; since `idunn-reincarnation` cut 2 `resolve` reaches it in production through `PhaseEnd::OperatorRequired` and `PhaseEnd::RetryForward`, both calling `leave_to_operator`, which opens the `operator-required` incident `IncidentCondition::OperatorRequired`, subject the transaction id; `close_spent_operator_incidents` closes it when the record no longer `leaves_to_operator`) | `TerminalRecovery::OperatorRequired` `:878-885`, validated `:1954`; constructed only in tests (`:12525`, `:12535`) | No production path produces it on main. |
+| I6 | `OperatorRequired` on B5 (superseded by cut 2: B5's deadlines merged as `PhaseDeadline`, and a continuity past its deadline now also lands here) | `hands/b5` `resolve_phase_deadline` (diff hunk at `control_plane.rs` ~8560-8625 on the branch), `PhaseEnd::OperatorRequired` | Deadline passed on a stateful deploy with an issued lease: `report_once("deadline:<transaction_id>")`, returns `Ok(None)`, the transaction stays live. No terminal transition and no operator action that ends it were found on the branch (`idunn expire` writes `idunn.expiry_request.v1`, which re-enters the same arm). |
 | I7 | Store kinds | `:55-61`, `:936-966`; B5 adds `idunn.expiry_request.v1` | `control.cc`: `idunn.deployment_command`, `idunn.deployment_transaction`, `idunn.admitted_generation.v4`, `idunn.target_supervision.v1`. `history.cc` beside it holds terminal transactions (`:3653`), retired one per tick (`:5068-5091`). |
 | I8 | Single-writer precedent inside `control.cc` | B5 `ExpiryRequest` doc comment | "The CLI only writes this record. The daemon's deadline resolver reads it ... No CLI writes a transaction field." One writer per kind. |
 | I9 | Serve loop | `:5041-5058`, `run_scheduler_tick` `:5098-5110` | 500 ms poll. A tick error is logged, never propagated. |
@@ -166,9 +166,10 @@ cut spec fixes them.
 
 Empty cells, stated plainly:
 
-- `operator-required` closure: no path on `hands/b5` ends a transaction left to
-  the operator (I6). The incident can open and never close until B5 names that
-  action.
+- `operator-required` closure: the incident closes when the transaction ends or
+  its step goes on (`close_spent_operator_incidents`). A stateful deployment
+  left to the operator still has no Idunn-owned terminal action; the operator's
+  `idunn expire` re-enters the same arm.
 - Delivery-failure visibility: no owner.
 - Discord `enforce_nonce` window: not verified against Discord's current docs
   in this pass.

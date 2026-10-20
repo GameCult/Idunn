@@ -30,9 +30,12 @@ journald (`report_once`, `control_plane.rs:4599`):
 - An admitted route is degraded. It fails its stable-route challenge
   (`supervise_admitted_route`, ~5973). The degraded mark is durable, but no
   one is told.
-- A post-fencing phase deadline expires into `OperatorRequired`. This lives on
-  B5, which is unmerged on `hands/b5`. The failure record is durable and the
-  notice is a log line.
+- A post-fencing phase deadline leaves a transaction to the operator: a
+  stateful deployment whose candidate was issued a lease, or a continuity
+  retrying forward past its deadline. Since `idunn-reincarnation` cut 2 it is
+  the second incident condition, `operator-required` (subject: the transaction
+  id), beside `continuity-exhausted`; it closes when the record ends or its
+  step goes on.
 
 Odin's own store condition (`odin.store_condition.v1`, `contested`) is mapped
 but not built. Idunn reads nothing about Odin's store health today.
@@ -85,8 +88,8 @@ the machine has a detector with no record, and a deliverer that nothing feeds.
 - Odin's store-recovery cuts, O2 included. They produce `odin.store_condition`
   and are Odin's campaign, still in prose. This campaign consumes the record
   once it exists.
-- Idunn's B5 phase deadlines. B5 is in prose on `hands/b5`. This campaign
-  reports its `OperatorRequired` outcome once B5 merges.
+- Idunn's phase deadlines. They landed in `idunn-reincarnation` cut 2, which
+  also owns the `operator-required` incident condition.
 - VoidBot's `notify_owner` MCP tool and its separate DM code.
 - Bifrost's Persona delivery crossing.
 - Eve/TUI lowering of incidents.
