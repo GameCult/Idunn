@@ -32,6 +32,9 @@ pub(crate) const INCIDENT_RETENTION_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum IncidentCondition {
     ContinuityExhausted,
+    /// A transaction past its deadline in a state Idunn will not end by
+    /// itself. Subject: the transaction id.
+    OperatorRequired,
 }
 
 impl IncidentCondition {
@@ -40,6 +43,7 @@ impl IncidentCondition {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::ContinuityExhausted => "continuity-exhausted",
+            Self::OperatorRequired => "operator-required",
         }
     }
 
@@ -49,6 +53,7 @@ impl IncidentCondition {
     pub(crate) const fn ends_with_admission(self) -> bool {
         match self {
             Self::ContinuityExhausted => true,
+            Self::OperatorRequired => false,
         }
     }
 }
@@ -271,6 +276,17 @@ impl IncidentStore {
         Ok(true)
     }
 
+    /// The subjects of every open incident of `condition`.
+    pub(crate) fn open_subjects(&self, condition: IncidentCondition) -> Result<Vec<String>> {
+        Ok(self
+            .snapshot()?
+            .records
+            .into_iter()
+            .filter(|record| record.is_open() && record.condition == condition)
+            .map(|record| record.subject)
+            .collect())
+    }
+
     /// Close the open incident for `(condition, subject)`, if there is one.
     /// `Ok(true)` means this call wrote the closure.
     pub(crate) fn close(
@@ -468,11 +484,12 @@ pub(crate) mod tests {
         );
         // The wire spelling readers match on is the spelling the key and
         // status use.
-        let payload = rmp_serde::to_vec(&IncidentCondition::ContinuityExhausted).unwrap();
-        assert_eq!(
-            rmp_serde::from_slice::<String>(&payload).unwrap(),
-            IncidentCondition::ContinuityExhausted.name()
-        );
+        for condition in [IncidentCondition::ContinuityExhausted, IncidentCondition::OperatorRequired] {
+            let payload = rmp_serde::to_vec(&condition).unwrap();
+            assert_eq!(rmp_serde::from_slice::<String>(&payload).unwrap(), condition.name());
+        }
+        assert_eq!(IncidentCondition::OperatorRequired.name(), "operator-required");
+        assert!(!IncidentCondition::OperatorRequired.ends_with_admission());
         let payload = rmp_serde::to_vec(&CloseReason::NoLongerAdmitted).unwrap();
         assert_eq!(
             rmp_serde::from_slice::<String>(&payload).unwrap(),

@@ -475,6 +475,13 @@ pub const DEFAULT_AWAITING_READY_DEADLINE_SECONDS: u32 = 300;
 pub const DEFAULT_ROUTING_DEADLINE_SECONDS: u32 = 120;
 pub const DEFAULT_COMMITTING_DEADLINE_SECONDS: u32 = 120;
 
+/// Idunn's own deadlines, not binding-declared: a new `PhaseDeadlines` field
+/// would change every v3 plan id (`recomputed_plan_id` re-encodes the plan).
+/// Warming is timed for every transaction, owner or not.
+pub const WARMING_DEADLINE_SECONDS: u32 = 600;
+/// A pre-fencing abort is timed from its beginning.
+pub const PRE_FENCING_ABORT_DEADLINE_SECONDS: u32 = 300;
+
 /// The resolved per-phase deadline durations a plan carries. Entering a
 /// post-fencing phase stamps its deadline from them, and the deadline
 /// resolver ends the phase once it passes.
