@@ -575,3 +575,26 @@ its stores and `idunn.running` together, because the cb60965 binary cannot read
 "migrated 5 control record(s) … idunn.target_supervision.v2". streampixels-service
 kept running through the restart (unit 73ca40ba, PID 968752, NRestarts 0). The
 catalog returned 200, and 4443/udp was listening.
+
+## Installed: cut 2
+
+Cuts c2-phase-split, c2b-owner-deadlines, c2c-post-fence-forward and
+c2d-continuity-yields (branch tip `8760a4f`) were installed on Yggdrasil on
+2026-10-20 at 00:34:06 UTC, with the operator's OK.
+
+- **The hotfix before it.** `ec45906` (`bounded_detail`) was installed on its
+  own on 2026-10-19 at 17:32 UTC. It unwedged tx-f978ab86.
+- **Build.** `/srv/build/idunn-8760a4f`; `cargo test --lib` passed 471.
+- **Backup.** `/root/idunn-store-backup-*-pre-reincarnation-c2` holds the
+  stores, `incidents.cc` and the binaries. A rollback must restore them
+  together: older binaries refuse two live transactions on one target, and
+  they refuse the `operator-required` incident condition.
+- **First boot.** The boot lift returned exactly tx-039b91e9 (ghostlight) and
+  tx-4eaed669 (odin) to forward retry, as the Soul install gate predicted.
+  Odin's continuity, wedged in Routing since the 2026-10-18 reboot, committed
+  4 s later. Generation tx-4eaed669 is admitted, its route is healthy, and the
+  same PID 2571 still runs. Ghostlight's continuity is retrying forward in
+  AwaitingReady. Its daemon's readiness is a ghostlight-side fault
+  (`Permission denied` reading its session-wrapping key).
+- **Live processes.** Every live MainPID was the same before and after the
+  install. The streampixels catalog returned 200, and 4443/udp was listening.
