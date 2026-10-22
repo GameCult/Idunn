@@ -13475,6 +13475,40 @@ processes 9
 
     #[cfg(unix)]
     #[test]
+    fn write_lease_grant_binds_the_exact_warming_candidate_and_the_holder_read_keeps_custody()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("lease.cc");
+        let driver = CultCacheWriteLeaseDriver::new("service", &path);
+        let (expected, activation, warming, _) = authenticated_warming(temp.path())?;
+        let good = lease(&expected, &activation, &warming);
+        let mut foreign = good.clone();
+        foreign.warming_presence_sha256 = digest('8');
+        assert!(
+            driver
+                .grant(&expected, &activation, &warming, &foreign)
+                .is_err()
+        );
+        let other = CultCacheWriteLeaseDriver::new("other", temp.path().join("other.cc"));
+        assert!(other.grant(&expected, &activation, &warming, &good).is_err());
+        assert!(driver.current_for_holder()?.is_none());
+        driver.grant(&expected, &activation, &warming, &good)?;
+        assert_eq!(
+            driver.current_for_holder()?.map(|(_, held)| held),
+            Some(good)
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        assert!(
+            driver.current_for_holder().is_err(),
+            "a service-writable lease store is not authority"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn installed_release_is_root_owned_and_nonwritable() -> Result<()> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 

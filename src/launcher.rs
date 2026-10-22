@@ -2022,6 +2022,172 @@ mod tests {
     }
 
     #[test]
+    fn contract_parsing_reads_every_declared_field() {
+        let args: Vec<String> = [
+            "--child", "bin/c", "--child-arg", "-x", "--child-arg", "y", "--config-flag", "-c",
+            "--template", "t", "--listener", "loopback", "--health-path", "/h",
+            "--health-contract", "hc", "--state-root", "/s", "--lease-wait-secs", "11",
+            "--startup-secs", "22", "--heartbeat-secs", "33",
+        ]
+        .map(String::from)
+        .to_vec();
+        let contract = LaunchContract::parse(PathBuf::from("/r"), args.clone()).unwrap();
+        assert_eq!(contract.child_args, ["-x", "y"]);
+        assert_eq!(contract.config_flag.as_deref(), Some("-c"));
+        assert_eq!(contract.listener, ChildListener::LoopbackPort);
+        assert_eq!(contract.state_root, Some(PathBuf::from("/s")));
+        assert_eq!(
+            (contract.lease_wait, contract.startup, contract.heartbeat),
+            (Duration::from_secs(11), Duration::from_secs(22), Duration::from_secs(33))
+        );
+        for zero in ["--lease-wait-secs", "--startup-secs", "--heartbeat-secs"] {
+            let mut bad = args.clone();
+            bad.extend([zero.to_owned(), "0".to_owned()]);
+            assert!(LaunchContract::parse(PathBuf::from("/r"), bad).is_err(), "{zero}");
+        }
+    }
+
+    #[test]
+    fn credential_names_cannot_escape_or_be_empty() {
+        struct Any;
+        impl CredentialSource for Any {
+            fn contents(&self, _: &str) -> Result<Vec<u8>> {
+                Ok(b"v".to_vec())
+            }
+            fn path(&self, name: &str) -> Result<PathBuf> {
+                Ok(PathBuf::from(name))
+            }
+        }
+        let renderer = ConfigRenderer { credentials: &Any, listen: "L", state_root: None };
+        for ok in ["A", "a-b_9", "Z0"] {
+            assert_eq!(renderer.render(&format!("{{{{credential:{ok}}}}}")).unwrap(), "v");
+        }
+        for bad in ["", "../x", "a/b", "a b", "a.b", "a:b", "é"] {
+            assert!(renderer.render(&format!("{{{{credential:{bad}}}}}")).is_err(), "{bad}");
+            assert!(renderer.render(&format!("{{{{credential_path:{bad}}}}}")).is_err(), "{bad}");
+        }
+        assert_eq!(renderer.render("a{{child.listen}}b{{child.listen}}c").unwrap(), "aLbLc");
+    }
+
+    #[test]
+    fn env_credentials_resolve_through_the_variable_idunn_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cred");
+        fs::write(&file, b"abc\n").unwrap();
+        // SAFETY: a variable no other test reads.
+        unsafe { std::env::set_var("IDUNN_LAUNCH_TEST_CREDENTIAL", &file) };
+        assert_eq!(EnvCredentials.path("IDUNN_LAUNCH_TEST_CREDENTIAL").unwrap(), file);
+        assert_eq!(EnvCredentials.contents("IDUNN_LAUNCH_TEST_CREDENTIAL").unwrap(), b"abc\n");
+        assert!(EnvCredentials.path("IDUNN_LAUNCH_TEST_UNBOUND").is_err());
+    }
+
+    #[test]
+    fn odin_sink_takes_its_endpoint_only_from_the_odin_dependency() {
+        let fx = fixture(false);
+        let dependency = |capability: &str, endpoint: &str| cultnet_rs::IdunnExpectedDependency {
+            kind: "shared-infrastructure".into(),
+            capability: capability.into(),
+            schema: "s".into(),
+            compatibility: "v1".into(),
+            minimum_capacity: 1,
+            startup: "before-promotion".into(),
+            provider_id: None,
+            provider_authority: None,
+            provider_expected_projection_sha256: None,
+            provider_endpoint: Some(endpoint.into()),
+        };
+        let mut expected = fx.expected.clone();
+        assert!(OdinRudpSink::from_expected(&expected).is_err());
+        expected.dependencies = vec![dependency("other.thing", "rudp://127.0.0.1:1")];
+        assert!(OdinRudpSink::from_expected(&expected).is_err());
+        expected.dependencies = vec![
+            dependency("other.thing", "rudp://127.0.0.1:1"),
+            dependency(ODIN_CAPABILITY, "rudp://127.0.0.1:4100"),
+        ];
+        assert_eq!(
+            OdinRudpSink::from_expected(&expected).unwrap().endpoint,
+            "127.0.0.1:4100".parse().unwrap()
+        );
+        expected.dependencies = vec![dependency(ODIN_CAPABILITY, "rudp://not-an-address")];
+        assert!(OdinRudpSink::from_expected(&expected).is_err());
+    }
+
+    #[test]
+    fn half_closed_member_requests_still_reach_a_child_that_waits_for_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("child.sock");
+        let child = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let fake = thread::spawn(move || {
+            let (mut stream, _) = child.accept().unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).unwrap();
+            stream.write_all(&received.iter().rev().copied().collect::<Vec<u8>>()).unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let halt = Arc::new(AtomicBool::new(false));
+        let responder: Responder = Arc::new(|_| bail!("never"));
+        let acceptor = RouteAcceptor::new(listener, ChildEndpoint::Unix(socket), responder);
+        let serving = {
+            let halt = halt.clone();
+            thread::spawn(move || acceptor.serve(halt))
+        };
+        let mut member = TcpStream::connect(address).unwrap();
+        member.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        member.write_all(b"GET /abc").unwrap();
+        member.shutdown(Shutdown::Write).unwrap();
+        let mut answer = Vec::new();
+        member.read_to_end(&mut answer).unwrap();
+        assert_eq!(answer, b"cba/ TEG");
+        fake.join().unwrap();
+        halt.store(true, Ordering::SeqCst);
+        serving.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn heartbeats_are_paced_and_a_stop_exits_zero() {
+        let fx = fixture(true);
+        let launch = start(&fx, fx.contract("x"), true);
+        thread::sleep(Duration::from_millis(250));
+        let waiting = launch
+            .sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.detail == "write-lease-pending")
+            .count();
+        assert!((1..=12).contains(&waiting), "{waiting} lease-wait heartbeats");
+        let mut launch = launch;
+        let warming = launch.sink.first("warming").unwrap();
+        *launch.lease.0.lock().unwrap() = Some(fx.lease(&warming.canonical_sha256().unwrap()));
+        wait_until("active", || launch.sink.first("active").is_some());
+        thread::sleep(Duration::from_millis(250));
+        let beats = launch
+            .sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.detail == "heartbeat")
+            .count();
+        assert!((1..=12).contains(&beats), "{beats} active heartbeats");
+        assert_eq!(launch.stop().exit_code(), 0);
+    }
+
+    #[test]
+    fn process_spawner_escalates_to_kill_when_the_child_ignores_sigterm() {
+        let mut stubborn = ProcessSpawner
+            .spawn(Path::new("/bin/sh"), &["-c".into(), "trap '' TERM; while :; do :; done".into()])
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        stubborn.terminate(Duration::from_millis(400));
+        assert!(started.elapsed() >= Duration::from_millis(400), "SIGTERM gets its grace period");
+        assert!(stubborn.exited().is_some(), "then SIGKILL ends it");
+    }
+
+    #[test]
     fn process_spawner_reports_exit_codes_and_terminates_a_running_child() {
         let mut gone = ProcessSpawner
             .spawn(Path::new("/bin/sh"), &["-c".into(), "exit 3".into()])
