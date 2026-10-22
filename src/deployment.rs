@@ -184,6 +184,11 @@ pub enum StateKind {
     /// Process-owned state imposed by an external runtime contract. Idunn
     /// preserves and fences the file but never interprets its payload.
     ExternalFile,
+    /// A process-owned directory imposed by an external runtime contract (for
+    /// example Synapse's media store). Idunn preserves and fences it and never
+    /// interprets its contents. Same writer, recovery and startup rules as
+    /// `ExternalFile`.
+    ExternalDirectory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2256,6 +2261,17 @@ nodes = ["yggdrasil"]
         let declaration = TargetDeclaration::parse(&input).unwrap();
         let slot = &declaration.state.as_ref().unwrap().slots[0];
         assert_eq!(slot.kind, StateKind::ExternalFile);
+        assert_eq!(slot.writer, StateWriter::ProcessBoundSingleWriter);
+        assert_eq!(slot.startup, StateStartup::CreateOrOpenAfterWriteLease);
+        assert!(declaration.write_lease_required());
+    }
+
+    #[test]
+    fn external_directory_state_is_lease_gated_like_external_file() {
+        let input = RECIPE.replace("kind = \"cultcache-file\"", "kind = \"external-directory\"");
+        let declaration = TargetDeclaration::parse(&input).unwrap();
+        let slot = &declaration.state.as_ref().unwrap().slots[0];
+        assert_eq!(slot.kind, StateKind::ExternalDirectory);
         assert_eq!(slot.writer, StateWriter::ProcessBoundSingleWriter);
         assert_eq!(slot.startup, StateStartup::CreateOrOpenAfterWriteLease);
         assert!(declaration.write_lease_required());

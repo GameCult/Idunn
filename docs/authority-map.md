@@ -55,7 +55,10 @@ A deployable repository publishes one strict declaration, normally
 - immutable artifact outputs, optionally pinned to an expected SHA-256;
 - a constrained launch contract;
 - one health-contract identity;
-- an optional typed state contract with state schema generation and slots;
+- an optional typed state contract with state schema generation and slots
+  (kinds `cultcache-file`, `external-file` and `external-directory`; the
+  external kinds are process-owned state an external runtime imposes, which
+  Idunn preserves and fences but never interprets);
 - provided capabilities, dependency kinds, startup requirements, capacity, and
   conflicts.
 
