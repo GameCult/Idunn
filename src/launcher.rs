@@ -2630,8 +2630,13 @@ mod tests {
             .unwrap();
         // The launcher dies: its own descriptor goes with it.
         drop(guard);
-        let denial = idunn.revoke_exact(Some(&lease)).unwrap_err();
-        assert!(denial.to_string().contains("shared-lock consumer"), "the child does not hold the lock");
+        // Held for a full second: a fork of some other test could pin the lock
+        // for an instant, only the child under test keeps it that long.
+        for _ in 0..10 {
+            let denial = idunn.revoke_exact(Some(&lease)).unwrap_err();
+            assert!(denial.to_string().contains("shared-lock consumer"), "the child does not hold the lock");
+            thread::sleep(Duration::from_millis(100));
+        }
         child.terminate(Duration::from_secs(5));
         wait_until("child gone", || child.exited().is_some());
         idunn.revoke_exact(Some(&lease)).unwrap();
