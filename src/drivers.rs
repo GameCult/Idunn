@@ -22,7 +22,8 @@ use crate::control_plane::SequenceAdmittedWarming;
 use crate::deployment::{
     ArtifactOutput, ArtifactSource, DockerRunnerBinding, GitlinkBinding,
     IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT, IDUNN_RUNTIME_BUNDLE_ENVIRONMENT,
-    IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT, LaunchArgument, OperatorBinding,
+    IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT, IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT,
+    LaunchArgument, OperatorBinding,
     RUNTIME_PRESENCE_IDENTITY_BINDING, RUNTIME_PRESENCE_IDENTITY_FD_NAME, RouteBinding,
     RouteDriver, SourceSelectionPolicy, TargetDeclaration, WorkloadNetwork,
 };
@@ -3377,10 +3378,32 @@ impl SystemdTransientWorkloadDriver {
                         .is_none(),
                     "operator binding attempts to replace the Idunn candidate bind"
                 );
+                let member_port = binding
+                    .route
+                    .as_ref()
+                    .map(|binding_route| binding_route.member_candidate_port(port))
+                    .transpose()?
+                    .flatten();
+                match member_port {
+                    Some(member_port) => ensure!(
+                        environment
+                            .insert(
+                                IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT.into(),
+                                format!("{host}:{member_port}"),
+                            )
+                            .is_none(),
+                        "operator binding attempts to replace the Idunn member bind"
+                    ),
+                    None => ensure!(
+                        !environment.contains_key(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT),
+                        "workload without a member listener carries an Idunn member bind"
+                    ),
+                }
             }
             None => ensure!(
-                !environment.contains_key(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT),
-                "unrouted workload carries an Idunn candidate bind"
+                !environment.contains_key(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT)
+                    && !environment.contains_key(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT),
+                "unrouted workload carries an Idunn route bind"
             ),
         }
         match &binding.process_write_lease {
@@ -5241,49 +5264,66 @@ impl NginxRouteDriver {
         }
     }
 
-    /// The one firewall rule this route owns: inbound to the stable endpoint's
-    /// address and port, its transport's protocol, tagged with the route id.
-    fn endpoint_rule(&self) -> Result<Vec<OsString>> {
-        let (host, port) = self.binding.stable_socket()?;
+    /// The firewall rules this route owns, one per stable socket (the
+    /// presence endpoint, then the member endpoint when the binding has one):
+    /// inbound to the socket's address and port, its transport's protocol.
+    fn endpoint_rules(&self) -> Result<Vec<Vec<OsString>>> {
         let protocol = match self.binding.driver {
             RouteDriver::NginxStreamTcp => "tcp",
             RouteDriver::NginxStreamUdp => "udp",
         };
-        Ok(vec![
-            OsString::from("allow"),
-            OsString::from("in"),
-            OsString::from("to"),
-            OsString::from(host.to_string()),
-            OsString::from("port"),
-            OsString::from(port.to_string()),
-            OsString::from("proto"),
-            OsString::from(protocol),
-        ])
+        let mut sockets = vec![self.binding.stable_socket()?];
+        sockets.extend(self.binding.member_stable_socket()?);
+        Ok(sockets
+            .into_iter()
+            .map(|(host, port)| {
+                vec![
+                    OsString::from("allow"),
+                    OsString::from("in"),
+                    OsString::from("to"),
+                    OsString::from(host.to_string()),
+                    OsString::from("port"),
+                    OsString::from(port.to_string()),
+                    OsString::from("proto"),
+                    OsString::from(protocol),
+                ]
+            })
+            .collect())
     }
 
     fn admit_endpoint(&self) -> Result<()> {
-        let mut args = self.endpoint_rule()?;
-        args.push(OsString::from("comment"));
-        args.push(OsString::from(format!(
-            "Idunn route {}",
-            self.binding.route_id
-        )));
-        self.command(&self.ufw_program, args)
-            .context("admitting the stable endpoint on the host firewall")?;
+        for mut args in self.endpoint_rules()? {
+            args.push(OsString::from("comment"));
+            args.push(OsString::from(format!(
+                "Idunn route {}",
+                self.binding.route_id
+            )));
+            self.command(&self.ufw_program, args)
+                .context("admitting a route endpoint on the host firewall")?;
+        }
         Ok(())
     }
 
     fn withdraw_endpoint(&self) -> Result<()> {
-        let mut args = vec![OsString::from("delete")];
-        args.extend(self.endpoint_rule()?);
-        match self.command(&self.ufw_program, args) {
-            Ok(_) => Ok(()),
-            // ufw reports a rule that is already gone as a failure; for a
-            // withdrawal that is the state being asked for.
-            Err(error) if format!("{error:#}").contains("non-existent") => Ok(()),
-            Err(error) => {
-                Err(error).context("withdrawing the stable endpoint from the host firewall")
+        let mut first_error = None;
+        for rule in self.endpoint_rules()? {
+            let mut args = vec![OsString::from("delete")];
+            args.extend(rule);
+            match self.command(&self.ufw_program, args) {
+                Ok(_) => {}
+                // ufw reports a rule that is already gone as a failure; for a
+                // withdrawal that is the state being asked for.
+                Err(error) if format!("{error:#}").contains("non-existent") => {}
+                Err(error) => {
+                    first_error.get_or_insert(
+                        error.context("withdrawing a route endpoint from the host firewall"),
+                    );
+                }
             }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -5345,8 +5385,20 @@ impl NginxRouteDriver {
             RouteDriver::NginxStreamTcp => {
                 let (stable_host, stable_port) =
                     endpoint_host_port(&route.stable_endpoint, endpoint_prefix)?;
+                let member_blocks = match (
+                    self.binding.member_stable_socket()?,
+                    self.binding.member_candidate_port(candidate_port)?,
+                ) {
+                    (Some((member_host, member_stable_port)), Some(member_port)) => {
+                        let member_upstream = format!("{upstream}_member");
+                        format!(
+                            "upstream {member_upstream} {{\n    server {candidate_host}:{member_port};\n}}\nserver {{\n    listen {member_host}:{member_stable_port};\n    proxy_pass {member_upstream};\n}}\n"
+                        )
+                    }
+                    _ => String::new(),
+                };
                 format!(
-                    "# Idunn Expected {expected_projection_sha256}\nupstream {upstream} {{\n    server {candidate_host}:{candidate_port};\n}}\nserver {{\n    listen {stable_host}:{stable_port};\n    proxy_pass {upstream};\n}}\n"
+                    "# Idunn Expected {expected_projection_sha256}\nupstream {upstream} {{\n    server {candidate_host}:{candidate_port};\n}}\nserver {{\n    listen {stable_host}:{stable_port};\n    proxy_pass {upstream};\n}}\n{member_blocks}"
                 )
             }
             RouteDriver::NginxStreamUdp => {
@@ -8366,7 +8418,7 @@ fn ensure_source_directory(path: &Path, identity: Option<ProcessIdentity>) -> Re
     }
 }
 
-fn authority_lock_path(path: &Path) -> PathBuf {
+pub(crate) fn authority_lock_path(path: &Path) -> PathBuf {
     let mut lock = path.as_os_str().to_os_string();
     lock.push(".lock");
     PathBuf::from(lock)
@@ -8698,6 +8750,7 @@ mod tests {
             private_port_end: port,
             config_path: temp.path().join("service.conf"),
             reload_unit: "nginx.service".into(),
+            member: None,
         })
         .request_candidate_runtime_presence(&candidate, "candidate-probe")
     }
@@ -9521,6 +9574,7 @@ Content-Le".to_vec()), |_| {}),
             private_port_end: 17998,
             config_path: temp.path().join("service.conf"),
             reload_unit: "nginx.service".into(),
+            member: None,
         });
         let mut candidate = expected();
         candidate.route = Some(cultnet_rs::IdunnExpectedRoute {
@@ -12253,6 +12307,7 @@ processes 9
                 private_port_end: 17979,
                 config_path: temp.path().join("odin.conf"),
                 reload_unit: "nginx.service".into(),
+                member: None,
             },
             nginx_program: program("nginx", "#!/bin/sh\nexit 0\n")?,
             systemd_run_program: program("systemd-run", "#!/bin/sh\nexit 64\n")?,
@@ -12262,12 +12317,15 @@ processes 9
         };
         assert_eq!(
             driver
-                .endpoint_rule()?
+                .endpoint_rules()?
                 .iter()
-                .map(|value| value.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(" "),
-            "allow in to 10.77.0.1 port 17971 proto udp"
+                .map(|rule| rule
+                    .iter()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" "))
+                .collect::<Vec<_>>(),
+            vec!["allow in to 10.77.0.1 port 17971 proto udp"]
         );
 
         driver.restore(None, &Unmetered)?;
@@ -12327,6 +12385,7 @@ processes 9
                 private_port_end: 4109,
                 config_path: temp.join("service.conf"),
                 reload_unit: "nginx.service".into(),
+                member: None,
             },
             &RouteActuators {
                 nginx: program("nginx")?,
@@ -12359,6 +12418,117 @@ processes 9
             incumbent_membership_sha256: None,
             incumbent_configuration: None,
         })
+    }
+
+    fn with_member_listener(driver: &mut NginxRouteDriver) {
+        driver.binding.member = Some(crate::deployment::MemberListenerBinding {
+            stable_endpoint: "http://127.0.0.1:4120".into(),
+            private_port_start: 4121,
+        });
+    }
+
+    /// The fragment as the base commit rendered it, computed from its format
+    /// string and not from the code under test.
+    #[cfg(unix)]
+    fn base_fragment(sha: &str, candidate_port: u16) -> String {
+        format!(
+            "# Idunn Expected {sha}\nupstream idunn_service_route {{\n    server 127.0.0.1:{candidate_port};\n}}\nserver {{\n    listen 127.0.0.1:4103;\n    proxy_pass idunn_service_route;\n}}\n"
+        )
+    }
+
+    /// A route without a member listener renders the bytes it always did; a
+    /// member listener adds a second upstream and server block to the one
+    /// fragment, under the one Expected comment.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_listener_renders_a_second_block_only_when_bound() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (mut driver, mut candidate, _calls) = stubbed_route_driver(temp.path())?;
+        let sha = candidate.canonical_sha256()?;
+        assert_eq!(
+            String::from_utf8(driver.render(&candidate)?)?,
+            base_fragment(&sha, 4104)
+        );
+
+        with_member_listener(&mut driver);
+        let member_blocks = |member_port: u16| {
+            format!(
+                "upstream idunn_service_route_member {{\n    server 127.0.0.1:{member_port};\n}}\nserver {{\n    listen 127.0.0.1:4120;\n    proxy_pass idunn_service_route_member;\n}}\n"
+            )
+        };
+        let rendered = String::from_utf8(driver.render(&candidate)?)?;
+        assert_eq!(rendered, base_fragment(&sha, 4104) + &member_blocks(4121));
+        assert_eq!(rendered.matches("# Idunn Expected").count(), 1);
+        assert_eq!(rendered.matches("server {").count(), 2);
+
+        candidate.route.as_mut().unwrap().candidate_endpoint = "http://127.0.0.1:4106".into();
+        let sha = candidate.canonical_sha256()?;
+        assert_eq!(
+            String::from_utf8(driver.render(&candidate)?)?,
+            base_fragment(&sha, 4106) + &member_blocks(4123)
+        );
+        Ok(())
+    }
+
+    /// Both stable sockets are admitted on the firewall, and both withdrawn.
+    #[cfg(unix)]
+    #[test]
+    fn both_route_endpoints_are_admitted_and_withdrawn() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (mut driver, _candidate, calls) = stubbed_route_driver(temp.path())?;
+        with_member_listener(&mut driver);
+        driver.admit_endpoint()?;
+        driver.withdraw_endpoint()?;
+        let log = fs::read_to_string(&calls)?;
+        let ufw: Vec<&str> = log.lines().filter(|line| line.starts_with("ufw ")).collect();
+        assert_eq!(
+            ufw,
+            vec![
+                "ufw allow in to 127.0.0.1 port 4103 proto tcp comment Idunn route service-route",
+                "ufw allow in to 127.0.0.1 port 4120 proto tcp comment Idunn route service-route",
+                "ufw delete allow in to 127.0.0.1 port 4103 proto tcp",
+                "ufw delete allow in to 127.0.0.1 port 4120 proto tcp",
+            ]
+        );
+        Ok(())
+    }
+
+    /// Idunn sets the member bind for a bound member listener, derived from the
+    /// candidate, and for no other workload.
+    #[test]
+    fn the_member_bind_is_set_only_for_a_bound_member_listener() -> Result<()> {
+        use crate::deployment::tests::{BINDING, RECIPE, member_listener_pair};
+
+        let driver = SystemdTransientWorkloadDriver::default();
+        let mut routed = expected();
+        routed.route = Some(cultnet_rs::IdunnExpectedRoute {
+            route_id: "test-service-public".into(),
+            transport: "http".into(),
+            stable_endpoint: "http://127.0.0.1:18830".into(),
+            candidate_endpoint: "http://127.0.0.1:18833".into(),
+        });
+        let bundle = Path::new("/etc/gamecult/test-service/runtime/bundle");
+        let unit = "idunn-test-service-abc";
+
+        let (recipe, binding) = member_listener_pair();
+        let binding = OperatorBinding::parse(&binding)?;
+        binding.admit(&TargetDeclaration::parse(&recipe)?)?;
+        let environment = driver.launch_environment(&binding, bundle, &routed, unit)?;
+        assert_eq!(
+            environment.get(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT).map(String::as_str),
+            Some("127.0.0.1:18843")
+        );
+        assert_eq!(
+            environment.get(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT).map(String::as_str),
+            Some("127.0.0.1:18833")
+        );
+
+        let plain = OperatorBinding::parse(BINDING)?;
+        plain.admit(&TargetDeclaration::parse(RECIPE)?)?;
+        let environment = driver.launch_environment(&plain, bundle, &routed, unit)?;
+        assert!(!environment.contains_key(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT));
+        assert!(environment.contains_key(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT));
+        Ok(())
     }
 
     /// A refused forward change stops before any host mutation: no program
@@ -12680,6 +12850,7 @@ processes 9
                 private_port_end: 4109,
                 config_path: config.clone(),
                 reload_unit: "nginx.service".into(),
+                member: None,
             },
             nginx_program: program("nginx")?,
             systemd_run_program: program("systemd-run")?,
@@ -12740,6 +12911,7 @@ processes 9
             private_port_end: 27879,
             config_path: config_path.clone(),
             reload_unit: "nginx.service".into(),
+            member: None,
         });
         assert_eq!(driver.current_configuration()?, None);
         // What systemd leaves behind when it materializes the preflight's bind
@@ -12766,6 +12938,7 @@ processes 9
             private_port_end: 27879,
             config_path: "/etc/nginx/idunn-stream-routes/odin-rudp.conf".into(),
             reload_unit: "nginx.service".into(),
+            member: None,
         });
         let mut candidate = expected();
         candidate.route = Some(cultnet_rs::IdunnExpectedRoute {
@@ -12827,6 +13000,7 @@ processes 9
             private_port_end: 4109,
             config_path: config.clone(),
             reload_unit: "nginx.service".into(),
+            member: None,
         };
         let driver = NginxRouteDriver {
             binding,

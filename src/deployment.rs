@@ -9,12 +9,27 @@ pub const TARGET_DECLARATION_SCHEMA: &str = "gamecult.idunn.target_declaration.v
 pub const OPERATOR_BINDING_SCHEMA: &str = "gamecult.idunn.operator_binding.v2";
 pub const IDUNN_RUNTIME_BUNDLE_ENVIRONMENT: &str = "GAMECULT_IDUNN_RUNTIME_BUNDLE";
 pub const IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT: &str = "GAMECULT_IDUNN_CANDIDATE_BIND";
+pub const IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT: &str = "GAMECULT_IDUNN_MEMBER_BIND";
 pub const IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT: &str = "GAMECULT_IDUNN_PROCESS_WRITE_LEASE";
 pub const RUNTIME_PRESENCE_IDENTITY_BINDING: &str = "GAMECULT_RUNTIME_PRESENCE_IDENTITY";
 /// A host actuator hands the workload its activation credential as a file
 /// named by this variable; on the Idunn host it arrives as a parent-only
 /// descriptor instead and this name is never set.
 pub const IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT: &str = "GAMECULT_IDUNN_ACTIVATION_CREDENTIAL";
+/// systemd hands a unit its credential directory under this name; Idunn owns
+/// the directory, so no binding may set it.
+pub const SYSTEMD_CREDENTIALS_DIRECTORY_ENVIRONMENT: &str = "CREDENTIALS_DIRECTORY";
+/// Every launch-environment name Idunn sets or reserves. A binding may name
+/// none of them; this is the one list both the binding check and the
+/// launch-input check read.
+pub(crate) const IDUNN_OWNED_LAUNCH_ENVIRONMENT: [&str; 6] = [
+    IDUNN_RUNTIME_BUNDLE_ENVIRONMENT,
+    IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT,
+    IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT,
+    IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT,
+    IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT,
+    SYSTEMD_CREDENTIALS_DIRECTORY_ENVIRONMENT,
+];
 pub const RUNTIME_PRESENCE_IDENTITY_FD_NAME: &str = "gamecult-runtime-presence-identity";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,8 +524,7 @@ impl WorkloadBinding {
         {
             require_environment_name(name)?;
             ensure!(
-                name != IDUNN_RUNTIME_BUNDLE_ENVIRONMENT
-                    && name != IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT,
+                !IDUNN_OWNED_LAUNCH_ENVIRONMENT.contains(&name.as_str()),
                 "operator binding attempts to replace Idunn-owned workload environment"
             );
         }
@@ -667,40 +681,87 @@ pub struct RouteBinding {
     pub private_port_end: u16,
     pub config_path: PathBuf,
     pub reload_unit: String,
+    /// A second listener for the route's members. When set, members reach the
+    /// workload straight through a second nginx server block, and the
+    /// workload's launcher answers presence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<MemberListenerBinding>,
+}
+
+/// The member listener of a route: where members connect, and the first of the
+/// private ports the workload binds for them. The private range is as wide as
+/// the route's own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberListenerBinding {
+    pub stable_endpoint: String,
+    pub private_port_start: u16,
 }
 
 impl RouteBinding {
     pub(crate) fn stable_socket(&self) -> Result<(IpAddr, u16)> {
-        let authority = match self.driver {
-            RouteDriver::NginxStreamTcp => self
-                .stable_endpoint
-                .strip_prefix("http://")
-                .or_else(|| self.stable_endpoint.strip_prefix("tcp://")),
-            RouteDriver::NginxStreamUdp => self.stable_endpoint.strip_prefix("rudp://"),
-        }
-        .context("stable endpoint transport does not match its route driver")?;
-        ensure!(
-            !authority
-                .chars()
-                .any(|character| matches!(character, '/' | '?' | '#' | '@' | '[' | ']')),
-            "stable endpoint is not a plain IP address and port"
-        );
-        let (host, port) = authority
-            .rsplit_once(':')
-            .context("stable endpoint has no port")?;
-        let host = host
-            .parse::<IpAddr>()
-            .context("stable endpoint host is not an IP address")?;
-        ensure!(
-            matches!(host, IpAddr::V4(_)),
-            "route binding v2 stable endpoints use explicit IPv4 addresses"
-        );
-        let port = port
-            .parse::<u16>()
-            .context("stable endpoint port is not a u16")?;
-        ensure!(port > 0, "stable endpoint port is zero");
-        Ok((host, port))
+        parse_stable_socket(self.driver, &self.stable_endpoint, "stable endpoint")
     }
+
+    /// The member listener's stable socket, when the route has one.
+    pub(crate) fn member_stable_socket(&self) -> Result<Option<(IpAddr, u16)>> {
+        self.member
+            .as_ref()
+            .map(|member| {
+                parse_stable_socket(self.driver, &member.stable_endpoint, "member endpoint")
+            })
+            .transpose()
+    }
+
+    /// The private port the workload binds for members when its presence
+    /// candidate is `candidate_port`. Derived, never stored: the member range
+    /// is the private range shifted to the member start.
+    pub(crate) fn member_candidate_port(&self, candidate_port: u16) -> Result<Option<u16>> {
+        let Some(member) = self.member.as_ref() else {
+            return Ok(None);
+        };
+        ensure!(
+            (self.private_port_start..=self.private_port_end).contains(&candidate_port),
+            "candidate port is outside the route binding"
+        );
+        let offset = candidate_port - self.private_port_start;
+        let port = member
+            .private_port_start
+            .checked_add(offset)
+            .context("member private port overflows")?;
+        Ok(Some(port))
+    }
+}
+
+fn parse_stable_socket(driver: RouteDriver, endpoint: &str, what: &str) -> Result<(IpAddr, u16)> {
+    let authority = match driver {
+        RouteDriver::NginxStreamTcp => endpoint
+            .strip_prefix("http://")
+            .or_else(|| endpoint.strip_prefix("tcp://")),
+        RouteDriver::NginxStreamUdp => endpoint.strip_prefix("rudp://"),
+    }
+    .with_context(|| format!("{what} transport does not match its route driver"))?;
+    ensure!(
+        !authority
+            .chars()
+            .any(|character| matches!(character, '/' | '?' | '#' | '@' | '[' | ']')),
+        "{what} is not a plain IP address and port"
+    );
+    let (host, port) = authority
+        .rsplit_once(':')
+        .with_context(|| format!("{what} has no port"))?;
+    let host = host
+        .parse::<IpAddr>()
+        .with_context(|| format!("{what} host is not an IP address"))?;
+    ensure!(
+        matches!(host, IpAddr::V4(_)),
+        "route binding v2 endpoints use explicit IPv4 addresses"
+    );
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("{what} port is not a u16"))?;
+    ensure!(port > 0, "{what} port is zero");
+    Ok((host, port))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,6 +984,14 @@ impl TargetDeclaration {
                 .contains(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT)
                 == self.service.route_required,
             "routed services must require exactly one Idunn-owned candidate bind"
+        );
+        ensure!(
+            !self
+                .service
+                .required_environment
+                .contains(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT)
+                || self.service.route_required,
+            "only routed services may require the Idunn-owned member bind"
         );
         ensure!(
             self.service
@@ -1381,7 +1450,35 @@ impl OperatorBinding {
                 route.private_port_start < route.private_port_end,
                 "candidate rollout requires at least two private ports"
             );
-            route.stable_socket()?;
+            let stable = route.stable_socket()?;
+            if let Some(member) = route.member.as_ref() {
+                ensure!(
+                    route.driver == RouteDriver::NginxStreamTcp,
+                    "only a TCP route may carry a member listener"
+                );
+                require_value(&member.stable_endpoint, "member endpoint")?;
+                let member_stable = route
+                    .member_stable_socket()?
+                    .context("route has no member listener")?;
+                ensure!(
+                    member_stable != stable,
+                    "member endpoint equals the route's stable endpoint"
+                );
+                ensure!(
+                    member.private_port_start > 0,
+                    "member private port range starts at zero"
+                );
+                let width = route.private_port_end - route.private_port_start;
+                let member_end = member
+                    .private_port_start
+                    .checked_add(width)
+                    .context("member private port range overflows")?;
+                ensure!(
+                    member_end < route.private_port_start
+                        || member.private_port_start > route.private_port_end,
+                    "member private port range overlaps the route's private range"
+                );
+            }
             require_absolute_path(&route.config_path, "route config")?;
             require_unit(&route.reload_unit, "route reload unit")?;
         }
@@ -1559,12 +1656,7 @@ impl OperatorBinding {
             .keys()
             .chain(self.workload.secret_environment_names())
             .collect();
-        for owned in [
-            IDUNN_RUNTIME_BUNDLE_ENVIRONMENT,
-            IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT,
-            IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT,
-            IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT,
-        ] {
+        for owned in IDUNN_OWNED_LAUNCH_ENVIRONMENT {
             ensure!(
                 !workload_names.contains(&owned.to_string()),
                 "operator binding cannot replace Idunn-owned launch environment {owned}"
@@ -1586,6 +1678,9 @@ impl OperatorBinding {
         }
         if declaration.service.route_required {
             available_environment.insert(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT.into());
+            if self.route.as_ref().is_some_and(|route| route.member.is_some()) {
+                available_environment.insert(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT.into());
+            }
         }
         if declaration.write_lease_required() {
             available_environment.insert(IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT.into());
@@ -1933,10 +2028,10 @@ fn require_host(value: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const RECIPE: &str = r#"
+    pub(crate) const RECIPE: &str = r#"
 schema = "gamecult.idunn.target_declaration.v1"
 target = "test-service"
 source_stamp_environment = "TEST_SERVICE_BUILD_COMMIT"
@@ -2008,7 +2103,7 @@ compatibility = "v1"
 startup = "before-promotion"
 "#;
 
-    const BINDING: &str = r#"
+    pub(crate) const BINDING: &str = r#"
 schema = "gamecult.idunn.operator_binding.v2"
 target = "test-service"
 profiles = ["aetheria", "full-gamecult"]
@@ -2232,6 +2327,166 @@ nodes = ["yggdrasil"]
             let rejected = OperatorBinding::parse(&input)
                 .and_then(|binding| binding.admit(&recipe).map(|_| ()));
             assert!(rejected.is_err());
+        }
+    }
+
+    /// The recipe and binding of a routed service whose members connect to a
+    /// listener of their own.
+    pub(crate) fn member_listener_pair() -> (String, String) {
+        let recipe = RECIPE.replace(
+            "required_environment = [",
+            "required_environment = [\"GAMECULT_IDUNN_MEMBER_BIND\", ",
+        );
+        let binding = BINDING.replace(
+            "reload_unit = \"nginx.service\"\n",
+            "reload_unit = \"nginx.service\"\n\n[route.member]\nstable_endpoint = \"http://127.0.0.1:18840\"\nprivate_port_start = 18841\n",
+        );
+        (recipe, binding)
+    }
+
+    fn member_binding_with(replacement: (&str, &str)) -> Result<OperatorBinding> {
+        let (recipe, binding) = member_listener_pair();
+        let recipe = TargetDeclaration::parse(&recipe)?;
+        let binding = OperatorBinding::parse(&binding.replace(replacement.0, replacement.1))?;
+        binding.admit(&recipe)?;
+        Ok(binding)
+    }
+
+    #[test]
+    fn a_member_listener_admits_with_a_recipe_that_requires_the_member_bind() {
+        let binding = member_binding_with(("never-matches", "")).unwrap();
+        let route = binding.route.unwrap();
+        assert_eq!(route.member_stable_socket().unwrap().unwrap().1, 18840);
+        assert_eq!(route.member_candidate_port(18831).unwrap(), Some(18841));
+        assert_eq!(route.member_candidate_port(18839).unwrap(), Some(18849));
+        assert!(route.member_candidate_port(18840).is_err());
+    }
+
+    #[test]
+    fn a_binding_without_a_member_listener_has_no_member_ports() {
+        let binding = OperatorBinding::parse(BINDING).unwrap();
+        let route = binding.route.unwrap();
+        assert_eq!(route.member_stable_socket().unwrap(), None);
+        assert_eq!(route.member_candidate_port(18831).unwrap(), None);
+    }
+
+    #[test]
+    fn a_member_listener_needs_a_recipe_that_requires_the_member_bind() {
+        let (recipe, binding) = member_listener_pair();
+        // Bound but not required: the recipe never asked for the variable.
+        let plain_recipe = TargetDeclaration::parse(RECIPE).unwrap();
+        assert!(
+            OperatorBinding::parse(&binding)
+                .unwrap()
+                .admit(&plain_recipe)
+                .is_err()
+        );
+        // Required but not bound: the variable would never be set.
+        let recipe = TargetDeclaration::parse(&recipe).unwrap();
+        assert!(
+            OperatorBinding::parse(BINDING)
+                .unwrap()
+                .admit(&recipe)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn only_a_routed_recipe_may_require_the_member_bind() {
+        let recipe = RECIPE
+            .replace("route_required = true", "route_required = false")
+            .replace(
+                "required_environment = [\"GAMECULT_IDUNN_CANDIDATE_BIND\", ",
+                "required_environment = [\"GAMECULT_IDUNN_MEMBER_BIND\", ",
+            );
+        assert!(recipe.contains("GAMECULT_IDUNN_MEMBER_BIND"));
+        assert!(TargetDeclaration::parse(&recipe).is_err());
+    }
+
+    #[test]
+    fn member_listener_bindings_are_validated() {
+        let start = |value: &str| {
+            member_binding_with((
+                "private_port_start = 18841",
+                &format!("private_port_start = {value}"),
+            ))
+        };
+        // Overlapping the route's own private range, in either direction.
+        assert!(start("18835").is_err());
+        assert!(start("18825").is_err());
+        // Adjacent but disjoint is fine.
+        assert!(start("18840").is_ok());
+        // Zero, and a width that overflows u16.
+        assert!(start("0").is_err());
+        assert!(start("65530").is_err());
+        // The member endpoint may not be the route's stable endpoint.
+        assert!(member_binding_with(("http://127.0.0.1:18840", "http://127.0.0.1:18830")).is_err());
+        // The same transport and address rules as the stable endpoint.
+        assert!(member_binding_with(("http://127.0.0.1:18840", "rudp://127.0.0.1:18840")).is_err());
+        assert!(member_binding_with(("http://127.0.0.1:18840", "http://example.test:18840")).is_err());
+    }
+
+    #[test]
+    fn a_udp_route_cannot_carry_a_member_listener() {
+        let (recipe, binding) = member_listener_pair();
+        let binding = binding
+            .replace("nginx-stream-tcp", "nginx-stream-udp")
+            .replace("http://127.0.0.1:18830", "rudp://127.0.0.1:18830")
+            .replace("http://127.0.0.1:18840", "rudp://127.0.0.1:18840");
+        let recipe = TargetDeclaration::parse(&recipe).unwrap();
+        assert!(
+            OperatorBinding::parse(&binding)
+                .and_then(|binding| binding.admit(&recipe))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn idunn_owned_names_are_reserved_in_one_list() {
+        let recipe = TargetDeclaration::parse(RECIPE).unwrap();
+        let owned = [
+            "GAMECULT_IDUNN_RUNTIME_BUNDLE",
+            "GAMECULT_IDUNN_CANDIDATE_BIND",
+            "GAMECULT_IDUNN_MEMBER_BIND",
+            "GAMECULT_IDUNN_PROCESS_WRITE_LEASE",
+            "GAMECULT_IDUNN_ACTIVATION_CREDENTIAL",
+            "CREDENTIALS_DIRECTORY",
+        ];
+        let mut listed = IDUNN_OWNED_LAUNCH_ENVIRONMENT.to_vec();
+        listed.sort_unstable();
+        let mut expected = owned.to_vec();
+        expected.sort_unstable();
+        assert_eq!(listed, expected);
+
+        let as_environment = |name: &str| {
+            BINDING.replace(
+                "[workload.argument_bindings]",
+                &format!("[workload.environment]\n{name} = \"value\"\n\n[workload.argument_bindings]"),
+            )
+        };
+        let as_secret = |name: &str| {
+            BINDING.replace(
+                "[workload.secret_files]",
+                &format!("[workload.secret_files]\n{name} = \"/etc/gamecult/test-service/other.cc\""),
+            )
+        };
+        // The fixtures are well formed: an unowned name parses in both
+        // shapes, so the refusals below are about the name.
+        assert!(OperatorBinding::parse(&as_environment("UNOWNED_NAME")).is_ok());
+        assert!(OperatorBinding::parse(&as_secret("UNOWNED_NAME")).is_ok());
+        for name in owned {
+            assert!(
+                OperatorBinding::parse(&as_environment(name))
+                    .and_then(|binding| binding.admit(&recipe))
+                    .is_err(),
+                "{name} accepted as environment"
+            );
+            assert!(
+                OperatorBinding::parse(&as_secret(name))
+                    .and_then(|binding| binding.admit(&recipe))
+                    .is_err(),
+                "{name} accepted as a secret file"
+            );
         }
     }
 

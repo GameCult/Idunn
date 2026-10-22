@@ -10723,6 +10723,7 @@ mod tests {
             private_port_end,
             config_path: PathBuf::from(format!("/etc/nginx/idunn-stream-routes/{route_id}.conf")),
             reload_unit: "nginx.service".into(),
+            member: None,
         }
     }
 
