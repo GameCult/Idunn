@@ -70,6 +70,42 @@ recipe fields.
 Stateless services declare no state block. Their operator binding therefore has
 no state root, state-transition policy, or process write-lease record.
 
+## Foreign workloads: idunn-launch
+
+An upstream daemon that cannot speak Idunn's runtime contract (Synapse, MAS)
+runs under `idunn-launch`, the unit's own process. Idunn's two-witness rule is
+unchanged: Idunn observes the unit, and the launcher, inside the unit and
+supervising the child, signs presence with the provider identity and the
+activation key.
+
+- **Owner:** the launcher owns presence, config rendering and the child's
+  lifetime inside the unit, and the route answers it signs for that child.
+  Idunn owns admission, lease, route and continuity, as before.
+- **Inputs:** the runtime bundle, the activation credential and provider
+  identity descriptors, the process write lease, the systemd credentials the
+  binding names, and the child's health over its private listener.
+- **Outputs:** signed `gamecult.runtime_presence_health.v2` (Warming, Active
+  and failed to Odin; route observations on the candidate endpoint), one child
+  process, and a rendered config in the unit's private tmp that is never read
+  back.
+- **Route:** the launcher, not the child, binds the candidate endpoint. A first
+  byte of 0x00 is an Idunn challenge frame and is answered by the launcher;
+  every other byte is copied untouched to the child's private listener.
+- **Lease:** with `write_lease_required` the launcher starts the child only
+  after it holds the lease (bound to this Expected, this activation and one of
+  its own Warming proofs) and keeps the lease store share-locked while the
+  child lives. Losing the lease stops the child.
+- **Config:** one template from the release is rendered with the closed
+  placeholder set `{{child.listen}}`, `{{credential:NAME}}`,
+  `{{credential_path:NAME}}` and `{{state_root}}`. Any other placeholder
+  refuses to start.
+- **Forbidden:** the child binding the candidate endpoint; a child of a
+  lease-requiring target running without a held lease; any presence not signed
+  by both keys.
+- **State kind `external-directory`:** a process-owned directory imposed by an
+  external runtime contract. Same writer, recovery and startup rules as
+  `external-file`: it is lease-gated, preserved and fenced, never interpreted.
+
 ## Operator binding
 
 The root-admitted operator binding supplies the physical policy a repository

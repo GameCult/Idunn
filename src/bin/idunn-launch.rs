@@ -17,7 +17,11 @@ fn main() -> std::process::ExitCode {
     }
 
     fn launch() -> anyhow::Result<Outcome> {
-        let contract = LaunchContract::parse(std::env::args().skip(1))?;
+        let release_root = std::env::current_exe()?
+            .parent()
+            .context("the launcher is not inside a release")?
+            .to_owned();
+        let contract = LaunchContract::parse(release_root, std::env::args().skip(1))?;
         let bundle = std::env::var_os(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT)
             .context("the Idunn runtime bundle is not set")?;
         let bind = std::env::var(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT)
@@ -52,8 +56,8 @@ fn main() -> std::process::ExitCode {
         };
         // SAFETY: the handler only stores to an atomic.
         unsafe {
-            libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-            libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         }
         Ok(launcher::run(
             &contract,

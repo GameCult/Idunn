@@ -150,6 +150,31 @@ omits one. Unknown fields are rejected on both sides. A repository that gets
 compromised can therefore change what is built, but not what it is allowed to
 touch on the host.
 
+An upstream daemon that does not speak Idunn's runtime contract is deployed
+with `idunn-launch` as its executable artifact and the upstream tree as a
+required adjacent artifact; the launcher finds the child inside the release that
+holds it. The launcher is the unit's process: it binds the
+candidate endpoint, answers Idunn's challenge, renders the child's config,
+starts a stateful child only once it holds the write lease, and signs presence.
+
+```toml
+# recipe fragment — the upstream tree is built or fetched as an artifact
+[service]
+executable_artifact = "idunn-launch"
+arguments = [
+  { kind = "literal", value = "--child" },
+  { kind = "literal", value = "upstream/bin/daemon" },
+  { kind = "literal", value = "--template" },
+  { kind = "literal", value = "config.tmpl" },
+  { kind = "literal", value = "--listener" },
+  { kind = "literal", value = "unix" },
+  { kind = "literal", value = "--health-path" },
+  { kind = "literal", value = "/health" },
+  { kind = "literal", value = "--health-contract" },
+  { kind = "literal", value = "example.presence-launcher.v1" },
+]
+```
+
 ## Contracts
 
 Idunn's typed contracts are published by

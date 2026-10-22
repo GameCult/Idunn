@@ -66,7 +66,8 @@ pub enum ChildListener {
 }
 
 /// Everything the recipe declares about the child, parsed from the launcher's
-/// argv (`--flag value` pairs; `--child-arg` repeats).
+/// argv (`--flag value` pairs; `--child-arg` repeats). The release root is the
+/// sealed release directory that holds the launcher itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchContract {
     pub release_root: PathBuf,
@@ -86,8 +87,8 @@ pub struct LaunchContract {
 }
 
 impl LaunchContract {
-    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
-        let mut release_root = None;
+    pub fn parse(release_root: PathBuf, args: impl IntoIterator<Item = String>) -> Result<Self> {
+        ensure!(release_root.is_absolute(), "the release root is not absolute");
         let mut child = None;
         let mut child_args = Vec::new();
         let mut config_flag = None;
@@ -108,7 +109,6 @@ impl LaunchContract {
                     .with_context(|| format!("launcher argument {field} is not a positive integer"))
             };
             match flag.as_str() {
-                "--release-root" => release_root = Some(PathBuf::from(value)),
                 "--child" => child = Some(release_relative(&value, "--child")?),
                 "--child-arg" => child_args.push(value),
                 "--config-flag" => config_flag = Some(value),
@@ -135,11 +135,6 @@ impl LaunchContract {
                 _ => bail!("unknown launcher argument"),
             }
         }
-        let release_root = release_root.context("launcher argument --release-root is required")?;
-        ensure!(
-            release_root.is_absolute(),
-            "launcher argument --release-root is not absolute"
-        );
         Ok(Self {
             release_root,
             child: child.context("launcher argument --child is required")?,
@@ -1157,7 +1152,7 @@ fn lifecycle(
 
     // 1. Warming reaches Odin before any child exists.
     let mut proofs: VecDeque<String> = VecDeque::new();
-    let mut remember = |sha: Option<String>, proofs: &mut VecDeque<String>| {
+    let remember = |sha: Option<String>, proofs: &mut VecDeque<String>| {
         if let Some(sha) = sha {
             proofs.push_back(sha);
             while proofs.len() > MAX_RECENT_WARMING_PROOFS {
@@ -1938,8 +1933,6 @@ mod tests {
     fn contract_parsing_refuses_escapes_and_echoes_nothing() {
         let base = |extra: &[&str]| -> Result<LaunchContract> {
             let mut args: Vec<String> = [
-                "--release-root",
-                "/r",
                 "--child",
                 "bin/c",
                 "--template",
@@ -1954,7 +1947,7 @@ mod tests {
             .map(String::from)
             .to_vec();
             args.extend(extra.iter().map(|value| value.to_string()));
-            LaunchContract::parse(args)
+            LaunchContract::parse(PathBuf::from("/r"), args)
         };
         assert!(base(&["--child-arg", "--flag-looking-value"]).is_ok());
         assert!(base(&["--child", "../escape"]).is_err());
@@ -1986,5 +1979,60 @@ mod tests {
         assert!(denial.to_string().contains("shared-lock consumer"));
         drop(hold);
         idunn.revoke_exact(Some(&lease)).unwrap();
+    }
+
+    #[test]
+    fn authority_binds_the_candidate_and_signs_strictly_increasing_sequences() {
+        let fx = fixture(false);
+        let mut authority = fx.authority();
+        assert!(authority.require_candidate_bind("127.0.0.1:18835").is_ok());
+        assert!(authority.require_candidate_bind("127.0.0.1:18836").is_err());
+        let first = authority.sign("warming", "a", None, 5_000).unwrap();
+        let second = authority.sign("warming", "b", None, 5_000).unwrap();
+        assert_eq!(first.publisher_sequence, 5_000);
+        assert_eq!(second.publisher_sequence, 5_001);
+        assert_eq!(
+            first.bound_endpoint.as_deref(),
+            Some("tcp://127.0.0.1:18835")
+        );
+    }
+
+    #[test]
+    fn health_probe_is_healthy_only_on_a_200_from_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("child.sock");
+        let probe = HttpHealthProbe {
+            endpoint: ChildEndpoint::Unix(socket.clone()),
+            path: "/health".into(),
+        };
+        assert!(!probe.healthy(), "no listener is not healthy");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for status in ["200 OK", "503 Service Unavailable"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 64];
+                let read = stream.read(&mut request).unwrap();
+                assert!(request[..read].starts_with(b"GET /health HTTP/1.1\r\n"));
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 2\r\n\r\nOK").unwrap();
+            }
+        });
+        assert!(probe.healthy());
+        assert!(!probe.healthy());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn process_spawner_reports_exit_codes_and_terminates_a_running_child() {
+        let mut gone = ProcessSpawner
+            .spawn(Path::new("/bin/sh"), &["-c".into(), "exit 3".into()])
+            .unwrap();
+        wait_until("child exit", || gone.exited().is_some());
+        assert_eq!(gone.exited(), Some(3));
+        let mut running = ProcessSpawner
+            .spawn(Path::new("/bin/sh"), &["-c".into(), "sleep 30".into()])
+            .unwrap();
+        assert_eq!(running.exited(), None);
+        running.terminate(Duration::from_secs(5));
+        assert!(running.exited().is_some());
     }
 }
