@@ -1275,3 +1275,716 @@ fn start_child(
         .spawn(&contract.release_root.join(&contract.child), &args)
         .ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    use cultcache_rs::{CultCacheEnvelope, TryCompareExchangeSnapshotOutcome};
+    use cultnet_rs::{
+        IdunnExpectedCapability, IdunnExpectedRoute, IdunnRuntimeActivationLaunch,
+        IdunnServiceIdentity, RuntimePresenceAuthenticationContext, VerifiedRuntimeAuthority,
+        authenticate_runtime_presence_claim, enroll_service_identity_at, verify_runtime_authority,
+    };
+
+    use super::*;
+    use crate::drivers::{WriteLeasePort, exact_route_snapshot_response, request_tcp_snapshot};
+
+    fn digest(byte: char) -> String {
+        format!("sha256-{}", byte.to_string().repeat(64))
+    }
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+        expected: IdunnExpectedIncarnationRecord,
+        activation: IdunnRuntimeActivationRecord,
+        activation_credential: Vec<u8>,
+        provider_credential: Vec<u8>,
+        verified: VerifiedRuntimeAuthority,
+    }
+
+    fn write_record(path: &Path, key: &str, kind: &str, schema: &str, payload: Vec<u8>) {
+        let envelope = CultCacheEnvelope {
+            key: key.into(),
+            r#type: kind.into(),
+            payload,
+            stored_at: chrono::Utc::now().to_rfc3339(),
+            schema_id: Some(schema.into()),
+        };
+        let outcome = SingleFileMessagePackBackingStore::new(path)
+            .try_compare_exchange_snapshot(&[], &[envelope])
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            TryCompareExchangeSnapshotOutcome::Exchanged
+        ));
+    }
+
+    fn fixture(lease_required: bool) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let provider_path = root.join("provider.cc");
+        let provider =
+            enroll_service_identity_at::<GameCultProviderHealthIdentity>(&provider_path).unwrap();
+        let idunn =
+            enroll_service_identity_at::<IdunnServiceIdentity>(&root.join("idunn.cc")).unwrap();
+        let expected = IdunnExpectedIncarnationRecord {
+            schema_version: IDUNN_EXPECTED_INCARNATION_SCHEMA.into(),
+            target: "synapse".into(),
+            plan_id: digest('1'),
+            incarnation_id: "incarnation-1".into(),
+            sealed_release_id: digest('2'),
+            source_repository: "github.com/GameCult/gamecult-chat".into(),
+            source_revision: "3".repeat(40),
+            recipe_sha256: digest('4'),
+            runtime_id: "synapse-yggdrasil".into(),
+            expected_signer_identity_id: provider.entry().identity_id.clone(),
+            health_contract: "gamecult.chat.synapse.presence-launcher.v1".into(),
+            artifact_sha256: digest('5'),
+            state_schema_generation: lease_required.then(|| "state-v1".into()),
+            state_contract_sha256: lease_required.then(|| digest('6')),
+            write_lease_required: lease_required,
+            route: Some(IdunnExpectedRoute {
+                route_id: "synapse-tcp".into(),
+                transport: "tcp".into(),
+                stable_endpoint: "tcp://127.0.0.1:18834".into(),
+                candidate_endpoint: "tcp://127.0.0.1:18835".into(),
+            }),
+            capabilities: vec![IdunnExpectedCapability {
+                capability: "gamecult.chat.homeserver".into(),
+                schema: "matrix.client.v3".into(),
+                compatibility: "v3".into(),
+                minimum_capacity: 1,
+            }],
+            dependencies: Vec::new(),
+        };
+        let launch =
+            IdunnRuntimeActivationLaunch::issue(&expected, digest('7'), 100, &idunn).unwrap();
+        let activation = launch.activation().clone();
+        let mut activation_credential = Vec::new();
+        launch.write_credential(&mut activation_credential).unwrap();
+        let verified = verify_runtime_authority(
+            &expected,
+            &activation,
+            &idunn.trust_anchor().unwrap(),
+            &provider.entry().public_key,
+        )
+        .unwrap();
+        let bundle = root.join("bundle");
+        fs::create_dir(&bundle).unwrap();
+        write_record(
+            &bundle.join("expected.cc"),
+            &expected.target,
+            IdunnExpectedIncarnationRecord::TYPE,
+            IDUNN_EXPECTED_INCARNATION_SCHEMA,
+            expected.canonical_bytes().unwrap(),
+        );
+        write_record(
+            &bundle.join("activation.cc"),
+            &expected.target,
+            IdunnRuntimeActivationRecord::TYPE,
+            IDUNN_RUNTIME_ACTIVATION_SCHEMA,
+            activation.canonical_bytes().unwrap(),
+        );
+        let provider_credential = fs::read(&provider_path).unwrap();
+        for directory in ["release/bin", "tmp"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        Fixture {
+            dir,
+            expected,
+            activation,
+            activation_credential,
+            provider_credential,
+            verified,
+        }
+    }
+
+    impl Fixture {
+        fn authority(&self) -> RuntimeAuthority {
+            RuntimeAuthority::open(
+                &self.dir.path().join("bundle"),
+                &self.activation_credential[..],
+                &self.provider_credential[..],
+            )
+            .unwrap()
+        }
+
+        fn lease(&self, warming_sha256: &str) -> IdunnProcessWriteLeaseRecord {
+            IdunnProcessWriteLeaseRecord {
+                schema_version: cultnet_rs::IDUNN_PROCESS_WRITE_LEASE_SCHEMA.into(),
+                target: self.expected.target.clone(),
+                expected_projection_sha256: self.expected.canonical_sha256().unwrap(),
+                plan_id: self.expected.plan_id.clone(),
+                incarnation_id: self.expected.incarnation_id.clone(),
+                sealed_release_id: self.expected.sealed_release_id.clone(),
+                activation_witness_sha256: self.activation.canonical_sha256().unwrap(),
+                state_schema_generation: self.expected.state_schema_generation.clone().unwrap(),
+                state_contract_sha256: self.expected.state_contract_sha256.clone().unwrap(),
+                runtime_id: self.expected.runtime_id.clone(),
+                runtime_instance_id: self.activation.runtime_instance_id.clone(),
+                warming_presence_sha256: warming_sha256.into(),
+                lease_epoch: 1,
+                issued_at_unix_millis: 200,
+            }
+        }
+
+        fn contract(&self, template: &str) -> LaunchContract {
+            fs::write(self.dir.path().join("release/config.tmpl"), template).unwrap();
+            LaunchContract {
+                release_root: self.dir.path().join("release"),
+                child: PathBuf::from("bin/child"),
+                child_args: vec!["--serve".into()],
+                config_flag: Some("--config".into()),
+                template: PathBuf::from("config.tmpl"),
+                listener: ChildListener::UnixSocket,
+                health_path: "/health".into(),
+                health_contract: self.expected.health_contract.clone(),
+                state_root: Some(PathBuf::from("/var/lib/synapse")),
+                lease_wait: Duration::from_secs(3600),
+                startup: Duration::from_secs(3600),
+                heartbeat: Duration::from_secs(5),
+            }
+        }
+    }
+
+    /// Virtual time runs a hundred times faster than the wall clock.
+    struct FastClock(AtomicU64);
+
+    impl Clock for FastClock {
+        fn now_millis(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.0
+                .fetch_add(duration.as_millis() as u64, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[derive(Default)]
+    struct Sink(Mutex<Vec<GameCultRuntimePresenceHealthRecord>>);
+
+    impl PresenceSink for Sink {
+        fn put(&self, record: &GameCultRuntimePresenceHealthRecord) -> Result<()> {
+            self.0.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    impl Sink {
+        fn states(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|record| record.state.clone())
+                .collect()
+        }
+
+        fn first(&self, state: &str) -> Option<GameCultRuntimePresenceHealthRecord> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|record| record.state == state)
+                .cloned()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeLease(Mutex<Option<IdunnProcessWriteLeaseRecord>>);
+
+    impl LeaseReader for FakeLease {
+        fn read(&self) -> Result<Option<IdunnProcessWriteLeaseRecord>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+
+        fn hold_shared(&self) -> Result<Box<dyn Send>> {
+            Ok(Box::new(()))
+        }
+    }
+
+    struct Health(AtomicBool);
+
+    impl HealthProbe for Health {
+        fn healthy(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Default)]
+    struct Child {
+        spawns: AtomicUsize,
+        exit: Mutex<Option<i32>>,
+        terminated: AtomicBool,
+        args: Mutex<Vec<Vec<String>>>,
+    }
+
+    struct FakeChild(Arc<Child>);
+
+    impl ChildHandle for FakeChild {
+        fn exited(&mut self) -> Option<i32> {
+            *self.0.exit.lock().unwrap()
+        }
+
+        fn terminate(&mut self, _grace: Duration) {
+            self.0.terminated.store(true, Ordering::SeqCst);
+            *self.0.exit.lock().unwrap() = Some(143);
+        }
+    }
+
+    struct FakeSpawner(Arc<Child>);
+
+    impl ChildSpawner for FakeSpawner {
+        fn spawn(&self, _program: &Path, args: &[String]) -> Result<Box<dyn ChildHandle>> {
+            self.0.spawns.fetch_add(1, Ordering::SeqCst);
+            self.0.args.lock().unwrap().push(args.to_vec());
+            Ok(Box::new(FakeChild(Arc::clone(&self.0))))
+        }
+    }
+
+    struct Credentials(BTreeMap<String, Vec<u8>>);
+
+    impl CredentialSource for Credentials {
+        fn contents(&self, name: &str) -> Result<Vec<u8>> {
+            self.0.get(name).cloned().ok_or_else(|| anyhow!("unbound"))
+        }
+
+        fn path(&self, name: &str) -> Result<PathBuf> {
+            self.0
+                .contains_key(name)
+                .then(|| PathBuf::from(format!("/run/credentials/unit/{name}")))
+                .ok_or_else(|| anyhow!("unbound"))
+        }
+    }
+
+    struct Run {
+        sink: Arc<Sink>,
+        lease: Arc<FakeLease>,
+        child: Arc<Child>,
+        stop: Arc<AtomicBool>,
+        outcome: Option<thread::JoinHandle<Outcome>>,
+    }
+
+    fn start(fx: &Fixture, contract: LaunchContract, healthy: bool) -> Run {
+        let sink = Arc::new(Sink::default());
+        let lease = Arc::new(FakeLease::default());
+        let health = Arc::new(Health(AtomicBool::new(healthy)));
+        let child = Arc::new(Child::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut secrets = BTreeMap::new();
+        secrets.insert("SYNAPSE_KEY".to_owned(), b"s3cret-value\n".to_vec());
+        let ports = Ports {
+            credentials: Arc::new(Credentials(secrets)),
+            clock: Arc::new(FastClock(AtomicU64::new(1_000_000))),
+            sink: sink.clone(),
+            lease: lease.clone(),
+            spawner: Box::new(FakeSpawner(child.clone())),
+            health: Box::new(move |_| health.clone()),
+        };
+        let authority = fx.authority();
+        let route = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tmp = fx.dir.path().join("tmp");
+        let flag = stop.clone();
+        let outcome = thread::spawn(move || run(&contract, authority, route, &tmp, ports, &flag));
+        Run {
+            sink,
+            lease,
+            child,
+            stop,
+            outcome: Some(outcome),
+        }
+    }
+
+    impl Run {
+        fn finish(&mut self) -> Outcome {
+            self.outcome.take().unwrap().join().unwrap()
+        }
+
+        fn stop(&mut self) -> Outcome {
+            self.stop.store(true, Ordering::SeqCst);
+            self.finish()
+        }
+    }
+
+    fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..4000 {
+            if condition() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn stateful_child_never_starts_before_its_lease() {
+        let fx = fixture(true);
+        let mut launch = start(&fx, fx.contract("listen {{child.listen}}"), true);
+        wait_until("two warming heartbeats", || {
+            launch.sink.states().iter().filter(|s| *s == "warming").count() >= 2
+        });
+        assert_eq!(launch.child.spawns.load(Ordering::SeqCst), 0);
+        let warming = launch.sink.first("warming").unwrap();
+        assert!(warming.write_lease_sha256.is_none());
+
+        // The lease binds the launcher's own Warming proof; only then it starts.
+        let lease = fx.lease(&warming.canonical_sha256().unwrap());
+        *launch.lease.0.lock().unwrap() = Some(lease.clone());
+        wait_until("child spawn", || {
+            launch.child.spawns.load(Ordering::SeqCst) == 1
+        });
+        wait_until("active", || launch.sink.first("active").is_some());
+        let active = launch.sink.first("active").unwrap();
+        assert_eq!(
+            active.write_lease_sha256.as_deref(),
+            Some(lease.canonical_sha256().unwrap().as_str())
+        );
+        assert_eq!(launch.stop(), Outcome::Stopped);
+        assert!(launch.child.terminated.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_lease_for_another_activation_or_expected_is_not_accepted() {
+        let fx = fixture(true);
+        let foreign: [(&str, fn(&mut IdunnProcessWriteLeaseRecord)); 3] = [
+            ("another runtime instance", |lease| {
+                lease.runtime_instance_id = "other".into()
+            }),
+            ("another Expected", |lease| {
+                lease.expected_projection_sha256 = digest('9')
+            }),
+            ("another warming proof", |lease| {
+                lease.warming_presence_sha256 = digest('9')
+            }),
+        ];
+        for (name, edit) in foreign {
+            let mut contract = fx.contract("x");
+            contract.lease_wait = Duration::from_secs(5);
+            let mut launch = start(&fx, contract, true);
+            // Installed at once; the launcher's own proofs are never digest('8').
+            let mut lease = fx.lease(&digest('8'));
+            edit(&mut lease);
+            *launch.lease.0.lock().unwrap() = Some(lease);
+            assert_eq!(launch.finish(), Outcome::Failed("lease-timeout"), "{name}");
+            assert_eq!(launch.child.spawns.load(Ordering::SeqCst), 0, "{name}");
+            assert_eq!(launch.sink.states().last().unwrap(), "failed", "{name}");
+        }
+    }
+
+    #[test]
+    fn lease_loss_stops_the_child() {
+        let fx = fixture(true);
+        let mut launch = start(&fx, fx.contract("x"), true);
+        wait_until("warming", || launch.sink.first("warming").is_some());
+        let warming = launch.sink.first("warming").unwrap();
+        *launch.lease.0.lock().unwrap() = Some(fx.lease(&warming.canonical_sha256().unwrap()));
+        wait_until("active", || launch.sink.first("active").is_some());
+        *launch.lease.0.lock().unwrap() = None;
+        let outcome = launch.finish();
+        assert_eq!(outcome, Outcome::Failed("lease-lost"));
+        assert_ne!(outcome.exit_code(), 0);
+        assert!(launch.child.terminated.load(Ordering::SeqCst));
+        assert_eq!(launch.sink.states().last().unwrap(), "failed");
+    }
+
+    #[test]
+    fn stateless_child_starts_without_a_lease() {
+        let fx = fixture(false);
+        let mut launch = start(&fx, fx.contract("x"), true);
+        wait_until("active", || launch.sink.first("active").is_some());
+        assert_eq!(launch.child.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(launch.sink.states().first().unwrap(), "warming");
+        assert!(
+            launch
+                .sink
+                .first("active")
+                .unwrap()
+                .write_lease_sha256
+                .is_none()
+        );
+        launch.stop();
+    }
+
+    #[test]
+    fn child_exit_ends_the_launcher() {
+        for code in [0, 3] {
+            let fx = fixture(false);
+            let mut launch = start(&fx, fx.contract("x"), true);
+            wait_until("active", || launch.sink.first("active").is_some());
+            *launch.child.exit.lock().unwrap() = Some(code);
+            let outcome = launch.finish();
+            assert_eq!(outcome, Outcome::Failed("child-exited"), "exit {code}");
+            assert_eq!(outcome.exit_code(), 1);
+            assert_eq!(launch.sink.states().last().unwrap(), "failed");
+        }
+    }
+
+    #[test]
+    fn closed_placeholder_set_renders_and_refuses() {
+        let fx = fixture(false);
+        let template = "listen={{child.listen}}\nroot={{state_root}}\nkey={{credential:SYNAPSE_KEY}}\npath={{credential_path:SYNAPSE_KEY}}\n";
+        let mut launch = start(&fx, fx.contract(template), true);
+        wait_until("spawn", || launch.child.spawns.load(Ordering::SeqCst) == 1);
+        let args = launch.child.args.lock().unwrap()[0].clone();
+        assert_eq!(args[..2], ["--serve", "--config"]);
+        let config = PathBuf::from(&args[2]);
+        assert_eq!(config.parent().unwrap(), fx.dir.path().join("tmp"));
+        assert_eq!(
+            fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let rendered = fs::read_to_string(&config).unwrap();
+        let socket = fx.dir.path().join("tmp/child.sock");
+        assert_eq!(
+            rendered,
+            format!(
+                "listen={}\nroot=/var/lib/synapse\nkey=s3cret-value\npath=/run/credentials/unit/SYNAPSE_KEY\n",
+                socket.display()
+            )
+        );
+        assert!(
+            !rendered.contains("18835"),
+            "the candidate bind never reaches the child"
+        );
+        launch.stop();
+
+        // Any other placeholder refuses to start, and the refusal names no input.
+        let fx = fixture(false);
+        let mut launch = start(&fx, fx.contract("a={{canary_bind}}"), true);
+        assert_eq!(launch.finish(), Outcome::Failed("child-start-refused"));
+        assert_eq!(launch.child.spawns.load(Ordering::SeqCst), 0);
+        let credentials = Credentials(BTreeMap::new());
+        let renderer = ConfigRenderer {
+            credentials: &credentials,
+            listen: "L",
+            state_root: None,
+        };
+        for template in [
+            "{{canary_bind}}",
+            "{{credential:CANARY-MISSING}}",
+            "{{credential:canary b}}",
+            "{{child.listen}} {{canary",
+            "{{state_root}}",
+        ] {
+            let error = format!("{:#}", renderer.render(template).unwrap_err());
+            assert!(!error.to_lowercase().contains("canary"), "{error}");
+        }
+    }
+
+    fn shared(fx: &Fixture, health: Arc<Health>) -> Arc<Shared> {
+        Arc::new(Shared {
+            authority: Mutex::new(fx.authority()),
+            phase: Mutex::new(Phase::Active(None)),
+            lease: Mutex::new(None),
+            lease_required: false,
+            health,
+            clock: Arc::new(SystemClock),
+        })
+    }
+
+    #[test]
+    fn route_answer_degrades_with_the_child() {
+        let fx = fixture(false);
+        let health = Arc::new(Health(AtomicBool::new(true)));
+        let shared = shared(&fx, health.clone());
+        let state_of = |shared: &Shared| {
+            let request = CultNetMessage::SnapshotRequest {
+                message_id: "challenge-1".into(),
+                schema_ids: None,
+                record_keys: None,
+            };
+            let CultNetMessage::SnapshotResponseRaw { documents, .. } =
+                shared.observe(request).unwrap()
+            else {
+                panic!("not a raw snapshot response")
+            };
+            let record: GameCultRuntimePresenceHealthRecord =
+                rmp_serde::from_slice(&documents[0].payload).unwrap();
+            assert_eq!(record.detail, "route-observation:challenge-1");
+            record.state
+        };
+        assert_eq!(state_of(&shared), "active");
+        health.0.store(false, Ordering::SeqCst);
+        assert_eq!(state_of(&shared), "degraded");
+    }
+
+    #[test]
+    fn route_challenge_is_answered_with_both_signatures_through_idunns_client() {
+        let fx = fixture(false);
+        let shared = shared(&fx, Arc::new(Health(AtomicBool::new(true))));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder: Responder = Arc::new(move |request| shared.observe(request));
+        let halt = Arc::new(AtomicBool::new(false));
+        let acceptor = RouteAcceptor::new(
+            listener,
+            ChildEndpoint::Unix("/nonexistent".into()),
+            responder,
+        );
+        let serving = {
+            let halt = halt.clone();
+            thread::spawn(move || acceptor.serve(halt))
+        };
+        let request = CultNetMessage::SnapshotRequest {
+            message_id: "challenge-7".into(),
+            schema_ids: Some(vec![GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into()]),
+            record_keys: Some(vec![fx.expected.target.clone()]),
+        };
+        let payload =
+            encode_cultnet_message_to_vec(&request, CultNetWireContract::CultNetSchemaV0).unwrap();
+        let response = request_tcp_snapshot(address, &payload).ok().unwrap();
+        let message =
+            decode_cultnet_message_from_slice(&response, CultNetWireContract::CultNetSchemaV0)
+                .unwrap();
+        let answer =
+            exact_route_snapshot_response(message, "challenge-7", &fx.expected.target).unwrap();
+        let record: GameCultRuntimePresenceHealthRecord =
+            rmp_serde::from_slice(&answer.canonical_presence).unwrap();
+        let claim = authenticate_runtime_presence_claim(
+            &answer.canonical_presence,
+            &fx.verified,
+            RuntimePresenceAuthenticationContext {
+                trusted_received_at_unix_millis: record.observed_at_unix_millis,
+                maximum_age_millis: 10_000,
+                maximum_future_skew_millis: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(claim.record().state, "active");
+        halt.store(true, Ordering::SeqCst);
+        serving.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn member_bytes_reach_the_child_verbatim_and_only_challenge_frames_are_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("child.sock");
+        let child = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let request: Vec<u8> =
+            b"POST /_matrix/x HTTP/1.1\r\nContent-Length: 6\r\n\r\n\x00\x01\x00\x02\x00\x03".to_vec();
+        let response: Vec<u8> =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\x00\xff\x00\x10".to_vec();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let fake = {
+            let (received, connections, response, want) = (
+                received.clone(),
+                connections.clone(),
+                response.clone(),
+                request.len(),
+            );
+            thread::spawn(move || {
+                for stream in child.incoming() {
+                    let mut stream = stream.unwrap();
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = vec![0_u8; want];
+                    if stream.read_exact(&mut buffer).is_err() {
+                        continue;
+                    }
+                    *received.lock().unwrap() = buffer;
+                    stream.write_all(&response).unwrap();
+                    return;
+                }
+            })
+        };
+        let challenges = Arc::new(AtomicUsize::new(0));
+        let responder: Responder = {
+            let challenges = challenges.clone();
+            Arc::new(move |_| {
+                challenges.fetch_add(1, Ordering::SeqCst);
+                bail!("not under test")
+            })
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let halt = Arc::new(AtomicBool::new(false));
+        let acceptor = RouteAcceptor::new(listener, ChildEndpoint::Unix(socket), responder);
+        let serving = {
+            let halt = halt.clone();
+            thread::spawn(move || acceptor.serve(halt))
+        };
+
+        // A leading 0x00 that is not a challenge frame never reaches the child.
+        let mut probe = TcpStream::connect(address).unwrap();
+        probe.write_all(&[0x00, 0xff, 0xff, 0xff, 1, 2, 3]).unwrap();
+        let mut answered = Vec::new();
+        let _ = probe.read_to_end(&mut answered);
+        assert!(answered.is_empty());
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+
+        // Everything else is copied untouched, both ways, 0x00 bytes included.
+        let mut member = TcpStream::connect(address).unwrap();
+        member.write_all(&request).unwrap();
+        let mut answer = Vec::new();
+        member.read_to_end(&mut answer).unwrap();
+        assert_eq!(answer, response);
+        fake.join().unwrap();
+        assert_eq!(*received.lock().unwrap(), request);
+        assert_eq!(
+            challenges.load(Ordering::SeqCst),
+            0,
+            "a malformed frame fails before the responder; member traffic never reaches it"
+        );
+        halt.store(true, Ordering::SeqCst);
+        serving.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn contract_parsing_refuses_escapes_and_echoes_nothing() {
+        let base = |extra: &[&str]| -> Result<LaunchContract> {
+            let mut args: Vec<String> = [
+                "--release-root",
+                "/r",
+                "--child",
+                "bin/c",
+                "--template",
+                "t",
+                "--listener",
+                "unix",
+                "--health-path",
+                "/health",
+                "--health-contract",
+                "h",
+            ]
+            .map(String::from)
+            .to_vec();
+            args.extend(extra.iter().map(|value| value.to_string()));
+            LaunchContract::parse(args)
+        };
+        assert!(base(&["--child-arg", "--flag-looking-value"]).is_ok());
+        assert!(base(&["--child", "../escape"]).is_err());
+        assert!(base(&["--template", "/etc/passwd"]).is_err());
+        let error = base(&["--canary-flag", "canary-value"])
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("canary"));
+    }
+
+    #[test]
+    fn real_lease_reader_holds_the_shared_lock_idunn_must_respect() {
+        let fx = fixture(true);
+        let path = fx.dir.path().join("lease.cc");
+        let warming = digest('a');
+        let lease = fx.lease(&warming);
+        write_record(
+            &path,
+            &lease.target,
+            IdunnProcessWriteLeaseRecord::TYPE,
+            cultnet_rs::IDUNN_PROCESS_WRITE_LEASE_SCHEMA,
+            lease.canonical_bytes().unwrap(),
+        );
+        let reader: Arc<dyn LeaseReader> = Arc::new(DriverLeaseReader::new(&lease.target, &path));
+        let hold = LeaseHold::acquire(reader, &fx.expected, &fx.activation, &[warming]).unwrap();
+        assert!(hold.still_current());
+        let idunn = CultCacheWriteLeaseDriver::new(&lease.target, &path);
+        let denial = idunn.revoke_exact(Some(&lease)).unwrap_err();
+        assert!(denial.to_string().contains("shared-lock consumer"));
+        drop(hold);
+        idunn.revoke_exact(Some(&lease)).unwrap();
+    }
+}
