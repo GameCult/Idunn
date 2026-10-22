@@ -1606,7 +1606,7 @@ mod tests {
         }
     }
 
-    fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         for _ in 0..4000 {
             if condition() {
                 return;
