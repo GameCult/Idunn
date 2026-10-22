@@ -657,9 +657,7 @@ pub struct ProcessWriteLeaseBinding {
 
 impl ProcessWriteLeaseBinding {
     pub fn lock_path(&self) -> PathBuf {
-        let mut lock_path = self.record_path.as_os_str().to_os_string();
-        lock_path.push(".lock");
-        PathBuf::from(lock_path)
+        crate::drivers::authority_lock_path(&self.record_path)
     }
 }
 

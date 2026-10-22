@@ -154,8 +154,11 @@ An upstream daemon that does not speak Idunn's runtime contract is deployed
 with `idunn-launch` as its executable artifact and the upstream tree as a
 required adjacent artifact; the launcher finds the child inside the release that
 holds it. The launcher is the unit's process: it binds the
-candidate endpoint, answers Idunn's challenge, renders the child's config,
-starts a stateful child only once it holds the write lease, and signs presence.
+candidate endpoint and answers Idunn's challenge there, renders the child's
+config, starts a stateful child only once it holds the write lease, and signs
+presence. Members never pass through it: the binding's `[route.member]` makes
+Idunn route a second listener straight to the child, which binds the address
+Idunn gives it in `GAMECULT_IDUNN_MEMBER_BIND`.
 
 ```toml
 # recipe fragment â€” the upstream tree is built or fetched as an artifact
@@ -166,13 +169,31 @@ arguments = [
   { kind = "literal", value = "upstream/bin/daemon" },
   { kind = "literal", value = "--template" },
   { kind = "literal", value = "config.tmpl" },
-  { kind = "literal", value = "--listener" },
-  { kind = "literal", value = "unix" },
   { kind = "literal", value = "--health-path" },
   { kind = "literal", value = "/health" },
   { kind = "literal", value = "--health-contract" },
   { kind = "literal", value = "example.presence-launcher.v1" },
 ]
+required_environment = [
+  "GAMECULT_IDUNN_RUNTIME_BUNDLE",
+  "GAMECULT_IDUNN_CANDIDATE_BIND",
+  "GAMECULT_IDUNN_MEMBER_BIND",
+]
+```
+
+```toml
+# binding fragment — members connect to the member endpoint, which Idunn
+# forwards to the private port derived from the candidate: member
+# private_port_start + (candidate port - route private_port_start)
+[route]
+stable_endpoint = "tcp://10.77.0.1:8008"
+private_port_start = 18831
+private_port_end = 18839
+# ...
+
+[route.member]
+stable_endpoint = "tcp://10.77.0.1:8448"
+private_port_start = 18841
 ```
 
 ## Contracts

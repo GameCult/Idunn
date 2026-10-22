@@ -7,7 +7,7 @@ fn main() -> std::process::ExitCode {
     use anyhow::Context;
     use idunn_daemon::deployment::{
         IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT, IDUNN_RUNTIME_BUNDLE_ENVIRONMENT,
-        IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT,
+        IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT, IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT,
     };
     use idunn_daemon::launcher::{self, *};
 
@@ -26,6 +26,11 @@ fn main() -> std::process::ExitCode {
             .context("the Idunn runtime bundle is not set")?;
         let bind = std::env::var(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT)
             .context("the Idunn candidate bind is not set")?;
+        let member = launcher::parse_member_bind(
+            &std::env::var(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT)
+                .context("the Idunn member bind is not set")?,
+            &bind,
+        )?;
         let (activation, provider) = launcher::inherited_authority_files()?;
         let authority = RuntimeAuthority::open(bundle.as_ref(), activation, provider)?;
         authority.require_candidate_bind(&bind)?;
@@ -47,10 +52,9 @@ fn main() -> std::process::ExitCode {
             sink: std::sync::Arc::new(sink),
             lease: std::sync::Arc::new(lease),
             spawner: Box::new(ProcessSpawner),
-            route_bounds: RouteBounds::default(),
-            health: Box::new(move |endpoint| {
+            health: Box::new(move |member| {
                 std::sync::Arc::new(HttpHealthProbe {
-                    endpoint: endpoint.clone(),
+                    member,
                     path: health_path.clone(),
                 })
             }),
@@ -64,6 +68,7 @@ fn main() -> std::process::ExitCode {
             &contract,
             authority,
             route,
+            member,
             &std::env::temp_dir(),
             ports,
             &STOP,

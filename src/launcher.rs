@@ -4,9 +4,11 @@
 //! Idunn observes the unit; the launcher, inside it and supervising the child,
 //! signs the presence statement with the provider identity and the activation
 //! key. The launcher binds the candidate endpoint Idunn challenges, because the
-//! child cannot answer a CultNet frame. It starts a stateful child only after
-//! it holds the process write lease, renders the child's config from a closed
-//! set of placeholders, and ends with the child.
+//! child cannot answer a CultNet frame, and answers presence there and nowhere
+//! else: members reach the child on the member bind Idunn routes them to. It
+//! starts a stateful child only after it holds the process write lease, renders
+//! the child's config from a closed set of placeholders, and ends with the
+//! child.
 //!
 //! Errors, logs and refusals name a field and a code. They never echo an
 //! argument, a template line, a path or a credential.
@@ -14,14 +16,13 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,21 +42,22 @@ use cultnet_rs::{
     encode_cultnet_message_to_vec, encode_frame, open_service_identity_credential_reader,
 };
 
-use crate::deployment::RUNTIME_PRESENCE_IDENTITY_FD_NAME;
-use crate::drivers::{CultCacheWriteLeaseDriver, lease_binds_candidate};
+use crate::deployment::{RUNTIME_PRESENCE_IDENTITY_FD_NAME, SYSTEMD_CREDENTIALS_DIRECTORY_ENVIRONMENT};
+use crate::drivers::{CultCacheWriteLeaseDriver, authority_lock_path, lease_binds_candidate};
 
 /// The route challenge is the only thing that begins with this byte: a
 /// CultNet frame's 4-byte big-endian length is bounded at 1 MiB, and an HTTP
 /// request starts with a method letter.
 const CHALLENGE_FIRST_BYTE: u8 = 0x00;
 const CHALLENGE_MAX_BYTES: usize = 1024 * 1024;
-const CHALLENGE_IO_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long a public connection may stay silent before its first byte.
-const FIRST_BYTE_DEADLINE: Duration = Duration::from_secs(5);
-/// A whole challenge, from its first byte to its answer, however it trickles.
-const CHALLENGE_DEADLINE: Duration = Duration::from_secs(5);
-/// Concurrent connections the acceptor serves; the rest are refused unspawned.
-const MAX_CONNECTIONS: usize = 256;
+/// One whole presence exchange on the candidate endpoint, from accept to
+/// answer, however the peer paces it. It is shorter than the 3 s Idunn waits
+/// for a challenge answer, so one stalled peer cannot cost the next challenge
+/// its reply.
+const PRESENCE_DEADLINE: Duration = Duration::from_secs(1);
+/// How long the presence acceptor waits after an accept error before trying
+/// again. No accept error ends the acceptor.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(100);
 const MAX_RECENT_WARMING_PROOFS: usize = 64;
@@ -64,14 +66,6 @@ const ODIN_CULTMESH_CATALOG_CONNECTION_ID: u32 = 0x0d1d_0002;
 const ODIN_CAPABILITY: &str = "odin.verse-rendezvous";
 
 // ---------------------------------------------------------------- contract
-
-/// Where the child listens. The launcher chooses the address; the child is
-/// told it through `{{child.listen}}`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChildListener {
-    UnixSocket,
-    LoopbackPort,
-}
 
 /// Everything the recipe declares about the child, parsed from the launcher's
 /// argv (`--flag value` pairs; `--child-arg` repeats). The release root is the
@@ -85,7 +79,6 @@ pub struct LaunchContract {
     /// child takes one.
     pub config_flag: Option<String>,
     pub template: PathBuf,
-    pub listener: ChildListener,
     pub health_path: String,
     pub health_contract: String,
     pub state_root: Option<PathBuf>,
@@ -101,7 +94,6 @@ impl LaunchContract {
         let mut child_args = Vec::new();
         let mut config_flag = None;
         let mut template = None;
-        let mut listener = None;
         let mut health_path = None;
         let mut health_contract = None;
         let mut state_root = None;
@@ -121,13 +113,6 @@ impl LaunchContract {
                 "--child-arg" => child_args.push(value),
                 "--config-flag" => config_flag = Some(value),
                 "--template" => template = Some(release_relative(&value, "--template")?),
-                "--listener" => {
-                    listener = Some(match value.as_str() {
-                        "unix" => ChildListener::UnixSocket,
-                        "loopback" => ChildListener::LoopbackPort,
-                        _ => bail!("launcher argument --listener is not unix or loopback"),
-                    })
-                }
                 "--health-path" => {
                     ensure!(
                         value.starts_with('/'),
@@ -149,7 +134,6 @@ impl LaunchContract {
             child_args,
             config_flag,
             template: template.context("launcher argument --template is required")?,
-            listener: listener.context("launcher argument --listener is required")?,
             health_path: health_path.context("launcher argument --health-path is required")?,
             health_contract: health_contract
                 .context("launcher argument --health-contract is required")?,
@@ -426,7 +410,7 @@ impl CredentialsDirectory {
 
     /// The directory systemd exported; no directory means no credential is bound.
     pub fn from_environment() -> Self {
-        Self(std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from))
+        Self(std::env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY_ENVIRONMENT).map(PathBuf::from))
     }
 }
 
@@ -523,9 +507,7 @@ impl LeaseReader for DriverLeaseReader {
     /// description: a child that inherits it keeps the lock after the launcher
     /// dies.
     fn hold_shared(&self) -> Result<Box<dyn LeaseLock>> {
-        let mut lock = self.driver.record_path.clone().into_os_string();
-        lock.push(".lock");
-        let file = File::open(&lock).map_err(|_| anyhow!("write-lease lock could not be held"))?;
+        let file = File::open(authority_lock_path(&self.driver.record_path)).map_err(|_| anyhow!("write-lease lock could not be held"))?;
         // SAFETY: flock on a descriptor this function owns.
         ensure!(
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0,
@@ -640,108 +622,34 @@ fn presence_document(
     })
 }
 
-/// The child's private listener.
-#[derive(Clone, Debug)]
-pub enum ChildEndpoint {
-    Unix(PathBuf),
-    Loopback(SocketAddr),
-}
-
-pub enum ChildStream {
-    Unix(UnixStream),
-    Tcp(TcpStream),
-}
-
-impl ChildEndpoint {
-    pub fn connect(&self) -> io::Result<ChildStream> {
-        match self {
-            Self::Unix(path) => UnixStream::connect(path).map(ChildStream::Unix),
-            Self::Loopback(address) => {
-                TcpStream::connect_timeout(address, HEALTH_PROBE_TIMEOUT).map(ChildStream::Tcp)
-            }
-        }
-    }
-
-    /// What `{{child.listen}}` renders to.
-    fn listen_value(&self) -> String {
-        match self {
-            Self::Unix(path) => path.display().to_string(),
-            Self::Loopback(address) => address.to_string(),
-        }
-    }
-}
-
-impl ChildStream {
-    fn try_clone(&self) -> io::Result<Self> {
-        match self {
-            Self::Unix(stream) => stream.try_clone().map(Self::Unix),
-            Self::Tcp(stream) => stream.try_clone().map(Self::Tcp),
-        }
-    }
-
-    fn shutdown_write(&self) {
-        let _ = match self {
-            Self::Unix(stream) => stream.shutdown(Shutdown::Write),
-            Self::Tcp(stream) => stream.shutdown(Shutdown::Write),
-        };
-    }
-
-    fn set_timeout(&self, timeout: Duration) {
-        let _ = match self {
-            Self::Unix(stream) => stream
-                .set_read_timeout(Some(timeout))
-                .and_then(|()| stream.set_write_timeout(Some(timeout))),
-            Self::Tcp(stream) => stream
-                .set_read_timeout(Some(timeout))
-                .and_then(|()| stream.set_write_timeout(Some(timeout))),
-        };
-    }
-}
-
-impl Read for ChildStream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Unix(stream) => stream.read(buffer),
-            Self::Tcp(stream) => stream.read(buffer),
-        }
-    }
-}
-
-impl Write for ChildStream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Unix(stream) => stream.write(buffer),
-            Self::Tcp(stream) => stream.write(buffer),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Unix(stream) => stream.flush(),
-            Self::Tcp(stream) => stream.flush(),
-        }
-    }
-}
-
-/// `GET <path>` over the child's private listener; healthy on a 200.
+/// `GET <path>` over TCP at the child's member bind; healthy on a 200. One
+/// deadline covers connect, write and read, so a full backlog or a silent child
+/// answers false within `HEALTH_PROBE_TIMEOUT`.
 pub struct HttpHealthProbe {
-    pub endpoint: ChildEndpoint,
+    pub member: SocketAddr,
     pub path: String,
 }
 
 impl HealthProbe for HttpHealthProbe {
     fn healthy(&self) -> bool {
-        let Ok(mut stream) = self.endpoint.connect() else {
+        let deadline = Instant::now() + HEALTH_PROBE_TIMEOUT;
+        let Ok(mut stream) = TcpStream::connect_timeout(&self.member, HEALTH_PROBE_TIMEOUT) else {
             return false;
         };
-        stream.set_timeout(HEALTH_PROBE_TIMEOUT);
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            return false;
+        };
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             self.path
         );
         let mut head = [0_u8; 12];
-        stream.write_all(request.as_bytes()).is_ok()
-            && stream.read_exact(&mut head).is_ok()
+        stream.set_write_timeout(Some(remaining)).is_ok()
+            && stream.write_all(request.as_bytes()).is_ok()
+            && read_by(&mut stream, &mut head, deadline).is_ok()
             && head.starts_with(b"HTTP/1.")
             && &head[8..12] == b" 200"
     }
@@ -816,7 +724,8 @@ impl ChildHandle for ProcessChild {
 /// The closed placeholder set (decision D6). Any other `{{...}}` refuses.
 pub struct ConfigRenderer<'a> {
     pub credentials: &'a dyn CredentialSource,
-    pub listen: &'a str,
+    /// The member bind the child serves on.
+    pub listen: SocketAddr,
     pub state_root: Option<&'a Path>,
 }
 
@@ -838,8 +747,11 @@ impl ConfigRenderer<'_> {
     }
 
     fn expand(&self, key: &str) -> Result<String> {
-        if key == "child.listen" {
-            return Ok(self.listen.to_owned());
+        match key {
+            "child.listen" => return Ok(self.listen.to_string()),
+            "child.listen_host" => return Ok(self.listen.ip().to_string()),
+            "child.listen_port" => return Ok(self.listen.port().to_string()),
+            _ => {}
         }
         if key == "state_root" {
             return Ok(self
@@ -940,7 +852,7 @@ enum Phase {
     Failed,
 }
 
-/// What the launcher currently is, shared with the route acceptor.
+/// What the launcher currently is, shared with the presence acceptor.
 struct Shared {
     authority: Mutex<RuntimeAuthority>,
     phase: Mutex<Phase>,
@@ -948,15 +860,13 @@ struct Shared {
     lease_required: bool,
     health: Arc<dyn HealthProbe>,
     clock: Arc<dyn Clock>,
-    /// False once the route acceptor has stopped for any reason but a halt:
-    /// the launcher cannot answer Idunn's challenge, so it must not say active.
-    acceptor_alive: AtomicBool,
 }
 
 impl Shared {
-    /// Active only while the child is healthy and the route is being served.
+    /// Active only while the child is healthy. A dead presence acceptor does
+    /// not degrade presence: it fails the unit.
     fn serving_state(&self) -> &'static str {
-        if self.health.healthy() && self.acceptor_alive.load(Ordering::SeqCst) {
+        if self.health.healthy() {
             "active"
         } else {
             "degraded"
@@ -1007,134 +917,66 @@ impl Shared {
 
 type Responder = Arc<dyn Fn(CultNetMessage) -> Result<CultNetMessage> + Send + Sync>;
 
-/// Bounds on what the public route endpoint spends on one peer.
-#[derive(Clone, Copy, Debug)]
-pub struct RouteBounds {
-    pub first_byte: Duration,
-    pub challenge: Duration,
-    pub max_connections: usize,
-}
-
-impl Default for RouteBounds {
-    fn default() -> Self {
-        Self {
-            first_byte: FIRST_BYTE_DEADLINE,
-            challenge: CHALLENGE_DEADLINE,
-            max_connections: MAX_CONNECTIONS,
-        }
-    }
-}
-
-/// Counts a live connection; dropping it frees the slot.
-struct Slot(Arc<AtomicUsize>);
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Owns the candidate endpoint. A leading 0x00 is an Idunn challenge frame and
-/// is answered here; every other byte is copied untouched to the child. The
-/// endpoint is public, so it spends bounded resources on a peer: a first-byte
-/// deadline, a total challenge deadline, and a cap on live connections whose
-/// overflow is closed without a thread.
-pub struct RouteAcceptor {
+/// Owns the candidate endpoint and answers presence there and nowhere else.
+/// Members never reach it: Idunn routes them to the child's member bind.
+///
+/// The endpoint is public, so it spends bounded resources on a peer: one
+/// connection at a time, so a connection holds at most one descriptor; a total
+/// deadline for the whole exchange; and any first byte but a challenge's closes
+/// the connection unanswered. No accept error ends it: it backs off and accepts
+/// again, and only `halt` stops it.
+pub struct PresenceAcceptor {
     listener: TcpListener,
-    child: ChildEndpoint,
     responder: Responder,
-    bounds: RouteBounds,
-    live: Arc<AtomicUsize>,
 }
 
-impl RouteAcceptor {
-    pub fn new(listener: TcpListener, child: ChildEndpoint, responder: Responder, bounds: RouteBounds) -> Self {
-        Self {
-            listener,
-            child,
-            responder,
-            bounds,
-            live: Arc::new(AtomicUsize::new(0)),
-        }
+impl PresenceAcceptor {
+    pub fn new(listener: TcpListener, responder: Responder) -> Self {
+        Self { listener, responder }
     }
 
-    /// Serves until `halt`. Any other end is an error: a failed accept or a
-    /// thread that cannot be created means the route is no longer served.
-    pub fn serve(self, halt: Arc<AtomicBool>) -> Result<()> {
-        self.listener.set_nonblocking(true)?;
-        let acceptor = Arc::new(self);
+    pub fn serve(self, halt: Arc<AtomicBool>) {
+        self.serve_accepting(halt, |listener| listener.accept());
+    }
+
+    fn serve_accepting(
+        self,
+        halt: Arc<AtomicBool>,
+        mut accept: impl FnMut(&TcpListener) -> io::Result<(TcpStream, SocketAddr)>,
+    ) {
+        // A listener that cannot be made non-blocking could never observe
+        // `halt`; ending here is a dead acceptor, which fails the unit.
+        if self.listener.set_nonblocking(true).is_err() {
+            return;
+        }
         while !halt.load(Ordering::SeqCst) {
-            match acceptor.listener.accept() {
+            match accept(&self.listener) {
                 Ok((connection, _)) => {
-                    if acceptor.live.fetch_add(1, Ordering::SeqCst) >= acceptor.bounds.max_connections {
-                        acceptor.live.fetch_sub(1, Ordering::SeqCst);
-                        continue;
-                    }
-                    let slot = Slot(Arc::clone(&acceptor.live));
-                    let worker = Arc::clone(&acceptor);
-                    thread::Builder::new()
-                        .spawn(move || {
-                            let _slot = slot;
-                            let _ = connection.set_nonblocking(false);
-                            let _ = worker.handle(connection);
-                        })
-                        .map_err(|_| anyhow!("a route connection thread could not be created"))?;
+                    let _ = connection.set_nonblocking(false);
+                    let _ = self.answer(connection);
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock
-                            | io::ErrorKind::Interrupted
-                            | io::ErrorKind::ConnectionAborted
-                    ) =>
-                {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(_) => bail!("the route listener could not accept"),
+                Err(_) => thread::sleep(ACCEPT_BACKOFF),
             }
         }
-        Ok(())
     }
 
-    fn handle(&self, mut connection: TcpStream) -> Result<()> {
+    fn answer(&self, mut connection: TcpStream) -> Result<()> {
+        let deadline = Instant::now() + PRESENCE_DEADLINE;
         let mut first = [0_u8; 1];
-        read_by(&mut connection, &mut first, Instant::now() + self.bounds.first_byte)?;
-        if first[0] == CHALLENGE_FIRST_BYTE {
-            return self.answer_challenge(&mut connection);
-        }
-        let mut upstream = self.child.connect()?;
-        upstream.write_all(&first)?;
-        let mut upstream_reader = upstream.try_clone()?;
-        let mut client_reader = connection.try_clone()?;
-        let forward = thread::Builder::new()
-            .spawn(move || {
-                let _ = io::copy(&mut client_reader, &mut upstream);
-                upstream.shutdown_write();
-            })
-            .map_err(|_| anyhow!("a route splice thread could not be created"))?;
-        // The first-byte deadline bounded the silent peer; a spliced session
-        // runs as long as the member and the child keep it.
-        connection.set_read_timeout(None)?;
-        let _ = io::copy(&mut upstream_reader, &mut connection);
-        let _ = connection.shutdown(Shutdown::Write);
-        let _ = forward.join();
-        Ok(())
-    }
-
-    fn answer_challenge(&self, connection: &mut TcpStream) -> Result<()> {
-        // The challenge began with its first byte; the rest must arrive within
-        // the total deadline, however slowly the peer sends it.
-        let deadline = Instant::now() + self.bounds.challenge;
-        connection.set_write_timeout(Some(CHALLENGE_IO_TIMEOUT))?;
+        read_by(&mut connection, &mut first, deadline)?;
+        ensure!(first[0] == CHALLENGE_FIRST_BYTE, "not a challenge frame");
         let mut rest = [0_u8; 3];
-        read_by(connection, &mut rest, deadline)?;
+        read_by(&mut connection, &mut rest, deadline)?;
         let length = u32::from_be_bytes([CHALLENGE_FIRST_BYTE, rest[0], rest[1], rest[2]]) as usize;
         ensure!(
             (1..=CHALLENGE_MAX_BYTES).contains(&length),
             "challenge frame is outside its bound"
         );
         let mut payload = vec![0_u8; length];
-        read_by(connection, &mut payload, deadline)?;
+        read_by(&mut connection, &mut payload, deadline)?;
         let request =
             decode_cultnet_message_from_slice(&payload, CultNetWireContract::CultNetSchemaV0)?;
         let response = (self.responder)(request)?;
@@ -1142,6 +984,11 @@ impl RouteAcceptor {
             &response,
             CultNetWireContract::CultNetSchemaV0,
         )?)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .context("the answer was not ready in time")?;
+        connection.set_write_timeout(Some(remaining))?;
         connection.write_all(&frame)?;
         connection.flush()?;
         Ok(())
@@ -1175,9 +1022,8 @@ pub struct Ports {
     pub sink: Arc<dyn PresenceSink>,
     pub lease: Arc<dyn LeaseReader>,
     pub spawner: Box<dyn ChildSpawner>,
-    pub route_bounds: RouteBounds,
-    /// Built from the endpoint `run` chooses.
-    pub health: Box<dyn Fn(&ChildEndpoint) -> Arc<dyn HealthProbe> + Send>,
+    /// Built from the member bind the child serves on.
+    pub health: Box<dyn Fn(SocketAddr) -> Arc<dyn HealthProbe> + Send>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1197,23 +1043,32 @@ impl Outcome {
     }
 }
 
-fn child_endpoint(listener: ChildListener, tmp: &Path) -> Result<ChildEndpoint> {
-    Ok(match listener {
-        ChildListener::UnixSocket => ChildEndpoint::Unix(tmp.join("child.sock")),
-        ChildListener::LoopbackPort => {
-            let probe = TcpListener::bind("127.0.0.1:0")?;
-            ChildEndpoint::Loopback(probe.local_addr()?)
-        }
-    })
+/// The member bind Idunn hands the unit: a socket address on a loopback IP,
+/// other than the candidate bind. Errors name the variable, never its value.
+pub fn parse_member_bind(raw: &str, candidate_bind: &str) -> Result<SocketAddr> {
+    let member: SocketAddr = raw
+        .parse()
+        .map_err(|_| anyhow!("the Idunn member bind is not a socket address"))?;
+    ensure!(
+        member.ip().is_loopback(),
+        "the Idunn member bind is not on a loopback address"
+    );
+    let candidate: SocketAddr = candidate_bind
+        .parse()
+        .map_err(|_| anyhow!("the Idunn candidate bind is not a socket address"))?;
+    ensure!(member != candidate, "the Idunn member bind equals the candidate bind");
+    Ok(member)
 }
 
 /// The unit's whole life: Warming, lease, child, Active, until the child or the
 /// lease ends or SIGTERM arrives. `route` is the already-bound candidate
-/// listener; `tmp` is the unit's private temporary directory.
+/// listener, answered for presence only; `member` is the address the child
+/// serves members on; `tmp` is the unit's private temporary directory.
 pub fn run(
     contract: &LaunchContract,
     authority: RuntimeAuthority,
     route: TcpListener,
+    member: SocketAddr,
     tmp: &Path,
     ports: Ports,
     stop: &AtomicBool,
@@ -1223,10 +1078,7 @@ pub fn run(
     if expected.health_contract != contract.health_contract {
         return Outcome::Failed("health-contract-mismatch");
     }
-    let Ok(endpoint) = child_endpoint(contract.listener, tmp) else {
-        return Outcome::Failed("child-endpoint");
-    };
-    let health = (ports.health)(&endpoint);
+    let health = (ports.health)(member);
     let shared = Arc::new(Shared {
         authority: Mutex::new(authority),
         phase: Mutex::new(Phase::Warming),
@@ -1234,26 +1086,23 @@ pub fn run(
         lease_required: expected.write_lease_required,
         health: Arc::clone(&health),
         clock: Arc::clone(&ports.clock),
-        acceptor_alive: AtomicBool::new(true),
     });
     let halt = Arc::new(AtomicBool::new(false));
     let responder: Responder = {
         let shared = Arc::clone(&shared);
         Arc::new(move |request| shared.observe(request))
     };
+    let acceptor = PresenceAcceptor::new(route, responder);
     let serving = {
-        let acceptor = RouteAcceptor::new(route, endpoint.clone(), responder, ports.route_bounds);
         let halt = Arc::clone(&halt);
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            let served = acceptor.serve(halt);
-            if served.is_err() {
-                shared.acceptor_alive.store(false, Ordering::SeqCst);
-            }
-            served
-        })
+        thread::Builder::new()
+            .name("presence-acceptor".into())
+            .spawn(move || acceptor.serve(halt))
     };
-    let outcome = lifecycle(contract, &expected, &activation, &endpoint, tmp, &ports, &shared, stop);
+    let Ok(serving) = serving else {
+        return Outcome::Failed("presence-acceptor");
+    };
+    let outcome = lifecycle(contract, &expected, &activation, member, tmp, &ports, &shared, &serving, stop);
     halt.store(true, Ordering::SeqCst);
     let _ = serving.join();
     outcome
@@ -1264,10 +1113,11 @@ fn lifecycle(
     contract: &LaunchContract,
     expected: &IdunnExpectedIncarnationRecord,
     activation: &IdunnRuntimeActivationRecord,
-    endpoint: &ChildEndpoint,
+    member: SocketAddr,
     tmp: &Path,
     ports: &Ports,
     shared: &Shared,
+    presence: &thread::JoinHandle<()>,
     stop: &AtomicBool,
 ) -> Outcome {
     let clock = &*ports.clock;
@@ -1316,6 +1166,9 @@ fn lifecycle(
             if stop.load(Ordering::SeqCst) {
                 return Outcome::Stopped;
             }
+            if presence.is_finished() {
+                return fail(None, "presence-acceptor");
+            }
             let held = LeaseHold::acquire(
                 Arc::clone(&ports.lease),
                 expected,
@@ -1343,7 +1196,7 @@ fn lifecycle(
     }
 
     // 3. Render, spawn, and wait for health.
-    let Some(mut child) = start_child(contract, endpoint, tmp, ports, lease_fd) else {
+    let Some(mut child) = start_child(contract, member, tmp, ports, lease_fd) else {
         return fail(None, "child-start-refused");
     };
     let startup_deadline = clock.now_millis() + contract.startup.as_millis() as u64;
@@ -1354,6 +1207,9 @@ fn lifecycle(
         }
         if child.exited().is_some() {
             return fail(None, "child-exited");
+        }
+        if presence.is_finished() {
+            return fail(Some(&mut child), "presence-acceptor");
         }
         if shared.health.healthy() {
             break;
@@ -1376,6 +1232,9 @@ fn lifecycle(
         if child.exited().is_some() {
             return fail(None, "child-exited");
         }
+        if presence.is_finished() {
+            return fail(Some(&mut child), "presence-acceptor");
+        }
         if !shared.lease_current() {
             return fail(Some(&mut child), "lease-lost");
         }
@@ -1390,16 +1249,15 @@ fn lifecycle(
 
 fn start_child(
     contract: &LaunchContract,
-    endpoint: &ChildEndpoint,
+    member: SocketAddr,
     tmp: &Path,
     ports: &Ports,
     lease_fd: Option<RawFd>,
 ) -> Option<Box<dyn ChildHandle>> {
     let template = fs::read_to_string(contract.release_root.join(&contract.template)).ok()?;
-    let listen = endpoint.listen_value();
     let rendered = ConfigRenderer {
         credentials: &*ports.credentials,
-        listen: &listen,
+        listen: member,
         state_root: contract.state_root.as_deref(),
     }
     .render(&template)
@@ -1421,7 +1279,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
-    use std::sync::mpsc;
 
     use cultcache_rs::{CultCacheEnvelope, TryCompareExchangeSnapshotOutcome};
     use cultnet_rs::{
@@ -1432,6 +1289,11 @@ mod tests {
 
     use super::*;
     use crate::drivers::{WriteLeasePort, exact_route_snapshot_response, request_tcp_snapshot};
+
+    /// The member bind Idunn would hand these fixtures' unit.
+    fn member() -> SocketAddr {
+        "127.0.0.1:18845".parse().unwrap()
+    }
 
     fn digest(byte: char) -> String {
         format!("sha256-{}", byte.to_string().repeat(64))
@@ -1580,7 +1442,6 @@ mod tests {
                 child_args: vec!["--serve".into()],
                 config_flag: Some("--config".into()),
                 template: PathBuf::from("config.tmpl"),
-                listener: ChildListener::UnixSocket,
                 health_path: "/health".into(),
                 health_contract: self.expected.health_contract.clone(),
                 state_root: Some(PathBuf::from("/var/lib/synapse")),
@@ -1743,14 +1604,14 @@ mod tests {
             sink: sink.clone(),
             lease: lease.clone(),
             spawner: Box::new(FakeSpawner(child.clone())),
-            route_bounds: RouteBounds::default(),
             health: Box::new(move |_| health.clone()),
         };
         let authority = fx.authority();
         let route = TcpListener::bind("127.0.0.1:0").unwrap();
         let tmp = fx.dir.path().join("tmp");
         let flag = stop.clone();
-        let outcome = thread::spawn(move || run(&contract, authority, route, &tmp, ports, &flag));
+        let outcome =
+            thread::spawn(move || run(&contract, authority, route, member(), &tmp, ports, &flag));
         Run {
             sink,
             lease,
@@ -1887,7 +1748,7 @@ mod tests {
     #[test]
     fn closed_placeholder_set_renders_and_refuses() {
         let fx = fixture(false);
-        let template = "listen={{child.listen}}\nroot={{state_root}}\nkey={{credential:SYNAPSE_KEY}}\npath={{credential_path:SYNAPSE_KEY}}\n";
+        let template = "listen={{child.listen}}\nhost={{child.listen_host}}\nport={{child.listen_port}}\nroot={{state_root}}\nkey={{credential:SYNAPSE_KEY}}\npath={{credential_path:SYNAPSE_KEY}}\n";
         let mut launch = start(&fx, fx.contract(template), true);
         wait_until("spawn", || launch.child.spawns.load(Ordering::SeqCst) == 1);
         let args = launch.child.args.lock().unwrap()[0].clone();
@@ -1899,13 +1760,9 @@ mod tests {
             0o600
         );
         let rendered = fs::read_to_string(&config).unwrap();
-        let socket = fx.dir.path().join("tmp/child.sock");
         assert_eq!(
             rendered,
-            format!(
-                "listen={}\nroot=/var/lib/synapse\nkey=s3cret-value\npath=/run/credentials/unit/SYNAPSE_KEY\n",
-                socket.display()
-            )
+            "listen=127.0.0.1:18845\nhost=127.0.0.1\nport=18845\nroot=/var/lib/synapse\nkey=s3cret-value\npath=/run/credentials/unit/SYNAPSE_KEY\n"
         );
         assert!(
             !rendered.contains("18835"),
@@ -1921,7 +1778,7 @@ mod tests {
         let credentials = Credentials(BTreeMap::new());
         let renderer = ConfigRenderer {
             credentials: &credentials,
-            listen: "L",
+            listen: member(),
             state_root: None,
         };
         for template in [
@@ -1944,7 +1801,6 @@ mod tests {
             lease_required: false,
             health,
             clock: Arc::new(SystemClock),
-            acceptor_alive: AtomicBool::new(true),
         })
     }
 
@@ -1982,12 +1838,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let responder: Responder = Arc::new(move |request| shared.observe(request));
         let halt = Arc::new(AtomicBool::new(false));
-        let acceptor = RouteAcceptor::new(
-            listener,
-            ChildEndpoint::Unix("/nonexistent".into()),
-            responder,
-            RouteBounds::default(),
-        );
+        let acceptor = PresenceAcceptor::new(listener, responder);
         let serving = {
             let halt = halt.clone();
             thread::spawn(move || acceptor.serve(halt))
@@ -2019,81 +1870,7 @@ mod tests {
         .unwrap();
         assert_eq!(claim.record().state, "active");
         halt.store(true, Ordering::SeqCst);
-        serving.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn member_bytes_reach_the_child_verbatim_and_only_challenge_frames_are_answered() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("child.sock");
-        let child = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let request: Vec<u8> =
-            b"POST /_matrix/x HTTP/1.1\r\nContent-Length: 6\r\n\r\n\x00\x01\x00\x02\x00\x03".to_vec();
-        let response: Vec<u8> =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\x00\xff\x00\x10".to_vec();
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let connections = Arc::new(AtomicUsize::new(0));
-        let fake = {
-            let (received, connections, response, want) = (
-                received.clone(),
-                connections.clone(),
-                response.clone(),
-                request.len(),
-            );
-            thread::spawn(move || {
-                for stream in child.incoming() {
-                    let mut stream = stream.unwrap();
-                    connections.fetch_add(1, Ordering::SeqCst);
-                    let mut buffer = vec![0_u8; want];
-                    if stream.read_exact(&mut buffer).is_err() {
-                        continue;
-                    }
-                    *received.lock().unwrap() = buffer;
-                    stream.write_all(&response).unwrap();
-                    return;
-                }
-            })
-        };
-        let challenges = Arc::new(AtomicUsize::new(0));
-        let responder: Responder = {
-            let challenges = challenges.clone();
-            Arc::new(move |_| {
-                challenges.fetch_add(1, Ordering::SeqCst);
-                bail!("not under test")
-            })
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let halt = Arc::new(AtomicBool::new(false));
-        let acceptor = RouteAcceptor::new(listener, ChildEndpoint::Unix(socket), responder, RouteBounds::default());
-        let serving = {
-            let halt = halt.clone();
-            thread::spawn(move || acceptor.serve(halt))
-        };
-
-        // A leading 0x00 that is not a challenge frame never reaches the child.
-        let mut probe = TcpStream::connect(address).unwrap();
-        probe.write_all(&[0x00, 0xff, 0xff, 0xff, 1, 2, 3]).unwrap();
-        let mut answered = Vec::new();
-        let _ = probe.read_to_end(&mut answered);
-        assert!(answered.is_empty());
-        assert_eq!(connections.load(Ordering::SeqCst), 0);
-
-        // Everything else is copied untouched, both ways, 0x00 bytes included.
-        let mut member = TcpStream::connect(address).unwrap();
-        member.write_all(&request).unwrap();
-        let mut answer = Vec::new();
-        member.read_to_end(&mut answer).unwrap();
-        assert_eq!(answer, response);
-        fake.join().unwrap();
-        assert_eq!(*received.lock().unwrap(), request);
-        assert_eq!(
-            challenges.load(Ordering::SeqCst),
-            0,
-            "a malformed frame fails before the responder; member traffic never reaches it"
-        );
-        halt.store(true, Ordering::SeqCst);
-        serving.join().unwrap().unwrap();
+        serving.join().unwrap();
     }
 
     #[test]
@@ -2104,8 +1881,6 @@ mod tests {
                 "bin/c",
                 "--template",
                 "t",
-                "--listener",
-                "unix",
                 "--health-path",
                 "/health",
                 "--health-contract",
@@ -2118,6 +1893,9 @@ mod tests {
         };
         assert!(base(&["--child-arg", "--flag-looking-value"]).is_ok());
         assert!(base(&["--child", "../escape"]).is_err());
+        // The child serves members on Idunn's member bind: there is no
+        // listener to choose.
+        assert!(base(&["--listener", "loopback"]).is_err());
         assert!(base(&["--template", "/etc/passwd"]).is_err());
         let error = base(&["--canary-flag", "canary-value"])
             .unwrap_err()
@@ -2166,14 +1944,9 @@ mod tests {
 
     #[test]
     fn health_probe_is_healthy_only_on_a_200_from_the_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("child.sock");
-        let probe = HttpHealthProbe {
-            endpoint: ChildEndpoint::Unix(socket.clone()),
-            path: "/health".into(),
-        };
-        assert!(!probe.healthy(), "no listener is not healthy");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let member = listener.local_addr().unwrap();
+        let probe = HttpHealthProbe { member, path: "/health".into() };
         let server = thread::spawn(move || {
             for status in ["200 OK", "503 Service Unavailable"] {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -2187,13 +1960,14 @@ mod tests {
         assert!(probe.healthy());
         assert!(!probe.healthy());
         server.join().unwrap();
+        assert!(!probe.healthy(), "no listener is not healthy");
     }
 
     #[test]
     fn contract_parsing_reads_every_declared_field() {
         let args: Vec<String> = [
             "--child", "bin/c", "--child-arg", "-x", "--child-arg", "y", "--config-flag", "-c",
-            "--template", "t", "--listener", "loopback", "--health-path", "/h",
+            "--template", "t", "--health-path", "/h",
             "--health-contract", "hc", "--state-root", "/s", "--lease-wait-secs", "11",
             "--startup-secs", "22", "--heartbeat-secs", "33",
         ]
@@ -2202,7 +1976,6 @@ mod tests {
         let contract = LaunchContract::parse(PathBuf::from("/r"), args.clone()).unwrap();
         assert_eq!(contract.child_args, ["-x", "y"]);
         assert_eq!(contract.config_flag.as_deref(), Some("-c"));
-        assert_eq!(contract.listener, ChildListener::LoopbackPort);
         assert_eq!(contract.state_root, Some(PathBuf::from("/s")));
         assert_eq!(
             (contract.lease_wait, contract.startup, contract.heartbeat),
@@ -2226,7 +1999,7 @@ mod tests {
                 Ok(PathBuf::from(name))
             }
         }
-        let renderer = ConfigRenderer { credentials: &Any, listen: "L", state_root: None };
+        let renderer = ConfigRenderer { credentials: &Any, listen: member(), state_root: None };
         for ok in ["A", "a-b_9", "Z0"] {
             assert_eq!(renderer.render(&format!("{{{{credential:{ok}}}}}")).unwrap(), "v");
         }
@@ -2234,7 +2007,7 @@ mod tests {
             assert!(renderer.render(&format!("{{{{credential:{bad}}}}}")).is_err(), "{bad}");
             assert!(renderer.render(&format!("{{{{credential_path:{bad}}}}}")).is_err(), "{bad}");
         }
-        assert_eq!(renderer.render("a{{child.listen}}b{{child.listen}}c").unwrap(), "aLbLc");
+        assert_eq!(renderer.render("a{{child.listen}}b{{child.listen}}c").unwrap(), "a127.0.0.1:18845b127.0.0.1:18845c");
     }
 
     #[test]
@@ -2263,7 +2036,7 @@ mod tests {
             std::env::set_var("IDUNN_LAUNCH_TEST_ENV_CREDENTIAL", &file);
         }
         let credentials = CredentialsDirectory::new(dir.path().to_owned());
-        let renderer = ConfigRenderer { credentials: &credentials, listen: "L", state_root: None };
+        let renderer = ConfigRenderer { credentials: &credentials, listen: member(), state_root: None };
         for name in [
             "GAMECULT_IDUNN_CANDIDATE_BIND",
             "IDUNN_LAUNCH_TEST_ENV_CREDENTIAL",
@@ -2314,38 +2087,6 @@ mod tests {
         );
         expected.dependencies = vec![dependency(ODIN_CAPABILITY, "rudp://not-an-address")];
         assert!(OdinRudpSink::from_expected(&expected).is_err());
-    }
-
-    #[test]
-    fn half_closed_member_requests_still_reach_a_child_that_waits_for_eof() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("child.sock");
-        let child = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let fake = thread::spawn(move || {
-            let (mut stream, _) = child.accept().unwrap();
-            let mut received = Vec::new();
-            stream.read_to_end(&mut received).unwrap();
-            stream.write_all(&received.iter().rev().copied().collect::<Vec<u8>>()).unwrap();
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let halt = Arc::new(AtomicBool::new(false));
-        let responder: Responder = Arc::new(|_| bail!("never"));
-        let acceptor = RouteAcceptor::new(listener, ChildEndpoint::Unix(socket), responder, RouteBounds::default());
-        let serving = {
-            let halt = halt.clone();
-            thread::spawn(move || acceptor.serve(halt))
-        };
-        let mut member = TcpStream::connect(address).unwrap();
-        member.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        member.write_all(b"GET /abc").unwrap();
-        member.shutdown(Shutdown::Write).unwrap();
-        let mut answer = Vec::new();
-        member.read_to_end(&mut answer).unwrap();
-        assert_eq!(answer, b"cba/ TEG");
-        fake.join().unwrap();
-        halt.store(true, Ordering::SeqCst);
-        serving.join().unwrap().unwrap();
     }
 
     #[test]
@@ -2406,32 +2147,35 @@ mod tests {
         assert!(running.exited().is_some());
     }
 
-    // ------------------------------------------------------------ Soul s1 fixes
+    // ------------------------------------------------------------ presence acceptor
 
-    fn serve_with(
+    type Accepted = io::Result<(TcpStream, SocketAddr)>;
+
+    fn serve_presence_accepting(
         fx: &Fixture,
-        bounds: RouteBounds,
-    ) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<Result<()>>) {
-        let shared = shared(fx, Arc::new(Health(AtomicBool::new(true))));
+        responder: Responder,
+        accept: impl FnMut(&TcpListener) -> Accepted + Send + 'static,
+    ) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let _ = fx;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let responder: Responder = Arc::new(move |request| shared.observe(request));
-        let acceptor =
-            RouteAcceptor::new(listener, ChildEndpoint::Unix("/nonexistent".into()), responder, bounds);
+        let acceptor = PresenceAcceptor::new(listener, responder);
         let halt = Arc::new(AtomicBool::new(false));
         let flag = halt.clone();
-        (address, halt, thread::spawn(move || acceptor.serve(flag)))
+        (address, halt, thread::spawn(move || acceptor.serve_accepting(flag, accept)))
     }
 
-    fn quick(first_byte_ms: u64, challenge_ms: u64, max_connections: usize) -> RouteBounds {
-        RouteBounds {
-            first_byte: Duration::from_millis(first_byte_ms),
-            challenge: Duration::from_millis(challenge_ms),
-            max_connections,
-        }
+    fn observing(fx: &Fixture) -> Responder {
+        let shared = shared(fx, Arc::new(Health(AtomicBool::new(true))));
+        Arc::new(move |request| shared.observe(request))
     }
 
-    /// True when the peer closed (EOF or reset) within `within`.
+    fn serve_presence(fx: &Fixture) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        serve_presence_accepting(fx, observing(fx), |listener| listener.accept())
+    }
+
+    /// True when the peer closed (EOF or reset) within `within`, having sent
+    /// nothing.
     fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
         stream.set_read_timeout(Some(within)).unwrap();
         let mut byte = [0_u8; 64];
@@ -2454,24 +2198,58 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_connection_is_closed_at_the_first_byte_deadline() {
+    fn only_challenge_frames_are_answered_and_anything_else_is_closed_unanswered() {
         let fx = fixture(false);
-        let (address, halt, serving) = serve_with(&fx, quick(300, 5000, 64));
-        let mut idle = TcpStream::connect(address).unwrap();
-        let started = Instant::now();
-        assert!(closed_within(&mut idle, Duration::from_secs(4)), "never closed");
-        assert!(started.elapsed() >= Duration::from_millis(250), "closed before its deadline");
+        let reached = Arc::new(AtomicUsize::new(0));
+        let responder: Responder = {
+            let (inner, reached) = (observing(&fx), reached.clone());
+            Arc::new(move |request| {
+                reached.fetch_add(1, Ordering::SeqCst);
+                inner(request)
+            })
+        };
+        let (address, halt, serving) =
+            serve_presence_accepting(&fx, responder, |listener| listener.accept());
+        // Member traffic is not presence: an HTTP request gets no byte back.
+        let mut member = TcpStream::connect(address).unwrap();
+        member
+            .write_all(b"POST /_matrix/x HTTP/1.1\r\nContent-Length: 2\r\n\r\n\x00\x01")
+            .unwrap();
+        assert!(closed_within(&mut member, Duration::from_secs(3)), "member bytes were answered");
+        // A leading 0x00 with a frame length outside its bound never reaches
+        // the responder.
+        let mut malformed = TcpStream::connect(address).unwrap();
+        malformed.write_all(&[0x00, 0xff, 0xff, 0xff]).unwrap();
+        assert!(closed_within(&mut malformed, Duration::from_secs(3)), "a malformed frame was answered");
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        // A real challenge is answered, and is the only thing that reaches it.
         assert!(challenge_answered(address, &fx));
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
         halt.store(true, Ordering::SeqCst);
-        serving.join().unwrap().unwrap();
+        serving.join().unwrap();
     }
 
     #[test]
-    fn a_challenge_trickled_a_byte_at_a_time_is_cut_off_at_its_total_deadline() {
+    fn an_idle_peer_holds_the_acceptor_for_the_presence_deadline_and_no_longer() {
         let fx = fixture(false);
-        // Every pause is far inside the first-byte deadline: only the total
-        // challenge deadline can end this.
-        let (address, halt, serving) = serve_with(&fx, quick(5000, 600, 64));
+        let (address, halt, serving) = serve_presence(&fx);
+        let mut idle = TcpStream::connect(address).unwrap();
+        let started = Instant::now();
+        // Idunn waits 3 s for a challenge answer; one stalled peer ahead of it
+        // must not cost it that.
+        assert!(challenge_answered(address, &fx));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(800), "the idle peer was cut early: {waited:?}");
+        assert!(waited < Duration::from_millis(2200), "the idle peer held the acceptor: {waited:?}");
+        assert!(closed_within(&mut idle, Duration::from_secs(1)), "the idle peer stayed connected");
+        halt.store(true, Ordering::SeqCst);
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn a_challenge_trickled_a_byte_at_a_time_is_cut_off_at_the_presence_deadline() {
+        let fx = fixture(false);
+        let (address, halt, serving) = serve_presence(&fx);
         let mut slow = TcpStream::connect(address).unwrap();
         slow.write_all(&[0x00, 0x00, 0x01, 0x00]).unwrap();
         let started = Instant::now();
@@ -2483,51 +2261,34 @@ mod tests {
             }
         }
         assert!(closed, "the trickle was never cut off");
-        assert!(started.elapsed() >= Duration::from_millis(500), "cut before its deadline");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(800), "cut before its deadline: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(2200), "cut after its deadline: {elapsed:?}");
         assert!(challenge_answered(address, &fx));
         halt.store(true, Ordering::SeqCst);
-        serving.join().unwrap().unwrap();
+        serving.join().unwrap();
     }
 
     #[test]
-    fn live_connections_are_capped_and_the_overflow_is_refused_unspawned() {
+    fn accept_errors_never_end_the_presence_acceptor() {
         let fx = fixture(false);
-        let (address, halt, serving) = serve_with(&fx, quick(30_000, 5000, 4));
-        let mut held: Vec<TcpStream> = (0..4).map(|_| TcpStream::connect(address).unwrap()).collect();
-        thread::sleep(Duration::from_millis(300));
-        let threads_before = thread_count();
-        let mut overflow: Vec<TcpStream> = (0..40).map(|_| TcpStream::connect(address).unwrap()).collect();
-        for stream in &mut overflow {
-            assert!(closed_within(stream, Duration::from_secs(3)), "an overflow connection was served");
-        }
-        assert!(thread_count() < threads_before + 8, "overflow connections cost threads");
-        for stream in &mut held {
-            assert!(!closed_within(stream, Duration::from_millis(100)), "a held connection was cut");
-        }
-        // A freed slot serves the next peer.
-        held.pop();
-        let mut answered = false;
-        for _ in 0..40 {
-            if challenge_answered(address, &fx) {
-                answered = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(answered, "a freed slot was never reused");
+        // Descriptor exhaustion: the first accepts fail, then descriptors free.
+        let failures = Arc::new(AtomicUsize::new(0));
+        let (address, halt, serving) = {
+            let failures = failures.clone();
+            serve_presence_accepting(&fx, observing(&fx), move |listener| {
+                if failures.fetch_add(1, Ordering::SeqCst) < 3 {
+                    Err(io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    listener.accept()
+                }
+            })
+        };
+        assert!(challenge_answered(address, &fx), "the acceptor did not recover");
+        assert!(failures.load(Ordering::SeqCst) >= 4);
+        assert!(!serving.is_finished());
         halt.store(true, Ordering::SeqCst);
-        serving.join().unwrap().unwrap();
-    }
-
-    fn thread_count() -> usize {
-        fs::read_to_string("/proc/self/status")
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("Threads:"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
+        serving.join().unwrap();
     }
 
     /// A listener whose accept always fails: a datagram socket's descriptor.
@@ -2539,50 +2300,57 @@ mod tests {
     }
 
     #[test]
-    fn an_acceptor_that_cannot_accept_ends_with_an_error() {
+    fn an_acceptor_whose_every_accept_fails_runs_until_halted() {
         let fx = fixture(false);
-        let shared = shared(&fx, Arc::new(Health(AtomicBool::new(true))));
-        let responder: Responder = Arc::new(move |request| shared.observe(request));
-        let acceptor = RouteAcceptor::new(
-            failing_listener(),
-            ChildEndpoint::Unix("/nonexistent".into()),
-            responder,
-            RouteBounds::default(),
-        );
-        assert!(acceptor.serve(Arc::new(AtomicBool::new(false))).is_err());
+        let acceptor = PresenceAcceptor::new(failing_listener(), observing(&fx));
+        let halt = Arc::new(AtomicBool::new(false));
+        let flag = halt.clone();
+        let serving = thread::spawn(move || acceptor.serve(flag));
+        thread::sleep(Duration::from_millis(400));
+        assert!(!serving.is_finished(), "the acceptor ended on an accept error");
+        halt.store(true, Ordering::SeqCst);
+        serving.join().unwrap();
+    }
+
+    /// Healthy for everyone but the presence thread, which it kills: the
+    /// stand-in for a presence acceptor that dies while the child is fine.
+    struct PresenceTripwire;
+
+    impl HealthProbe for PresenceTripwire {
+        fn healthy(&self) -> bool {
+            assert_ne!(thread::current().name(), Some("presence-acceptor"), "presence thread killed");
+            true
+        }
     }
 
     #[test]
-    fn presence_stops_claiming_active_when_the_route_acceptor_dies() {
+    fn a_dead_presence_acceptor_fails_the_unit() {
         let fx = fixture(false);
         let sink = Arc::new(Sink::default());
         let child = Arc::new(Child::default());
-        let health = Arc::new(Health(AtomicBool::new(true)));
         let ports = Ports {
             credentials: Arc::new(Credentials(BTreeMap::new())),
             clock: Arc::new(FastClock(AtomicU64::new(1_000_000))),
             sink: sink.clone(),
             lease: Arc::new(FakeLease::default()),
-            spawner: Box::new(FakeSpawner(child)),
-            route_bounds: RouteBounds::default(),
-            health: Box::new(move |_| health.clone()),
+            spawner: Box::new(FakeSpawner(child.clone())),
+            health: Box::new(|_| Arc::new(PresenceTripwire)),
         };
         let contract = fx.contract("x");
         let authority = fx.authority();
+        let route = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = route.local_addr().unwrap();
         let tmp = fx.dir.path().join("tmp");
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let handle = thread::spawn(move || run(&contract, authority, failing_listener(), &tmp, ports, &flag));
-        wait_until("two degraded heartbeats", || {
-            sink.states().iter().filter(|state| *state == "degraded").count() >= 2
-        });
-        // The child is healthy throughout; only the dead acceptor degrades it,
-        // and nothing says active after that.
-        let states = sink.states();
-        let first_degraded = states.iter().position(|state| state == "degraded").unwrap();
-        assert!(states[first_degraded..].iter().all(|state| state != "active"), "{states:?}");
-        stop.store(true, Ordering::SeqCst);
-        assert_eq!(handle.join().unwrap(), Outcome::Stopped);
+        let handle =
+            thread::spawn(move || run(&contract, authority, route, member(), &tmp, ports, &flag));
+        wait_until("active", || sink.first("active").is_some());
+        // The first challenge reaches the tripwire on the presence thread.
+        assert!(!challenge_answered(address, &fx));
+        assert_eq!(handle.join().unwrap(), Outcome::Failed("presence-acceptor"));
+        assert_eq!(sink.first("failed").unwrap().detail, "presence-acceptor");
+        assert!(child.terminated.load(Ordering::SeqCst), "the child outlived the unit");
     }
 
     #[test]
@@ -2701,7 +2469,6 @@ mod tests {
             sink: sink.clone(),
             lease: Arc::new(FakeLease::default()),
             spawner: Box::new(FakeSpawner(child.clone())),
-            route_bounds: RouteBounds::default(),
             health: Box::new(move |_| health.clone()),
         };
         let authority = fx.authority();
@@ -2709,7 +2476,8 @@ mod tests {
         let tmp = fx.dir.path().join("tmp");
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let handle = thread::spawn(move || run(&contract, authority, route, &tmp, ports, &flag));
+        let handle =
+            thread::spawn(move || run(&contract, authority, route, member(), &tmp, ports, &flag));
         wait_until("active", || sink.first("active").is_some());
         assert!(!child.terminated.load(Ordering::SeqCst), "killed while it was still starting");
         assert_eq!(child.spawns.load(Ordering::SeqCst), 1);
@@ -2719,23 +2487,86 @@ mod tests {
     }
 
     #[test]
-    fn a_hung_health_probe_times_out_instead_of_blocking() {
+    fn a_silent_child_fails_the_probe_within_its_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = ChildEndpoint::Loopback(listener.local_addr().unwrap());
+        let member = listener.local_addr().unwrap();
         // Accepts and never answers.
         let held = thread::spawn(move || {
             let _connection = listener.accept().unwrap();
-            thread::sleep(Duration::from_secs(8));
+            thread::sleep(Duration::from_secs(4));
         });
-        let probe = HttpHealthProbe { endpoint, path: "/health".into() };
-        let (done, verdict) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = done.send(probe.healthy());
-        });
-        let healthy = verdict
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the probe outlived its timeout against a hung child");
-        assert!(!healthy);
+        let probe = HttpHealthProbe { member, path: "/health".into() };
+        let started = Instant::now();
+        assert!(!probe.healthy());
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(900), "gave up before its timeout: {elapsed:?}");
+        assert!(elapsed < HEALTH_PROBE_TIMEOUT + Duration::from_millis(200), "outlived its timeout: {elapsed:?}");
         drop(held);
+    }
+
+    #[test]
+    fn the_probe_deadline_covers_the_whole_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let member = listener.local_addr().unwrap();
+        // Every byte arrives inside any per-read timeout, but the head takes
+        // three seconds in all.
+        let dribbler = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for byte in b"HTTP/1.1 200 OK" {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
+        let probe = HttpHealthProbe { member, path: "/health".into() };
+        let started = Instant::now();
+        assert!(!probe.healthy());
+        let elapsed = started.elapsed();
+        assert!(elapsed < HEALTH_PROBE_TIMEOUT + Duration::from_millis(200), "outlived its deadline: {elapsed:?}");
+        let _ = dribbler.join();
+    }
+
+    #[test]
+    fn a_process_spawner_refuses_an_invalid_lease_descriptor_and_runs_no_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let script = format!("touch '{}'", marker.display());
+        for invalid in [-1, 9999] {
+            let refused = ProcessSpawner.spawn(
+                Path::new("/bin/sh"),
+                &["-c".to_owned(), script.clone()],
+                Some(invalid),
+            );
+            assert!(refused.is_err(), "descriptor {invalid} was accepted");
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "a child ran past an invalid descriptor");
+        // Control: the same spawn without a descriptor runs the child.
+        let mut child = ProcessSpawner
+            .spawn(Path::new("/bin/sh"), &["-c".to_owned(), script], None)
+            .unwrap();
+        wait_until("the control child to exit", || child.exited().is_some());
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn the_member_bind_is_a_loopback_address_other_than_the_candidate() {
+        let candidate = "127.0.0.1:18835";
+        assert_eq!(
+            parse_member_bind("127.0.0.1:18845", candidate).unwrap(),
+            "127.0.0.1:18845".parse().unwrap()
+        );
+        for bad in [
+            "127.0.0.1:18835",
+            "10.0.0.5:18845",
+            "0.0.0.0:18845",
+            "canary-not-an-address",
+            "",
+        ] {
+            let error = parse_member_bind(bad, candidate).unwrap_err().to_string();
+            assert!(!error.contains("canary") && !error.contains("10.0.0.5"), "{error}");
+        }
+        assert!(parse_member_bind("127.0.0.1:18845", "not-an-address").is_err());
     }
 }

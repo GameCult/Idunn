@@ -83,24 +83,30 @@ activation key.
   Idunn owns admission, lease, route and continuity, as before.
 - **Inputs:** the runtime bundle, the activation credential and provider
   identity descriptors, the process write lease, the systemd credentials the
-  binding names, and the child's health over its private listener.
+  binding names, and the child's health over TCP at the member bind.
 - **Outputs:** signed `gamecult.runtime_presence_health.v2` (Warming, Active
   and failed to Odin; route observations on the candidate endpoint), one child
   process, and a rendered config in the unit's private tmp that is never read
   back.
-- **Route:** the launcher, not the child, binds the candidate endpoint. A first
-  byte of 0x00 is an Idunn challenge frame and is answered by the launcher;
-  every other byte is copied untouched to the child's private listener.
+- **Route:** Idunn owns both listeners of the route: the Expected route's
+  stable endpoint (presence) and, when the binding has `[route.member]`, the
+  member endpoint, rendered as a second server block in the one nginx fragment.
+  The launcher binds the candidate endpoint and answers Idunn's challenge there,
+  one connection at a time within a one-second deadline; any other first byte
+  closes the connection. The child binds the member bind Idunn sets in
+  `GAMECULT_IDUNN_MEMBER_BIND`, derived from the candidate port. Member bytes
+  never touch the launcher.
 - **Lease:** with `write_lease_required` the launcher starts the child only
   after it holds the lease (bound to this Expected, this activation and one of
   its own Warming proofs) and keeps the lease store share-locked while the
   child lives. Losing the lease stops the child.
 - **Config:** one template from the release is rendered with the closed
-  placeholder set `{{child.listen}}`, `{{credential:NAME}}`,
+  placeholder set `{{child.listen}}`, `{{child.listen_host}}`,
+  `{{child.listen_port}}` (all three the member bind), `{{credential:NAME}}`,
   `{{credential_path:NAME}}` and `{{state_root}}`. Any other placeholder
   refuses to start.
-- **Forbidden:** the child binding the candidate endpoint; a child of a
-  lease-requiring target running without a held lease; any presence not signed
+- **Forbidden:** member traffic through the launcher; the child binding the
+  candidate endpoint; a child of a lease-requiring target running without a held lease; any presence not signed
   by both keys.
 - **State kind `external-directory`:** a process-owned directory imposed by an
   external runtime contract. Same writer, recovery and startup rules as
