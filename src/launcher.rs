@@ -2177,9 +2177,10 @@ mod tests {
         let server = thread::spawn(move || {
             for status in ["200 OK", "503 Service Unavailable"] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 64];
-                let read = stream.read(&mut request).unwrap();
-                assert!(request[..read].starts_with(b"GET /health HTTP/1.1\r\n"));
+                let mut line = String::new();
+                io::BufRead::read_line(&mut io::BufReader::new(stream.try_clone().unwrap()), &mut line)
+                    .unwrap();
+                assert_eq!(line, "GET /health HTTP/1.1\r\n");
                 write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 2\r\n\r\nOK").unwrap();
             }
         });
@@ -2645,7 +2646,9 @@ mod tests {
             .spawn(Path::new("/bin/sh"), &["-c".into(), "exec sleep 30".into()], None)
             .unwrap();
         drop(guard);
-        idunn.revoke_exact(Some(&lease)).unwrap();
+        // Another test's fork may hold a copy for the instant before its exec;
+        // the child under test would hold it for thirty seconds.
+        wait_until("lock released", || idunn.revoke_exact(Some(&lease)).is_ok());
         child.terminate(Duration::from_secs(5));
     }
 
