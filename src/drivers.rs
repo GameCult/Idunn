@@ -4110,6 +4110,20 @@ impl CultCacheWriteLeaseDriver {
 
     fn current(&self) -> Result<Option<(CultCacheEnvelope, IdunnProcessWriteLeaseRecord)>> {
         validate_root_authority_path(&self.record_path)?;
+        self.read_record()
+    }
+
+    /// The lease as its holder reads it: the same custody, envelope, key and
+    /// target validation Idunn applies, without requiring the reader to be
+    /// root. The holder is a service uid by construction; root is who writes.
+    pub(crate) fn current_for_holder(
+        &self,
+    ) -> Result<Option<(CultCacheEnvelope, IdunnProcessWriteLeaseRecord)>> {
+        validate_authority_path_custody(&self.record_path)?;
+        self.read_record()
+    }
+
+    fn read_record(&self) -> Result<Option<(CultCacheEnvelope, IdunnProcessWriteLeaseRecord)>> {
         if !self.record_path.exists() {
             return Ok(None);
         }
@@ -4156,34 +4170,59 @@ impl CultCacheWriteLeaseDriver {
         expected.validate()?;
         activation.validate()?;
         lease.validate()?;
-        let expected_sha256 = expected.canonical_sha256()?;
-        let activation_sha256 = activation.canonical_sha256()?;
         ensure!(
-            self.target == expected.target
-                && lease.target == expected.target
-                && lease.expected_projection_sha256 == expected_sha256
-                && lease.plan_id == expected.plan_id
-                && lease.incarnation_id == expected.incarnation_id
-                && lease.sealed_release_id == expected.sealed_release_id
-                && lease.activation_witness_sha256 == activation_sha256
-                && lease.runtime_id == expected.runtime_id
-                && lease.runtime_instance_id == activation.runtime_instance_id
-                && lease.state_schema_generation
-                    == expected
-                        .state_schema_generation
-                        .as_deref()
-                        .context("write-lease Expected has no state generation")?
-                && lease.state_contract_sha256
-                    == expected
-                        .state_contract_sha256
-                        .as_deref()
-                        .context("write-lease Expected has no state contract")?
-                && lease.warming_presence_sha256 == warming.signed_presence_sha256()
-                && warming.runtime_instance_id() == activation.runtime_instance_id.as_str(),
+            self.target == expected.target,
             "process write lease does not bind the exact warming candidate"
         );
-        Ok(())
+        ensure!(
+            warming.runtime_instance_id() == activation.runtime_instance_id.as_str(),
+            "process write lease does not bind the exact warming candidate"
+        );
+        lease_binds_candidate(
+            expected,
+            activation,
+            lease,
+            std::slice::from_ref(&warming.signed_presence_sha256().to_owned()),
+        )
     }
+}
+
+/// The one rule for what makes a process write lease this incarnation's: it
+/// binds this Expected, this activation and one of the given provider-signed
+/// Warming proofs. Idunn grants with it and the lease holder accepts with it.
+pub(crate) fn lease_binds_candidate(
+    expected: &IdunnExpectedIncarnationRecord,
+    activation: &IdunnRuntimeActivationRecord,
+    lease: &IdunnProcessWriteLeaseRecord,
+    warming_presence_sha256es: &[String],
+) -> Result<()> {
+    let expected_sha256 = expected.canonical_sha256()?;
+    let activation_sha256 = activation.canonical_sha256()?;
+    ensure!(
+        lease.target == expected.target
+            && lease.expected_projection_sha256 == expected_sha256
+            && lease.plan_id == expected.plan_id
+            && lease.incarnation_id == expected.incarnation_id
+            && lease.sealed_release_id == expected.sealed_release_id
+            && lease.activation_witness_sha256 == activation_sha256
+            && lease.runtime_id == expected.runtime_id
+            && lease.runtime_instance_id == activation.runtime_instance_id
+            && lease.state_schema_generation
+                == expected
+                    .state_schema_generation
+                    .as_deref()
+                    .context("write-lease Expected has no state generation")?
+            && lease.state_contract_sha256
+                == expected
+                    .state_contract_sha256
+                    .as_deref()
+                    .context("write-lease Expected has no state contract")?
+            && warming_presence_sha256es
+                .iter()
+                .any(|sha256| sha256 == &lease.warming_presence_sha256),
+        "process write lease does not bind the exact warming candidate"
+    );
+    Ok(())
 }
 
 impl WriteLeasePort for CultCacheWriteLeaseDriver {
@@ -5861,7 +5900,7 @@ impl<R: Read> Answer<R> {
     }
 }
 
-fn request_tcp_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, ChallengeFailure> {
+pub(crate) fn request_tcp_snapshot(target: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, ChallengeFailure> {
     let mut stream = connect_route_socket(target)
         .with_context(|| format!("connecting stable CultNet TCP route {target}"))
         .map_err(silent)?;
@@ -6070,7 +6109,7 @@ fn connect_route_socket(target: SocketAddr) -> std::io::Result<TcpStream> {
     }
 }
 
-fn exact_route_snapshot_response(
+pub(crate) fn exact_route_snapshot_response(
     response: CultNetMessage,
     message_id: &str,
     target: &str,
@@ -8335,12 +8374,17 @@ fn authority_lock_path(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn validate_root_authority_path(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     ensure!(
         unsafe { libc::geteuid() } == 0,
         "process write-lease actuation requires root Idunn"
     );
+    validate_authority_path_custody(path)
+}
+
+#[cfg(unix)]
+fn validate_authority_path_custody(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     let parent = path
         .parent()
         .context("process write-lease path has no parent")?;
@@ -8380,6 +8424,11 @@ fn validate_root_authority_path(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn validate_root_authority_path(_path: &Path) -> Result<()> {
+    bail!("process write-lease actuation requires a Unix authority path")
+}
+
+#[cfg(not(unix))]
+fn validate_authority_path_custody(_path: &Path) -> Result<()> {
     bail!("process write-lease actuation requires a Unix authority path")
 }
 

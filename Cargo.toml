@@ -18,6 +18,10 @@ path = "src/bin/idunn-provision.rs"
 name = "idunn-host"
 path = "src/bin/idunn-host.rs"
 
+[[bin]]
+name = "idunn-launch"
+path = "src/bin/idunn-launch.rs"
+
 [lib]
 name = "idunn_daemon"
 path = "src/lib.rs"
