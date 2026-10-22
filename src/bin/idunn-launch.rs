@@ -42,11 +42,12 @@ fn main() -> std::process::ExitCode {
         );
         let health_path = contract.health_path.clone();
         let ports = Ports {
-            credentials: std::sync::Arc::new(EnvCredentials),
+            credentials: std::sync::Arc::new(CredentialsDirectory::from_environment()),
             clock: std::sync::Arc::new(SystemClock),
             sink: std::sync::Arc::new(sink),
             lease: std::sync::Arc::new(lease),
             spawner: Box::new(ProcessSpawner),
+            route_bounds: RouteBounds::default(),
             health: Box::new(move |endpoint| {
                 std::sync::Arc::new(HttpHealthProbe {
                     endpoint: endpoint.clone(),
