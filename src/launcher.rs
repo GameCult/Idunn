@@ -955,9 +955,8 @@ impl PresenceAcceptor {
                     let _ = connection.set_nonblocking(false);
                     let _ = self.answer(connection);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
+                // An idle non-blocking accept is an error too; every one waits
+                // and tries again.
                 Err(_) => thread::sleep(ACCEPT_BACKOFF),
             }
         }
@@ -2225,6 +2224,30 @@ mod tests {
         // A real challenge is answered, and is the only thing that reaches it.
         assert!(challenge_answered(address, &fx));
         assert_eq!(reached.load(Ordering::SeqCst), 1);
+        halt.store(true, Ordering::SeqCst);
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn a_challenge_up_to_the_frame_bound_is_answered_and_one_past_it_is_not() {
+        let fx = fixture(false);
+        let (address, halt, serving) = serve_presence(&fx);
+        // A request far larger than a few KiB, well inside the 1 MiB bound.
+        let request = CultNetMessage::SnapshotRequest {
+            message_id: "large".into(),
+            schema_ids: Some(vec![GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into()]),
+            record_keys: Some((0..300).map(|index| format!("{index:0>40}")).collect()),
+        };
+        let payload =
+            encode_cultnet_message_to_vec(&request, CultNetWireContract::CultNetSchemaV0).unwrap();
+        assert!(payload.len() > 10_000 && payload.len() < CHALLENGE_MAX_BYTES);
+        assert!(request_tcp_snapshot(address, &payload).is_ok());
+        // One byte past the bound is closed unanswered.
+        let past = (CHALLENGE_MAX_BYTES as u32 + 1).to_be_bytes();
+        assert_eq!(past[0], CHALLENGE_FIRST_BYTE);
+        let mut oversized = TcpStream::connect(address).unwrap();
+        oversized.write_all(&past).unwrap();
+        assert!(closed_within(&mut oversized, Duration::from_secs(3)), "an oversized frame was read");
         halt.store(true, Ordering::SeqCst);
         serving.join().unwrap();
     }

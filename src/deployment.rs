@@ -2412,8 +2412,10 @@ nodes = ["yggdrasil"]
         // Overlapping the route's own private range, in either direction.
         assert!(start("18835").is_err());
         assert!(start("18825").is_err());
-        // Adjacent but disjoint is fine.
+        // Adjacent but disjoint is fine, above the route's range or below it.
         assert!(start("18840").is_ok());
+        assert!(start("18822").is_ok());
+        assert!(start("18823").is_err());
         // Zero, and a width that overflows u16.
         assert!(start("0").is_err());
         assert!(start("65530").is_err());
@@ -2473,18 +2475,37 @@ nodes = ["yggdrasil"]
         assert!(OperatorBinding::parse(&as_environment("UNOWNED_NAME")).is_ok());
         assert!(OperatorBinding::parse(&as_secret("UNOWNED_NAME")).is_ok());
         for name in owned {
+            // Refused when the binding is parsed...
             assert!(
-                OperatorBinding::parse(&as_environment(name))
-                    .and_then(|binding| binding.admit(&recipe))
-                    .is_err(),
-                "{name} accepted as environment"
+                OperatorBinding::parse(&as_environment(name)).is_err(),
+                "{name} accepted as environment at parse"
             );
             assert!(
-                OperatorBinding::parse(&as_secret(name))
-                    .and_then(|binding| binding.admit(&recipe))
-                    .is_err(),
-                "{name} accepted as a secret file"
+                OperatorBinding::parse(&as_secret(name)).is_err(),
+                "{name} accepted as a secret file at parse"
             );
+            // ...and again at admission, for a binding that did not come
+            // through parse. Each site reads the one list.
+            for secret in [false, true] {
+                let mut binding = OperatorBinding::parse(BINDING).unwrap();
+                let WorkloadBinding::SystemdTransient(workload) = &mut binding.workload else {
+                    panic!("the fixture is a systemd workload");
+                };
+                if secret {
+                    workload.secret_files.insert(name.into(), "/etc/gamecult/test-service/other.cc".into());
+                } else {
+                    workload.environment.insert(name.into(), "forged".into());
+                }
+                assert!(
+                    binding.workload.validate_launch_environment().is_err(),
+                    "{name} (secret: {secret}) accepted by the binding check"
+                );
+                let error = binding.admit(&recipe).unwrap_err().to_string();
+                assert!(
+                    error.contains("Idunn-owned launch environment"),
+                    "{name} (secret: {secret}) accepted by the launch-input check: {error}"
+                );
+            }
         }
     }
 
