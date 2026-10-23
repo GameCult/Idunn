@@ -379,7 +379,12 @@ pub fn inherited_authority_files() -> Result<(File, File)> {
 // ---------------------------------------------------------------- ports
 
 pub trait Clock: Send + Sync {
+    /// Wall-clock time, for values signed or published to another party. No
+    /// decision about freshness, deadlines or schedules reads it.
     fn now_millis(&self) -> u64;
+    /// Monotonic time: never steps back, unaffected by wall-clock changes. Every
+    /// age, deadline and schedule in the launcher reads this one source.
+    fn monotonic_millis(&self) -> u64;
     fn sleep(&self, duration: Duration);
 }
 
@@ -388,6 +393,12 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now_millis(&self) -> u64 {
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
+    }
+
+    fn monotonic_millis(&self) -> u64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        u64::try_from(START.get_or_init(std::time::Instant::now).elapsed().as_millis())
+            .unwrap_or(u64::MAX)
     }
 
     fn sleep(&self, duration: Duration) {
@@ -864,7 +875,7 @@ struct Shared {
     lease: Mutex<Option<LeaseHold>>,
     lease_required: bool,
     health: Arc<dyn HealthProbe>,
-    /// The last probe result and the clock time it started. Only the lifecycle
+    /// The last probe result and the monotonic time it started. Only the lifecycle
     /// probes; a challenge reads this and never waits on the child.
     probed: Mutex<Option<(bool, u64)>>,
     clock: Arc<dyn Clock>,
@@ -873,7 +884,7 @@ struct Shared {
 impl Shared {
     /// Probes the child now and keeps the result for presence to answer from.
     fn refresh_health(&self) -> bool {
-        let started = self.clock.now_millis();
+        let started = self.clock.monotonic_millis();
         let healthy = self.health.healthy();
         if let Ok(mut probed) = self.probed.lock() {
             *probed = Some((healthy, started));
@@ -885,14 +896,14 @@ impl Shared {
     /// A child never probed, wedged, or probed too long ago reads degraded. A
     /// dead presence acceptor does not degrade presence: it fails the unit.
     fn serving_state(&self) -> &'static str {
-        let now = self.clock.now_millis();
+        let now = self.clock.monotonic_millis();
         let stale = u64::try_from(HEALTH_STALE.as_millis()).unwrap_or(u64::MAX);
         let healthy = self
             .probed
             .lock()
             .ok()
             .and_then(|probed| *probed)
-            .is_some_and(|(healthy, at)| healthy && now.saturating_sub(at) <= stale);
+            .is_some_and(|(healthy, at)| healthy && now.checked_sub(at).is_some_and(|age| age <= stale));
         if healthy { "active" } else { "degraded" }
     }
 
@@ -1178,13 +1189,13 @@ fn lifecycle(
     };
     remember(publish("warming", "launcher-started", None), &mut proofs);
     let heartbeat = u64::try_from(contract.heartbeat.as_millis()).unwrap_or(u64::MAX);
-    let mut next_heartbeat = clock.now_millis() + heartbeat;
+    let mut next_heartbeat = clock.monotonic_millis() + heartbeat;
 
     // 2. A stateful child waits for the lease; a stateless one does not.
     let mut lease_sha = None;
     let mut lease_fd = None;
     if expected.write_lease_required {
-        let deadline = clock.now_millis() + contract.lease_wait.as_millis() as u64;
+        let deadline = clock.monotonic_millis() + contract.lease_wait.as_millis() as u64;
         loop {
             if stop.load(Ordering::SeqCst) {
                 return Outcome::Stopped;
@@ -1206,7 +1217,7 @@ fn lifecycle(
                 }
                 break;
             }
-            let now = clock.now_millis();
+            let now = clock.monotonic_millis();
             if now >= deadline {
                 return fail(None, "lease-timeout");
             }
@@ -1222,7 +1233,7 @@ fn lifecycle(
     let Some(mut child) = start_child(contract, member, tmp, ports, lease_fd) else {
         return fail(None, "child-start-refused");
     };
-    let startup_deadline = clock.now_millis() + contract.startup.as_millis() as u64;
+    let startup_deadline = clock.monotonic_millis() + contract.startup.as_millis() as u64;
     loop {
         if stop.load(Ordering::SeqCst) {
             child.terminate(TERMINATE_GRACE);
@@ -1237,7 +1248,7 @@ fn lifecycle(
         if shared.refresh_health() {
             break;
         }
-        if clock.now_millis() >= startup_deadline {
+        if clock.monotonic_millis() >= startup_deadline {
             return fail(Some(&mut child), "startup-timeout");
         }
         clock.sleep(POLL);
@@ -1247,8 +1258,8 @@ fn lifecycle(
     set_phase(Phase::Active(lease_sha.clone()));
     publish(shared.serving_state(), "child-healthy", lease_sha.clone());
     let refresh = u64::try_from(HEALTH_REFRESH.as_millis()).unwrap_or(u64::MAX);
-    let mut next_probe = clock.now_millis() + refresh;
-    next_heartbeat = clock.now_millis() + heartbeat;
+    let mut next_probe = clock.monotonic_millis() + refresh;
+    next_heartbeat = clock.monotonic_millis() + heartbeat;
     loop {
         if stop.load(Ordering::SeqCst) {
             child.terminate(TERMINATE_GRACE);
@@ -1263,7 +1274,7 @@ fn lifecycle(
         if !shared.lease_current() {
             return fail(Some(&mut child), "lease-lost");
         }
-        let now = clock.now_millis();
+        let now = clock.monotonic_millis();
         if now >= next_probe {
             shared.refresh_health();
             next_probe = now + refresh;
@@ -1307,7 +1318,7 @@ fn start_child(
 mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize};
 
     use cultcache_rs::{CultCacheEnvelope, TryCompareExchangeSnapshotOutcome};
     use cultnet_rs::{
@@ -1482,15 +1493,34 @@ mod tests {
     }
 
     /// Virtual time runs a hundred times faster than the wall clock.
-    struct FastClock(AtomicU64);
+    struct FastClock {
+        monotonic: AtomicU64,
+        wall_step: AtomicI64,
+    }
+
+    impl FastClock {
+        fn new(start: u64) -> Self {
+            Self { monotonic: AtomicU64::new(start), wall_step: AtomicI64::new(0) }
+        }
+
+        /// Steps the wall clock alone, as timesyncd or a VM restore would.
+        fn step_wall(&self, millis: i64) {
+            self.wall_step.fetch_add(millis, Ordering::SeqCst);
+        }
+    }
 
     impl Clock for FastClock {
         fn now_millis(&self) -> u64 {
-            self.0.load(Ordering::SeqCst)
+            let wall = self.monotonic.load(Ordering::SeqCst) as i64 + self.wall_step.load(Ordering::SeqCst);
+            u64::try_from(wall).unwrap_or(0)
+        }
+
+        fn monotonic_millis(&self) -> u64 {
+            self.monotonic.load(Ordering::SeqCst)
         }
 
         fn sleep(&self, duration: Duration) {
-            self.0
+            self.monotonic
                 .fetch_add(duration.as_millis() as u64, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(1));
         }
@@ -1629,7 +1659,7 @@ mod tests {
         secrets.insert("SYNAPSE_KEY".to_owned(), b"s3cret-value\n".to_vec());
         let ports = Ports {
             credentials: Arc::new(Credentials(secrets)),
-            clock: Arc::new(FastClock(AtomicU64::new(1_000_000))),
+            clock: Arc::new(FastClock::new(1_000_000)),
             sink: sink.clone(),
             lease: lease.clone(),
             spawner: Box::new(FakeSpawner(child.clone())),
@@ -1720,9 +1750,13 @@ mod tests {
             let mut lease = fx.lease(&digest('8'));
             edit(&mut lease);
             *launch.lease.0.lock().unwrap() = Some(lease);
-            assert_eq!(launch.finish(), Outcome::Failed("lease-timeout"), "{name}");
-            assert_eq!(launch.child.spawns.load(Ordering::SeqCst), 0, "{name}");
-            assert_eq!(launch.sink.states().last().unwrap(), "failed", "{name}");
+            let (child, sink) = (launch.child.clone(), launch.sink.clone());
+            // Bounded: a lease deadline that never arrives fails here, not at the
+            // suite's outer timeout.
+            let outcome = within(Duration::from_secs(20), move || launch.finish());
+            assert_eq!(outcome, Outcome::Failed("lease-timeout"), "{name}");
+            assert_eq!(child.spawns.load(Ordering::SeqCst), 0, "{name}");
+            assert_eq!(sink.states().last().unwrap(), "failed", "{name}");
         }
     }
 
@@ -2134,16 +2168,212 @@ mod tests {
     #[test]
     fn a_probe_result_is_evidence_only_while_it_is_recent() {
         let fx = fixture(false);
-        let clock = Arc::new(FastClock(AtomicU64::new(1_000_000)));
+        let clock = Arc::new(FastClock::new(1_000_000));
         let shared = shared_on(&fx, Arc::new(Health(AtomicBool::new(true))), clock.clone());
         shared.refresh_health();
         let stale = HEALTH_STALE.as_millis() as u64;
-        clock.0.fetch_add(stale, Ordering::SeqCst);
+        clock.monotonic.fetch_add(stale, Ordering::SeqCst);
         assert_eq!(shared.serving_state(), "active", "a result exactly at the bound is still recent");
-        clock.0.fetch_add(1, Ordering::SeqCst);
+        clock.monotonic.fetch_add(1, Ordering::SeqCst);
         assert_eq!(shared.serving_state(), "degraded", "a result past the bound is not evidence");
         shared.refresh_health();
         assert_eq!(shared.serving_state(), "active");
+    }
+
+    /// A lease reader that grants, at the first read once `after` Warming
+    /// records exist, a lease bound to the Warming record `back` places before
+    /// the newest. The launcher reads it from its own thread between publishes,
+    /// so the record it names is at a known place in the retained window.
+    struct WindowLease {
+        sink: Arc<Sink>,
+        template: IdunnProcessWriteLeaseRecord,
+        after: usize,
+        back: usize,
+        granted: Mutex<Option<IdunnProcessWriteLeaseRecord>>,
+    }
+
+    impl LeaseReader for WindowLease {
+        fn read(&self) -> Result<Option<IdunnProcessWriteLeaseRecord>> {
+            let mut granted = self.granted.lock().unwrap();
+            if granted.is_none() {
+                let records = self.sink.0.lock().unwrap();
+                let warming: Vec<_> = records.iter().filter(|r| r.state == "warming").collect();
+                if warming.len() >= self.after {
+                    let mut lease = self.template.clone();
+                    lease.warming_presence_sha256 =
+                        warming[warming.len() - self.back].canonical_sha256().unwrap();
+                    *granted = Some(lease);
+                }
+            }
+            Ok(granted.clone())
+        }
+
+        fn hold_shared(&self) -> Result<Box<dyn LeaseLock>> {
+            Ok(Box::new(FakeLock))
+        }
+    }
+
+    /// Starts a stateful unit waiting on a `WindowLease` and reports whether it
+    /// accepted the lease (spawned the child) or retried well past the grant.
+    fn warming_window_accepts(back: usize) -> bool {
+        let fx = fixture(true);
+        let sink = Arc::new(Sink::default());
+        let child = Arc::new(Child::default());
+        let lease = Arc::new(WindowLease {
+            sink: sink.clone(),
+            template: fx.lease(""),
+            after: MAX_RECENT_WARMING_PROOFS + 6,
+            back,
+            granted: Mutex::new(None),
+        });
+        let ports = Ports {
+            credentials: Arc::new(Credentials(BTreeMap::new())),
+            clock: Arc::new(FastClock::new(1_000_000)),
+            sink: sink.clone(),
+            lease: lease.clone(),
+            spawner: Box::new(FakeSpawner(child.clone())),
+            health: Box::new(|_| Arc::new(Health(AtomicBool::new(true)))),
+        };
+        let mut contract = fx.contract("x");
+        contract.heartbeat = POLL;
+        let authority = fx.authority();
+        let route = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tmp = fx.dir.path().join("tmp");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let unit = thread::spawn(move || run(&contract, authority, route, member(), &tmp, ports, &flag));
+        wait_until("the lease is granted", || lease.granted.lock().unwrap().is_some());
+        let warming = || sink.states().iter().filter(|s| *s == "warming").count();
+        let granted_at = warming();
+        let mut spawned = false;
+        for _ in 0..4000 {
+            spawned = child.spawns.load(Ordering::SeqCst) == 1;
+            if spawned || warming() >= granted_at + 10 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::SeqCst);
+        // A mutant may wedge the unit; only a unit that took the lease is joined.
+        if spawned {
+            assert_eq!(join_within(Duration::from_secs(10), unit), Outcome::Stopped);
+        }
+        spawned
+    }
+
+    #[test]
+    fn the_warming_proof_window_keeps_exactly_the_cap() {
+        assert!(
+            warming_window_accepts(MAX_RECENT_WARMING_PROOFS),
+            "the oldest of the retained Warming proofs is accepted"
+        );
+        assert!(
+            !warming_window_accepts(MAX_RECENT_WARMING_PROOFS + 1),
+            "a Warming proof past the cap is no longer accepted"
+        );
+    }
+
+    /// The child is healthy, then the wall clock steps by `step_millis`, then
+    /// the child wedges. A challenge must keep reading the truth throughout.
+    fn a_wall_clock_step_never_decides_freshness(step_millis: i64) {
+        struct Toggle {
+            healthy: AtomicBool,
+            probes: AtomicUsize,
+        }
+        impl HealthProbe for Toggle {
+            fn healthy(&self) -> bool {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                self.healthy.load(Ordering::SeqCst)
+            }
+        }
+        let fx = fixture(false);
+        let sink = Arc::new(Sink::default());
+        let clock = Arc::new(FastClock::new(100_000_000));
+        let probe = Arc::new(Toggle { healthy: AtomicBool::new(true), probes: AtomicUsize::new(0) });
+        let given = probe.clone();
+        let ports = Ports {
+            credentials: Arc::new(Credentials(BTreeMap::new())),
+            clock: clock.clone(),
+            sink: sink.clone(),
+            lease: Arc::new(FakeLease::default()),
+            spawner: Box::new(FakeSpawner(Arc::new(Child::default()))),
+            health: Box::new(move |_| given.clone()),
+        };
+        let contract = fx.contract("x");
+        let authority = fx.authority();
+        let route = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = route.local_addr().unwrap();
+        let tmp = fx.dir.path().join("tmp");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let unit = thread::spawn(move || run(&contract, authority, route, member(), &tmp, ports, &flag));
+        wait_until("active", || sink.first("active").is_some());
+        assert_eq!(challenge_state(address, &fx).as_deref(), Some("active"));
+
+        clock.step_wall(step_millis);
+        for _ in 0..10 {
+            assert_eq!(
+                challenge_state(address, &fx).as_deref(),
+                Some("active"),
+                "a healthy child reads active across a wall-clock step of {step_millis} ms"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        probe.healthy.store(false, Ordering::SeqCst);
+        let probed = probe.probes.load(Ordering::SeqCst);
+        let published = sink.0.lock().unwrap().len();
+        let started = Instant::now();
+        let mut state = None;
+        while started.elapsed() < Duration::from_secs(5) {
+            state = challenge_state(address, &fx);
+            if state.as_deref() == Some("degraded") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            state.as_deref(),
+            Some("degraded"),
+            "a wedged child reads degraded within the freshness window after a wall-clock step of {step_millis} ms"
+        );
+        assert!(probe.probes.load(Ordering::SeqCst) > probed, "probing continued");
+        wait_until("a heartbeat after the step", || sink.0.lock().unwrap().len() > published);
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(join_within(Duration::from_secs(10), unit), Outcome::Stopped);
+    }
+
+    #[test]
+    fn a_backward_wall_clock_step_does_not_keep_a_wedged_child_active() {
+        a_wall_clock_step_never_decides_freshness(-600_000);
+    }
+
+    #[test]
+    fn a_forward_wall_clock_step_does_not_make_a_healthy_child_degraded() {
+        a_wall_clock_step_never_decides_freshness(600_000);
+    }
+
+    #[test]
+    fn the_cached_result_ages_on_the_monotonic_clock_alone() {
+        let fx = fixture(false);
+        let clock = Arc::new(FastClock::new(100_000_000));
+        let shared = shared_on(&fx, Arc::new(Health(AtomicBool::new(true))), clock.clone());
+        shared.refresh_health();
+        for step in [-600_000, 1_200_000] {
+            clock.step_wall(step);
+            assert_eq!(shared.serving_state(), "active", "wall step {step}");
+        }
+        clock.monotonic.fetch_add(HEALTH_STALE.as_millis() as u64 + 1, Ordering::SeqCst);
+        assert_eq!(shared.serving_state(), "degraded", "monotonic age decides, whatever the wall says");
+    }
+
+    #[test]
+    fn a_result_stamped_after_now_is_not_evidence() {
+        let fx = fixture(false);
+        let clock = Arc::new(FastClock::new(100_000_000));
+        let shared = shared_on(&fx, Arc::new(Health(AtomicBool::new(true))), clock.clone());
+        *shared.probed.lock().unwrap() = Some((true, 100_000_001));
+        assert_eq!(shared.serving_state(), "degraded");
     }
 
     /// Runs `work` and returns its result, failing the test when it has not
@@ -2384,7 +2614,7 @@ mod tests {
 
     impl HealthProbe for RecordingProbe {
         fn healthy(&self) -> bool {
-            self.at.lock().unwrap().push(self.clock.now_millis());
+            self.at.lock().unwrap().push(self.clock.monotonic_millis());
             true
         }
     }
@@ -2393,7 +2623,7 @@ mod tests {
     fn an_active_child_is_probed_at_the_refresh_cadence() {
         let fx = fixture(false);
         let sink = Arc::new(Sink::default());
-        let clock = Arc::new(FastClock(AtomicU64::new(1_000_000)));
+        let clock = Arc::new(FastClock::new(1_000_000));
         let probe = Arc::new(RecordingProbe { clock: clock.clone(), at: Mutex::new(Vec::new()) });
         let seen = probe.clone();
         let ports = Ports {
@@ -2650,6 +2880,10 @@ mod tests {
             self.0.now_millis()
         }
 
+        fn monotonic_millis(&self) -> u64 {
+            self.0.monotonic_millis()
+        }
+
         fn sleep(&self, duration: Duration) {
             self.0.sleep(duration);
         }
@@ -2662,7 +2896,7 @@ mod tests {
         let child = Arc::new(Child::default());
         let ports = Ports {
             credentials: Arc::new(Credentials(BTreeMap::new())),
-            clock: Arc::new(PresenceTripwire(FastClock(AtomicU64::new(1_000_000)))),
+            clock: Arc::new(PresenceTripwire(FastClock::new(1_000_000))),
             sink: sink.clone(),
             lease: Arc::new(FakeLease::default()),
             spawner: Box::new(FakeSpawner(child.clone())),
@@ -2797,7 +3031,7 @@ mod tests {
         let health = Arc::new(LateHealth { calls: AtomicUsize::new(0), probes: 5 });
         let ports = Ports {
             credentials: Arc::new(Credentials(BTreeMap::new())),
-            clock: Arc::new(FastClock(AtomicU64::new(1_000_000))),
+            clock: Arc::new(FastClock::new(1_000_000)),
             sink: sink.clone(),
             lease: Arc::new(FakeLease::default()),
             spawner: Box::new(FakeSpawner(child.clone())),
