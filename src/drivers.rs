@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -2302,27 +2302,7 @@ impl DockerRunnerDriver {
             }
             ArtifactSource::WorktreeTree => (source.root.clone(), source.root.join(&artifact.source)),
         };
-        ensure!(source_path.exists(), "declared artifact output is absent");
-        let destination = staging_root.join(&artifact.destination);
-        ensure!(
-            destination.starts_with(staging_root),
-            "artifact destination escaped its release staging root"
-        );
-        copy_artifact(&containment_root, &source_path, &destination)?;
-        let (sha256, size_bytes) = digest_artifact(&destination)?;
-        if let Some(expected) = &artifact.expected_sha256 {
-            ensure!(
-                &sha256 == expected,
-                "artifact output differs from its recipe-pinned digest"
-            );
-        }
-        Ok(ArtifactReceipt {
-            artifact_id: artifact.id.clone(),
-            destination: artifact.destination.clone(),
-            sha256: format!("sha256-{sha256}"),
-            size_bytes,
-            executable: artifact.executable,
-        })
+        seal_artifact(artifact, &containment_root, &source_path, staging_root)
     }
 }
 
@@ -6810,21 +6790,7 @@ fn hash_frozen_source_tree(root: &Path, current: &Path, hasher: &mut Sha256) -> 
             );
             hasher.update(b"\0");
             hasher.update(metadata.len().to_le_bytes());
-            // S9: streamed in fixed-size chunks rather than `fs::read`ing the
-            // whole file, so peak RSS is bounded by the buffer, not by the
-            // largest file in the tree.
-            let mut file = fs::File::open(&path)
-                .with_context(|| format!("opening {} to hash it", path.display()))?;
-            let mut buffer = [0u8; 1 << 16];
-            loop {
-                let read = file
-                    .read(&mut buffer)
-                    .with_context(|| format!("reading {} to hash it", path.display()))?;
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-            }
+            hash_file_exact(&path, metadata.len(), hasher)?;
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path)?;
             hasher.update(b"link\0");
@@ -6846,20 +6812,28 @@ fn frozen_source_sha256(_root: &Path) -> Result<String> {
 
 #[cfg(unix)]
 fn harden_installed_release(root: &Path, artifacts: &[ArtifactReceipt]) -> Result<()> {
-    let executable_paths = artifacts
-        .iter()
-        .filter(|artifact| artifact.executable)
-        .map(|artifact| root.join(&artifact.destination))
-        .collect::<std::collections::BTreeSet<_>>();
-    harden_root_tree(root, root, &executable_paths)
+    let mut executable_paths = BTreeSet::new();
+    for artifact in artifacts {
+        let destination = root.join(&artifact.destination);
+        for member in &artifact.executable_members {
+            executable_paths.insert(destination.join(member));
+        }
+        if artifact.executable {
+            executable_paths.insert(destination);
+        }
+    }
+    harden_root_tree(root, &mut executable_paths)?;
+    ensure!(
+        executable_paths.is_empty(),
+        "declared executable is missing or not a regular file"
+    );
+    Ok(())
 }
 
+/// Each regular file the walk seals 0555 is removed from `executable_paths`;
+/// whatever remains was declared executable and never sealed.
 #[cfg(unix)]
-fn harden_root_tree(
-    root: &Path,
-    current: &Path,
-    executable_paths: &std::collections::BTreeSet<PathBuf>,
-) -> Result<()> {
+fn harden_root_tree(current: &Path, executable_paths: &mut BTreeSet<PathBuf>) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(current)?;
@@ -6871,45 +6845,25 @@ fn harden_root_tree(
         let mut entries = fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            harden_root_tree(root, &entry.path(), executable_paths)?;
+            harden_root_tree(&entry.path(), &mut *executable_paths)?;
         }
         fs::set_permissions(current, fs::Permissions::from_mode(0o555))?;
     } else if metadata.is_file() {
         fs::set_permissions(
             current,
-            fs::Permissions::from_mode(if executable_paths.contains(current) {
+            fs::Permissions::from_mode(if executable_paths.remove(current) {
                 0o555
             } else {
                 0o444
             }),
         )?;
     } else if metadata.file_type().is_symlink() {
-        validate_release_symlink(root, current)?;
+        // Left untouched: containment was decided by check_release_link in
+        // digest_tree, which install_release and validate_installed_release
+        // run over every receipt before this walk (map T16).
     } else {
         bail!("sealed release contains a special filesystem entry")
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_release_symlink(root: &Path, path: &Path) -> Result<()> {
-    let target = fs::read_link(path)?;
-    ensure!(target.is_relative(), "sealed release symlink is absolute");
-    ensure!(
-        target.components().all(|component| matches!(
-            component,
-            std::path::Component::CurDir | std::path::Component::Normal(_)
-        )),
-        "sealed release symlink has a parent traversal"
-    );
-    let destination = path
-        .parent()
-        .context("sealed release symlink has no parent")?
-        .join(target);
-    ensure!(
-        destination.starts_with(root),
-        "sealed release symlink escaped its release"
-    );
     Ok(())
 }
 
@@ -8102,7 +8056,7 @@ fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
 /// checked to contain the fully resolved `source` with the same
 /// whole-chain-aware resolver `validate_frozen_source_symlink` uses, before
 /// anything is read from it.
-pub(crate) fn copy_artifact(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+fn copy_artifact(root: &Path, source: &Path, destination: &Path) -> Result<()> {
     let canonical_root = root.canonicalize().context("resolving artifact root")?;
     let canonical_source = source
         .canonicalize()
@@ -8125,11 +8079,124 @@ pub(crate) fn copy_artifact(root: &Path, source: &Path, destination: &Path) -> R
     }
 }
 
+/// The one seal-time owner of mode declarations for a copied artifact: a
+/// directory output is never `executable` (it declares `executable_members`),
+/// a file output never declares members, and every member is a regular file
+/// reached through real directories, never through a symlink. Errors name the
+/// rule, never the member path.
+fn check_artifact_modes(artifact: &ArtifactOutput, destination: &Path) -> Result<()> {
+    let is_dir = fs::symlink_metadata(destination)
+        .context("inspecting a copied artifact")?
+        .is_dir();
+    ensure!(
+        !(is_dir && artifact.executable),
+        "directory artifact {} cannot be executable; declare executable_members",
+        artifact.id
+    );
+    if !is_dir {
+        ensure!(
+            artifact.executable_members.is_empty(),
+            "file artifact {} cannot declare executable_members",
+            artifact.id
+        );
+        return Ok(());
+    }
+    for member in &artifact.executable_members {
+        ensure!(!member.as_os_str().is_empty(), "executable member is empty");
+        let mut current = destination.to_path_buf();
+        let mut components = member.components().peekable();
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                bail!("executable member has a forbidden path component");
+            };
+            current.push(name);
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    bail!("executable member is missing")
+                }
+                Err(error) => return Err(error).context("inspecting an executable member"),
+            };
+            if components.peek().is_some() {
+                ensure!(
+                    metadata.is_dir(),
+                    "executable member passes through a symlink or non-directory"
+                );
+            } else {
+                ensure!(metadata.is_file(), "executable member is not a regular file");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The one seal step for a declared artifact, for systemd and host targets
+/// alike: copy it into the staging root, check its mode declarations, digest it
+/// and check the recipe pin. Modes are applied by harden on systemd targets;
+/// host targets (Windows, map T15) carry `executable` and `executable_members`
+/// in the receipt and do not apply them.
+pub(crate) fn seal_artifact(
+    artifact: &ArtifactOutput,
+    containment_root: &Path,
+    source_path: &Path,
+    staging_root: &Path,
+) -> Result<ArtifactReceipt> {
+    ensure!(
+        source_path.exists(),
+        "declared artifact output {} is absent",
+        artifact.id
+    );
+    let destination = staging_root.join(&artifact.destination);
+    ensure!(
+        destination.starts_with(staging_root),
+        "artifact {} destination escaped its staging root",
+        artifact.id
+    );
+    copy_artifact(containment_root, source_path, &destination)?;
+    check_artifact_modes(artifact, &destination)?;
+    let (sha256, size_bytes) = digest_artifact(&destination)?;
+    if let Some(expected) = &artifact.expected_sha256 {
+        ensure!(
+            &sha256 == expected,
+            "artifact {} differs from its recipe-pinned digest",
+            artifact.id
+        );
+    }
+    Ok(ArtifactReceipt {
+        artifact_id: artifact.id.clone(),
+        destination: artifact.destination.clone(),
+        sha256: format!("sha256-{sha256}"),
+        size_bytes,
+        executable: artifact.executable,
+        executable_members: artifact.executable_members.clone(),
+    })
+}
+
+/// Streams `path` into `hasher` in 64 KiB chunks, so peak memory is the buffer
+/// and not the largest file in the tree, and refuses if the bytes read differ
+/// from `expected_len`. The only owner of the length check.
+pub(crate) fn hash_file_exact(path: &Path, expected_len: u64, hasher: &mut Sha256) -> Result<()> {
+    let mut file = fs::File::open(path).context("opening a file to hash it")?;
+    let mut buffer = [0u8; 1 << 16];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).context("reading a file to hash it")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+    }
+    ensure!(total == expected_len, "file changed while hashing");
+    Ok(())
+}
+
 pub(crate) fn digest_artifact(path: &Path) -> Result<(String, u64)> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_file() {
-        let bytes = fs::read(path)?;
-        return Ok((raw_sha256(&bytes), bytes.len().try_into()?));
+        let mut hasher = Sha256::new();
+        hash_file_exact(path, metadata.len(), &mut hasher)?;
+        return Ok((format!("{:x}", hasher.finalize()), metadata.len()));
     }
     ensure!(metadata.is_dir(), "artifact is not a file or directory");
     let mut hasher = Sha256::new();
@@ -8153,15 +8220,16 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
             hasher.update(b"\0");
             digest_tree(root, &path, hasher, size)?;
         } else if metadata.is_file() {
-            let bytes = fs::read(&path)?;
+            let length = metadata.len();
             hasher.update(b"file\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(&bytes);
-            *size = size.saturating_add(bytes.len().try_into()?);
+            hasher.update(length.to_le_bytes());
+            hash_file_exact(&path, length, hasher)?;
+            *size = size.saturating_add(length);
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path)?;
+            check_release_link(path.strip_prefix(root)?, &target)?;
             hasher.update(b"link\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
@@ -8171,6 +8239,35 @@ fn digest_tree(root: &Path, current: &Path, hasher: &mut Sha256, size: &mut u64)
             bail!("artifact tree contains a special filesystem entry")
         }
     }
+    Ok(())
+}
+
+/// The one judge of link containment in a release tree, pure and static:
+/// `link` is the link's path relative to its artifact's top and `target` what
+/// it reads. A target is relative, its `..` steps all come first, and they
+/// climb no higher than the link's own directory depth, so the link can only
+/// land inside the artifact. Lexical normalisation of parent and target is not
+/// enough: with `s -> ..` it admits `s/../x` and escapes (map T14).
+fn check_release_link(link: &Path, target: &Path) -> Result<()> {
+    use std::path::Component;
+
+    let depth = link.components().count().saturating_sub(1);
+    let mut climbs = 0_usize;
+    let mut named = false;
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("sealed release symlink is absolute")
+            }
+            Component::ParentDir => {
+                ensure!(!named, "sealed release symlink climbs after a name");
+                climbs += 1;
+            }
+            Component::Normal(_) => named = true,
+        }
+    }
+    ensure!(climbs <= depth, "sealed release symlink escapes its artifact");
     Ok(())
 }
 
@@ -13862,6 +13959,7 @@ processes 9
                 sha256: sha256_id(b"sealed"),
                 size_bytes: 6,
                 executable: true,
+                executable_members: BTreeSet::new(),
             }],
         )?;
         let root_metadata = fs::symlink_metadata(&root)?;
@@ -13870,6 +13968,554 @@ processes 9
         assert_eq!(root_metadata.permissions().mode() & 0o777, 0o555);
         assert_eq!(artifact_metadata.uid(), 0);
         assert_eq!(artifact_metadata.permissions().mode() & 0o777, 0o555);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    const MEMBER_CANARY: &str = "zzcanary";
+
+    #[cfg(unix)]
+    fn tree_output(executable: bool, members: &[&str]) -> ArtifactOutput {
+        ArtifactOutput {
+            id: "upstream".into(),
+            source_kind: ArtifactSource::WorktreeTree,
+            runner: None,
+            source: PathBuf::from("upstream"),
+            destination: PathBuf::from("upstream"),
+            expected_sha256: None,
+            executable,
+            executable_members: members.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(path.parent().context("file has no parent")?)?;
+        fs::write(path, bytes)?;
+        // Builds and git leave arbitrary exec bits; the seal must not inherit them.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn sealed_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// `<root>/src/upstream` is the worktree tree; `<root>/staging` the release.
+    #[cfg(unix)]
+    fn sample_tree(root: &Path) -> Result<(PathBuf, PathBuf)> {
+        let source = root.join("src");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging)?;
+        let tree = source.join("upstream");
+        write_file(&tree.join("bin/daemon"), b"daemon")?;
+        write_file(&tree.join("bin/helper"), b"helper")?;
+        write_file(&tree.join("lib/tool"), b"tool")?;
+        write_file(&tree.join("lib/data.txt"), b"data")?;
+        write_file(&tree.join("NOTICE"), b"notice")?;
+        Ok((source, staging))
+    }
+
+    #[cfg(unix)]
+    fn collect_tree(
+        source: &Path,
+        staging: &Path,
+        output: ArtifactOutput,
+    ) -> Result<ArtifactReceipt> {
+        let mut declaration =
+            TargetDeclaration::parse(crate::deployment::tests::RECIPE)?;
+        let id = output.id.clone();
+        declaration.artifacts = vec![output];
+        let frozen = FrozenSource {
+            receipt: FrozenSourceReceipt {
+                transaction_id: "tx".into(),
+                plan_id: "plan".into(),
+                snapshot_sha256: "snapshot".into(),
+            },
+            facts: crate::deployment_plan::tests::source(crate::deployment::tests::RECIPE),
+            recipe_bytes: Vec::new(),
+            root: source.to_path_buf(),
+        };
+        DockerRunnerDriver::default().collect_artifact(
+            &declaration,
+            &frozen,
+            &BTreeMap::new(),
+            staging,
+            &id,
+        )
+    }
+
+    #[cfg(unix)]
+    fn refusal_text<T>(result: Result<T>) -> String {
+        let Err(error) = result else {
+            panic!("the release was not refused");
+        };
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains(MEMBER_CANARY),
+            "the refusal echoed a member path: {text}"
+        );
+        text
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_member_sealed_0555_and_siblings_0444() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (source, staging) = sample_tree(temp.path())?;
+        let receipt = collect_tree(
+            &source,
+            &staging,
+            tree_output(false, &["bin/daemon", "lib/tool"]),
+        )?;
+        assert_eq!(
+            receipt.executable_members,
+            BTreeSet::from([PathBuf::from("bin/daemon"), PathBuf::from("lib/tool")])
+        );
+        harden_installed_release(&staging, &[receipt])?;
+        let tree = staging.join("upstream");
+        assert_eq!(sealed_mode(&tree.join("bin/daemon")), 0o555);
+        assert_eq!(sealed_mode(&tree.join("lib/tool")), 0o555);
+        assert_eq!(sealed_mode(&tree.join("bin/helper")), 0o444);
+        assert_eq!(sealed_mode(&tree.join("lib/data.txt")), 0o444);
+        assert_eq!(sealed_mode(&tree.join("NOTICE")), 0o444);
+        for directory in [&staging, &tree, &tree.join("bin"), &tree.join("lib")] {
+            assert_eq!(sealed_mode(directory), 0o555);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_link_rule_is_containment() {
+        for (link, target) in [
+            ("a/b/l", "../t/x"),
+            ("a/l", ".."),
+            ("a/l", "./../b"),
+            ("a/l", "b/./c"),
+            ("l", "python3.12"),
+            ("a/b/c/l", "../../x"),
+        ] {
+            check_release_link(Path::new(link), Path::new(target))
+                .unwrap_or_else(|error| panic!("({link}, {target}) refused: {error:#}"));
+        }
+        for (link, target, rule) in [
+            ("l", "/x", "absolute"),
+            ("a/l", "s/../x", "climbs after a name"),
+            ("a/l", "D/D/../../../etc/passwd", "climbs after a name"),
+            ("a/l", "../../x", "escapes its artifact"),
+            ("l", "..", "escapes its artifact"),
+            ("a/b/l", "../../../x", "escapes its artifact"),
+            ("a/l", "./s/../x", "climbs after a name"),
+        ] {
+            let text = format!(
+                "{:#}",
+                check_release_link(Path::new(link), Path::new(target))
+                    .expect_err(&format!("({link}, {target}) was admitted"))
+            );
+            assert!(text.contains(rule), "({link}, {target}): {text}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_member_refuses_the_release() -> Result<()> {
+        // The bad member sorts after the good one in one case and before it in
+        // the other, so a check that stops at the first (or last) member fails.
+        for members in [
+            &["bin/daemon", "lib/zzcanary-missing"][..],
+            &["aaa-zzcanary-missing", "bin/daemon"][..],
+            &["zzcanary-dir/tool"][..],
+        ] {
+            let temp = tempfile::tempdir()?;
+            let (source, staging) = sample_tree(temp.path())?;
+            let text = refusal_text(collect_tree(&source, &staging, tree_output(false, members)));
+            assert!(text.contains("executable member is missing"), "{text}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_member_refuses_the_release() -> Result<()> {
+        for link_target in ["daemon", "../zzcanary-nowhere"] {
+            let temp = tempfile::tempdir()?;
+            let (source, staging) = sample_tree(temp.path())?;
+            std::os::unix::fs::symlink(
+                link_target,
+                source.join("upstream/bin/zzcanary-link"),
+            )?;
+            let text = refusal_text(collect_tree(
+                &source,
+                &staging,
+                tree_output(false, &["bin/daemon", "bin/zzcanary-link"]),
+            ));
+            assert!(text.contains("not a regular file"), "{text}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn member_through_symlinked_directory_refuses_the_release() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (source, staging) = sample_tree(temp.path())?;
+        let tree = source.join("upstream");
+        write_file(&tree.join("real-bin/zzcanary-tool"), b"tool")?;
+        std::os::unix::fs::symlink("real-bin", tree.join("linked-bin"))?;
+        let text = refusal_text(collect_tree(
+            &source,
+            &staging,
+            tree_output(false, &["linked-bin/zzcanary-tool"]),
+        ));
+        assert!(text.contains("symlink or non-directory"), "{text}");
+        // A member below a regular file is refused the same way.
+        let second_staging = temp.path().join("second-staging");
+        fs::create_dir_all(&second_staging)?;
+        let text = refusal_text(collect_tree(
+            &source,
+            &second_staging,
+            tree_output(false, &["bin/daemon/zzcanary-below-file"]),
+        ));
+        assert!(text.contains("symlink or non-directory"), "{text}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_member_refuses_the_release() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (source, staging) = sample_tree(temp.path())?;
+        let text = refusal_text(collect_tree(
+            &source,
+            &staging,
+            tree_output(false, &["bin/daemon", "lib"]),
+        ));
+        assert!(text.contains("not a regular file"), "{text}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_flag_on_tree_output_refuses() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (source, staging) = sample_tree(temp.path())?;
+        let text = refusal_text(collect_tree(&source, &staging, tree_output(true, &[])));
+        assert!(text.contains("cannot be executable"), "{text}");
+        // The same flag on a file output stays admitted.
+        let file = temp.path().join("file-artifact");
+        fs::write(&file, b"x")?;
+        let mut output = tree_output(true, &[]);
+        output.id = "file".into();
+        check_artifact_modes(&output, &file)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn members_on_file_output_refuse() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let file = temp.path().join("file-artifact");
+        fs::write(&file, b"x")?;
+        check_artifact_modes(&tree_output(false, &[]), &file)?;
+        let text = refusal_text(check_artifact_modes(
+            &tree_output(false, &["zzcanary"]),
+            &file,
+        ));
+        assert!(text.contains("cannot declare executable_members"), "{text}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_artifact_modes_refuses_a_member_that_is_not_a_clean_relative_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (source, _) = sample_tree(temp.path())?;
+        let tree = source.join("upstream");
+        write_file(&temp.path().join("zzcanary-outside"), b"x")?;
+        for member in ["../../zzcanary-outside", "bin/../bin/daemon", "/zzcanary", ""] {
+            refusal_text(check_artifact_modes(&tree_output(false, &[member]), &tree));
+        }
+        check_artifact_modes(&tree_output(false, &["bin/daemon"]), &tree)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_member_is_not_reported_as_missing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (source, _) = sample_tree(temp.path())?;
+        // A component past NAME_MAX fails with an io error that is not NotFound.
+        let long = "z".repeat(300);
+        let text = refusal_text(check_artifact_modes(
+            &tree_output(false, &[long.as_str()]),
+            &source.join("upstream"),
+        ));
+        assert!(!text.contains("missing"), "{text}");
+        assert!(text.contains("inspecting an executable member"), "{text}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_fails_when_a_declared_member_is_absent() -> Result<()> {
+        let receipt = |members: &[&str]| ArtifactReceipt {
+            artifact_id: "upstream".into(),
+            destination: PathBuf::from("upstream"),
+            sha256: sha256_id(b"x"),
+            size_bytes: 1,
+            executable: false,
+            executable_members: members.iter().map(PathBuf::from).collect(),
+        };
+        let installed = |root: &Path| -> Result<()> {
+            write_file(&root.join("upstream/bin/daemon"), b"daemon")?;
+            write_file(&root.join("upstream/lib/tool"), b"tool")?;
+            fs::create_dir_all(root.join("upstream/zzcanary-dir"))?;
+            std::os::unix::fs::symlink("daemon", root.join("upstream/bin/zzcanary-link"))?;
+            Ok(())
+        };
+        let temp = tempfile::tempdir()?;
+        installed(temp.path())?;
+        harden_installed_release(temp.path(), &[receipt(&["bin/daemon", "lib/tool"])])?;
+        for members in [
+            &["bin/daemon", "lib/zzcanary-gone"][..],
+            &["zzcanary-gone", "bin/daemon"][..],
+            &["zzcanary-dir"][..],
+            &["bin/zzcanary-link"][..],
+            &["bin/daemon/zzcanary-below-file"][..],
+        ] {
+            let temp = tempfile::tempdir()?;
+            installed(temp.path())?;
+            let text = refusal_text(harden_installed_release(temp.path(), &[receipt(members)]));
+            assert!(text.contains("declared executable is missing"), "{text}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_in_tree_symlink_survives_the_seal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (source, staging) = sample_tree(temp.path())?;
+        let tree = source.join("upstream");
+        write_file(&tree.join("bin/python3.12"), b"python")?;
+        std::os::unix::fs::symlink("python3.12", tree.join("bin/python3"))?;
+        write_file(&tree.join("lib/terminfo/b/real"), b"terminfo")?;
+        fs::create_dir_all(tree.join("lib/terminfo/a"))?;
+        std::os::unix::fs::symlink("../b/real", tree.join("lib/terminfo/a/alias"))?;
+        let receipt = collect_tree(&source, &staging, tree_output(false, &["bin/python3.12"]))?;
+        let (before, _) = digest_artifact(&staging.join("upstream"))?;
+        harden_installed_release(&staging, &[receipt])?;
+        let link = staging.join("upstream/bin/python3");
+        assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
+        assert_eq!(fs::read_link(&link)?, PathBuf::from("python3.12"));
+        assert_eq!(sealed_mode(&staging.join("upstream/bin/python3.12")), 0o555);
+        let alias = staging.join("upstream/lib/terminfo/a/alias");
+        assert!(fs::symlink_metadata(&alias)?.file_type().is_symlink());
+        assert_eq!(fs::read_link(&alias)?, PathBuf::from("../b/real"));
+        assert_eq!(digest_artifact(&staging.join("upstream"))?.0, before);
+
+        // A link that escapes, is absolute or climbs after a name is refused at
+        // the seal, before any receipt exists.
+        for (target, rule) in [
+            ("../../zzcanary-up", "escapes its artifact"),
+            ("/zzcanary/absolute", "absolute"),
+            ("zzcanary-s/../x", "climbs after a name"),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let (source, staging) = sample_tree(temp.path())?;
+            std::os::unix::fs::symlink(target, source.join("upstream/lib/zzcanary-link"))?;
+            let text = refusal_text(collect_tree(&source, &staging, tree_output(false, &["bin/daemon"])));
+            assert!(text.contains(rule), "{text}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_to_existing_targets_are_refused_at_the_seal() -> Result<()> {
+        // Every refused shape, aimed at a target that EXISTS (file and
+        // directory): a judge guarded by `exists()`, `is_dir()` or a file-type
+        // test passes the dangling fixtures and fails these.
+        for kind in ["file", "dir"] {
+            for (shape, rule) in [
+                ("absolute", "absolute"),
+                ("escape", "escapes its artifact"),
+                ("after-name", "climbs after a name"),
+            ] {
+                let temp = tempfile::tempdir()?;
+                let (source, staging) = sample_tree(temp.path())?;
+                let target = match (shape, kind) {
+                    ("absolute", "file") => source.join("upstream/bin/daemon"),
+                    ("absolute", _) => source.join("upstream/lib"),
+                    ("escape", "file") => {
+                        write_file(&source.join("outside-file"), b"outside")?;
+                        PathBuf::from("../../outside-file")
+                    }
+                    ("escape", _) => {
+                        fs::create_dir_all(source.join("outside-dir"))?;
+                        PathBuf::from("../../outside-dir")
+                    }
+                    (_, "file") => PathBuf::from("../bin/../NOTICE"),
+                    _ => PathBuf::from("../bin/../lib"),
+                };
+                let link = source.join("upstream/lib/zzcanary-link");
+                std::os::unix::fs::symlink(&target, &link)?;
+                assert!(fs::metadata(&link).is_ok(), "{shape} {kind} link must resolve");
+                let text = refusal_text(collect_tree(&source, &staging, tree_output(false, &["bin/daemon"])));
+                assert!(text.contains(rule), "{shape} {kind}: {text}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_digest_is_byte_compatible() -> Result<()> {
+        // Not a multiple of the 64 KiB read buffer, so a short last chunk
+        // matters; the aligned and empty files are the other boundaries.
+        let big = (0..3 * 65536 + 17).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        let aligned = vec![7_u8; 65536];
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        write_file(&tree.join("a.txt"), b"alpha")?;
+        write_file(&tree.join("empty"), b"")?;
+        write_file(&tree.join("sub/aligned.bin"), &aligned)?;
+        write_file(&tree.join("sub/big.bin"), &big)?;
+        std::os::unix::fs::symlink("a.txt", tree.join("zlink"))?;
+
+        // The encoding digest_tree had before it streamed, written out by hand.
+        fn add_file(hasher: &mut Sha256, name: &str, bytes: &[u8]) {
+            hasher.update(b"file\0");
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        let mut expected = Sha256::new();
+        add_file(&mut expected, "a.txt", b"alpha");
+        add_file(&mut expected, "empty", b"");
+        let mut expected_size = 5_u64;
+        expected.update(b"dir\0sub\0");
+        add_file(&mut expected, "sub/aligned.bin", &aligned);
+        add_file(&mut expected, "sub/big.bin", &big);
+        expected_size += (aligned.len() + big.len()) as u64;
+        expected.update(b"link\0zlink\0a.txt");
+        expected_size += "a.txt".len() as u64;
+        assert_eq!(
+            digest_artifact(&tree)?,
+            (format!("{:x}", expected.finalize()), expected_size)
+        );
+
+        let single = tree.join("sub/big.bin");
+        assert_eq!(
+            digest_artifact(&single)?,
+            (raw_sha256(&big), big.len() as u64)
+        );
+        let mut hasher = Sha256::new();
+        hash_file_exact(&single, big.len() as u64, &mut hasher)?;
+        assert_eq!(format!("{:x}", hasher.finalize()), raw_sha256(&big));
+        for wrong in [big.len() as u64 + 1, big.len() as u64 - 1] {
+            let text = refusal_text(hash_file_exact(&single, wrong, &mut Sha256::new()));
+            assert!(text.contains("changed while hashing"), "{text}");
+        }
+        Ok(())
+    }
+
+    /// Acceptance on the real trees: `IDUNN_BIG_TREE` holds `python/` and
+    /// `blender/`. Run on Yggdrasil as its own job (see the cut spec).
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs IDUNN_BIG_TREE: a CPython+torch tree and a Blender tree"]
+    fn big_tree_seals_from_env() -> Result<()> {
+        use std::time::Instant;
+
+        /// (links, links with a `..` step, regular files, files at 0555), never
+        /// following a link; every regular file must be 0444 or a member's 0555.
+        fn census(
+            root: &Path,
+            path: &Path,
+            members: &BTreeSet<PathBuf>,
+            modes: bool,
+            totals: &mut [usize; 4],
+        ) -> Result<()> {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_dir() {
+                    census(root, &entry.path(), members, modes, totals)?;
+                } else if metadata.file_type().is_symlink() {
+                    totals[0] += 1;
+                    let target = fs::read_link(entry.path())?;
+                    if target
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                    {
+                        totals[1] += 1;
+                    }
+                } else {
+                    totals[2] += 1;
+                    let member = members.contains(entry.path().strip_prefix(root)?);
+                    let mode = sealed_mode(&entry.path());
+                    if modes {
+                        assert_eq!(mode, if member { 0o555 } else { 0o444 });
+                        totals[3] += usize::from(mode == 0o555);
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn peak_rss() -> String {
+            fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find(|line| line.starts_with("VmHWM"))
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default()
+        }
+
+        let tree = PathBuf::from(
+            std::env::var_os("IDUNN_BIG_TREE").context("IDUNN_BIG_TREE is not set")?,
+        );
+        let members = ["python/bin/python3.12", "blender/blender"];
+        let temp = tempfile::tempdir()?;
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(&staging)?;
+        let destination = staging.join("tree");
+        let output = ArtifactOutput {
+            destination: PathBuf::from("tree"),
+            ..tree_output(false, &members)
+        };
+
+        let started = Instant::now();
+        let receipt = seal_artifact(&output, &tree, &tree, &staging)?;
+        println!("seal {:?} {}", started.elapsed(), peak_rss());
+        let started = Instant::now();
+        let again = digest_artifact(&destination)?;
+        assert_eq!(format!("sha256-{}", again.0), receipt.sha256);
+        assert_eq!(again.1, receipt.size_bytes);
+        println!("digest {:?} {}", started.elapsed(), peak_rss());
+        let mut before = [0; 4];
+        census(&destination, &destination, &output.executable_members, false, &mut before)?;
+        let started = Instant::now();
+        harden_installed_release(&staging, &[receipt.clone()])?;
+        println!("harden {:?} {}", started.elapsed(), peak_rss());
+        let mut totals = [0; 4];
+        census(&destination, &destination, &output.executable_members, true, &mut totals)?;
+        assert_eq!(totals[0], before[0], "links changed across harden");
+        assert_eq!(totals[3], members.len());
+        println!(
+            "dotdot links {} links before {} after {} files {} exec {}",
+            totals[1], before[0], totals[0], totals[2], totals[3]
+        );
+        println!("bytes {}", receipt.size_bytes);
         Ok(())
     }
 

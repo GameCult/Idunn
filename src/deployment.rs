@@ -113,6 +113,10 @@ pub struct ArtifactOutput {
     pub expected_sha256: Option<String>,
     #[serde(default)]
     pub executable: bool,
+    /// Regular files inside a directory artifact that are sealed executable
+    /// (0555); every other file in the tree is sealed 0444.
+    #[serde(default)]
+    pub executable_members: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -911,6 +915,14 @@ impl TargetDeclaration {
             require_leaf_path(&artifact.destination, "artifact destination")?;
             if let Some(expected_sha256) = &artifact.expected_sha256 {
                 require_sha256(expected_sha256, "expected artifact sha256")?;
+            }
+            ensure!(
+                !(artifact.executable && !artifact.executable_members.is_empty()),
+                "artifact {} declares both executable and executable_members",
+                artifact.id
+            );
+            for member in &artifact.executable_members {
+                require_relative_path(member, "executable member", false)?;
             }
             ensure!(
                 destinations.insert(artifact.destination.as_path()),
@@ -2209,6 +2221,76 @@ nodes = ["yggdrasil"]
             "target = \"test-service\"\nroot = true",
         );
         assert!(TargetDeclaration::parse(&input).is_err());
+    }
+
+    const MEMBER_CANARY: &str = "zzcanary";
+
+    fn recipe_with_members(members: &str) -> String {
+        let input = RECIPE.replace("executable = true", &format!("executable_members = [{members}]"));
+        assert_ne!(input, RECIPE, "the fixture lost its executable line");
+        input
+    }
+
+    /// A refused member list is refused by name of the field, never by echoing
+    /// the member.
+    fn assert_members_refused(members: &[&str]) {
+        let control = TargetDeclaration::parse(&recipe_with_members("\"bin/daemon\"")).unwrap();
+        assert!(control.artifacts[0].executable_members.contains(Path::new("bin/daemon")));
+        for member in members {
+            let error = TargetDeclaration::parse(&recipe_with_members(&format!("\"{member}\"")))
+                .expect_err(member);
+            assert!(
+                !format!("{error:#}").contains(MEMBER_CANARY),
+                "the refusal echoed a member path"
+            );
+        }
+    }
+
+    #[test]
+    fn recipe_executable_member_refuses_parent_traversal() {
+        assert_members_refused(&[
+            "zzcanary/../b",
+            "../zzcanary",
+            "bin/zzcanary/..",
+            "bin/../../zzcanary",
+        ]);
+    }
+
+    #[test]
+    fn recipe_executable_member_refuses_absolute_path() {
+        assert_members_refused(&["/zzcanary/sh", "/zzcanary"]);
+    }
+
+    #[test]
+    fn recipe_executable_member_refuses_empty_and_current_dir() {
+        assert_members_refused(&["", ".", "./", "zzcanary/.."]);
+    }
+
+    #[test]
+    fn recipe_refuses_executable_flag_with_members() {
+        let input = RECIPE.replace(
+            "executable = true",
+            "executable = true\nexecutable_members = [\"bin/daemon\"]",
+        );
+        let error = TargetDeclaration::parse(&input).unwrap_err();
+        assert!(format!("{error:#}").contains("executable_members"));
+        assert!(!format!("{error:#}").contains("bin/daemon"));
+        // executable = true alone, and members alone, both stay admitted.
+        assert!(TargetDeclaration::parse(RECIPE).is_ok());
+        assert!(TargetDeclaration::parse(&recipe_with_members("\"bin/daemon\"")).is_ok());
+    }
+
+    #[test]
+    fn recipe_admits_members_on_both_source_kinds() {
+        let runner_output = TargetDeclaration::parse(&recipe_with_members("\"a/b\", \"c\"")).unwrap();
+        assert_eq!(runner_output.artifacts[0].source_kind, ArtifactSource::RunnerOutput);
+        assert_eq!(runner_output.artifacts[0].executable_members.len(), 2);
+        let worktree = recipe_with_members("\"a/b\", \"c\"")
+            .replace("source_kind = \"runner-output\"\nrunner = \"rust\"\n", "source_kind = \"worktree-tree\"\n")
+            .replace("expected_sha256 = \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"\n", "");
+        let worktree = TargetDeclaration::parse(&worktree).unwrap();
+        assert_eq!(worktree.artifacts[0].source_kind, ArtifactSource::WorktreeTree);
+        assert_eq!(worktree.artifacts[0].executable_members.len(), 2);
     }
 
     #[test]

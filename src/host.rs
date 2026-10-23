@@ -30,13 +30,13 @@ use serde::Deserialize;
 
 use crate::control_plane::read_trust_anchor;
 use crate::deployment::{
-    ArtifactSource, HostWorkloadBinding, IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT,
+    HostWorkloadBinding, IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT,
     IDUNN_RUNTIME_BUNDLE_ENVIRONMENT, LaunchArgument, OperatorBinding, TargetDeclaration,
 };
-use crate::deployment_plan::{ArtifactReceipt, CompiledDeploymentPlan, SealedRelease};
+use crate::deployment_plan::{CompiledDeploymentPlan, SealedRelease};
 use crate::drivers::{
-    HostWorkloadObservation, InstalledReleaseObservation, copy_artifact, copy_tree,
-    digest_artifact, release_artifact, remove_tree_inside, sha256_id, write_runtime_bundle_records,
+    HostWorkloadObservation, InstalledReleaseObservation, copy_tree, digest_artifact,
+    release_artifact, remove_tree_inside, seal_artifact, sha256_id, write_runtime_bundle_records,
 };
 use crate::host_actuator::{
     HOST_ACTUATOR_CHANNEL, HOST_ACTUATOR_CONNECTION_ID, HOST_ACTUATOR_PING_MS,
@@ -1048,37 +1048,12 @@ fn materialize(
     fs::create_dir_all(&staging)?;
     let mut artifacts = Vec::new();
     for artifact in &declaration.artifacts {
-        let source_path = match artifact.source_kind {
-            ArtifactSource::RunnerOutput | ArtifactSource::WorktreeTree => {
-                source.join(&artifact.source)
-            }
-        };
-        ensure!(
-            source_path.exists(),
-            "declared artifact output {} is absent",
-            artifact.id
-        );
-        let destination = staging.join(&artifact.destination);
-        ensure!(
-            destination.starts_with(&staging),
-            "artifact destination escaped its staging root"
-        );
-        copy_artifact(&source, &source_path, &destination)?;
-        let (sha256, size_bytes) = digest_artifact(&destination)?;
-        if let Some(expected) = &artifact.expected_sha256 {
-            ensure!(
-                &sha256 == expected,
-                "artifact {} differs from its recipe-pinned digest",
-                artifact.id
-            );
-        }
-        artifacts.push(ArtifactReceipt {
-            artifact_id: artifact.id.clone(),
-            destination: artifact.destination.clone(),
-            sha256: format!("sha256-{sha256}"),
-            size_bytes,
-            executable: artifact.executable,
-        });
+        artifacts.push(seal_artifact(
+            artifact,
+            &source,
+            &source.join(&artifact.source),
+            &staging,
+        )?);
     }
     let release = SealedRelease::new(plan, artifacts, Vec::new(), sealed_at_unix_millis)?;
     Ok((release, staging))
