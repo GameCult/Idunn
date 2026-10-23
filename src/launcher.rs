@@ -902,12 +902,17 @@ impl Shared {
     /// dead presence acceptor does not degrade presence: it fails the unit.
     fn serving_state(&self) -> &'static str {
         let stale = u64::try_from(HEALTH_STALE.as_millis()).unwrap_or(u64::MAX);
-        // The result is read before the clock: a stamp is taken before it is
-        // stored, so a later reading of the monotonic clock is never behind it,
-        // whatever the presence thread does between the two.
-        let probed = self.probed.lock().ok().and_then(|probed| *probed);
         let now = self.clock.monotonic_millis();
-        let healthy = probed.is_some_and(|(healthy, at)| healthy && now.saturating_sub(at) <= stale);
+        // A probe can finish between this thread reading the clock and locking
+        // the result, so a stamp later than `now` is a result fresher than the
+        // reading, age zero: monotonic time does not run backwards, so the stamp
+        // is not wrong.
+        let healthy = self
+            .probed
+            .lock()
+            .ok()
+            .and_then(|probed| *probed)
+            .is_some_and(|(healthy, at)| healthy && now.saturating_sub(at) <= stale);
         if healthy { "active" } else { "degraded" }
     }
 
@@ -2448,8 +2453,8 @@ mod tests {
         .to_vec();
         for flag in ["--lease-wait-secs", "--startup-secs", "--heartbeat-secs"] {
             for (value, accepted) in [
-                (MAX_DECLARED_SECONDS.to_string(), true),
-                ((MAX_DECLARED_SECONDS + 1).to_string(), false),
+                ("86400".to_owned(), true),
+                ("86401".to_owned(), false),
                 (u64::MAX.to_string(), false),
             ] {
                 let mut args = base.clone();
