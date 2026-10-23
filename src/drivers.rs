@@ -13979,7 +13979,7 @@ processes 9
     }
 
     #[cfg(unix)]
-    fn mode_of(path: &Path) -> u32 {
+    fn sealed_mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
 
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
@@ -14057,12 +14057,12 @@ processes 9
         );
         harden_installed_release(&staging, &[receipt])?;
         let tree = staging.join("upstream");
-        assert_eq!(mode_of(&tree.join("bin/daemon")), 0o555);
-        assert_eq!(mode_of(&tree.join("lib/tool")), 0o555);
-        assert_eq!(mode_of(&tree.join("bin/helper")), 0o444);
-        assert_eq!(mode_of(&tree.join("lib/data.txt")), 0o444);
+        assert_eq!(sealed_mode(&tree.join("bin/daemon")), 0o555);
+        assert_eq!(sealed_mode(&tree.join("lib/tool")), 0o555);
+        assert_eq!(sealed_mode(&tree.join("bin/helper")), 0o444);
+        assert_eq!(sealed_mode(&tree.join("lib/data.txt")), 0o444);
         for directory in [&staging, &tree, &tree.join("bin"), &tree.join("lib")] {
-            assert_eq!(mode_of(directory), 0o555);
+            assert_eq!(sealed_mode(directory), 0o555);
         }
         Ok(())
     }
@@ -14240,7 +14240,7 @@ processes 9
         let link = staging.join("upstream/bin/python3");
         assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
         assert_eq!(fs::read_link(&link)?, PathBuf::from("python3.12"));
-        assert_eq!(mode_of(&staging.join("upstream/bin/python3.12")), 0o555);
+        assert_eq!(sealed_mode(&staging.join("upstream/bin/python3.12")), 0o555);
         assert_eq!(digest_artifact(&staging.join("upstream"))?.0, before);
 
         // A link out of the release, by `..` or by absolute target, still refuses.
@@ -14377,14 +14377,14 @@ processes 9
         )?;
         println!("harden {:?} {}", started.elapsed(), peak_rss());
         for member in members {
-            assert_eq!(mode_of(&destination.join(member)), 0o555);
+            assert_eq!(sealed_mode(&destination.join(member)), 0o555);
         }
         let sample = fs::read_dir(&destination)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<Vec<_>>>()?;
         for path in sample {
             if fs::symlink_metadata(&path)?.is_file() {
-                assert_eq!(mode_of(&path), 0o444);
+                assert_eq!(sealed_mode(&path), 0o444);
             }
         }
         assert_eq!(symlinks(&destination)?, links);
