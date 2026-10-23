@@ -59,6 +59,11 @@ const PRESENCE_DEADLINE: Duration = Duration::from_secs(1);
 /// again. No accept error ends the acceptor.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often the lifecycle probes the child once it is Active.
+const HEALTH_REFRESH: Duration = Duration::from_millis(500);
+/// A probe result older than this is not evidence of health: the lifecycle
+/// that refreshes it is itself stuck.
+const HEALTH_STALE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(100);
 const MAX_RECENT_WARMING_PROOFS: usize = 64;
 const TERMINATE_GRACE: Duration = Duration::from_secs(20);
@@ -859,18 +864,36 @@ struct Shared {
     lease: Mutex<Option<LeaseHold>>,
     lease_required: bool,
     health: Arc<dyn HealthProbe>,
+    /// The last probe result and the clock time it started. Only the lifecycle
+    /// probes; a challenge reads this and never waits on the child.
+    probed: Mutex<Option<(bool, u64)>>,
     clock: Arc<dyn Clock>,
 }
 
 impl Shared {
-    /// Active only while the child is healthy. A dead presence acceptor does
-    /// not degrade presence: it fails the unit.
-    fn serving_state(&self) -> &'static str {
-        if self.health.healthy() {
-            "active"
-        } else {
-            "degraded"
+    /// Probes the child now and keeps the result for presence to answer from.
+    fn refresh_health(&self) -> bool {
+        let started = self.clock.now_millis();
+        let healthy = self.health.healthy();
+        if let Ok(mut probed) = self.probed.lock() {
+            *probed = Some((healthy, started));
         }
+        healthy
+    }
+
+    /// Active only while the last probe found the child healthy and is recent.
+    /// A child never probed, wedged, or probed too long ago reads degraded. A
+    /// dead presence acceptor does not degrade presence: it fails the unit.
+    fn serving_state(&self) -> &'static str {
+        let now = self.clock.now_millis();
+        let stale = u64::try_from(HEALTH_STALE.as_millis()).unwrap_or(u64::MAX);
+        let healthy = self
+            .probed
+            .lock()
+            .ok()
+            .and_then(|probed| *probed)
+            .is_some_and(|(healthy, at)| healthy && now.saturating_sub(at) <= stale);
+        if healthy { "active" } else { "degraded" }
     }
 
     fn sign(&self, state: &str, detail: &str, lease: Option<String>) -> Result<GameCultRuntimePresenceHealthRecord> {
@@ -1084,6 +1107,7 @@ pub fn run(
         lease: Mutex::new(None),
         lease_required: expected.write_lease_required,
         health: Arc::clone(&health),
+        probed: Mutex::new(None),
         clock: Arc::clone(&ports.clock),
     });
     let halt = Arc::new(AtomicBool::new(false));
@@ -1210,7 +1234,7 @@ fn lifecycle(
         if presence.is_finished() {
             return fail(Some(&mut child), "presence-acceptor");
         }
-        if shared.health.healthy() {
+        if shared.refresh_health() {
             break;
         }
         if clock.now_millis() >= startup_deadline {
@@ -1222,6 +1246,8 @@ fn lifecycle(
     // 4. Active, and heartbeats while it holds.
     set_phase(Phase::Active(lease_sha.clone()));
     publish(shared.serving_state(), "child-healthy", lease_sha.clone());
+    let refresh = u64::try_from(HEALTH_REFRESH.as_millis()).unwrap_or(u64::MAX);
+    let mut next_probe = clock.now_millis() + refresh;
     next_heartbeat = clock.now_millis() + heartbeat;
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -1238,6 +1264,10 @@ fn lifecycle(
             return fail(Some(&mut child), "lease-lost");
         }
         let now = clock.now_millis();
+        if now >= next_probe {
+            shared.refresh_health();
+            next_probe = now + refresh;
+        }
         if now >= next_heartbeat {
             publish(shared.serving_state(), "heartbeat", lease_sha.clone());
             next_heartbeat = now + heartbeat;
@@ -1793,13 +1823,18 @@ mod tests {
     }
 
     fn shared(fx: &Fixture, health: Arc<Health>) -> Arc<Shared> {
+        shared_on(fx, health, Arc::new(SystemClock))
+    }
+
+    fn shared_on(fx: &Fixture, health: Arc<Health>, clock: Arc<dyn Clock>) -> Arc<Shared> {
         Arc::new(Shared {
             authority: Mutex::new(fx.authority()),
             phase: Mutex::new(Phase::Active(None)),
             lease: Mutex::new(None),
             lease_required: false,
             health,
-            clock: Arc::new(SystemClock),
+            probed: Mutex::new(None),
+            clock,
         })
     }
 
@@ -1824,8 +1859,14 @@ mod tests {
             assert_eq!(record.detail, "route-observation:challenge-1");
             record.state
         };
+        // Never probed: nothing says the child is healthy.
+        assert_eq!(state_of(&shared), "degraded");
+        shared.refresh_health();
         assert_eq!(state_of(&shared), "active");
+        // A challenge answers from the last probe and never runs one.
         health.0.store(false, Ordering::SeqCst);
+        assert_eq!(state_of(&shared), "active");
+        shared.refresh_health();
         assert_eq!(state_of(&shared), "degraded");
     }
 
@@ -1833,6 +1874,7 @@ mod tests {
     fn route_challenge_is_answered_with_both_signatures_through_idunns_client() {
         let fx = fixture(false);
         let shared = shared(&fx, Arc::new(Health(AtomicBool::new(true))));
+        shared.refresh_health();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let responder: Responder = Arc::new(move |request| shared.observe(request));
@@ -2088,34 +2130,248 @@ mod tests {
         assert!(OdinRudpSink::from_expected(&expected).is_err());
     }
 
+
     #[test]
-    fn heartbeats_are_paced_and_a_stop_exits_zero() {
+    fn a_probe_result_is_evidence_only_while_it_is_recent() {
+        let fx = fixture(false);
+        let clock = Arc::new(FastClock(AtomicU64::new(1_000_000)));
+        let shared = shared_on(&fx, Arc::new(Health(AtomicBool::new(true))), clock.clone());
+        shared.refresh_health();
+        let stale = HEALTH_STALE.as_millis() as u64;
+        clock.0.fetch_add(stale, Ordering::SeqCst);
+        assert_eq!(shared.serving_state(), "active", "a result exactly at the bound is still recent");
+        clock.0.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(shared.serving_state(), "degraded", "a result past the bound is not evidence");
+        shared.refresh_health();
+        assert_eq!(shared.serving_state(), "active");
+    }
+
+    /// Runs `work` and returns its result, failing the test when it has not
+    /// finished within `limit`, so a mutant that makes it wait forever fails
+    /// instead of hanging the suite.
+    fn within<T: Send + 'static>(limit: Duration, work: impl FnOnce() -> T + Send + 'static) -> T {
+        join_within(limit, thread::spawn(work))
+    }
+
+    fn join_within<T>(limit: Duration, handle: thread::JoinHandle<T>) -> T {
+        let started = Instant::now();
+        while !handle.is_finished() {
+            assert!(started.elapsed() < limit, "still running after {limit:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap()
+    }
+
+    /// The state the presence endpoint signs in answer to a challenge, or None
+    /// when it is not answered promptly.
+    fn challenge_state(address: SocketAddr, fx: &Fixture) -> Option<String> {
+        let request = CultNetMessage::SnapshotRequest {
+            message_id: "wedge".into(),
+            schema_ids: Some(vec![GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into()]),
+            record_keys: Some(vec![fx.expected.target.clone()]),
+        };
+        let payload =
+            encode_cultnet_message_to_vec(&request, CultNetWireContract::CultNetSchemaV0).unwrap();
+        let started = Instant::now();
+        let answer = request_tcp_snapshot(address, &payload).ok()?;
+        if started.elapsed() > Duration::from_millis(750) {
+            return None;
+        }
+        let CultNetMessage::SnapshotResponseRaw { documents, .. } =
+            decode_cultnet_message_from_slice(&answer, CultNetWireContract::CultNetSchemaV0).ok()?
+        else {
+            return None;
+        };
+        let record: GameCultRuntimePresenceHealthRecord =
+            rmp_serde::from_slice(&documents.first()?.payload).ok()?;
+        Some(record.state)
+    }
+
+    #[derive(Clone, Copy)]
+    enum Wedge {
+        /// Accepts and never answers.
+        Silent,
+        /// Never accepts; the kernel backlog fills.
+        FullBacklog,
+        /// Accepts and answers 200 after 1.1 s, past the probe's deadline.
+        Slow,
+    }
+
+    type WedgeSwitch = Arc<Mutex<Option<Wedge>>>;
+
+    /// A child that answers 200 until wedged. Returns the member address, the
+    /// switch, and the thread to join after `halt`.
+    fn serving_child(halt: Arc<AtomicBool>) -> (SocketAddr, WedgeSwitch, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let wedge: WedgeSwitch = Arc::default();
+        let mode = wedge.clone();
+        let serving = thread::spawn(move || {
+            while !halt.load(Ordering::SeqCst) {
+                let current = *mode.lock().unwrap();
+                if matches!(current, Some(Wedge::FullBacklog)) {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                match current {
+                    None => {
+                        let mut request = [0_u8; 256];
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    Some(Wedge::Slow) => {
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_millis(1100));
+                            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                        });
+                    }
+                    _ => {
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_secs(8));
+                            drop(stream);
+                        });
+                    }
+                }
+            }
+        });
+        (address, wedge, serving)
+    }
+
+    /// Whatever wedges the child, every challenge is still answered promptly,
+    /// and the answer turns to a signed degraded within a few probes.
+    fn a_wedged_child_is_answered_degraded(wedge: Wedge) {
+        let fx = fixture(false);
+        let sink = Arc::new(Sink::default());
+        let halt = Arc::new(AtomicBool::new(false));
+        let (member, mode, child) = serving_child(halt.clone());
+        let ports = Ports {
+            credentials: Arc::new(Credentials(BTreeMap::new())),
+            clock: Arc::new(SystemClock),
+            sink: sink.clone(),
+            lease: Arc::new(FakeLease::default()),
+            spawner: Box::new(FakeSpawner(Arc::new(Child::default()))),
+            health: Box::new(|member| Arc::new(HttpHealthProbe { member, path: "/health".into() })),
+        };
+        let contract = fx.contract("x");
+        let authority = fx.authority();
+        let route = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = route.local_addr().unwrap();
+        let tmp = fx.dir.path().join("tmp");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let unit = thread::spawn(move || run(&contract, authority, route, member, &tmp, ports, &flag));
+        wait_until("active", || sink.first("active").is_some());
+        assert_eq!(challenge_state(address, &fx).as_deref(), Some("active"));
+
+        *mode.lock().unwrap() = Some(wedge);
+        // A backlog fills only once clients have connected without being
+        // accepted.
+        let mut queued = Vec::new();
+        if matches!(wedge, Wedge::FullBacklog) {
+            for _ in 0..4096 {
+                match TcpStream::connect_timeout(&member, Duration::from_millis(20)) {
+                    Ok(stream) => queued.push(stream),
+                    Err(_) => break,
+                }
+            }
+        }
+        let started = Instant::now();
+        let mut degraded = false;
+        while started.elapsed() < Duration::from_secs(6) {
+            let state = challenge_state(address, &fx);
+            assert!(state.is_some(), "a challenge went unanswered after {:?}", started.elapsed());
+            if state.as_deref() == Some("degraded") {
+                degraded = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(degraded, "the wedged child was never reported degraded");
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(join_within(Duration::from_secs(10), unit), Outcome::Stopped);
+        halt.store(true, Ordering::SeqCst);
+        join_within(Duration::from_secs(10), child);
+        drop(queued);
+    }
+
+    #[test]
+    fn a_silent_child_is_answered_degraded_never_silent() {
+        a_wedged_child_is_answered_degraded(Wedge::Silent);
+    }
+
+    #[test]
+    fn a_child_with_a_full_backlog_is_answered_degraded_never_silent() {
+        a_wedged_child_is_answered_degraded(Wedge::FullBacklog);
+    }
+
+    #[test]
+    fn a_child_answering_after_the_probe_deadline_is_answered_degraded_never_silent() {
+        a_wedged_child_is_answered_degraded(Wedge::Slow);
+    }
+
+    /// The virtual time (milliseconds) of each record that has the given
+    /// detail.
+    fn times_of(sink: &Sink, detail: &str) -> Vec<u64> {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.detail == detail)
+            .map(|record| record.observed_at_unix_millis)
+            .collect()
+    }
+
+    #[test]
+    fn a_child_that_never_becomes_healthy_fails_the_unit_at_the_startup_timeout() {
+        let fx = fixture(false);
+        let mut contract = fx.contract("x");
+        contract.startup = Duration::from_secs(5);
+        let mut launch = start(&fx, contract, false);
+        let sink = launch.sink.clone();
+        let child = launch.child.clone();
+        let outcome = within(Duration::from_secs(20), move || launch.finish());
+        assert_eq!(outcome, Outcome::Failed("startup-timeout"));
+        assert!(child.terminated.load(Ordering::SeqCst), "the child outlived the unit");
+        let started = times_of(&sink, "launcher-started")[0];
+        let failed = times_of(&sink, "startup-timeout")[0];
+        // Virtual time: the deadline, found within one poll of it.
+        let waited = failed - started;
+        assert!(
+            (5_000..=5_000 + POLL.as_millis() as u64).contains(&waited),
+            "failed after {waited} ms of virtual time"
+        );
+    }
+
+    #[test]
+    fn heartbeats_follow_the_contracts_cadence_while_waiting_for_the_lease_and_while_active() {
         let fx = fixture(true);
-        let launch = start(&fx, fx.contract("x"), true);
-        thread::sleep(Duration::from_millis(250));
-        let waiting = launch
-            .sink
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|record| record.detail == "write-lease-pending")
-            .count();
-        assert!((1..=12).contains(&waiting), "{waiting} lease-wait heartbeats");
-        let mut launch = launch;
+        let mut contract = fx.contract("x");
+        contract.heartbeat = Duration::from_secs(1);
+        let mut launch = start(&fx, contract, true);
+        let cadence = 1_000..=1_000 + POLL.as_millis() as u64;
+        wait_until("lease-wait heartbeats", || {
+            times_of(&launch.sink, "write-lease-pending").len() >= 4
+        });
         let warming = launch.sink.first("warming").unwrap();
+        let mut beats = vec![warming.observed_at_unix_millis];
+        beats.extend(times_of(&launch.sink, "write-lease-pending").into_iter().take(4));
+        for pair in beats.windows(2) {
+            assert!(cadence.contains(&(pair[1] - pair[0])), "lease-wait beats {beats:?}");
+        }
         *launch.lease.0.lock().unwrap() = Some(fx.lease(&warming.canonical_sha256().unwrap()));
-        wait_until("active", || launch.sink.first("active").is_some());
-        thread::sleep(Duration::from_millis(250));
-        let beats = launch
-            .sink
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|record| record.detail == "heartbeat")
-            .count();
-        assert!((1..=12).contains(&beats), "{beats} active heartbeats");
+        wait_until("active heartbeats", || times_of(&launch.sink, "heartbeat").len() >= 4);
+        let mut beats = vec![times_of(&launch.sink, "child-healthy")[0]];
+        beats.extend(times_of(&launch.sink, "heartbeat").into_iter().take(4));
+        for pair in beats.windows(2) {
+            assert!(cadence.contains(&(pair[1] - pair[0])), "active beats {beats:?}");
+        }
         assert_eq!(launch.stop().exit_code(), 0);
     }
 
@@ -2166,6 +2422,7 @@ mod tests {
 
     fn observing(fx: &Fixture) -> Responder {
         let shared = shared(fx, Arc::new(Health(AtomicBool::new(true))));
+        shared.refresh_health();
         Arc::new(move |request| shared.observe(request))
     }
 
@@ -2371,7 +2628,7 @@ mod tests {
         wait_until("active", || sink.first("active").is_some());
         // The first challenge reaches the tripwire on the presence thread.
         assert!(!challenge_answered(address, &fx));
-        assert_eq!(handle.join().unwrap(), Outcome::Failed("presence-acceptor"));
+        assert_eq!(join_within(Duration::from_secs(20), handle), Outcome::Failed("presence-acceptor"));
         assert_eq!(sink.first("failed").unwrap().detail, "presence-acceptor");
         assert!(child.terminated.load(Ordering::SeqCst), "the child outlived the unit");
     }
@@ -2520,7 +2777,7 @@ mod tests {
         });
         let probe = HttpHealthProbe { member, path: "/health".into() };
         let started = Instant::now();
-        assert!(!probe.healthy());
+        assert!(!within(Duration::from_secs(5), move || probe.healthy()));
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(900), "gave up before its timeout: {elapsed:?}");
         assert!(elapsed < HEALTH_PROBE_TIMEOUT + Duration::from_millis(200), "outlived its timeout: {elapsed:?}");
@@ -2544,10 +2801,10 @@ mod tests {
         });
         let probe = HttpHealthProbe { member, path: "/health".into() };
         let started = Instant::now();
-        assert!(!probe.healthy());
+        assert!(!within(Duration::from_secs(5), move || probe.healthy()));
         let elapsed = started.elapsed();
         assert!(elapsed < HEALTH_PROBE_TIMEOUT + Duration::from_millis(200), "outlived its deadline: {elapsed:?}");
-        let _ = dribbler.join();
+        join_within(Duration::from_secs(10), dribbler);
     }
 
     #[test]
