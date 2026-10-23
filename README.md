@@ -181,6 +181,26 @@ required_environment = [
 ]
 ```
 
+A directory artifact is sealed read-only: its files are 0444 and its
+directories 0555, whatever mode the build or git gave them. A file the tree
+must run, such as the launcher's `upstream/bin/daemon` child, is declared in
+`executable_members` and sealed 0555. The members are part of the sealed release
+address, so changing the list makes a new release. Idunn refuses the release if a
+member is absolute, climbs with `..`, is missing, is a symlink or sits behind
+one, or is not a regular file; `executable = true` on a directory output and
+`executable_members` on a file output are refused too.
+
+```toml
+# recipe fragment â€” the upstream artifact declares the child it launches
+[[artifacts]]
+id = "upstream"
+source_kind = "runner-output"
+runner = "build"
+source = "dist/upstream"
+destination = "upstream"
+executable_members = ["bin/daemon"]
+```
+
 ```toml
 # binding fragment — members connect to the member endpoint, which Idunn
 # forwards to the private port derived from the candidate: member
