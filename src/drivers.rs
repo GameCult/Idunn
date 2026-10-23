@@ -12462,7 +12462,7 @@ processes 9
         with_member_listener(&mut driver);
         let member_blocks = |member_port: u16| {
             format!(
-                "upstream idunn_service_route_member {{\n    server 127.0.0.1:{member_port};\n}}\nserver {{\n    listen 127.0.0.1:4120;\n    proxy_pass idunn_service_route_member;\n}}\n"
+                "limit_conn_zone \"idunn_service_route_member\" zone=idunn_service_route_member:64k;\nupstream idunn_service_route_member {{\n    server 127.0.0.1:{member_port};\n}}\nserver {{\n    listen 127.0.0.1:4120;\n    limit_conn idunn_service_route_member 200;\n    proxy_pass idunn_service_route_member;\n}}\n"
             )
         };
         let rendered = String::from_utf8(driver.render(&candidate)?)?;
