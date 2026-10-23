@@ -2375,6 +2375,53 @@ mod tests {
         assert_eq!(launch.stop().exit_code(), 0);
     }
 
+
+    /// Healthy, and notes the virtual time of every probe.
+    struct RecordingProbe {
+        clock: Arc<FastClock>,
+        at: Mutex<Vec<u64>>,
+    }
+
+    impl HealthProbe for RecordingProbe {
+        fn healthy(&self) -> bool {
+            self.at.lock().unwrap().push(self.clock.now_millis());
+            true
+        }
+    }
+
+    #[test]
+    fn an_active_child_is_probed_at_the_refresh_cadence() {
+        let fx = fixture(false);
+        let sink = Arc::new(Sink::default());
+        let clock = Arc::new(FastClock(AtomicU64::new(1_000_000)));
+        let probe = Arc::new(RecordingProbe { clock: clock.clone(), at: Mutex::new(Vec::new()) });
+        let seen = probe.clone();
+        let ports = Ports {
+            credentials: Arc::new(Credentials(BTreeMap::new())),
+            clock,
+            sink: sink.clone(),
+            lease: Arc::new(FakeLease::default()),
+            spawner: Box::new(FakeSpawner(Arc::new(Child::default()))),
+            health: Box::new(move |_| probe.clone()),
+        };
+        let contract = fx.contract("x");
+        let authority = fx.authority();
+        let route = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tmp = fx.dir.path().join("tmp");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let unit = thread::spawn(move || run(&contract, authority, route, member(), &tmp, ports, &flag));
+        wait_until("five probes", || seen.at.lock().unwrap().len() >= 5);
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(join_within(Duration::from_secs(10), unit), Outcome::Stopped);
+        let at = seen.at.lock().unwrap().clone();
+        // The first probe ends startup; the rest follow the refresh cadence.
+        let cadence = HEALTH_REFRESH.as_millis() as u64..=HEALTH_REFRESH.as_millis() as u64 + POLL.as_millis() as u64;
+        for pair in at[1..].windows(2) {
+            assert!(cadence.contains(&(pair[1] - pair[0])), "probes at {at:?}");
+        }
+    }
+
     #[test]
     fn process_spawner_escalates_to_kill_when_the_child_ignores_sigterm() {
         let mut stubborn = ProcessSpawner
