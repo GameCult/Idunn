@@ -734,6 +734,11 @@ pub struct ArtifactReceipt {
     pub sha256: String,
     pub size_bytes: u64,
     pub executable: bool,
+    /// Files sealed executable inside a directory artifact. Skipped when empty
+    /// so a receipt with no members keeps its original encoding, and so its
+    /// sealed release id.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub executable_members: BTreeSet<PathBuf>,
 }
 
 impl ArtifactReceipt {
@@ -747,7 +752,9 @@ impl ArtifactReceipt {
             .find(|artifact| artifact.id == self.artifact_id)
             .with_context(|| format!("plan declares no artifact {}", self.artifact_id))?;
         ensure!(
-            self.destination == declared.destination && self.executable == declared.executable,
+            self.destination == declared.destination
+                && self.executable == declared.executable
+                && self.executable_members == declared.executable_members,
             "artifact receipt differs from declared output"
         );
         if let Some(expected_sha256) = &declared.expected_sha256 {
@@ -1425,6 +1432,7 @@ nodes = ["yggdrasil"]
             sha256: digest(b'c'),
             size_bytes: 42,
             executable: true,
+            executable_members: BTreeSet::new(),
         }
     }
 
@@ -1789,6 +1797,113 @@ nodes = ["yggdrasil"]
         let mut changed = release;
         changed.external_inputs[0].size_bytes = 18;
         assert!(changed.validate_against(&plan).is_err());
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn receipt_without_members_encodes_as_before() {
+        // Both values were computed outside this code, from the five-field
+        // msgpack array the receipt encoded to at base d74ac8d.
+        const BASE_RECEIPT: &str = "95a66461656d6f6ea773657276696365d9477368613235362d636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632ac3";
+        const BASE_RELEASE_ID: &str =
+            "sha256-b9143d8f546ad71c493c70037813547aaec10fd87994a6f3bdc77ac3a8b3495e";
+        let receipt = artifact_receipt();
+        let encoded = rmp_serde::to_vec(&receipt).unwrap();
+        assert_eq!(hex(&encoded), BASE_RECEIPT);
+        let bytes = (0..BASE_RECEIPT.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&BASE_RECEIPT[at..at + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rmp_serde::from_slice::<ArtifactReceipt>(&bytes).unwrap(), receipt);
+        let release = SealedRelease {
+            schema: SEALED_RELEASE_SCHEMA.into(),
+            sealed_release_id: String::new(),
+            plan_id: digest(b'a'),
+            artifacts: vec![receipt],
+            external_inputs: vec![],
+            sealed_at_unix_millis: 0,
+        };
+        assert_eq!(release.recomputed_release_id().unwrap(), BASE_RELEASE_ID);
+    }
+
+    #[test]
+    fn sealed_release_address_covers_executable_members() {
+        let release_with = |members: &[&str]| SealedRelease {
+            schema: SEALED_RELEASE_SCHEMA.into(),
+            sealed_release_id: String::new(),
+            plan_id: digest(b'a'),
+            artifacts: vec![ArtifactReceipt {
+                executable: false,
+                executable_members: members.iter().map(PathBuf::from).collect(),
+                ..artifact_receipt()
+            }],
+            external_inputs: vec![],
+            sealed_at_unix_millis: 0,
+        };
+        let none = release_with(&[]).recomputed_release_id().unwrap();
+        let one = release_with(&["bin/daemon"]).recomputed_release_id().unwrap();
+        let other = release_with(&["bin/other"]).recomputed_release_id().unwrap();
+        let two = release_with(&["bin/daemon", "bin/other"])
+            .recomputed_release_id()
+            .unwrap();
+        let all = [&none, &one, &other, &two];
+        for (index, left) in all.iter().enumerate() {
+            for right in &all[index + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+
+        // The declaration is the other half: a receipt must carry exactly the
+        // declared list, in a plan that declares one and in one that does not.
+        let plain = plan();
+        let mut with_members = artifact_receipt();
+        with_members.executable_members = BTreeSet::from([PathBuf::from("bin/daemon")]);
+        assert!(
+            SealedRelease::new(&plain, vec![with_members], vec![external_input_receipt()], 120)
+                .is_err()
+        );
+        let recipe = RECIPE.replace("executable = true", "executable_members = [\"bin/daemon\", \"lib/tool\"]");
+        let declaring = compile_deployment_plan(
+            recipe.as_bytes(),
+            BINDING.as_bytes(),
+            source(&recipe),
+            "service-incarnation-1",
+            Some(18001),
+            110,
+            &[ready_odin_provider("odin", "odin-yggdrasil", 1)],
+        )
+        .unwrap();
+        let honest = ArtifactReceipt {
+            executable: false,
+            executable_members: BTreeSet::from([PathBuf::from("bin/daemon"), PathBuf::from("lib/tool")]),
+            ..artifact_receipt()
+        };
+        let release = SealedRelease::new(
+            &declaring,
+            vec![honest.clone()],
+            vec![external_input_receipt()],
+            120,
+        )
+        .unwrap();
+        release.validate_against(&declaring).unwrap();
+        for drifted in [
+            BTreeSet::from([PathBuf::from("bin/daemon")]),
+            BTreeSet::from([PathBuf::from("bin/daemon"), PathBuf::from("lib/other")]),
+            BTreeSet::new(),
+        ] {
+            let mut receipt = honest.clone();
+            receipt.executable_members = drifted;
+            assert!(
+                SealedRelease::new(&declaring, vec![receipt], vec![external_input_receipt()], 120)
+                    .is_err()
+            );
+        }
+        let mut changed = release.clone();
+        changed.artifacts[0].executable_members.insert(PathBuf::from("lib/extra"));
+        assert!(changed.validate_against(&declaring).is_err());
     }
 
     fn binding_with_deadlines(table: &str) -> String {

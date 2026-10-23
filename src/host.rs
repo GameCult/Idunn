@@ -35,8 +35,9 @@ use crate::deployment::{
 };
 use crate::deployment_plan::{ArtifactReceipt, CompiledDeploymentPlan, SealedRelease};
 use crate::drivers::{
-    HostWorkloadObservation, InstalledReleaseObservation, copy_artifact, copy_tree,
-    digest_artifact, release_artifact, remove_tree_inside, sha256_id, write_runtime_bundle_records,
+    HostWorkloadObservation, InstalledReleaseObservation, check_artifact_modes, copy_artifact,
+    copy_tree, digest_artifact, release_artifact, remove_tree_inside, sha256_id,
+    write_runtime_bundle_records,
 };
 use crate::host_actuator::{
     HOST_ACTUATOR_CHANNEL, HOST_ACTUATOR_CONNECTION_ID, HOST_ACTUATOR_PING_MS,
@@ -1064,6 +1065,7 @@ fn materialize(
             "artifact destination escaped its staging root"
         );
         copy_artifact(&source, &source_path, &destination)?;
+        check_artifact_modes(artifact, &destination)?;
         let (sha256, size_bytes) = digest_artifact(&destination)?;
         if let Some(expected) = &artifact.expected_sha256 {
             ensure!(
@@ -1078,6 +1080,7 @@ fn materialize(
             sha256: format!("sha256-{sha256}"),
             size_bytes,
             executable: artifact.executable,
+            executable_members: artifact.executable_members.clone(),
         });
     }
     let release = SealedRelease::new(plan, artifacts, Vec::new(), sealed_at_unix_millis)?;
