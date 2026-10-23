@@ -190,6 +190,12 @@ member is absolute, climbs with `..`, is missing, is a symlink or sits behind
 one, or is not a regular file; `executable = true` on a directory output and
 `executable_members` on a file output are refused too.
 
+A tree may hold relative symlinks whose `..` steps all come first and climb no
+higher than the artifact's top (`share/terminfo/4/4025ex -> ../t/tek4025ex` is
+kept). An absolute link, a `..` after a name, or a climb out of the artifact
+refuses the release when it is sealed. Host targets (Windows) record
+`executable` and `executable_members` in the receipt and do not apply them.
+
 ```toml
 # recipe fragment — the upstream artifact declares the child it launches
 [[artifacts]]
