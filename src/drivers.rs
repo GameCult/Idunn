@@ -12508,7 +12508,7 @@ processes 9
     /// 4103, 4104, 4120 and 4121, so it runs on demand in a container:
     /// `cargo test --lib real_nginx -- --ignored`.
     #[cfg(unix)]
-    fn challenges_answered_during_a_member_flood(max_connections: u32) -> Result<usize> {
+    fn challenges_answered_during_a_member_flood(max_connections: u16) -> Result<usize> {
         use std::net::{TcpListener, TcpStream};
         use std::process::{Child, Command};
         use std::sync::Arc;
@@ -12636,9 +12636,9 @@ processes 9
     #[test]
     #[ignore = "needs nginx on PATH and fixed loopback ports; run in a container"]
     fn real_nginx_flood_starves_presence_without_a_member_limit() -> Result<()> {
-        // The control: the same flood against a limit too high to bind starves
+        // The control: the same flood against a limit too high to bind (nginx allows up to 65535) starves
         // presence, so the test above measures the limit and not the load.
-        assert!(challenges_answered_during_a_member_flood(100_000)? < 20);
+        assert!(challenges_answered_during_a_member_flood(60_000)? < 20);
         Ok(())
     }
 

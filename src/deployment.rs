@@ -699,12 +699,12 @@ pub struct MemberListenerBinding {
     /// route's presence block shares, so this limit is what keeps members from
     /// exhausting it.
     #[serde(default = "default_member_max_connections")]
-    pub max_connections: u32,
+    pub max_connections: u16,
 }
 
-const DEFAULT_MEMBER_MAX_CONNECTIONS: u32 = 128;
+const DEFAULT_MEMBER_MAX_CONNECTIONS: u16 = 128;
 
-fn default_member_max_connections() -> u32 {
+fn default_member_max_connections() -> u16 {
     DEFAULT_MEMBER_MAX_CONNECTIONS
 }
 
@@ -2446,6 +2446,8 @@ max_connections = {value}"),
         );
         assert_eq!(limit("7").unwrap().route.unwrap().member.unwrap().max_connections, 7);
         assert!(limit("0").is_err());
+        assert!(limit("65535").is_ok());
+        assert!(limit("65536").is_err());
         // Zero, and a width that overflows u16.
         assert!(start("0").is_err());
         assert!(start("65530").is_err());

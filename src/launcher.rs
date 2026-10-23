@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use cultcache_rs::{DatabaseEntry, SingleFileMessagePackBackingStore};
+use cultcacheclock: Arc::new(PresenceTripwire(FastClock(AtomicU64::new(1_000_000)))),health: Box::new(|_| Arc::new(Health(AtomicBool::new(true)))),rs::{DatabaseEntry, SingleFileMessagePackBackingStore};
 use cultnet_rs::{
     CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding,
     CultNetRudpReliableSendStatus, CultNetRudpSocketTransportConnection,
@@ -2592,14 +2592,19 @@ mod tests {
         serving.join().unwrap();
     }
 
-    /// Healthy for everyone but the presence thread, which it kills: the
+    /// A clock that kills the presence thread when it reads the time: the
     /// stand-in for a presence acceptor that dies while the child is fine.
-    struct PresenceTripwire;
+    /// Answering a challenge signs, and signing reads the clock.
+    struct PresenceTripwire(FastClock);
 
-    impl HealthProbe for PresenceTripwire {
-        fn healthy(&self) -> bool {
+    impl Clock for PresenceTripwire {
+        fn now_millis(&self) -> u64 {
             assert_ne!(thread::current().name(), Some("presence-acceptor"), "presence thread killed");
-            true
+            self.0.now_millis()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.0.sleep(duration);
         }
     }
 
