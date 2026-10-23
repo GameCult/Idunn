@@ -12627,6 +12627,7 @@ processes 9
                 answered += 1;
             }
         }
+        eprintln!("answered {answered} of 20 challenges with a member limit of {max_connections}");
         drop(flood);
         halt.store(true, Ordering::SeqCst);
         presence.join().unwrap();
