@@ -65,6 +65,9 @@ const HEALTH_REFRESH: Duration = Duration::from_millis(500);
 /// that refreshes it is itself stuck.
 const HEALTH_STALE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(100);
+/// The largest duration a recipe may declare for the lease wait, the startup
+/// wait or the heartbeat: one day. Past it a deadline is not a deadline.
+const MAX_DECLARED_SECONDS: u64 = 86_400;
 const MAX_RECENT_WARMING_PROOFS: usize = 64;
 const TERMINATE_GRACE: Duration = Duration::from_secs(20);
 const ODIN_CULTMESH_CATALOG_CONNECTION_ID: u32 = 0x0d1d_0002;
@@ -110,8 +113,10 @@ impl LaunchContract {
                 value
                     .parse::<u64>()
                     .ok()
-                    .filter(|seconds| *seconds > 0)
-                    .with_context(|| format!("launcher argument {field} is not a positive integer"))
+                    .filter(|seconds| (1..=MAX_DECLARED_SECONDS).contains(seconds))
+                    .with_context(|| {
+                        format!("launcher argument {field} is outside 1 to {MAX_DECLARED_SECONDS} seconds")
+                    })
             };
             match flag.as_str() {
                 "--child" => child = Some(release_relative(&value, "--child")?),
@@ -896,14 +901,13 @@ impl Shared {
     /// A child never probed, wedged, or probed too long ago reads degraded. A
     /// dead presence acceptor does not degrade presence: it fails the unit.
     fn serving_state(&self) -> &'static str {
-        let now = self.clock.monotonic_millis();
         let stale = u64::try_from(HEALTH_STALE.as_millis()).unwrap_or(u64::MAX);
-        let healthy = self
-            .probed
-            .lock()
-            .ok()
-            .and_then(|probed| *probed)
-            .is_some_and(|(healthy, at)| healthy && now.checked_sub(at).is_some_and(|age| age <= stale));
+        // The result is read before the clock: a stamp is taken before it is
+        // stored, so a later reading of the monotonic clock is never behind it,
+        // whatever the presence thread does between the two.
+        let probed = self.probed.lock().ok().and_then(|probed| *probed);
+        let now = self.clock.monotonic_millis();
+        let healthy = probed.is_some_and(|(healthy, at)| healthy && now.saturating_sub(at) <= stale);
         if healthy { "active" } else { "degraded" }
     }
 
@@ -1093,6 +1097,12 @@ pub fn parse_member_bind(raw: &str, candidate_bind: &str) -> Result<SocketAddr> 
     Ok(member)
 }
 
+/// The monotonic reading `span` after `now`; a span too long to represent is a
+/// deadline that never arrives.
+fn after(now: u64, span: Duration) -> u64 {
+    now.saturating_add(u64::try_from(span.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// The unit's whole life: Warming, lease, child, Active, until the child or the
 /// lease ends or SIGTERM arrives. `route` is the already-bound candidate
 /// listener, answered for presence only; `member` is the address the child
@@ -1188,14 +1198,14 @@ fn lifecycle(
         }
     };
     remember(publish("warming", "launcher-started", None), &mut proofs);
-    let heartbeat = u64::try_from(contract.heartbeat.as_millis()).unwrap_or(u64::MAX);
-    let mut next_heartbeat = clock.monotonic_millis() + heartbeat;
+    let heartbeat = contract.heartbeat;
+    let mut next_heartbeat = after(clock.monotonic_millis(), heartbeat);
 
     // 2. A stateful child waits for the lease; a stateless one does not.
     let mut lease_sha = None;
     let mut lease_fd = None;
     if expected.write_lease_required {
-        let deadline = clock.monotonic_millis() + contract.lease_wait.as_millis() as u64;
+        let deadline = after(clock.monotonic_millis(), contract.lease_wait);
         loop {
             if stop.load(Ordering::SeqCst) {
                 return Outcome::Stopped;
@@ -1223,7 +1233,7 @@ fn lifecycle(
             }
             if now >= next_heartbeat {
                 remember(publish("warming", "write-lease-pending", None), &mut proofs);
-                next_heartbeat = now + heartbeat;
+                next_heartbeat = after(now, heartbeat);
             }
             clock.sleep(POLL);
         }
@@ -1233,7 +1243,7 @@ fn lifecycle(
     let Some(mut child) = start_child(contract, member, tmp, ports, lease_fd) else {
         return fail(None, "child-start-refused");
     };
-    let startup_deadline = clock.monotonic_millis() + contract.startup.as_millis() as u64;
+    let startup_deadline = after(clock.monotonic_millis(), contract.startup);
     loop {
         if stop.load(Ordering::SeqCst) {
             child.terminate(TERMINATE_GRACE);
@@ -1257,9 +1267,8 @@ fn lifecycle(
     // 4. Active, and heartbeats while it holds.
     set_phase(Phase::Active(lease_sha.clone()));
     publish(shared.serving_state(), "child-healthy", lease_sha.clone());
-    let refresh = u64::try_from(HEALTH_REFRESH.as_millis()).unwrap_or(u64::MAX);
-    let mut next_probe = clock.monotonic_millis() + refresh;
-    next_heartbeat = clock.monotonic_millis() + heartbeat;
+    let mut next_probe = after(clock.monotonic_millis(), HEALTH_REFRESH);
+    next_heartbeat = after(clock.monotonic_millis(), heartbeat);
     loop {
         if stop.load(Ordering::SeqCst) {
             child.terminate(TERMINATE_GRACE);
@@ -1277,11 +1286,11 @@ fn lifecycle(
         let now = clock.monotonic_millis();
         if now >= next_probe {
             shared.refresh_health();
-            next_probe = now + refresh;
+            next_probe = after(now, HEALTH_REFRESH);
         }
         if now >= next_heartbeat {
             publish(shared.serving_state(), "heartbeat", lease_sha.clone());
-            next_heartbeat = now + heartbeat;
+            next_heartbeat = after(now, heartbeat);
         }
         clock.sleep(POLL);
     }
@@ -1492,6 +1501,8 @@ mod tests {
         }
     }
 
+    const WALL_EPOCH_MILLIS: i64 = 1_760_000_000_000;
+
     /// Virtual time runs a hundred times faster than the wall clock.
     struct FastClock {
         monotonic: AtomicU64,
@@ -1499,8 +1510,11 @@ mod tests {
     }
 
     impl FastClock {
+        /// The wall clock starts a Unix-epoch-sized distance from the monotonic
+        /// one, as the real pair does, so a deadline or schedule that reads the
+        /// wrong source is off by that distance and no test can pass by it.
         fn new(start: u64) -> Self {
-            Self { monotonic: AtomicU64::new(start), wall_step: AtomicI64::new(0) }
+            Self { monotonic: AtomicU64::new(start), wall_step: AtomicI64::new(WALL_EPOCH_MILLIS) }
         }
 
         /// Steps the wall clock alone, as timesyncd or a VM restore would.
@@ -2367,13 +2381,93 @@ mod tests {
         assert_eq!(shared.serving_state(), "degraded", "monotonic age decides, whatever the wall says");
     }
 
+    /// A monotonic clock whose read, on a thread that marks itself, returns the
+    /// current value and then waits to be released: the presence thread
+    /// descheduled right after it reads the time.
+    struct HeldClock {
+        monotonic: AtomicU64,
+        held: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    thread_local! {
+        static HOLD_THIS_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    impl Clock for HeldClock {
+        fn now_millis(&self) -> u64 {
+            0
+        }
+
+        fn monotonic_millis(&self) -> u64 {
+            let value = self.monotonic.load(Ordering::SeqCst);
+            if HOLD_THIS_READ.with(std::cell::Cell::get) {
+                self.held.lock().unwrap().take().unwrap().send(()).unwrap();
+                self.release.lock().unwrap().take().unwrap().recv().unwrap();
+            }
+            value
+        }
+
+        fn sleep(&self, _: Duration) {}
+    }
+
     #[test]
-    fn a_result_stamped_after_now_is_not_evidence() {
+    fn a_presence_read_descheduled_across_a_probe_still_sees_a_healthy_child() {
         let fx = fixture(false);
-        let clock = Arc::new(FastClock::new(100_000_000));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let clock = Arc::new(HeldClock {
+            monotonic: AtomicU64::new(1_000),
+            held: Mutex::new(Some(held_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
         let shared = shared_on(&fx, Arc::new(Health(AtomicBool::new(true))), clock.clone());
-        *shared.probed.lock().unwrap() = Some((true, 100_000_001));
-        assert_eq!(shared.serving_state(), "degraded");
+        shared.refresh_health();
+        let reader = {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                HOLD_THIS_READ.with(|hold| hold.set(true));
+                shared.serving_state()
+            })
+        };
+        // The reader is descheduled in its clock read. The lifecycle probes a
+        // millisecond later and stores a result stamped after the reader's time.
+        held_rx.recv().unwrap();
+        clock.monotonic.store(1_001, Ordering::SeqCst);
+        assert!(shared.refresh_health());
+        release_tx.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), "active");
+    }
+
+    #[test]
+    fn the_declared_durations_are_bounded_at_parse() {
+        let base: Vec<String> = [
+            "--child", "bin/c", "--template", "t", "--health-path", "/h", "--health-contract", "hc",
+        ]
+        .map(String::from)
+        .to_vec();
+        for flag in ["--lease-wait-secs", "--startup-secs", "--heartbeat-secs"] {
+            for (value, accepted) in [
+                (MAX_DECLARED_SECONDS.to_string(), true),
+                ((MAX_DECLARED_SECONDS + 1).to_string(), false),
+                (u64::MAX.to_string(), false),
+            ] {
+                let mut args = base.clone();
+                args.extend([flag.to_owned(), value.clone()]);
+                let parsed = LaunchContract::parse(PathBuf::from("/r"), args);
+                assert_eq!(parsed.is_ok(), accepted, "{flag} {value}");
+                if let Err(error) = parsed {
+                    assert!(!format!("{error:#}").contains(&value), "the refusal echoes its input");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_span_too_long_for_the_clock_is_a_deadline_that_never_arrives() {
+        assert_eq!(after(10, Duration::from_millis(5)), 15);
+        assert_eq!(after(u64::MAX - 1, Duration::from_secs(1)), u64::MAX);
+        assert_eq!(after(10, Duration::MAX), u64::MAX);
     }
 
     /// Runs `work` and returns its result, failing the test when it has not
@@ -2872,7 +2966,7 @@ mod tests {
     /// A clock that kills the presence thread when it reads the time: the
     /// stand-in for a presence acceptor that dies while the child is fine.
     /// Answering a challenge reads the cached result's age, which reads the
-    /// monotonic clock before any lock is held.
+    /// monotonic clock.
     struct PresenceTripwire(FastClock);
 
     impl Clock for PresenceTripwire {
