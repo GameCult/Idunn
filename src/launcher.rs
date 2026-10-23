@@ -2415,9 +2415,9 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         assert_eq!(join_within(Duration::from_secs(10), unit), Outcome::Stopped);
         let at = seen.at.lock().unwrap().clone();
-        // The first probe ends startup; the rest follow the refresh cadence.
+        // The first probe ends startup; every later one follows the cadence.
         let cadence = HEALTH_REFRESH.as_millis() as u64..=HEALTH_REFRESH.as_millis() as u64 + POLL.as_millis() as u64;
-        for pair in at[1..].windows(2) {
+        for pair in at.windows(2) {
             assert!(cadence.contains(&(pair[1] - pair[0])), "probes at {at:?}");
         }
     }
