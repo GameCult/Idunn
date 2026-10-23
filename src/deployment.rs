@@ -694,6 +694,18 @@ pub struct RouteBinding {
 pub struct MemberListenerBinding {
     pub stable_endpoint: String,
     pub private_port_start: u16,
+    /// Most member connections nginx holds open at once for this route. Each
+    /// costs nginx two connections (client and upstream) from the pool the
+    /// route's presence block shares, so this limit is what keeps members from
+    /// exhausting it.
+    #[serde(default = "default_member_max_connections")]
+    pub max_connections: u32,
+}
+
+const DEFAULT_MEMBER_MAX_CONNECTIONS: u32 = 128;
+
+fn default_member_max_connections() -> u32 {
+    DEFAULT_MEMBER_MAX_CONNECTIONS
 }
 
 impl RouteBinding {
@@ -1465,6 +1477,10 @@ impl OperatorBinding {
                 ensure!(
                     member.private_port_start > 0,
                     "member private port range starts at zero"
+                );
+                ensure!(
+                    member.max_connections > 0,
+                    "member connection limit is zero"
                 );
                 let width = route.private_port_end - route.private_port_start;
                 let member_end = member
@@ -2416,6 +2432,20 @@ nodes = ["yggdrasil"]
         assert!(start("18840").is_ok());
         assert!(start("18822").is_ok());
         assert!(start("18823").is_err());
+        // The connection limit defaults, and zero is refused.
+        let limit = |value: &str| {
+            member_binding_with((
+                "private_port_start = 18841",
+                &format!("private_port_start = 18841
+max_connections = {value}"),
+            ))
+        };
+        assert_eq!(
+            member_binding_with(("never-matches", "")).unwrap().route.unwrap().member.unwrap().max_connections,
+            128
+        );
+        assert_eq!(limit("7").unwrap().route.unwrap().member.unwrap().max_connections, 7);
+        assert!(limit("0").is_err());
         // Zero, and a width that overflows u16.
         assert!(start("0").is_err());
         assert!(start("65530").is_err());

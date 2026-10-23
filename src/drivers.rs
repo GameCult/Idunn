@@ -5391,8 +5391,16 @@ impl NginxRouteDriver {
                 ) {
                     (Some((member_host, member_stable_port)), Some(member_port)) => {
                         let member_upstream = format!("{upstream}_member");
+                        let max_connections = self
+                            .binding
+                            .member
+                            .as_ref()
+                            .map_or(0, |member| member.max_connections);
+                        // One constant key: the limit is on the route's members
+                        // together, so a flood of them can never take the
+                        // connections the presence block needs.
                         format!(
-                            "upstream {member_upstream} {{\n    server {candidate_host}:{member_port};\n}}\nserver {{\n    listen {member_host}:{member_stable_port};\n    proxy_pass {member_upstream};\n}}\n"
+                            "limit_conn_zone \"{member_upstream}\" zone={member_upstream}:64k;\nupstream {member_upstream} {{\n    server {candidate_host}:{member_port};\n}}\nserver {{\n    listen {member_host}:{member_stable_port};\n    limit_conn {member_upstream} {max_connections};\n    proxy_pass {member_upstream};\n}}\n"
                         )
                     }
                     _ => String::new(),
@@ -12424,6 +12432,7 @@ processes 9
         driver.binding.member = Some(crate::deployment::MemberListenerBinding {
             stable_endpoint: "http://127.0.0.1:4120".into(),
             private_port_start: 4121,
+            max_connections: 200,
         });
     }
 
@@ -12490,6 +12499,146 @@ processes 9
                 "ufw delete allow in to 127.0.0.1 port 4120 proto tcp",
             ]
         );
+        Ok(())
+    }
+
+    /// Real nginx over the rendered two-block fragment, a real presence
+    /// acceptor behind the presence block and a flood of idle members on the
+    /// member block. Needs an `nginx` on PATH and the fixed loopback ports
+    /// 4103, 4104, 4120 and 4121, so it runs on demand in a container:
+    /// `cargo test --lib real_nginx -- --ignored`.
+    #[cfg(unix)]
+    fn challenges_answered_during_a_member_flood(max_connections: u32) -> Result<usize> {
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Child, Command};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Nginx(Child);
+        impl Drop for Nginx {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let (mut driver, candidate, _calls) = stubbed_route_driver(temp.path())?;
+        with_member_listener(&mut driver);
+        driver.binding.member.as_mut().unwrap().max_connections = max_connections;
+        let fragment = temp.path().join("route.conf");
+        fs::write(&fragment, driver.render(&candidate)?)?;
+        // Debian builds the stream module dynamic.
+        let module = Path::new("/usr/lib/nginx/modules/ngx_stream_module.so");
+        let load = if module.exists() {
+            format!("load_module {};
+", module.display())
+        } else {
+            String::new()
+        };
+        let conf = temp.path().join("nginx.conf");
+        fs::write(
+            &conf,
+            format!(
+                "{load}worker_processes 1;\npid {dir}/nginx.pid;\nerror_log {dir}/error.log;\nevents {{ worker_connections 512; }}\nstream {{ include {fragment}; }}\n",
+                dir = temp.path().display(),
+                fragment = fragment.display()
+            ),
+        )?;
+        let halt = Arc::new(AtomicBool::new(false));
+        let presence = crate::launcher::PresenceAcceptor::new(
+            TcpListener::bind("127.0.0.1:4104")?,
+            Arc::new(|request| match request {
+                CultNetMessage::SnapshotRequest { message_id, .. } => {
+                    Ok(CultNetMessage::SnapshotResponseRaw { message_id, documents: vec![] })
+                }
+                _ => bail!("not a snapshot request"),
+            }),
+        );
+        let presence_halt = halt.clone();
+        let presence = thread::spawn(move || presence.serve(presence_halt));
+        // The member backend accepts and holds every connection.
+        let members = TcpListener::bind("127.0.0.1:4121")?;
+        members.set_nonblocking(true)?;
+        let member_halt = halt.clone();
+        let members = thread::spawn(move || {
+            let mut held = Vec::new();
+            while !member_halt.load(Ordering::SeqCst) {
+                match members.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        let _nginx = Nginx(
+            Command::new("nginx")
+                .args(["-p"])
+                .arg(temp.path())
+                .arg("-c")
+                .arg(&conf)
+                .args(["-g", "daemon off;"])
+                .spawn()?,
+        );
+        let stable: SocketAddr = "127.0.0.1:4103".parse()?;
+        let ready = Instant::now();
+        while TcpStream::connect(stable).is_err() {
+            ensure!(ready.elapsed() < Duration::from_secs(10), "nginx never listened");
+            thread::sleep(Duration::from_millis(50));
+        }
+        // The probe connection above reached the presence acceptor as an idle
+        // peer; let its deadline lapse so only the flood is measured.
+        thread::sleep(Duration::from_millis(1200));
+
+        let mut flood = Vec::new();
+        for _ in 0..300 {
+            if let Ok(mut stream) = TcpStream::connect("127.0.0.1:4120") {
+                let _ = stream.write_all(b"x");
+                flood.push(stream);
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+
+        let payload = encode_cultnet_message_to_vec(
+            &CultNetMessage::SnapshotRequest {
+                message_id: "flood".into(),
+                schema_ids: None,
+                record_keys: None,
+            },
+            CultNetWireContract::CultNetSchemaV0,
+        )?;
+        let mut answered = 0;
+        for _ in 0..20 {
+            let started = Instant::now();
+            if request_tcp_snapshot(stable, &payload).is_ok()
+                && started.elapsed() < Duration::from_secs(3)
+            {
+                answered += 1;
+            }
+        }
+        drop(flood);
+        halt.store(true, Ordering::SeqCst);
+        presence.join().unwrap();
+        members.join().unwrap();
+        Ok(answered)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs nginx on PATH and fixed loopback ports; run in a container"]
+    fn real_nginx_keeps_presence_answerable_under_a_member_flood() -> Result<()> {
+        // The rendered default limit keeps the route's members out of the
+        // presence block's share of a 512-connection pool.
+        assert_eq!(challenges_answered_during_a_member_flood(128)?, 20);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs nginx on PATH and fixed loopback ports; run in a container"]
+    fn real_nginx_flood_starves_presence_without_a_member_limit() -> Result<()> {
+        // The control: the same flood against a limit too high to bind starves
+        // presence, so the test above measures the limit and not the load.
+        assert!(challenges_answered_during_a_member_flood(100_000)? < 20);
         Ok(())
     }
 
