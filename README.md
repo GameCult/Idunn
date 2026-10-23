@@ -194,6 +194,7 @@ private_port_end = 18839
 [route.member]
 stable_endpoint = "tcp://10.77.0.1:8448"
 private_port_start = 18841
+# max_connections = 128   # nginx limit_conn on the member listener (1-65535)
 ```
 
 ## Contracts

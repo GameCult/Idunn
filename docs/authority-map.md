@@ -90,10 +90,14 @@ activation key.
   back.
 - **Route:** Idunn owns both listeners of the route: the Expected route's
   stable endpoint (presence) and, when the binding has `[route.member]`, the
-  member endpoint, rendered as a second server block in the one nginx fragment.
+  member endpoint, rendered as a second server block in the one nginx fragment
+  with a `limit_conn` on one per-route zone (`max_connections`, default 128), so
+  members cannot exhaust the connections the presence block shares with them.
   The launcher binds the candidate endpoint and answers Idunn's challenge there,
   one connection at a time within a one-second deadline; any other first byte
-  closes the connection. The child binds the member bind Idunn sets in
+  closes the connection. The answer never waits on the child: it reports the
+  lifecycle's last probe, and a failed, missing or stale probe reads `degraded`.
+  The child binds the member bind Idunn sets in
   `GAMECULT_IDUNN_MEMBER_BIND`, derived from the candidate port. Member bytes
   never touch the launcher.
 - **Lease:** with `write_lease_required` the launcher starts the child only
