@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use cultcacheclock: Arc::new(PresenceTripwire(FastClock(AtomicU64::new(1_000_000)))),health: Box::new(|_| Arc::new(Health(AtomicBool::new(true)))),rs::{DatabaseEntry, SingleFileMessagePackBackingStore};
+use cultcache_rs::{DatabaseEntry, SingleFileMessagePackBackingStore};
 use cultnet_rs::{
     CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding,
     CultNetRudpReliableSendStatus, CultNetRudpSocketTransportConnection,
@@ -2615,11 +2615,11 @@ mod tests {
         let child = Arc::new(Child::default());
         let ports = Ports {
             credentials: Arc::new(Credentials(BTreeMap::new())),
-            clock: Arc::new(FastClock(AtomicU64::new(1_000_000))),
+            clock: Arc::new(PresenceTripwire(FastClock(AtomicU64::new(1_000_000)))),
             sink: sink.clone(),
             lease: Arc::new(FakeLease::default()),
             spawner: Box::new(FakeSpawner(child.clone())),
-            health: Box::new(|_| Arc::new(PresenceTripwire)),
+            health: Box::new(|_| Arc::new(Health(AtomicBool::new(true)))),
         };
         let contract = fx.contract("x");
         let authority = fx.authority();
