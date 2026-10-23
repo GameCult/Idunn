@@ -14337,6 +14337,44 @@ processes 9
 
     #[cfg(unix)]
     #[test]
+    fn links_to_existing_targets_are_refused_at_the_seal() -> Result<()> {
+        // Every refused shape, aimed at a target that EXISTS (file and
+        // directory): a judge guarded by `exists()`, `is_dir()` or a file-type
+        // test passes the dangling fixtures and fails these.
+        for kind in ["file", "dir"] {
+            for (shape, rule) in [
+                ("absolute", "absolute"),
+                ("escape", "escapes its artifact"),
+                ("after-name", "climbs after a name"),
+            ] {
+                let temp = tempfile::tempdir()?;
+                let (source, staging) = sample_tree(temp.path())?;
+                let target = match (shape, kind) {
+                    ("absolute", "file") => source.join("upstream/bin/daemon"),
+                    ("absolute", _) => source.join("upstream/lib"),
+                    ("escape", "file") => {
+                        write_file(&source.join("outside-file"), b"outside")?;
+                        PathBuf::from("../../outside-file")
+                    }
+                    ("escape", _) => {
+                        fs::create_dir_all(source.join("outside-dir"))?;
+                        PathBuf::from("../../outside-dir")
+                    }
+                    (_, "file") => PathBuf::from("../bin/../NOTICE"),
+                    _ => PathBuf::from("../bin/../lib"),
+                };
+                let link = source.join("upstream/lib/zzcanary-link");
+                std::os::unix::fs::symlink(&target, &link)?;
+                assert!(fs::metadata(&link).is_ok(), "{shape} {kind} link must resolve");
+                let text = refusal_text(collect_tree(&source, &staging, tree_output(false, &["bin/daemon"])));
+                assert!(text.contains(rule), "{shape} {kind}: {text}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn streamed_digest_is_byte_compatible() -> Result<()> {
         // Not a multiple of the 64 KiB read buffer, so a short last chunk
         // matters; the aligned and empty files are the other boundaries.
