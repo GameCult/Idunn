@@ -12514,10 +12514,18 @@ processes 9
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        struct Nginx(Child);
+        /// Stopped through nginx itself: killing the master would orphan its
+        /// workers, which keep the test's output pipe open.
+        struct Nginx(Child, PathBuf, PathBuf);
         impl Drop for Nginx {
             fn drop(&mut self) {
-                let _ = self.0.kill();
+                let _ = Command::new("nginx")
+                    .arg("-p")
+                    .arg(&self.1)
+                    .arg("-c")
+                    .arg(&self.2)
+                    .args(["-s", "stop"])
+                    .status();
                 let _ = self.0.wait();
             }
         }
@@ -12577,7 +12585,11 @@ processes 9
                 .arg("-c")
                 .arg(&conf)
                 .args(["-g", "daemon off;"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()?,
+            temp.path().to_path_buf(),
+            conf.clone(),
         );
         let stable: SocketAddr = "127.0.0.1:4103".parse()?;
         let ready = Instant::now();
