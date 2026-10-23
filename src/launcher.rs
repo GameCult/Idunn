@@ -2871,16 +2871,17 @@ mod tests {
 
     /// A clock that kills the presence thread when it reads the time: the
     /// stand-in for a presence acceptor that dies while the child is fine.
-    /// Answering a challenge signs, and signing reads the clock.
+    /// Answering a challenge reads the cached result's age, which reads the
+    /// monotonic clock before any lock is held.
     struct PresenceTripwire(FastClock);
 
     impl Clock for PresenceTripwire {
         fn now_millis(&self) -> u64 {
-            assert_ne!(thread::current().name(), Some("presence-acceptor"), "presence thread killed");
             self.0.now_millis()
         }
 
         fn monotonic_millis(&self) -> u64 {
+            assert_ne!(thread::current().name(), Some("presence-acceptor"), "presence thread killed");
             self.0.monotonic_millis()
         }
 
