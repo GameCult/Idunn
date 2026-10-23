@@ -104,6 +104,8 @@ ReadWritePaths=/etc/gamecult/ghostlight/runtime /var/lib/gamecult/ghostlight-wor
 ReadWritePaths=/etc/gamecult/streampixels-service/runtime /var/lib/gamecult/streampixels-service /srv/streampixels-idunn/releases/service
 # StreamPixels web is stateless; it needs only its runtime bundle and releases.
 ReadWritePaths=/etc/gamecult/streampixels-web/runtime /srv/streampixels-idunn/releases/web
+# Vili (motion worker): runtime bundle, state, and releases.
+ReadWritePaths=/etc/gamecult/vili/runtime /var/lib/gamecult/vili /srv/vili-idunn/releases
 
 [Install]
 WantedBy=multi-user.target
