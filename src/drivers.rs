@@ -14192,6 +14192,22 @@ processes 9
 
     #[cfg(unix)]
     #[test]
+    fn an_unreadable_member_is_not_reported_as_missing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (source, _) = sample_tree(temp.path())?;
+        // A component past NAME_MAX fails with an io error that is not NotFound.
+        let long = "z".repeat(300);
+        let text = refusal_text(check_artifact_modes(
+            &tree_output(false, &[long.as_str()]),
+            &source.join("upstream"),
+        ));
+        assert!(!text.contains("missing"), "{text}");
+        assert!(text.contains("inspecting an executable member"), "{text}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn harden_fails_when_a_declared_member_is_absent() -> Result<()> {
         let receipt = |members: &[&str]| ArtifactReceipt {
             artifact_id: "upstream".into(),
