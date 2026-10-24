@@ -470,6 +470,9 @@ pub struct SystemdWorkloadObservation {
     pub no_new_privileges: bool,
     pub umask: String,
     pub inaccessible_paths: String,
+    /// Retired wire slot. systemd 257 displays `LoadCredential` as `[unprintable]` for
+    /// every unit, so it was never evidence: written empty, never compared. Kept so
+    /// compact (positional) MessagePack records of earlier Idunns still decode.
     pub load_credential: String,
     pub main_pid: u32,
     pub process_start_time: u64,
@@ -2459,7 +2462,6 @@ fn changed_systemd_workload_identity_fields(
         no_new_privileges,
         umask,
         inaccessible_paths,
-        load_credential,
         main_pid,
         process_start_time,
         process_uids,
@@ -2859,7 +2861,6 @@ impl SystemdTransientWorkloadDriver {
                 OsString::from("--property=NoNewPrivileges"),
                 OsString::from("--property=UMask"),
                 OsString::from("--property=InaccessiblePaths"),
-                OsString::from("--property=LoadCredential"),
                 OsString::from("--property=OpenFile"),
                 OsString::from("--property=WorkingDirectory"),
                 OsString::from("--property=ControlGroup"),
@@ -2971,38 +2972,7 @@ impl SystemdTransientWorkloadDriver {
         let umask = required_systemd_property(&values, "UMask")?.to_owned();
         let inaccessible_paths =
             required_systemd_property(&values, "InaccessiblePaths")?.to_owned();
-        let load_credential = required_systemd_property(&values, "LoadCredential")?.to_owned();
-        ensure!(
-            service_type == "exec"
-                && restart_policy == "no"
-                && kill_mode == "mixed"
-                // `User` is deliberately not asserted here. Idunn never emits a
-                // User property, and systemd reports the identity it *allocated*
-                // for a DynamicUser unit -- the unit name, or a generated `_du…`
-                // when that is too long -- so the property is never empty for a
-                // running workload and cannot tell an allocated identity from a
-                // pinned one. The invariant it was reaching for, that the workload
-                // does not run as a persistent named account, is carried by
-                // `dynamic_user` below and by Idunn never passing User at all.
-                && dynamic_user
-                && supplementary_groups.is_empty()
-                && capability_bounding_set.is_empty()
-                && ambient_capabilities.is_empty()
-                && private_mounts
-                && private_pids
-                && protect_proc == "invisible"
-                && proc_subset == "all"
-                && no_new_privileges
-                && umask == "0007"
-                && inaccessible_paths == self.credential_root.display().to_string()
-                && load_credential
-                    == if service_credential_names.is_empty() {
-                        ""
-                    } else {
-                        "[unprintable]"
-                    },
-            "systemd workload isolation properties differ from the Idunn contract"
-        );
+        require_systemd_isolation_contract(&values, &self.credential_root)?;
         let working_directory =
             PathBuf::from(required_systemd_property(&values, "WorkingDirectory")?);
         ensure!(
@@ -3144,6 +3114,11 @@ impl SystemdTransientWorkloadDriver {
             );
             Some(path)
         };
+        require_delivered_credentials(
+            &process_root.join("root"),
+            unit,
+            service_credential_names,
+        )?;
         let activation_descriptor = &parent_only_file_descriptors[0];
         ensure!(
             activation_descriptor.fd_name == IDUNN_RUNTIME_ACTIVATION_CREDENTIAL_NAME
@@ -3251,7 +3226,7 @@ impl SystemdTransientWorkloadDriver {
             no_new_privileges,
             umask,
             inaccessible_paths,
-            load_credential,
+            load_credential: String::new(),
             main_pid,
             process_start_time,
             process_uids: process_security.uids,
@@ -3465,12 +3440,7 @@ impl SystemdTransientWorkloadDriver {
         // workload. The same applies to `Group` when no fixed state group is
         // bound. In that case the numeric primary GID must match the allocated
         // UID; a fixed state group still requires both its exact name and GID.
-        let expected_load_credential = if regular_credential_names.is_empty() {
-            ""
-        } else {
-            "[unprintable]"
-        };
-        let launch_contract: [(bool, &str); 27] = [
+        let launch_contract: [(bool, &str); 26] = [
             (
                 observation.unit_description == expected_description,
                 "unit description",
@@ -3509,10 +3479,6 @@ impl SystemdTransientWorkloadDriver {
             (
                 observation.inaccessible_paths == self.credential_root.display().to_string(),
                 "inaccessible paths",
-            ),
-            (
-                observation.load_credential == expected_load_credential,
-                "load credential",
             ),
             (
                 observation.working_directory == installed,
@@ -7269,6 +7235,44 @@ fn path_inside_process_root(process_root: &Path, absolute_path: &Path) -> Result
     Ok(process_root.join(absolute_path.strip_prefix(Path::new("/"))?))
 }
 
+/// The workload holds exactly the credentials Idunn delivered: the entries of
+/// `/run/credentials/<unit>` in the MainPID's root (`process_root` is that root)
+/// equal `expected`, and an absent directory is the empty set. Only entry names
+/// are read; a credential is never opened here. The message names no credential.
+fn require_delivered_credentials(
+    process_root: &Path,
+    unit: &str,
+    expected: &[String],
+) -> Result<()> {
+    let directory = path_inside_process_root(
+        process_root,
+        &Path::new("/run/credentials").join(unit),
+    )?;
+    let mut delivered = Vec::new();
+    match fs::read_dir(&directory) {
+        Ok(entries) => {
+            for entry in entries {
+                let name = entry
+                    .context("reading a delivered credential entry")?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow!("delivered credential name is not UTF-8"))?;
+                delivered.push(name);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("reading the delivered credential directory");
+        }
+    }
+    delivered.sort();
+    ensure!(
+        delivered == expected,
+        "systemd delivered credentials that differ from the Idunn launch"
+    );
+    Ok(())
+}
+
 fn linux_process_security(
     status_path: &Path,
     expected_host_pid: u32,
@@ -7482,6 +7486,56 @@ fn parse_systemd_boolean(values: &BTreeMap<String, String>, name: &str) -> Resul
         "no" => Ok(false),
         _ => bail!("systemd unit exposed a non-boolean {name}"),
     }
+}
+
+/// The isolation properties of a transient workload unit, judged from `systemctl
+/// show`. `LoadCredential` is absent on purpose: systemd 257 displays it as
+/// `[unprintable]` whatever the unit holds, so what the workload was given is
+/// judged by `require_delivered_credentials` from the delivered directory.
+fn require_systemd_isolation_contract(
+    values: &BTreeMap<String, String>,
+    credential_root: &Path,
+) -> Result<()> {
+    let service_type = required_systemd_property(values, "Type")?;
+    let restart_policy = required_systemd_property(values, "Restart")?;
+    let kill_mode = required_systemd_property(values, "KillMode")?;
+    let dynamic_user = parse_systemd_boolean(values, "DynamicUser")?;
+    let supplementary_groups = systemd_property(values, "SupplementaryGroups")?;
+    let capability_bounding_set = systemd_property(values, "CapabilityBoundingSet")?;
+    let ambient_capabilities = systemd_property(values, "AmbientCapabilities")?;
+    let private_mounts = parse_systemd_boolean(values, "PrivateMounts")?;
+    let private_pids = parse_systemd_boolean(values, "PrivatePIDs")?;
+    let protect_proc = required_systemd_property(values, "ProtectProc")?;
+    let proc_subset = required_systemd_property(values, "ProcSubset")?;
+    let no_new_privileges = parse_systemd_boolean(values, "NoNewPrivileges")?;
+    let umask = required_systemd_property(values, "UMask")?;
+    let inaccessible_paths = required_systemd_property(values, "InaccessiblePaths")?;
+    ensure!(
+        service_type == "exec"
+            && restart_policy == "no"
+            && kill_mode == "mixed"
+            // `User` is deliberately not asserted here. Idunn never emits a
+            // User property, and systemd reports the identity it *allocated*
+            // for a DynamicUser unit -- the unit name, or a generated `_du…`
+            // when that is too long -- so the property is never empty for a
+            // running workload and cannot tell an allocated identity from a
+            // pinned one. The invariant it was reaching for, that the workload
+            // does not run as a persistent named account, is carried by
+            // `dynamic_user` below and by Idunn never passing User at all.
+            && dynamic_user
+            && supplementary_groups.is_empty()
+            && capability_bounding_set.is_empty()
+            && ambient_capabilities.is_empty()
+            && private_mounts
+            && private_pids
+            && protect_proc == "invisible"
+            && proc_subset == "all"
+            && no_new_privileges
+            && umask == "0007"
+            && inaccessible_paths == credential_root.display().to_string(),
+        "systemd workload isolation properties differ from the Idunn contract"
+    );
+    Ok(())
 }
 
 fn read_process_environment(path: &Path) -> Result<Vec<Vec<u8>>> {
@@ -9966,6 +10020,168 @@ processes 9
             changed_systemd_workload_identity_fields(&observed, &prior),
             vec!["main_pid"]
         );
+    }
+
+    #[cfg(unix)]
+    fn fixture_show_properties(text: &str) -> Result<BTreeMap<String, String>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let shown = temp.path().join("shown");
+        std::fs::write(&shown, text)?;
+        let systemctl = temp.path().join("systemctl");
+        std::fs::write(
+            &systemctl,
+            format!("#!/bin/sh\ncat '{}'\nexit 0\n", shown.display()),
+        )?;
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))?;
+        let driver = SystemdTransientWorkloadDriver {
+            systemctl_program: systemctl,
+            ..Default::default()
+        };
+        Ok(driver
+            .show_unit("idunn-test.service")?
+            .context("fixture unit was not found")?
+            .properties)
+    }
+
+    /// systemd 257 prints `LoadCredential=[unprintable]` for every unit, so the
+    /// isolation contract must admit the real output of a unit with no service
+    /// credential as well as one with one. The inputs are real captures, not a
+    /// re-spelling.
+    #[cfg(unix)]
+    #[test]
+    fn systemd_257_isolation_contract_admits_a_presence_only_target_and_one_with_service_credentials(
+    ) -> Result<()> {
+        let root = Path::new("/run/idunn/activation-credentials");
+        let vili = include_str!("../tests/fixtures/systemd-257/vili-presence-identity-only.show");
+        let odin = include_str!(
+            "../tests/fixtures/systemd-257/odin-presence-and-one-service-credential.show"
+        );
+        for text in [vili, odin] {
+            assert!(text.contains("LoadCredential=[unprintable]"));
+            require_systemd_isolation_contract(&fixture_show_properties(text)?, root)?;
+        }
+        let default_proc = vili.replace("ProtectProc=invisible", "ProtectProc=default");
+        assert_ne!(default_proc, vili);
+        let other_path = vili.replace(
+            "/run/idunn/activation-credentials",
+            "/run/idunn/elsewhere",
+        );
+        assert_ne!(other_path, vili);
+        for text in [default_proc, other_path] {
+            let error =
+                require_systemd_isolation_contract(&fixture_show_properties(&text)?, root)
+                    .expect_err("a drifted isolation property must be refused");
+            assert_eq!(
+                error.to_string(),
+                "systemd workload isolation properties differ from the Idunn contract"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivered_credentials_are_exactly_the_launch_names() -> Result<()> {
+        let unit = "idunn-test.service";
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        // `Some(entries)` creates the unit's directory in a fresh process root.
+        let check = |delivered: Option<&[&str]>, expected: &[&str]| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            if let Some(entries) = delivered {
+                let directory = temp.path().join("run/credentials").join(unit);
+                std::fs::create_dir_all(&directory)?;
+                for entry in entries {
+                    std::fs::write(directory.join(entry), "canary-credential-contents")?;
+                }
+            }
+            let result = require_delivered_credentials(temp.path(), unit, &names(expected));
+            if let Err(error) = &result {
+                let text = format!("{error:#}");
+                for canary in ["STOWAWAY", "ODIN_TOPOLOGY_IDENTITY", "canary-credential"] {
+                    assert!(!text.contains(canary), "error echoed {canary}");
+                }
+                assert!(!text.contains(&*temp.path().to_string_lossy()));
+            }
+            result
+        };
+        check(None, &[])?;
+        check(Some(&[]), &[])?;
+        check(Some(&["ODIN_TOPOLOGY_IDENTITY"]), &["ODIN_TOPOLOGY_IDENTITY"])?;
+        check(Some(&["B", "A"]), &["A", "B"])?;
+        for (delivered, expected) in [
+            (None, &["ODIN_TOPOLOGY_IDENTITY"][..]),
+            (Some(&[][..]), &["ODIN_TOPOLOGY_IDENTITY"][..]),
+            (
+                Some(&["ODIN_TOPOLOGY_IDENTITY", "STOWAWAY"][..]),
+                &["ODIN_TOPOLOGY_IDENTITY"][..],
+            ),
+            (Some(&["STOWAWAY"][..]), &[][..]),
+            (Some(&["A"][..]), &["B"][..]),
+            (Some(&["A"][..]), &["A", "B"][..]),
+        ] {
+            let error = check(delivered, expected)
+                .expect_err("delivered credentials differing from the launch must be refused");
+            assert_eq!(
+                error.to_string(),
+                "systemd delivered credentials that differ from the Idunn launch"
+            );
+        }
+        // A directory that cannot be listed is a refusal, never the empty set.
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("run/credentials");
+        std::fs::create_dir_all(&parent)?;
+        std::fs::write(parent.join(unit), "")?;
+        let error = require_delivered_credentials(temp.path(), unit, &[])
+            .expect_err("an unreadable credential directory must be refused");
+        assert!(!format!("{error:#}").contains(&*temp.path().to_string_lossy()));
+        // The rule reads the process root it is given, never the host's /run.
+        let temp = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let directory = outside.path().join("run/credentials").join(unit);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(directory.join("A"), "")?;
+        require_delivered_credentials(temp.path(), unit, &[])?;
+        assert!(require_delivered_credentials(temp.path(), unit, &names(&["A"])).is_err());
+        Ok(())
+    }
+
+    /// Live Odin and StreamPixels hold records persisted by the Idunn that
+    /// compared `LoadCredential`: `[unprintable]` in the retired slot. The bytes
+    /// are that Idunn's own output (tests/fixtures/pre-cut-*); they must decode
+    /// under both encodings and read as no drift against a new observation, or
+    /// `stop` refuses to stop the incumbents.
+    #[test]
+    fn an_incumbent_recorded_with_the_display_form_is_not_identity_drift() -> Result<()> {
+        let decode_hex = |text: &str| -> Vec<u8> {
+            (0..text.trim().len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&text.trim()[at..at + 2], 16).unwrap())
+                .collect()
+        };
+        let mut recorded = systemd_audit_observation("no", 61_000);
+        recorded.load_credential = "[unprintable]".into();
+        let observed = systemd_audit_observation("no", 61_000);
+        assert!(observed.load_credential.is_empty());
+        for hex in [
+            include_str!("../tests/fixtures/pre-cut-systemd-observation.compact.hex"),
+            include_str!("../tests/fixtures/pre-cut-systemd-observation.named.hex"),
+        ] {
+            let decoded: WorkloadObservation = rmp_serde::from_slice(&decode_hex(hex))?;
+            assert_eq!(decoded, WorkloadObservation::Systemd(recorded.clone()));
+            let WorkloadObservation::Systemd(prior) = decoded else {
+                unreachable!()
+            };
+            assert!(changed_systemd_workload_identity_fields(&observed, &prior).is_empty());
+        }
+        let mut drifted = observed.clone();
+        drifted.main_pid += 1;
+        assert_eq!(
+            changed_systemd_workload_identity_fields(&drifted, &recorded),
+            vec!["main_pid"]
+        );
+        Ok(())
     }
 
     #[test]
