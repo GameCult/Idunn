@@ -10128,6 +10128,14 @@ processes 9
                 "systemd delivered credentials that differ from the Idunn launch"
             );
         }
+        // A directory that cannot be listed is a refusal, never the empty set.
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("run/credentials");
+        std::fs::create_dir_all(&parent)?;
+        std::fs::write(parent.join(unit), "")?;
+        let error = require_delivered_credentials(temp.path(), unit, &[])
+            .expect_err("an unreadable credential directory must be refused");
+        assert!(!format!("{error:#}").contains(&*temp.path().to_string_lossy()));
         // The rule reads the process root it is given, never the host's /run.
         let temp = tempfile::tempdir()?;
         let outside = tempfile::tempdir()?;
