@@ -199,3 +199,88 @@ on Yggdrasil: a 3.5 GiB tree, its staging copy, downloads and pip cache. It
 removes it at the end. Revision 2 runs it on the trees as shipped, with the 300
 terminfo links (T13). If a tree holds a link the T14 rule refuses, the job
 prints it and stops, and the link is reported to Self, not deleted.
+
+## Cut `isolation-credential-evidence`
+
+Spec `idunn-deploy-provenance:cut_spec:cut-cut-isolation-credential-evidence.r1`,
+at `112a7a5` (origin/main, live on Yggdrasil since 2026-10-24 11:29 UTC). It
+serves Vili's admission (`motion-pipeline:cut_report:cut-vili-admission.h4`,
+first deviation): every `idunn up vili` is refused before fencing.
+
+### Body facts (probed read-only on Yggdrasil, 2026-10-24)
+
+- I1. `idunn up vili` runs 6 and 7 failed with
+  `systemd workload isolation properties differ from the Idunn contract`, the
+  message of `observe_unit` (`src/drivers.rs:2975-3005`). Of its conjuncts,
+  only one differs on the failed Vili unit: `LoadCredential`. Idunn expects
+  `""` because Vili has no service credential besides the presence identity
+  (`service_credential_names` empty); systemd shows `[unprintable]`. Every
+  other conjunct matches, InaccessiblePaths included (one value across all
+  five idunn-vili/odin units).
+- I2. systemd 257.13 `systemctl show -p LoadCredential` prints
+  `LoadCredential=[unprintable]` for every unit, whatever the credentials:
+  `ssh.service` and `systemd-journald.service` (not DynamicUser, zero
+  LoadCredential), the four failed `idunn-vili-*` units (zero), and the Odin
+  unit (one). The display form carries no information, so the conjunct was
+  vacuous whenever credentials existed and always false when none did. Odin
+  and StreamPixels passed only because each carries a regular credential.
+- I3. The exact value is readable: D-Bus
+  `org.freedesktop.systemd1.Service.LoadCredential` (`busctl get-property`)
+  answers `a(ss) 0` for the Vili units and ssh, `a(ss) 1
+  "ODIN_TOPOLOGY_IDENTITY" "<path>"` for Odin.
+- I4. What the workload can actually read is the delivered directory. On the
+  host, `/run/credentials/` holds a directory only for units with credentials
+  (getty, journald, Odin, StreamPixels service and web). Inside Odin's MainPID
+  root, `/run/credentials/<unit>/` holds exactly `ODIN_TOPOLOGY_IDENTITY`
+  (`-r--r-----+ root root`). The presence identity is a parent-only `OpenFile`
+  descriptor, never a credential.
+- I5. The rule arrived whole in `1fc0dad` (2026-09-03, "Rebuild Idunn
+  deployment transaction authority"), with its twin clause in
+  `validate_launch_observation` (`:3468-3472`, `:3513-3516`); no later commit
+  touched it. No ruling or finding in any campaign concerns workload isolation
+  verification; gamecult-chat's foreign-workloads cut touched
+  `CREDENTIALS_DIRECTORY` reservation, not this check.
+- I6. `SystemdWorkloadObservation` is persisted by previous Idunns in both
+  MessagePack encodings, compact (positional) included
+  (`persisted_systemd_observations_decode_as_the_systemd_variant`,
+  `:9915-9930`), so deleting the `load_credential` field shifts every later
+  slot of a live incumbent's record. The field is also in the drift list
+  (`:2462`) that `stop` (`:4064-4070`) uses to refuse stopping a changed
+  workload: changing what the field holds without leaving that list would make
+  the next Idunn refuse to stop the live Odin and StreamPixels incumbents.
+- I7. Fixtures: the verbatim 257.13 `systemctl show` output of base's 27
+  properties for a Vili unit (presence identity only) and the Odin unit
+  (presence identity plus one service credential), captured 2026-10-24 into
+  this Imagination's scratchpad `fixtures/`.
+- I8. The new rule holds for every live systemd incumbent: inside each
+  MainPID root the delivered entries equal its binding's `secret_files` keys
+  minus `GAMECULT_RUNTIME_PRESENCE_IDENTITY` (Odin 1, StreamPixels service 11,
+  StreamPixels web 1; key names compared, no values read). An Idunn restart onto
+  this cut re-observes them (`:3955-3970`) and passes.
+
+### Decision
+
+A property systemd cannot display does not belong in the comparison. The
+invariant it reached for, that the workload holds exactly the credentials Idunn
+delivered, is observed where it is decided: the entries of
+`/run/credentials/<unit>` in the MainPID's root equal Idunn's service
+credential names, absent directory equal to none. That covers
+`LoadCredential`, `SetCredential`, `ImportCredential` and drop-ins alike, and
+needs no new program. The D-Bus read (I3) is exact but sees only one of those
+properties and adds a second systemd client and parser; rejected.
+
+### Authority
+
+Owner: `observe_unit` decides the credential rule, from the delivered
+directory. `LoadCredential`'s display form is no longer read or compared; the
+`load_credential` field is a retired wire slot, written empty, out of the drift
+list, kept only so persisted records decode. Forbidden writers: the
+`observe_unit` conjunct and the `validate_launch_observation` clause. Dropping
+the slot waits on the next schema revision of the observation.
+
+### Deploy
+
+Idunn's body changes only through gamecult-ops
+`scripts/install-idunn-yggdrasil-release.sh` (stage `idunn` only; unit and
+bindings unchanged). After it, Vili's Hands reruns from step 4 of
+`motion-pipeline:cut_report:cut-vili-admission.h4`'s undone list.
