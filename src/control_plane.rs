@@ -4882,22 +4882,11 @@ fn status(
                     writeln!(out, "    pre-fencing abort {abort:?}")?;
                     // The step that failed and its output tail live in their
                     // own private store. An unreadable store costs its lines.
-                    match runner_evidence::for_transaction(
+                    runner_evidence::show_status(
+                        out,
                         &runner_evidence_store_path(store_path),
                         &transaction.transaction_id,
-                    ) {
-                        Ok(Some(record)) => {
-                            for line in runner_evidence::render(&record) {
-                                writeln!(out, "{line}")?;
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => writeln!(
-                            out,
-                            "    runner evidence unreadable: {}",
-                            error.root_cause()
-                        )?,
-                    }
+                    )?;
                 }
                 if let Some(abort) = &transaction.post_fencing_abort {
                     writeln!(out, "    post-fencing abort {abort:?}")?;
@@ -10707,9 +10696,15 @@ fn runner_failure_journal_line(
         Ok(kept) => {
             let aside = match kept {
                 Kept::Stored => String::new(),
-                Kept::AfterSettingAsideAnUnreadableStore => format!(
-                    "; an undecodable evidence store was set aside as {}",
-                    unreadable_store_path(store_path).display()
+                Kept::SetAside { replaced } => format!(
+                    "; an undecodable evidence store was set aside as {}{}",
+                    unreadable_store_path(store_path).display(),
+                    match replaced {
+                        Some(last_written) => format!(
+                            ", replacing an earlier set-aside store last written at unix millis {last_written}"
+                        ),
+                        None => String::new(),
+                    }
                 ),
             };
             format!(
@@ -25017,6 +25012,101 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         assert!(printed.contains("target service phase"), "{printed}");
         assert!(printed.contains("pre-fencing abort"), "{printed}");
         assert_eq!(printed.matches("runner evidence unreadable").count(), 1, "{printed}");
+        Ok(())
+    }
+
+    /// Everything status prints from the evidence store goes through one
+    /// allowlist, so a hostile build log reaches the terminal as visible
+    /// escapes whatever its class.
+    #[cfg(unix)]
+    #[test]
+    fn status_prints_hostile_runner_output_as_visible_escapes_only() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        let ended = tick_until_ended(&world)?;
+        let hostile: Vec<(&str, &str)> = vec![
+            ("\u{1b}[2J", "\\u{1b}[2J"),
+            ("\u{7}", "\\u{7}"),
+            ("\r", "\\u{d}"),
+            ("\u{202e}", "\\u{202e}"),
+            ("\u{2066}", "\\u{2066}"),
+            ("\u{85}", "\\u{85}"),
+            ("\u{e0041}", "\\u{e0041}"),
+            ("\u{200b}", "\\u{200b}"),
+            ("\u{feff}", "\\u{feff}"),
+        ];
+        let mut tail: Vec<u8> = Vec::new();
+        for &(raw, _) in &hostile {
+            tail.extend_from_slice(b"a");
+            tail.extend_from_slice(raw.as_bytes());
+            tail.extend_from_slice(b"b\n");
+        }
+        tail.extend_from_slice(b"bad \xff\xc1 bytes\n");
+        runner_evidence::record(
+            &runner_evidence_store_path(&world.state_store),
+            &RunnerFailureRecord::from_failure(
+                &ended.transaction_id,
+                &ended.command_id,
+                &ended.target,
+                &canary_failure(&tail),
+                9,
+            ),
+        )?;
+        let printed = printed_status(&world)?;
+        for &(raw, escaped) in &hostile {
+            assert!(!printed.contains(raw), "{escaped} reached the terminal raw");
+            assert!(printed.contains(&format!("a{escaped}b")), "{escaped} missing: {printed}");
+        }
+        assert!(printed.contains("bad \\xff\\xc1 bytes"), "{printed}");
+        let section = printed.find("    failed step").context("no evidence section")?;
+        assert!(printed[section..].is_ascii(), "non-ASCII reached the terminal: {printed}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_prints_the_unreadable_store_line_escaped() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        tick_until_ended(&world)?;
+        let evidence = runner_evidence_store_path(&world.state_store);
+        // The decode error of this store quotes the stored subject kind.
+        let mut bytes = std::fs::read(&evidence)?;
+        let at = bytes
+            .windows(4)
+            .position(|window| window == b"step")
+            .context("no step marker in the evidence store")?;
+        bytes[at..at + 4].copy_from_slice(b"\x1b[2J");
+        std::fs::write(&evidence, bytes)?;
+        let printed = printed_status(&world)?;
+        assert_eq!(printed.matches("runner evidence unreadable").count(), 1, "{printed}");
+        assert!(!printed.contains('\u{1b}'), "an escape byte reached the terminal");
+        assert!(printed.contains("\\u{1b}[2J"), "{printed}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_journal_line_names_a_displaced_set_aside_store_by_time_only() -> Result<()> {
+        let (transaction, _) = terminal_transaction_with_command("ghostlight")?;
+        let failure = canary_failure(RUNNER_CANARY.as_bytes());
+        let path = Path::new("/var/lib/gamecult/idunn/runner-evidence.cc");
+        let first = runner_failure_journal_line(
+            &transaction,
+            &failure,
+            path,
+            &Ok(Kept::SetAside { replaced: None }),
+        );
+        assert!(first.contains("was set aside as"), "{first}");
+        assert!(!first.contains("replacing"), "{first}");
+        let second = runner_failure_journal_line(
+            &transaction,
+            &failure,
+            path,
+            &Ok(Kept::SetAside { replaced: Some(1234) }),
+        );
+        assert!(
+            second.contains("replacing an earlier set-aside store last written at unix millis 1234"),
+            "{second}"
+        );
+        assert!(!second.contains(RUNNER_CANARY));
         Ok(())
     }
 
