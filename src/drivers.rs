@@ -157,6 +157,24 @@ pub struct FrozenSourceReceipt {
     pub snapshot_sha256: String,
 }
 
+#[cfg(test)]
+impl FrozenSource {
+    /// A frozen source over an existing tree, for tests that drive a runner.
+    pub(crate) fn fixture(
+        receipt: FrozenSourceReceipt,
+        facts: SourceSelectionFacts,
+        recipe_bytes: Vec<u8>,
+        root: PathBuf,
+    ) -> Self {
+        Self {
+            receipt,
+            facts,
+            recipe_bytes,
+            root,
+        }
+    }
+}
+
 impl FrozenSourceReceipt {
     pub fn validate_against(&self, plan: &CompiledDeploymentPlan) -> Result<()> {
         plan.validate()?;
@@ -16372,4 +16390,183 @@ processes 9
         );
         Ok(())
     }
+
+    // BEGIN runner-failure-evidence tests
+    // The runner decides what failed and what it kept: these drive the real
+    // DockerRunnerDriver over a fake docker program, never the capture alone.
+
+    const RUNNER_CANARY: &str = "CANARY-5d2e91b7";
+
+    #[cfg(unix)]
+    fn fake_docker(dir: &Path, body: &str) -> Result<DockerRunnerDriver> {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join("docker");
+        fs::write(&program, format!("#!/bin/sh\n{body}\n"))?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+        Ok(DockerRunnerDriver {
+            docker_program: program,
+        })
+    }
+
+    /// One recipe step through the real `run_in_workspace` path.
+    #[cfg(unix)]
+    fn run_step(driver: &DockerRunnerDriver, dir: &Path, step_id: &str) -> Result<()> {
+        let workspace = dir.join("workspace");
+        fs::create_dir_all(&workspace)?;
+        driver.run_in_workspace(
+            step_id,
+            "rust",
+            &fixture_docker_runner_binding(),
+            &workspace,
+            Path::new("."),
+            &["cargo".to_owned(), "test".to_owned()],
+            &std::collections::BTreeSet::new(),
+            ("IDUNN_STAMP", "rev"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn failure_of(result: Result<()>) -> Result<RunnerStepFailure> {
+        let error = result.expect_err("the step did not fail");
+        error
+            .downcast_ref::<RunnerStepFailure>()
+            .cloned()
+            .with_context(|| format!("the failure is not typed: {error:#}"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_step_is_named_with_both_tails() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        // The first step passes, the second fails: the count is the fake's.
+        let driver = fake_docker(
+            temp.path(),
+            &format!(
+                "n=$(cat \"$0.count\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.count\"\n\
+                 [ \"$n\" -lt 2 ] && exit 0\n\
+                 echo 'stdout line one'; echo 'stdout report {RUNNER_CANARY}'\n\
+                 echo 'stderr report' >&2\nexit 3"
+            ),
+        )?;
+        run_step(&driver, temp.path(), "first")?;
+        let failure = failure_of(run_step(&driver, temp.path(), "second"))?;
+        assert_eq!(failure.subject, RunnerSubject::Step("second".into()));
+        assert_eq!(failure.runner, "rust");
+        assert_eq!(failure.exit_code, Some(3));
+        assert_eq!(failure.signal, None);
+        assert!(
+            failure
+                .stdout_tail
+                .ends_with(format!("stdout report {RUNNER_CANARY}\n").as_bytes()),
+            "stdout was dropped: {:?}",
+            String::from_utf8_lossy(&failure.stdout_tail)
+        );
+        assert_eq!(failure.stderr_tail, b"stderr report\n");
+        assert_eq!(failure.stdout_total_bytes, failure.stdout_tail.len() as u64);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_step_killed_by_a_signal_is_named_by_its_signal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let driver = fake_docker(temp.path(), "kill -9 $$")?;
+        let failure = failure_of(run_step(&driver, temp.path(), "build"))?;
+        assert_eq!((failure.exit_code, failure.signal), (None, Some(9)));
+        assert!(failure.to_string().contains("exited with signal 9"), "{failure}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_external_input_is_named_as_one() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let driver = fake_docker(temp.path(), "echo curl failed >&2\nexit 22")?;
+        let declaration = TargetDeclaration::parse(crate::deployment_plan::tests::RECIPE)?;
+        let binding = OperatorBinding::parse(crate::deployment_plan::tests::BINDING)?;
+        let input_id = declaration.external_inputs[0].id.clone();
+        let workspaces = BTreeMap::from([("rust".to_owned(), temp.path().join("workspace"))]);
+        fs::create_dir_all(&workspaces["rust"])?;
+        let error = driver
+            .materialize_external_input(&declaration, &binding, &workspaces, &input_id)
+            .expect_err("the download did not fail");
+        let failure = error
+            .downcast_ref::<RunnerStepFailure>()
+            .with_context(|| format!("the failure is not typed: {error:#}"))?;
+        assert_eq!(failure.subject, RunnerSubject::ExternalInput(input_id.clone()));
+        assert_eq!(failure.exit_code, Some(22));
+        assert!(
+            failure.to_string().contains(&format!("runner external input {input_id} on runner rust")),
+            "{failure}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_output_never_reaches_the_error_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let driver = fake_docker(
+            temp.path(),
+            &format!("echo 'out {RUNNER_CANARY}'\necho 'err {RUNNER_CANARY}' >&2\nexit 1"),
+        )?;
+        let failure = failure_of(run_step(&driver, temp.path(), "build"))?;
+        assert!(String::from_utf8_lossy(&failure.stdout_tail).contains(RUNNER_CANARY));
+        assert!(String::from_utf8_lossy(&failure.stderr_tail).contains(RUNNER_CANARY));
+        let error = anyhow::Error::new(failure.clone()).context("sealing");
+        for text in [
+            format!("{error:#}"),
+            format!("{error:?}"),
+            format!("{failure}"),
+            format!("{failure:?}"),
+        ] {
+            assert!(!text.contains(RUNNER_CANARY), "runner output reached text: {text}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_tail_is_the_last_bound_bytes_with_the_total() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path().join("data");
+        for size in [
+            0,
+            1,
+            RUNNER_OUTPUT_TAIL_BYTES - 1,
+            RUNNER_OUTPUT_TAIL_BYTES,
+            RUNNER_OUTPUT_TAIL_BYTES + 1,
+            1024 * 1024,
+        ] {
+            // Distinct neighbours, so a shifted or head-keeping tail differs.
+            let bytes: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+            fs::write(&data, &bytes)?;
+            let driver = fake_docker(
+                temp.path(),
+                &format!("cat '{}'\ncat '{}' >&2\nexit 1", data.display(), data.display()),
+            )?;
+            let failure = failure_of(run_step(&driver, temp.path(), "build"))?;
+            let expected = &bytes[size.saturating_sub(RUNNER_OUTPUT_TAIL_BYTES)..];
+            assert_eq!(failure.stdout_tail, expected, "stdout tail at {size} bytes");
+            assert_eq!(failure.stderr_tail, expected, "stderr tail at {size} bytes");
+            assert_eq!(failure.stdout_total_bytes, size as u64);
+            assert_eq!(failure.stderr_total_bytes, size as u64);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_step_and_a_missing_program_keep_their_outcomes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        run_step(&fake_docker(temp.path(), "echo fine")?, temp.path(), "build")?;
+        let missing = DockerRunnerDriver {
+            docker_program: temp.path().join("no-such-docker"),
+        };
+        let error = run_step(&missing, temp.path(), "build").expect_err("a missing program ran");
+        assert!(error.downcast_ref::<RunnerStepFailure>().is_none());
+        assert!(format!("{error:#}").contains("starting Docker runner"), "{error:#}");
+        Ok(())
+    }
+    // END runner-failure-evidence tests
 }

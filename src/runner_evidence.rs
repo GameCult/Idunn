@@ -281,3 +281,149 @@ fn escape(text: &str) -> String {
     }
     escaped
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn failure(subject: RunnerSubject, stdout: &[u8], stderr: &[u8]) -> RunnerStepFailure {
+        RunnerStepFailure {
+            subject,
+            runner: "rust".into(),
+            exit_code: Some(3),
+            signal: None,
+            stdout_tail: stdout.to_vec(),
+            stdout_total_bytes: stdout.len() as u64,
+            stderr_tail: stderr.to_vec(),
+            stderr_total_bytes: stderr.len() as u64,
+        }
+    }
+
+    fn record_at(transaction: &str, now: u64) -> RunnerFailureRecord {
+        RunnerFailureRecord::from_failure(
+            transaction,
+            "up-service",
+            "service",
+            &failure(RunnerSubject::Step("build".into()), b"out\n", b"err\n"),
+            now,
+        )
+    }
+
+    #[test]
+    fn the_evidence_store_keeps_the_newest_32() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = runner_evidence_store_path(&temp.path().join("control.cc"));
+        for index in 0..=RUNNER_EVIDENCE_RECORDS {
+            record(&path, &record_at(&format!("tx-{index:02}"), 1000 + index as u64))?;
+        }
+        let kept: Vec<_> = snapshot(&path)?.1.into_iter().map(|stored| stored.transaction_id).collect();
+        assert_eq!(kept.len(), RUNNER_EVIDENCE_RECORDS);
+        assert!(!kept.contains(&"tx-00".to_owned()), "the oldest survived");
+        assert!(kept.contains(&"tx-32".to_owned()), "the newest was evicted");
+        assert!(kept.contains(&"tx-01".to_owned()), "the second oldest was evicted early");
+        // Rewriting a resident transaction replaces it and drops nothing.
+        let mut again = record_at("tx-05", 5000);
+        again.stdout_tail = b"rewritten\n".to_vec();
+        again.stdout_total_bytes = 10;
+        record(&path, &again)?;
+        let kept = snapshot(&path)?.1;
+        assert_eq!(kept.len(), RUNNER_EVIDENCE_RECORDS);
+        assert!(kept.iter().any(|stored| stored.transaction_id == "tx-01"));
+        let stored = for_transaction(&path, "tx-05")?.context("rewritten record is gone")?;
+        assert_eq!(stored.stdout_tail, b"rewritten\n");
+        assert_eq!(for_transaction(&path, "tx-00")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_round_trips_byte_for_byte() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = runner_evidence_store_path(&temp.path().join("control.cc"));
+        let written = RunnerFailureRecord::from_failure(
+            "tx-a",
+            "up-service",
+            "service",
+            &failure(RunnerSubject::ExternalInput("toolchain".into()), &[0, 1, 255, 10], b""),
+            77,
+        );
+        record(&path, &written)?;
+        assert_eq!(for_transaction(&path, "tx-a")?, Some(written));
+        assert_eq!(for_transaction(&path, "tx-b")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_evidence_store_is_private() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = runner_evidence_store_path(&temp.path().join("control.cc"));
+        // Whatever the umask, the mode is the store's own rule, on every write.
+        for index in 0..2 {
+            record(&path, &record_at(&format!("tx-{index}"), 10 + index))?;
+            assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_tail_over_its_bound_or_its_stream_is_refused() {
+        let mut oversize = record_at("tx-a", 1);
+        oversize.stdout_tail = vec![b'x'; RUNNER_OUTPUT_TAIL_BYTES + 1];
+        oversize.stdout_total_bytes = u64::MAX;
+        assert!(oversize.validate().is_err());
+        let mut impossible = record_at("tx-a", 1);
+        impossible.stderr_total_bytes = 1;
+        assert!(impossible.validate().is_err());
+        let mut exact = record_at("tx-a", 1);
+        exact.stdout_tail = vec![b'x'; RUNNER_OUTPUT_TAIL_BYTES];
+        exact.stdout_total_bytes = RUNNER_OUTPUT_TAIL_BYTES as u64;
+        assert!(exact.validate().is_ok());
+    }
+
+    #[test]
+    fn status_renders_the_tail_with_control_bytes_escaped() {
+        let mut stored = record_at("tx-a", 1);
+        stored.stdout_tail = b"first\n\x1b[2Jsecond\x00end\tTab\nlast\n".to_vec();
+        stored.stdout_total_bytes = 5000;
+        stored.stderr_tail = b"bad\r\x07".to_vec();
+        stored.stderr_total_bytes = 6;
+        let lines = render(&stored);
+        let text = lines.join("\n");
+        assert!(!text.contains('\u{1b}') && !text.contains('\0') && !text.contains('\r'));
+        assert!(!text.contains('\u{7}'));
+        assert_eq!(
+            lines,
+            vec![
+                "    failed step build",
+                "    runner rust",
+                "    status exit status 3",
+                "      stdout (last 30 of 5000 bytes)",
+                "      | first",
+                "      | \\u{1b}[2Jsecond\\u{0}end\tTab",
+                "      | last",
+                "      stderr (last 5 of 6 bytes)",
+                "      | bad\\u{d}\\u{7}",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_tail_renders_only_its_header() {
+        let mut stored = record_at("tx-a", 1);
+        stored.stdout_tail = Vec::new();
+        stored.stdout_total_bytes = 0;
+        let lines = render(&stored);
+        assert!(lines.contains(&"      stdout (last 0 of 0 bytes)".to_owned()));
+        assert!(!lines.iter().any(|line| line == "      | "));
+    }
+
+    #[test]
+    fn a_foreign_or_corrupt_store_is_an_error_not_an_empty_store() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = runner_evidence_store_path(&temp.path().join("control.cc"));
+        std::fs::write(&path, b"\xc1 not a store")?;
+        assert!(for_transaction(&path, "tx-a").is_err());
+        assert!(record(&path, &record_at("tx-a", 1)).is_err());
+        Ok(())
+    }
+}

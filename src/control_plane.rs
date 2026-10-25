@@ -5397,10 +5397,12 @@ impl Engine {
     /// store and says so on the journal, naming no output. The store write is
     /// best effort: its failure is named in the line and never stops the
     /// abort that follows.
-    fn keep_runner_failure(&self, transaction: &DeploymentTransaction, error: &anyhow::Error) {
-        let Some(failure) = error.downcast_ref::<RunnerStepFailure>() else {
-            return;
-        };
+    fn keep_runner_failure(
+        &self,
+        transaction: &DeploymentTransaction,
+        error: &anyhow::Error,
+    ) -> Option<String> {
+        let failure = error.downcast_ref::<RunnerStepFailure>()?;
         let path = runner_evidence_store_path(&self.options.state_store);
         let recorded = now_millis().and_then(|now| {
             runner_evidence::record(
@@ -5414,10 +5416,7 @@ impl Engine {
                 ),
             )
         });
-        eprintln!(
-            "{}",
-            runner_failure_journal_line(transaction, failure, &path, &recorded)
-        );
+        Some(runner_failure_journal_line(transaction, failure, &path, &recorded))
     }
 
     /// Settle the outcome of one incident operation. A failure never leaves
@@ -6361,7 +6360,9 @@ impl Engine {
                 if latest.value.pre_fencing_abort.is_none()
                     && error.downcast_ref::<LockContended>().is_none()
                 {
-                    self.keep_runner_failure(&latest.value, &error);
+                    if let Some(line) = self.keep_runner_failure(&latest.value, &error) {
+                        eprintln!("{line}");
+                    }
                     self.begin_pre_fencing_abort(latest, error)?;
                 } else {
                     self.record_resumable_error(latest, &error)?;
@@ -24726,4 +24727,298 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             Ok(())
         }
     }
+
+    // BEGIN runner-failure-evidence tests
+    // A failed runner step is named, its output tail is kept in
+    // runner-evidence.cc, and no output reaches an error, control.cc or the
+    // journal line. The runner is the real DockerRunnerDriver driving a fake
+    // docker program, through the engine's Sealing path.
+
+    const RUNNER_CANARY: &str = "CANARY-7c41e0d9";
+
+    /// A source that freezes a fixed tree, so a deployment reaches the runner.
+    struct TreeSource {
+        recipe: String,
+        root: PathBuf,
+    }
+
+    impl SourcePort for TreeSource {
+        fn resolve(
+            &self,
+            _: &OperatorBinding,
+            _: &str,
+            _: u64,
+        ) -> Result<crate::drivers::ResolvedSource> {
+            Ok(crate::drivers::ResolvedSource {
+                facts: crate::deployment_plan::tests::source(&self.recipe),
+                recipe_bytes: self.recipe.clone().into_bytes(),
+            })
+        }
+
+        fn freeze(&self, transaction_id: &str, plan: &CompiledDeploymentPlan) -> Result<FrozenSourceReceipt> {
+            Ok(FrozenSourceReceipt {
+                transaction_id: transaction_id.to_owned(),
+                plan_id: plan.plan_id.clone(),
+                snapshot_sha256: format!("sha256-{}", "a".repeat(64)),
+            })
+        }
+
+        fn observe_frozen(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            receipt: &FrozenSourceReceipt,
+        ) -> Result<crate::drivers::FrozenSource> {
+            Ok(crate::drivers::FrozenSource::fixture(
+                receipt.clone(),
+                plan.source.clone(),
+                plan.recipe_blob.clone(),
+                self.root.clone(),
+            ))
+        }
+
+        fn cleanup(&self, _: &str, _: Option<&FrozenSourceReceipt>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The unrouted recipe with two steps ahead of its build, and no external
+    /// input: the second step, `test-daemon`, is the one the fake docker fails.
+    fn two_step_recipe() -> String {
+        let recipe = unrouted_recipe();
+        let (head, rest) = recipe
+            .split_once("[[external_inputs]]")
+            .expect("the recipe declares an external input");
+        let (_, tail) = rest.split_once("[[artifacts]]").expect("the recipe declares artifacts");
+        let head = head.replacen(
+            "[[steps]]\nid = \"build\"",
+            "[[steps]]\nid = \"install\"\nphase = \"prepare\"\nrunner = \"rust\"\nargv = [\"cargo\", \"fetch\"]\n\n\
+             [[steps]]\nid = \"test-daemon\"\nphase = \"test\"\nrunner = \"rust\"\nargv = [\"cargo\", \"test\"]\n\n\
+             [[steps]]\nid = \"build\"",
+            1,
+        );
+        format!("{head}[[artifacts]]{tail}")
+    }
+
+    /// A Sealing world whose runner is the real driver over a fake docker: the
+    /// first call succeeds, the second prints the canary and an escape
+    /// sequence on both streams and exits 3.
+    #[cfg(unix)]
+    fn failing_runner_world() -> Result<(EngineFixture, TempDir)> {
+        use std::os::unix::fs::PermissionsExt;
+        let tools = TempDir::new()?;
+        let docker = tools.path().join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nn=$(cat \"$0.count\" 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > \"$0.count\"\n\
+                 [ \"$n\" -lt 2 ] && exit 0\n\
+                 printf 'out {RUNNER_CANARY} \\033[2J\\n'\nprintf 'err {RUNNER_CANARY}\\n' >&2\nexit 3\n"
+            ),
+        )?;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755))?;
+        let recipe = two_step_recipe();
+        let mut world = sealing_world(&recipe)?;
+        let tree = tools.path().join("tree");
+        std::fs::create_dir_all(&tree)?;
+        std::fs::write(tree.join("README"), b"source")?;
+        world.engine.source = Arc::new(TreeSource { recipe, root: tree });
+        world.engine.docker_runner = DockerRunnerDriver { docker_program: docker };
+        Ok((world, tools))
+    }
+
+    /// Scheduler ticks until the deployment ends (or the budget is spent).
+    fn tick_until_ended(world: &EngineFixture) -> Result<DeploymentTransaction> {
+        for _ in 0..24 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            let _ = world.engine.run_scheduler_tick();
+            if latest(world)?.completion.is_some() {
+                break;
+            }
+        }
+        latest(world)
+    }
+
+    fn printed_status(world: &EngineFixture) -> Result<String> {
+        let mut printed = Vec::new();
+        status(&mut printed, &world.state_store, &world.engine.options.incident_store, Some("up-service"))?;
+        Ok(String::from_utf8(printed)?)
+    }
+
+    fn canary_failure(stdout: &[u8]) -> RunnerStepFailure {
+        RunnerStepFailure {
+            subject: crate::drivers::RunnerSubject::Step("test-daemon".into()),
+            runner: "rust".into(),
+            exit_code: Some(3),
+            signal: None,
+            stdout_tail: stdout.to_vec(),
+            stdout_total_bytes: stdout.len() as u64,
+            stderr_tail: stdout.to_vec(),
+            stderr_total_bytes: stdout.len() as u64,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_runner_step_is_named_kept_and_never_echoed() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (world, _tools) = failing_runner_world()?;
+        let ended = tick_until_ended(&world)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the deployment did not fail before fencing: {:?} {:?}", ended.phase, ended.last_error);
+        };
+        // Named: the second step, on its runner, with the exit status.
+        assert!(
+            error.contains("runner step test-daemon on runner rust exited with exit status 3"),
+            "{error}"
+        );
+        // Never echoed: no error text, no control.cc byte, carries the output.
+        let abort = ended.pre_fencing_abort.as_ref().context("no pre-fencing abort")?;
+        for text in [error.as_str(), abort.error.as_str(), &format!("{ended:?}")] {
+            assert!(!text.contains(RUNNER_CANARY), "runner output reached a record: {text}");
+        }
+        let control = std::fs::read(&world.state_store)?;
+        assert!(
+            !control.windows(RUNNER_CANARY.len()).any(|window| window == RUNNER_CANARY.as_bytes()),
+            "runner output reached control.cc"
+        );
+        // Kept: in the private store, tails of both streams, and on status.
+        let evidence = runner_evidence_store_path(&world.state_store);
+        assert_eq!(std::fs::metadata(&evidence)?.permissions().mode() & 0o777, 0o600);
+        let record = runner_evidence::for_transaction(&evidence, &ended.transaction_id)?
+            .context("no evidence for the failed transaction")?;
+        assert_eq!(record.subject_id, "test-daemon");
+        assert_eq!(record.exit_code, Some(3));
+        assert!(String::from_utf8_lossy(&record.stdout_tail).contains(RUNNER_CANARY));
+        assert!(String::from_utf8_lossy(&record.stderr_tail).contains(RUNNER_CANARY));
+        let printed = printed_status(&world)?;
+        assert!(printed.contains("failed step test-daemon"), "{printed}");
+        assert!(printed.contains(RUNNER_CANARY), "{printed}");
+        assert!(!printed.contains('\u{1b}'), "status printed a raw escape byte");
+        Ok(())
+    }
+
+    #[test]
+    fn the_journal_line_names_the_store_and_never_the_output() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let (transaction, _) = terminal_transaction_with_command("ghostlight")?;
+        let failure = canary_failure(RUNNER_CANARY.as_bytes());
+        let line = world
+            .engine
+            .keep_runner_failure(&transaction, &anyhow::Error::new(failure.clone()).context("sealing"))
+            .context("a runner failure produced no journal line")?;
+        assert!(!line.contains(RUNNER_CANARY), "{line}");
+        for needle in [
+            transaction.transaction_id.as_str(),
+            "up-ghostlight",
+            "ghostlight",
+            "runner step test-daemon on runner rust exited with exit status 3",
+            "runner-evidence.cc",
+            "idunn status --command up-ghostlight",
+        ] {
+            assert!(line.contains(needle), "{needle} missing from {line}");
+        }
+        // Not a runner failure: nothing is kept and nothing is said.
+        assert!(
+            world
+                .engine
+                .keep_runner_failure(&transaction, &anyhow::anyhow!("a different failure"))
+                .is_none()
+        );
+        // The line a failed write produces says so, with no output.
+        let unwritable = runner_failure_journal_line(
+            &transaction,
+            &failure,
+            Path::new("/var/lib/gamecult/idunn/runner-evidence.cc"),
+            &Err(anyhow::anyhow!("disk full")),
+        );
+        assert!(unwritable.contains("evidence was not kept: disk full"), "{unwritable}");
+        assert!(!unwritable.contains(RUNNER_CANARY));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_evidence_write_does_not_stop_the_abort() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        // A directory where the store should be: every write to it fails.
+        std::fs::create_dir(runner_evidence_store_path(&world.state_store))?;
+        let ended = tick_until_ended(&world)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the unwritable store stopped the abort: {:?} {:?}", ended.phase, ended.last_error);
+        };
+        assert!(error.contains("runner step test-daemon on runner rust"), "{error}");
+        let line = world
+            .engine
+            .keep_runner_failure(&ended, &anyhow::Error::new(canary_failure(b"")))
+            .context("no journal line")?;
+        assert!(line.contains("evidence was not kept"), "{line}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_evidence_store_costs_only_its_lines() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        let ended = tick_until_ended(&world)?;
+        std::fs::write(runner_evidence_store_path(&world.state_store), b"\xc1not a store")?;
+        let printed = printed_status(&world)?;
+        assert!(printed.contains(&format!("transaction {}", ended.transaction_id)), "{printed}");
+        assert!(printed.contains("target service phase"), "{printed}");
+        assert!(printed.contains("pre-fencing abort"), "{printed}");
+        assert_eq!(printed.matches("runner evidence unreadable").count(), 1, "{printed}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_store_types_are_unchanged_by_a_runner_failure() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        tick_until_ended(&world)?;
+        // The store a rolled-back Idunn reads: it refuses any foreign type.
+        ControlSnapshot::read(&world.state_store)?;
+        let envelopes =
+            SingleFileMessagePackBackingStore::new(&world.state_store).pull_all_read_only_snapshot()?;
+        assert!(!envelopes.is_empty());
+        for envelope in &envelopes {
+            assert!(!envelope.r#type.contains("runner_failure"), "{}", envelope.r#type);
+            if envelope.r#type == DeploymentTransaction::TYPE {
+                assert_eq!(envelope.schema_id.as_deref(), Some("idunn.deployment_transaction.v4"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The records control.cc holds re-encode byte for byte. The hex was
+    /// captured at base 804ed75, before this cut touched anything: a runner
+    /// failure adds no field, no type and no schema to the control store.
+    #[test]
+    fn control_records_encode_exactly_as_they_did_at_base() -> Result<()> {
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "up-service".into(),
+            kind: CommandKind::Deploy,
+            selector: "service".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        let mut transaction = DeploymentTransaction::new(&command, "service".into(), 0, None, 100)?;
+        transaction.transaction_id = "tx-pinned".into();
+        transaction.last_error = Some("runner step test-daemon on runner rust exited with exit status 3".into());
+        transaction.pre_fencing_abort = Some(PreFencingAbort {
+            error: "runner step test-daemon on runner rust exited with exit status 3".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Complete,
+        });
+        let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let command_hex = hex(&command_envelope(&command, 100)?.payload);
+        let transaction_hex = hex(&transaction_envelope(&transaction, 100)?.payload);
+        assert_eq!(command_hex, PINNED_COMMAND_HEX, "command bytes changed");
+        assert_eq!(transaction_hex, PINNED_TRANSACTION_HEX, "transaction bytes changed");
+        Ok(())
+    }
+
+    const PINNED_COMMAND_HEX: &str = "96bb6964756e6e2e6465706c6f796d656e745f636f6d6d616e642e7632aa75702d73657276696365a66465706c6f79a773657276696365a47465737464";
+    const PINNED_TRANSACTION_HEX: &str = "dc0025bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7634a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0";
+    // END runner-failure-evidence tests
 }
