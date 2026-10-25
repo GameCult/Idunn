@@ -16667,7 +16667,9 @@ processes 9
         assert_eq!(kept.stdout_total_bytes, kept.stdout_tail.len() as u64);
         assert!(kept.stderr_tail.is_empty());
         assert_eq!(kept.stderr_total_bytes, 0);
-        let rendered = crate::runner_evidence::render(&kept).join("\n");
+        let mut shown = Vec::new();
+        crate::runner_evidence::show_status(&mut shown, &store, "tx-vili")?;
+        let rendered = String::from_utf8(shown)?;
         assert!(rendered.contains("stderr (last 0 of 0 bytes)"), "{rendered}");
         assert!(rendered.contains(&format!("| not ok 1 - daemon {RUNNER_CANARY}")), "{rendered}");
         // Debug names the failure and prints no tail.
