@@ -182,10 +182,44 @@ fn snapshot(path: &Path) -> Result<(Vec<CultCacheEnvelope>, Vec<RunnerFailureRec
     Ok((envelopes, records))
 }
 
+/// How a write left the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kept {
+    Stored,
+    /// The store could not be decoded; it was moved to
+    /// `unreadable_store_path` and the record opened a fresh one.
+    AfterSettingAsideAnUnreadableStore,
+}
+
+/// Where an undecodable store is kept. One slot: the next one replaces it, so
+/// the damage a bad store can cost is one extra file.
+pub(crate) fn unreadable_store_path(path: &Path) -> PathBuf {
+    path.with_file_name("runner-evidence.unreadable.cc")
+}
+
+/// An undecodable store (a corrupt file, or one a newer Idunn wrote) must not
+/// stop later failures from keeping their evidence. Move it aside, root-only,
+/// over the previous one. Nothing of its content is named: a decode error can
+/// quote stored values. A store that cannot even be read is left in place.
+fn set_aside_unreadable(path: &Path) -> Result<()> {
+    std::fs::read(path).context("the runner evidence store could not be read")?;
+    let aside = unreadable_store_path(path);
+    std::fs::rename(path, &aside)
+        .context("the runner evidence store is undecodable and could not be set aside")?;
+    keep_private(&aside)
+}
+
 /// The one writer. Upsert by transaction id; past `RUNNER_EVIDENCE_RECORDS` the
-/// oldest records go in the same exchange. The file ends at mode 0600.
-pub(crate) fn record(path: &Path, record: &RunnerFailureRecord) -> Result<()> {
-    let (envelopes, records) = snapshot(path)?;
+/// oldest records go in the same exchange. The file ends at mode 0600. A store
+/// that cannot be decoded is set aside first and the record opens a new one.
+pub(crate) fn record(path: &Path, record: &RunnerFailureRecord) -> Result<Kept> {
+    let (envelopes, records, how) = match snapshot(path) {
+        Ok((envelopes, records)) => (envelopes, records, Kept::Stored),
+        Err(_) => {
+            set_aside_unreadable(path)?;
+            (Vec::new(), Vec::new(), Kept::AfterSettingAsideAnUnreadableStore)
+        }
+    };
     let mut kept: Vec<(u64, CultCacheEnvelope)> = envelopes
         .iter()
         .zip(&records)
@@ -214,7 +248,8 @@ pub(crate) fn record(path: &Path, record: &RunnerFailureRecord) -> Result<()> {
             .into());
         }
     }
-    keep_private(path)
+    keep_private(path)?;
+    Ok(how)
 }
 
 #[cfg(unix)]
@@ -270,10 +305,22 @@ pub(crate) fn render(record: &RunnerFailureRecord) -> Vec<String> {
     lines
 }
 
+/// Format characters that reorder what a terminal shows: the set the mind's
+/// Title rule refuses.
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 fn escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
-        if character.is_control() && character != '\n' && character != '\t' {
+        if (character.is_control() || is_bidi_control(character))
+            && character != '\n'
+            && character != '\t'
+        {
             escaped.push_str(&format!("\\u{{{:x}}}", u32::from(character)));
         } else {
             escaped.push(character);
@@ -428,12 +475,162 @@ mod tests {
     }
 
     #[test]
-    fn a_foreign_or_corrupt_store_is_an_error_not_an_empty_store() -> Result<()> {
+    fn the_reader_names_an_unreadable_store_as_an_error() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = runner_evidence_store_path(&temp.path().join("control.cc"));
         std::fs::write(&path, b"\xc1 not a store")?;
         assert!(for_transaction(&path, "tx-a").is_err());
-        assert!(record(&path, &record_at("tx-a", 1)).is_err());
         Ok(())
+    }
+
+    fn files_beside(path: &Path) -> Result<Vec<String>> {
+        let mut names: Vec<String> = std::fs::read_dir(path.parent().context("no parent")?)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_>>()?;
+        names.retain(|name| name.starts_with("runner-evidence") && !name.contains("lock"));
+        names.sort();
+        Ok(names)
+    }
+
+    /// A store a newer Idunn wrote: well-formed, but a schema this one does not know.
+    fn write_future_store(path: &Path) -> Result<()> {
+        let mut future = record_at("tx-future", 1);
+        future.schema_version = "idunn.runner_failure.v2".into();
+        let envelope = typed_envelope(
+            &future.transaction_id,
+            RunnerFailureRecord::TYPE,
+            "idunn.runner_failure.v2",
+            &future,
+            1,
+        )?;
+        let outcome = exchange_behind_private_lock(path, &[], &[envelope])?;
+        ensure!(
+            matches!(outcome, TryCompareExchangeSnapshotOutcome::Exchanged),
+            "the future store was not written"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_store_is_set_aside_and_the_next_failure_keeps_its_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = runner_evidence_store_path(&temp.path().join("control.cc"));
+        let damage = b"\xc1 not a store \x00 damage";
+        std::fs::write(&path, damage)?;
+        let kept = record(&path, &record_at("tx-a", 5))?;
+        assert_eq!(kept, Kept::AfterSettingAsideAnUnreadableStore);
+        // Kept, not deleted: the damage is where the journal says, root-only.
+        let aside = unreadable_store_path(&path);
+        assert_eq!(std::fs::read(&aside)?, damage);
+        assert_eq!(std::fs::metadata(&aside)?.permissions().mode() & 0o777, 0o600);
+        // The failure's evidence is in a fresh, private store.
+        assert_eq!(
+            for_transaction(&path, "tx-a")?.map(|stored| stored.transaction_id),
+            Some("tx-a".to_owned())
+        );
+        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        // A healthy store is not set aside again.
+        assert_eq!(record(&path, &record_at("tx-b", 6))?, Kept::Stored);
+        assert_eq!(std::fs::read(&aside)?, damage);
+        Ok(())
+    }
+
+    #[test]
+    fn a_future_version_store_is_set_aside_and_the_next_failure_keeps_its_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = runner_evidence_store_path(&temp.path().join("control.cc"));
+        write_future_store(&path)?;
+        let before = std::fs::read(&path)?;
+        assert!(for_transaction(&path, "tx-future").is_err());
+        assert_eq!(
+            record(&path, &record_at("tx-a", 5))?,
+            Kept::AfterSettingAsideAnUnreadableStore
+        );
+        assert_eq!(std::fs::read(unreadable_store_path(&path))?, before);
+        assert!(for_transaction(&path, "tx-a")?.is_some());
+        assert_eq!(for_transaction(&path, "tx-future")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn at_most_one_unreadable_store_is_kept() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = runner_evidence_store_path(&temp.path().join("control.cc"));
+        let damages: [&[u8]; 3] = [b"\xc1 first", b"\xc1 second", b"\xc1 third"];
+        for (index, damage) in damages.into_iter().enumerate() {
+            std::fs::write(&path, damage)?;
+            record(&path, &record_at(&format!("tx-{index}"), 5 + index as u64))?;
+            assert_eq!(
+                std::fs::read(unreadable_store_path(&path))?,
+                damage,
+                "the newest damage is the one kept"
+            );
+        }
+        assert_eq!(
+            files_beside(&path)?,
+            vec![
+                "runner-evidence.cc".to_owned(),
+                "runner-evidence.unreadable.cc".to_owned()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_is_left_in_place_and_the_write_fails() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = runner_evidence_store_path(&temp.path().join("control.cc"));
+        // A directory where the store should be: unreadable, not undecodable.
+        std::fs::create_dir(&path)?;
+        assert!(record(&path, &record_at("tx-a", 1)).is_err());
+        assert!(path.is_dir());
+        assert!(!unreadable_store_path(&path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn status_escapes_bidi_controls_in_tails_and_in_names() {
+        for bidi in [
+            '\u{61c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            let mut stored = record_at("tx-a", 1);
+            let tail = format!("ok {bidi}gpj.exe\n");
+            stored.stdout_tail = tail.clone().into_bytes();
+            stored.stdout_total_bytes = tail.len() as u64;
+            stored.stderr_tail = tail.clone().into_bytes();
+            stored.stderr_total_bytes = tail.len() as u64;
+            stored.subject_id = format!("step{bidi}x");
+            stored.runner = format!("rust{bidi}");
+            let text = render(&stored).join("\n");
+            let escaped = format!("\\u{{{:x}}}", bidi as u32);
+            assert!(!text.contains(bidi), "U+{:04X} reached the terminal", bidi as u32);
+            // Escaped in every place it can appear: two tails, the subject, the runner.
+            assert_eq!(text.matches(&escaped).count(), 4, "{text}");
+        }
+        // Format characters either side of the set pass.
+        let mut stored = record_at("tx-a", 1);
+        stored.stdout_tail = "caf\u{e9} \u{200d}\u{202f}\u{2065}\u{206a}\n".as_bytes().to_vec();
+        stored.stdout_total_bytes = stored.stdout_tail.len() as u64;
+        let text = render(&stored).join("\n");
+        assert!(text.contains("caf\u{e9} \u{200d}\u{202f}\u{2065}\u{206a}"), "{text}");
+    }
+
+    #[test]
+    fn status_escapes_the_c1_controls() {
+        for code in 0x80u32..=0x9f {
+            let character = char::from_u32(code).unwrap();
+            let mut stored = record_at("tx-a", 1);
+            stored.stdout_tail = format!("a{character}b\n").into_bytes();
+            stored.stdout_total_bytes = stored.stdout_tail.len() as u64;
+            let text = render(&stored).join("\n");
+            assert!(!text.contains(character), "U+{code:04X} reached the terminal");
+            assert!(text.contains(&format!("a\\u{{{code:x}}}b")), "U+{code:04X}: {text}");
+        }
+        // U+00A0 is not a control character and passes.
+        let mut stored = record_at("tx-a", 1);
+        stored.stdout_tail = "a\u{a0}b\n".as_bytes().to_vec();
+        stored.stdout_total_bytes = stored.stdout_tail.len() as u64;
+        assert!(render(&stored).join("\n").contains("a\u{a0}b"));
     }
 }

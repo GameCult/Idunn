@@ -47,7 +47,9 @@ use crate::drivers::{
     WriteLeasePort,
 };
 use crate::incident::{CloseReason, IncidentCondition, IncidentStore, render_incidents};
-use crate::runner_evidence::{self, RunnerFailureRecord, runner_evidence_store_path};
+use crate::runner_evidence::{
+    self, Kept, RunnerFailureRecord, runner_evidence_store_path, unreadable_store_path,
+};
 use crate::host_actuator::{
     HostActuatorAccess, HostActuatorHub, HostActuatorRunnerDriver, HostActuatorWorkloadDriver,
     HostUnobservable, IdunnHostActuatorIdentity, SharedHostActuatorHub, spawn_hub_service,
@@ -10695,18 +10697,27 @@ fn runner_failure_journal_line(
     transaction: &DeploymentTransaction,
     failure: &RunnerStepFailure,
     store_path: &Path,
-    recorded: &Result<()>,
+    recorded: &Result<Kept>,
 ) -> String {
     let head = format!(
         "Idunn transaction {} (command {}, target {}) {failure}",
         transaction.transaction_id, transaction.command_id, transaction.target
     );
     match recorded {
-        Ok(()) => format!(
-            "{head}; evidence in {}; read it with idunn status --command {}",
-            store_path.display(),
-            transaction.command_id
-        ),
+        Ok(kept) => {
+            let aside = match kept {
+                Kept::Stored => String::new(),
+                Kept::AfterSettingAsideAnUnreadableStore => format!(
+                    "; an undecodable evidence store was set aside as {}",
+                    unreadable_store_path(store_path).display()
+                ),
+            };
+            format!(
+                "{head}; evidence in {}{aside}; read it with idunn status --command {}",
+                store_path.display(),
+                transaction.command_id
+            )
+        }
         Err(error) => format!("{head}; evidence was not kept: {error:#}"),
     }
 }
@@ -24960,6 +24971,38 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             .keep_runner_failure(&ended, &anyhow::Error::new(canary_failure(b"")))
             .context("no journal line")?;
         assert!(line.contains("evidence was not kept"), "{line}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undecodable_evidence_store_does_not_stop_the_next_failure_keeping_its_evidence() -> Result<()> {
+        let damage = format!("\u{c1} not a store {RUNNER_CANARY}-in-the-damage");
+        let (world, _tools) = failing_runner_world()?;
+        let evidence = runner_evidence_store_path(&world.state_store);
+        std::fs::write(&evidence, damage.as_bytes())?;
+        let ended = tick_until_ended(&world)?;
+        // The transaction's own outcome is the runner failure, not the store.
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the damaged store changed the outcome: {:?} {:?}", ended.phase, ended.last_error);
+        };
+        assert!(error.contains("runner step test-daemon on runner rust"), "{error}");
+        assert!(!error.contains("damage"), "{error}");
+        // The damage is kept aside; the failure's evidence is in a fresh store.
+        assert_eq!(std::fs::read(unreadable_store_path(&evidence))?, damage.as_bytes());
+        let record = runner_evidence::for_transaction(&evidence, &ended.transaction_id)?
+            .context("the failure kept no evidence beside a damaged store")?;
+        assert_eq!(record.subject_id, "test-daemon");
+        assert!(printed_status(&world)?.contains("failed step test-daemon"));
+        // The journal says it, naming the file and none of its content.
+        std::fs::write(&evidence, damage.as_bytes())?;
+        let line = world
+            .engine
+            .keep_runner_failure(&ended, &anyhow::Error::new(canary_failure(b"x")))
+            .context("no journal line")?;
+        assert!(line.contains("an undecodable evidence store was set aside as"), "{line}");
+        assert!(line.contains("runner-evidence.unreadable.cc"), "{line}");
+        assert!(!line.contains("damage") && !line.contains("not a store"), "{line}");
         Ok(())
     }
 
