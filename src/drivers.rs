@@ -16525,6 +16525,65 @@ processes 9
         Ok(())
     }
 
+    /// A reader that answers from a script, so a read error the OS rarely
+    /// produces (an interrupted call) is produced on demand.
+    struct ScriptedReader(Vec<std::io::Result<Vec<u8>>>);
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let bytes = self.0.remove(0)?;
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    struct BrokenReader;
+
+    impl Read for BrokenReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("persistent read failure"))
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_and_loses_no_byte() {
+        let reader = ScriptedReader(vec![
+            Ok(b"ab".to_vec()),
+            Err(std::io::Error::from(ErrorKind::Interrupted)),
+            Ok(b"cd".to_vec()),
+            Err(std::io::Error::from(ErrorKind::Interrupted)),
+        ]);
+        let drained = drain_tail(reader, 3).expect("an interrupted read ended the drain");
+        assert_eq!(drained, (b"bcd".to_vec(), 4));
+    }
+
+    #[test]
+    fn a_persistent_read_error_ends_the_drain_instead_of_spinning() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(drain_tail(BrokenReader, 8).is_err());
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "a persistent read error spun or was swallowed"
+        );
+    }
+
+    #[test]
+    fn a_non_interrupted_read_error_after_data_is_returned_not_retried() {
+        let reader = ScriptedReader(vec![
+            Ok(b"ab".to_vec()),
+            Err(std::io::Error::from(ErrorKind::BrokenPipe)),
+            Ok(b"cd".to_vec()),
+        ]);
+        let error = drain_tail(reader, 8).expect_err("a broken pipe was retried past");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
+
     #[cfg(unix)]
     #[test]
     fn each_tail_is_the_last_bound_bytes_with_the_total() -> Result<()> {
