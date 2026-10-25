@@ -2152,6 +2152,115 @@ pub(crate) fn docker_run_args(
     Ok(args)
 }
 
+/// Bytes of each output stream that a failed runner step keeps. The daemon
+/// never holds more than this per stream while the step runs.
+pub(crate) const RUNNER_OUTPUT_TAIL_BYTES: usize = 8192;
+
+/// What a runner container was running: a recipe step or an external input,
+/// by the id the recipe gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RunnerSubject {
+    Step(String),
+    ExternalInput(String),
+}
+
+impl RunnerSubject {
+    pub(crate) fn id(&self) -> &str {
+        match self {
+            Self::Step(id) | Self::ExternalInput(id) => id,
+        }
+    }
+
+    fn noun(&self) -> &'static str {
+        match self {
+            Self::Step(_) => "step",
+            Self::ExternalInput(_) => "external input",
+        }
+    }
+}
+
+/// A runner container that did not exit successfully: what failed, how, and
+/// the last `RUNNER_OUTPUT_TAIL_BYTES` of each stream with its total size.
+/// The tails are evidence for `runner-evidence.cc`. `Display` and `Debug`
+/// carry none of them, so no error chain, record or log line renders output.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RunnerStepFailure {
+    pub(crate) subject: RunnerSubject,
+    pub(crate) runner: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) signal: Option<i32>,
+    pub(crate) stdout_tail: Vec<u8>,
+    pub(crate) stdout_total_bytes: u64,
+    pub(crate) stderr_tail: Vec<u8>,
+    pub(crate) stderr_total_bytes: u64,
+}
+
+impl RunnerStepFailure {
+    /// The status as an operator reads it.
+    pub(crate) fn status(&self) -> String {
+        runner_status(self.exit_code, self.signal)
+    }
+}
+
+/// How a container ended, as an operator reads it.
+pub(crate) fn runner_status(exit_code: Option<i32>, signal: Option<i32>) -> String {
+    match (exit_code, signal) {
+        (Some(code), _) => format!("exit status {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "an unknown status".to_owned(),
+    }
+}
+
+impl std::fmt::Display for RunnerStepFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "runner {} {} on runner {} exited with {}; its output tail is kept in runner-evidence.cc",
+            self.subject.noun(),
+            self.subject.id(),
+            self.runner,
+            self.status()
+        )
+    }
+}
+
+impl std::fmt::Debug for RunnerStepFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunnerStepFailure")
+            .field("subject", &self.subject)
+            .field("runner", &self.runner)
+            .field("exit_code", &self.exit_code)
+            .field("signal", &self.signal)
+            .field("stdout_total_bytes", &self.stdout_total_bytes)
+            .field("stderr_total_bytes", &self.stderr_total_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for RunnerStepFailure {}
+
+/// Read `reader` to its end keeping only the last `cap` bytes and counting
+/// every byte, so a verbose step never buffers whole in the daemon.
+fn drain_tail(mut reader: impl Read, cap: usize) -> std::io::Result<(Vec<u8>, u64)> {
+    let mut tail = Vec::new();
+    let mut total = 0u64;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => return Ok((tail, total)),
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        total += read as u64;
+        tail.extend_from_slice(&chunk[..read]);
+        if tail.len() > cap {
+            tail.drain(..tail.len() - cap);
+        }
+    }
+}
+
 /// Docker is only a runner substrate. Recipe argv stays an argv vector, the
 /// operator binding selects the exact image/network/mount affordances, and the
 /// driver returns complete materialization receipts rather than build truth by
@@ -2170,7 +2279,7 @@ impl Default for DockerRunnerDriver {
 }
 
 impl DockerRunnerDriver {
-    fn docker<I, S>(&self, args: I) -> Result<Output>
+    fn docker<I, S>(&self, subject: RunnerSubject, runner_id: &str, args: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -2179,23 +2288,50 @@ impl DockerRunnerDriver {
             self.docker_program.is_absolute(),
             "Docker runner program is not absolute"
         );
-        let output = Command::new(&self.docker_program)
+        let mut child = Command::new(&self.docker_program)
             .args(args)
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("starting Docker runner {}", self.docker_program.display()))?;
-        if !output.status.success() {
-            bail!(
-                "Docker runner exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        let stdout = child.stdout.take().context("Docker runner has no stdout pipe")?;
+        let stderr = child.stderr.take().context("Docker runner has no stderr pipe")?;
+        let stdout = thread::spawn(move || drain_tail(stdout, RUNNER_OUTPUT_TAIL_BYTES));
+        let stderr = thread::spawn(move || drain_tail(stderr, RUNNER_OUTPUT_TAIL_BYTES));
+        let status = child.wait().context("waiting for the Docker runner")?;
+        let (stdout_tail, stdout_total_bytes) = stdout
+            .join()
+            .map_err(|_| anyhow!("the runner stdout reader panicked"))?
+            .context("reading the runner stdout")?;
+        let (stderr_tail, stderr_total_bytes) = stderr
+            .join()
+            .map_err(|_| anyhow!("the runner stderr reader panicked"))?
+            .context("reading the runner stderr")?;
+        if status.success() {
+            return Ok(());
         }
-        Ok(output)
+        #[cfg(unix)]
+        let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+        #[cfg(not(unix))]
+        let signal = None;
+        Err(RunnerStepFailure {
+            subject,
+            runner: runner_id.to_owned(),
+            exit_code: status.code(),
+            signal,
+            stdout_tail,
+            stdout_total_bytes,
+            stderr_tail,
+            stderr_total_bytes,
+        }
+        .into())
     }
 
     fn run_in_workspace(
         &self,
+        step_id: &str,
+        runner_id: &str,
         runner: &DockerRunnerBinding,
         workspace: &Path,
         working_directory: &Path,
@@ -2212,8 +2348,7 @@ impl DockerRunnerDriver {
         build_machine_id_file(workspace)?;
         let spec = ContainerSpec::for_step(runner, required_environment, source_stamp)?;
         let args = docker_run_args(&spec, workspace, working_directory, argv)?;
-        self.docker(args)?;
-        Ok(())
+        self.docker(RunnerSubject::Step(step_id.to_owned()), runner_id, args)
     }
 
     fn materialize_external_input(
@@ -2255,7 +2390,11 @@ impl DockerRunnerDriver {
             input.url.clone(),
         ];
         let args = docker_run_args(&spec, workspace, Path::new("."), &curl_argv)?;
-        self.docker(args)?;
+        self.docker(
+            RunnerSubject::ExternalInput(input.id.clone()),
+            &input.runner,
+            args,
+        )?;
         let bytes = fs::read(&destination).with_context(|| {
             format!(
                 "reading materialized external input {}",
@@ -2377,6 +2516,8 @@ impl RunnerPort for DockerRunnerDriver {
                 );
             }
             self.run_in_workspace(
+                &step.id,
+                &step.runner,
                 runner,
                 workspace,
                 &step.working_directory,

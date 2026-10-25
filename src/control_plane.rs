@@ -42,11 +42,12 @@ use crate::drivers::{
     ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
     GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
     LockContended, ProcessIdentity, RouteActuation, RouteActuationGate, RouteActuationRefused, RouteActuators,
-    RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
+    RouteObservation, RoutePreflightReceipt, RunnerPort, RunnerStepFailure, SourcePort,
     SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
     WriteLeasePort,
 };
 use crate::incident::{CloseReason, IncidentCondition, IncidentStore, render_incidents};
+use crate::runner_evidence::{self, RunnerFailureRecord, runner_evidence_store_path};
 use crate::host_actuator::{
     HostActuatorAccess, HostActuatorHub, HostActuatorRunnerDriver, HostActuatorWorkloadDriver,
     HostUnobservable, IdunnHostActuatorIdentity, SharedHostActuatorHub, spawn_hub_service,
@@ -4877,6 +4878,24 @@ fn status(
                 }
                 if let Some(abort) = &transaction.pre_fencing_abort {
                     writeln!(out, "    pre-fencing abort {abort:?}")?;
+                    // The step that failed and its output tail live in their
+                    // own private store. An unreadable store costs its lines.
+                    match runner_evidence::for_transaction(
+                        &runner_evidence_store_path(store_path),
+                        &transaction.transaction_id,
+                    ) {
+                        Ok(Some(record)) => {
+                            for line in runner_evidence::render(&record) {
+                                writeln!(out, "{line}")?;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => writeln!(
+                            out,
+                            "    runner evidence unreadable: {}",
+                            error.root_cause()
+                        )?,
+                    }
                 }
                 if let Some(abort) = &transaction.post_fencing_abort {
                     writeln!(out, "    post-fencing abort {abort:?}")?;
@@ -5372,6 +5391,33 @@ impl Engine {
 
     fn incidents(&self) -> IncidentStore {
         IncidentStore::new(&self.options.incident_store)
+    }
+
+    /// A failed runner step keeps its output tail in the runner evidence
+    /// store and says so on the journal, naming no output. The store write is
+    /// best effort: its failure is named in the line and never stops the
+    /// abort that follows.
+    fn keep_runner_failure(&self, transaction: &DeploymentTransaction, error: &anyhow::Error) {
+        let Some(failure) = error.downcast_ref::<RunnerStepFailure>() else {
+            return;
+        };
+        let path = runner_evidence_store_path(&self.options.state_store);
+        let recorded = now_millis().and_then(|now| {
+            runner_evidence::record(
+                &path,
+                &RunnerFailureRecord::from_failure(
+                    &transaction.transaction_id,
+                    &transaction.command_id,
+                    &transaction.target,
+                    failure,
+                    now,
+                ),
+            )
+        });
+        eprintln!(
+            "{}",
+            runner_failure_journal_line(transaction, failure, &path, &recorded)
+        );
     }
 
     /// Settle the outcome of one incident operation. A failure never leaves
@@ -6315,6 +6361,7 @@ impl Engine {
                 if latest.value.pre_fencing_abort.is_none()
                     && error.downcast_ref::<LockContended>().is_none()
                 {
+                    self.keep_runner_failure(&latest.value, &error);
                     self.begin_pre_fencing_abort(latest, error)?;
                 } else {
                     self.record_resumable_error(latest, &error)?;
@@ -10641,6 +10688,28 @@ const DETAIL_EMPTY: &str = "(no detail)";
 /// only judge, and this output always satisfies it. NUL is dropped, empty
 /// input gets a fixed placeholder, and an over-long value keeps its head and
 /// its tail (where a build log's error is) cut on char boundaries.
+/// The journal line for a failed runner step: the transaction, the subject and
+/// status (the failure's `Display`), and where the evidence is. Never output.
+fn runner_failure_journal_line(
+    transaction: &DeploymentTransaction,
+    failure: &RunnerStepFailure,
+    store_path: &Path,
+    recorded: &Result<()>,
+) -> String {
+    let head = format!(
+        "Idunn transaction {} (command {}, target {}) {failure}",
+        transaction.transaction_id, transaction.command_id, transaction.target
+    );
+    match recorded {
+        Ok(()) => format!(
+            "{head}; evidence in {}; read it with idunn status --command {}",
+            store_path.display(),
+            transaction.command_id
+        ),
+        Err(error) => format!("{head}; evidence was not kept: {error:#}"),
+    }
+}
+
 fn bounded_detail(value: &str) -> String {
     let value = value.replace(' ', "");
     if value.is_empty() {
