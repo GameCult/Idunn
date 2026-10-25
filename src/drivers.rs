@@ -16568,5 +16568,53 @@ processes 9
         assert!(format!("{error:#}").contains("starting Docker runner"), "{error:#}");
         Ok(())
     }
+
+    /// The 2026-10-25 vili failure: `node --test` reported on stdout alone,
+    /// stderr stayed empty (the runner's /tmp is a noexec tmpfs) and the step
+    /// exited 1. The old capture dropped stdout and printed an empty message.
+    #[cfg(unix)]
+    #[test]
+    fn a_step_that_reports_only_on_stdout_keeps_that_report_and_its_name() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let driver = fake_docker(
+            temp.path(),
+            &format!("echo 'not ok 1 - daemon {RUNNER_CANARY}'\necho '# fail 1'\nexit 1"),
+        )?;
+        let error = run_step(&driver, temp.path(), "test-daemon").expect_err("the step passed");
+        // The error names the step and carries no output.
+        let text = format!("{error:#}");
+        assert!(text.contains("runner step test-daemon on runner rust exited with exit status 1"), "{text}");
+        assert!(!text.contains(RUNNER_CANARY) && !text.contains("not ok"), "{text}");
+        // The evidence keeps the stdout tail; the empty stderr is a recorded 0.
+        let failure = error
+            .downcast_ref::<RunnerStepFailure>()
+            .context("the failure is not typed")?;
+        let store = temp.path().join("runner-evidence.cc");
+        let record = crate::runner_evidence::RunnerFailureRecord::from_failure(
+            "tx-vili",
+            "up-vili",
+            "vili",
+            failure,
+            1,
+        );
+        crate::runner_evidence::record(&store, &record)?;
+        let kept = crate::runner_evidence::for_transaction(&store, "tx-vili")?.context("no evidence kept")?;
+        assert_eq!(kept.subject_id, "test-daemon");
+        assert_eq!(kept.exit_code, Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&kept.stdout_tail),
+            format!("not ok 1 - daemon {RUNNER_CANARY}\n# fail 1\n")
+        );
+        assert_eq!(kept.stdout_total_bytes, kept.stdout_tail.len() as u64);
+        assert!(kept.stderr_tail.is_empty());
+        assert_eq!(kept.stderr_total_bytes, 0);
+        let rendered = crate::runner_evidence::render(&kept).join("\n");
+        assert!(rendered.contains("stderr (last 0 of 0 bytes)"), "{rendered}");
+        assert!(rendered.contains(&format!("| not ok 1 - daemon {RUNNER_CANARY}")), "{rendered}");
+        // Debug names the failure and prints no tail.
+        let debug = format!("{failure:?}");
+        assert!(debug.starts_with("RunnerStepFailure") && !debug.contains("not ok"), "{debug}");
+        Ok(())
+    }
     // END runner-failure-evidence tests
 }

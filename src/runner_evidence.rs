@@ -314,11 +314,12 @@ mod tests {
     fn the_evidence_store_keeps_the_newest_32() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = runner_evidence_store_path(&temp.path().join("control.cc"));
-        for index in 0..=RUNNER_EVIDENCE_RECORDS {
+        // The literal, not the constant: the spec's bound is 32.
+        for index in 0..=32 {
             record(&path, &record_at(&format!("tx-{index:02}"), 1000 + index as u64))?;
         }
         let kept: Vec<_> = snapshot(&path)?.1.into_iter().map(|stored| stored.transaction_id).collect();
-        assert_eq!(kept.len(), RUNNER_EVIDENCE_RECORDS);
+        assert_eq!(kept.len(), 32);
         assert!(!kept.contains(&"tx-00".to_owned()), "the oldest survived");
         assert!(kept.contains(&"tx-32".to_owned()), "the newest was evicted");
         assert!(kept.contains(&"tx-01".to_owned()), "the second oldest was evicted early");
@@ -328,7 +329,7 @@ mod tests {
         again.stdout_total_bytes = 10;
         record(&path, &again)?;
         let kept = snapshot(&path)?.1;
-        assert_eq!(kept.len(), RUNNER_EVIDENCE_RECORDS);
+        assert_eq!(kept.len(), 32);
         assert!(kept.iter().any(|stored| stored.transaction_id == "tx-01"));
         let stored = for_transaction(&path, "tx-05")?.context("rewritten record is gone")?;
         assert_eq!(stored.stdout_tail, b"rewritten\n");
@@ -405,6 +406,15 @@ mod tests {
                 "      | bad\\u{d}\\u{7}",
             ]
         );
+    }
+
+    #[test]
+    fn debug_names_the_record_and_prints_no_tail() {
+        let mut stored = record_at("tx-a", 1);
+        stored.stdout_tail = b"SECRET-OUTPUT".to_vec();
+        stored.stdout_total_bytes = 13;
+        let debug = format!("{stored:?}");
+        assert!(debug.contains("tx-a") && !debug.contains("SECRET"), "{debug}");
     }
 
     #[test]
