@@ -42,11 +42,14 @@ use crate::drivers::{
     ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
     GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
     LockContended, ProcessIdentity, RouteActuation, RouteActuationGate, RouteActuationRefused, RouteActuators,
-    RouteObservation, RoutePreflightReceipt, RunnerPort, SourcePort,
+    RouteObservation, RoutePreflightReceipt, RunnerPort, RunnerStepFailure, SourcePort,
     SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
     WriteLeasePort,
 };
 use crate::incident::{CloseReason, IncidentCondition, IncidentStore, render_incidents};
+use crate::runner_evidence::{
+    self, Kept, RunnerFailureRecord, runner_evidence_store_path, unreadable_store_path,
+};
 use crate::host_actuator::{
     HostActuatorAccess, HostActuatorHub, HostActuatorRunnerDriver, HostActuatorWorkloadDriver,
     HostUnobservable, IdunnHostActuatorIdentity, SharedHostActuatorHub, spawn_hub_service,
@@ -4877,6 +4880,13 @@ fn status(
                 }
                 if let Some(abort) = &transaction.pre_fencing_abort {
                     writeln!(out, "    pre-fencing abort {abort:?}")?;
+                    // The step that failed and its output tail live in their
+                    // own private store. An unreadable store costs its lines.
+                    runner_evidence::show_status(
+                        out,
+                        &runner_evidence_store_path(store_path),
+                        &transaction.transaction_id,
+                    )?;
                 }
                 if let Some(abort) = &transaction.post_fencing_abort {
                     writeln!(out, "    post-fencing abort {abort:?}")?;
@@ -5372,6 +5382,32 @@ impl Engine {
 
     fn incidents(&self) -> IncidentStore {
         IncidentStore::new(&self.options.incident_store)
+    }
+
+    /// A failed runner step keeps its output tail in the runner evidence
+    /// store and says so on the journal, naming no output. The store write is
+    /// best effort: its failure is named in the line and never stops the
+    /// abort that follows.
+    fn keep_runner_failure(
+        &self,
+        transaction: &DeploymentTransaction,
+        error: &anyhow::Error,
+    ) -> Option<String> {
+        let failure = error.downcast_ref::<RunnerStepFailure>()?;
+        let path = runner_evidence_store_path(&self.options.state_store);
+        let recorded = now_millis().and_then(|now| {
+            runner_evidence::record(
+                &path,
+                &RunnerFailureRecord::from_failure(
+                    &transaction.transaction_id,
+                    &transaction.command_id,
+                    &transaction.target,
+                    failure,
+                    now,
+                ),
+            )
+        });
+        Some(runner_failure_journal_line(transaction, failure, &path, &recorded))
     }
 
     /// Settle the outcome of one incident operation. A failure never leaves
@@ -6315,6 +6351,9 @@ impl Engine {
                 if latest.value.pre_fencing_abort.is_none()
                     && error.downcast_ref::<LockContended>().is_none()
                 {
+                    if let Some(line) = self.keep_runner_failure(&latest.value, &error) {
+                        eprintln!("{line}");
+                    }
                     self.begin_pre_fencing_abort(latest, error)?;
                 } else {
                     self.record_resumable_error(latest, &error)?;
@@ -10641,6 +10680,43 @@ const DETAIL_EMPTY: &str = "(no detail)";
 /// only judge, and this output always satisfies it. NUL is dropped, empty
 /// input gets a fixed placeholder, and an over-long value keeps its head and
 /// its tail (where a build log's error is) cut on char boundaries.
+/// The journal line for a failed runner step: the transaction, the subject and
+/// status (the failure's `Display`), and where the evidence is. Never output.
+fn runner_failure_journal_line(
+    transaction: &DeploymentTransaction,
+    failure: &RunnerStepFailure,
+    store_path: &Path,
+    recorded: &Result<Kept>,
+) -> String {
+    let head = format!(
+        "Idunn transaction {} (command {}, target {}) {failure}",
+        transaction.transaction_id, transaction.command_id, transaction.target
+    );
+    match recorded {
+        Ok(kept) => {
+            let aside = match kept {
+                Kept::Stored => String::new(),
+                Kept::SetAside { replaced } => format!(
+                    "; an undecodable evidence store was set aside as {}{}",
+                    unreadable_store_path(store_path).display(),
+                    match replaced {
+                        Some(last_written) => format!(
+                            ", replacing an earlier set-aside store last written at unix millis {last_written}"
+                        ),
+                        None => String::new(),
+                    }
+                ),
+            };
+            format!(
+                "{head}; evidence in {}{aside}; read it with idunn status --command {}",
+                store_path.display(),
+                transaction.command_id
+            )
+        }
+        Err(error) => format!("{head}; evidence was not kept: {error:#}"),
+    }
+}
+
 fn bounded_detail(value: &str) -> String {
     let value = value.replace(' ', "");
     if value.is_empty() {
@@ -24657,4 +24733,435 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             Ok(())
         }
     }
+
+    // BEGIN runner-failure-evidence tests
+    // A failed runner step is named, its output tail is kept in
+    // runner-evidence.cc, and no output reaches an error, control.cc or the
+    // journal line. The runner is the real DockerRunnerDriver driving a fake
+    // docker program, through the engine's Sealing path.
+
+    const RUNNER_CANARY: &str = "CANARY-7c41e0d9";
+
+    /// A source that freezes a fixed tree, so a deployment reaches the runner.
+    struct TreeSource {
+        recipe: String,
+        root: PathBuf,
+    }
+
+    impl SourcePort for TreeSource {
+        fn resolve(
+            &self,
+            _: &OperatorBinding,
+            _: &str,
+            _: u64,
+        ) -> Result<crate::drivers::ResolvedSource> {
+            Ok(crate::drivers::ResolvedSource {
+                facts: crate::deployment_plan::tests::source(&self.recipe),
+                recipe_bytes: self.recipe.clone().into_bytes(),
+            })
+        }
+
+        fn freeze(&self, transaction_id: &str, plan: &CompiledDeploymentPlan) -> Result<FrozenSourceReceipt> {
+            Ok(FrozenSourceReceipt {
+                transaction_id: transaction_id.to_owned(),
+                plan_id: plan.plan_id.clone(),
+                snapshot_sha256: format!("sha256-{}", "a".repeat(64)),
+            })
+        }
+
+        fn observe_frozen(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            receipt: &FrozenSourceReceipt,
+        ) -> Result<crate::drivers::FrozenSource> {
+            Ok(crate::drivers::FrozenSource::fixture(
+                receipt.clone(),
+                plan.source.clone(),
+                plan.recipe_blob.clone(),
+                self.root.clone(),
+            ))
+        }
+
+        fn cleanup(&self, _: &str, _: Option<&FrozenSourceReceipt>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The unrouted recipe with two steps ahead of its build, and no external
+    /// input: the second step, `test-daemon`, is the one the fake docker fails.
+    fn two_step_recipe() -> String {
+        let recipe = unrouted_recipe().replace(
+            "capability = \"service.runtime\"",
+            &format!("capability = \"{ODIN_RENDEZVOUS_CAPABILITY}\""),
+        );
+        let (head, rest) = recipe
+            .split_once("[[external_inputs]]")
+            .expect("the recipe declares an external input");
+        let (_, tail) = rest.split_once("[[artifacts]]").expect("the recipe declares artifacts");
+        let head = head.replacen(
+            "[[steps]]\nid = \"build\"",
+            "[[steps]]\nid = \"install\"\nphase = \"prepare\"\nrunner = \"rust\"\nargv = [\"cargo\", \"fetch\"]\n\n\
+             [[steps]]\nid = \"test-daemon\"\nphase = \"test\"\nrunner = \"rust\"\nargv = [\"cargo\", \"test\"]\n\n\
+             [[steps]]\nid = \"build\"",
+            1,
+        );
+        format!("{head}[[artifacts]]{tail}")
+    }
+
+    /// A Sealing world whose runner is the real driver over a fake docker: the
+    /// first call succeeds, the second prints the canary and an escape
+    /// sequence on both streams and exits 3.
+    #[cfg(unix)]
+    fn failing_runner_world() -> Result<(EngineFixture, TempDir)> {
+        use std::os::unix::fs::PermissionsExt;
+        let tools = TempDir::new()?;
+        let docker = tools.path().join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nn=$(cat \"$0.count\" 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > \"$0.count\"\n\
+                 [ \"$n\" -lt 2 ] && exit 0\n\
+                 printf 'out {RUNNER_CANARY} \\033[2J\\n'\nprintf 'err {RUNNER_CANARY}\\n' >&2\nexit 3\n"
+            ),
+        )?;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755))?;
+        let recipe = two_step_recipe();
+        let mut world = sealing_world(&recipe)?;
+        let tree = tools.path().join("tree");
+        std::fs::create_dir_all(&tree)?;
+        std::fs::write(tree.join("README"), b"source")?;
+        world.engine.source = Arc::new(TreeSource { recipe, root: tree });
+        world.engine.docker_runner = DockerRunnerDriver { docker_program: docker };
+        Ok((world, tools))
+    }
+
+    /// Scheduler ticks until the deployment ends (or the budget is spent).
+    fn tick_until_ended(world: &EngineFixture) -> Result<DeploymentTransaction> {
+        for _ in 0..24 {
+            world.engine.resume_backoff.lock().unwrap().clear();
+            let _ = world.engine.run_scheduler_tick();
+            if latest(world)?.completion.is_some() {
+                break;
+            }
+        }
+        latest(world)
+    }
+
+    fn printed_status(world: &EngineFixture) -> Result<String> {
+        let mut printed = Vec::new();
+        status(&mut printed, &world.state_store, &world.engine.options.incident_store, Some("up-service"))?;
+        Ok(String::from_utf8(printed)?)
+    }
+
+    fn canary_failure(stdout: &[u8]) -> RunnerStepFailure {
+        RunnerStepFailure {
+            subject: crate::drivers::RunnerSubject::Step("test-daemon".into()),
+            runner: "rust".into(),
+            exit_code: Some(3),
+            signal: None,
+            stdout_tail: stdout.to_vec(),
+            stdout_total_bytes: stdout.len() as u64,
+            stderr_tail: stdout.to_vec(),
+            stderr_total_bytes: stdout.len() as u64,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_runner_step_is_named_kept_and_never_echoed() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (world, _tools) = failing_runner_world()?;
+        let ended = tick_until_ended(&world)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the deployment did not fail before fencing: {:?} {:?}", ended.phase, ended.last_error);
+        };
+        // Named: the second step, on its runner, with the exit status.
+        assert!(
+            error.contains("runner step test-daemon on runner rust exited with exit status 3"),
+            "{error}"
+        );
+        // Never echoed: no error text, no control.cc byte, carries the output.
+        let abort = ended.pre_fencing_abort.as_ref().context("no pre-fencing abort")?;
+        for text in [error.as_str(), abort.error.as_str(), &format!("{ended:?}")] {
+            assert!(!text.contains(RUNNER_CANARY), "runner output reached a record: {text}");
+        }
+        // The terminal transaction has moved to history.cc: both stores.
+        for store in [world.state_store.clone(), history_store_path(&world.state_store)] {
+            let bytes = std::fs::read(&store)?;
+            assert!(!bytes.is_empty(), "{} is empty", store.display());
+            assert!(
+                !bytes.windows(RUNNER_CANARY.len()).any(|window| window == RUNNER_CANARY.as_bytes()),
+                "runner output reached {}",
+                store.display()
+            );
+        }
+        // Kept: in the private store, tails of both streams, and on status.
+        let evidence = runner_evidence_store_path(&world.state_store);
+        assert_eq!(std::fs::metadata(&evidence)?.permissions().mode() & 0o777, 0o600);
+        let record = runner_evidence::for_transaction(&evidence, &ended.transaction_id)?
+            .context("no evidence for the failed transaction")?;
+        assert_eq!(record.subject_id, "test-daemon");
+        assert_eq!(record.exit_code, Some(3));
+        assert!(String::from_utf8_lossy(&record.stdout_tail).contains(RUNNER_CANARY));
+        assert!(String::from_utf8_lossy(&record.stderr_tail).contains(RUNNER_CANARY));
+        let printed = printed_status(&world)?;
+        assert!(printed.contains("failed step test-daemon"), "{printed}");
+        assert!(printed.contains(RUNNER_CANARY), "{printed}");
+        assert!(!printed.contains('\u{1b}'), "status printed a raw escape byte");
+        Ok(())
+    }
+
+    #[test]
+    fn the_journal_line_names_the_store_and_never_the_output() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let (transaction, _) = terminal_transaction_with_command("ghostlight")?;
+        let failure = canary_failure(RUNNER_CANARY.as_bytes());
+        let line = world
+            .engine
+            .keep_runner_failure(&transaction, &anyhow::Error::new(failure.clone()).context("sealing"))
+            .context("a runner failure produced no journal line")?;
+        assert!(!line.contains(RUNNER_CANARY), "{line}");
+        for needle in [
+            transaction.transaction_id.as_str(),
+            "up-ghostlight",
+            "ghostlight",
+            "runner step test-daemon on runner rust exited with exit status 3",
+            "runner-evidence.cc",
+            "idunn status --command up-ghostlight",
+        ] {
+            assert!(line.contains(needle), "{needle} missing from {line}");
+        }
+        // Not a runner failure: nothing is kept and nothing is said.
+        assert!(
+            world
+                .engine
+                .keep_runner_failure(&transaction, &anyhow::anyhow!("a different failure"))
+                .is_none()
+        );
+        // The line a failed write produces says so, with no output.
+        let unwritable = runner_failure_journal_line(
+            &transaction,
+            &failure,
+            Path::new("/var/lib/gamecult/idunn/runner-evidence.cc"),
+            &Err(anyhow::anyhow!("disk full")),
+        );
+        assert!(unwritable.contains("evidence was not kept: disk full"), "{unwritable}");
+        assert!(!unwritable.contains(RUNNER_CANARY));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_evidence_write_does_not_stop_the_abort() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        // A directory where the store should be: every write to it fails.
+        std::fs::create_dir(runner_evidence_store_path(&world.state_store))?;
+        let ended = tick_until_ended(&world)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the unwritable store stopped the abort: {:?} {:?}", ended.phase, ended.last_error);
+        };
+        assert!(error.contains("runner step test-daemon on runner rust"), "{error}");
+        let line = world
+            .engine
+            .keep_runner_failure(&ended, &anyhow::Error::new(canary_failure(b"")))
+            .context("no journal line")?;
+        assert!(line.contains("evidence was not kept"), "{line}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undecodable_evidence_store_does_not_stop_the_next_failure_keeping_its_evidence() -> Result<()> {
+        let damage = format!("\u{c1} not a store {RUNNER_CANARY}-in-the-damage");
+        let (world, _tools) = failing_runner_world()?;
+        let evidence = runner_evidence_store_path(&world.state_store);
+        std::fs::write(&evidence, damage.as_bytes())?;
+        let ended = tick_until_ended(&world)?;
+        // The transaction's own outcome is the runner failure, not the store.
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the damaged store changed the outcome: {:?} {:?}", ended.phase, ended.last_error);
+        };
+        assert!(error.contains("runner step test-daemon on runner rust"), "{error}");
+        assert!(!error.contains("damage"), "{error}");
+        // The damage is kept aside; the failure's evidence is in a fresh store.
+        assert_eq!(std::fs::read(unreadable_store_path(&evidence))?, damage.as_bytes());
+        let record = runner_evidence::for_transaction(&evidence, &ended.transaction_id)?
+            .context("the failure kept no evidence beside a damaged store")?;
+        assert_eq!(record.subject_id, "test-daemon");
+        assert!(printed_status(&world)?.contains("failed step test-daemon"));
+        // The journal says it, naming the file and none of its content.
+        std::fs::write(&evidence, damage.as_bytes())?;
+        let line = world
+            .engine
+            .keep_runner_failure(&ended, &anyhow::Error::new(canary_failure(b"x")))
+            .context("no journal line")?;
+        assert!(line.contains("an undecodable evidence store was set aside as"), "{line}");
+        assert!(line.contains("runner-evidence.unreadable.cc"), "{line}");
+        assert!(!line.contains("damage") && !line.contains("not a store"), "{line}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_evidence_store_costs_only_its_lines() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        let ended = tick_until_ended(&world)?;
+        std::fs::write(runner_evidence_store_path(&world.state_store), b"\xc1not a store")?;
+        let printed = printed_status(&world)?;
+        assert!(printed.contains(&format!("transaction {}", ended.transaction_id)), "{printed}");
+        assert!(printed.contains("target service phase"), "{printed}");
+        assert!(printed.contains("pre-fencing abort"), "{printed}");
+        assert_eq!(printed.matches("runner evidence unreadable").count(), 1, "{printed}");
+        Ok(())
+    }
+
+    /// Everything status prints from the evidence store goes through one
+    /// allowlist, so a hostile build log reaches the terminal as visible
+    /// escapes whatever its class.
+    #[cfg(unix)]
+    #[test]
+    fn status_prints_hostile_runner_output_as_visible_escapes_only() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        let ended = tick_until_ended(&world)?;
+        let hostile: Vec<(&str, &str)> = vec![
+            ("\u{1b}[2J", "\\u{1b}[2J"),
+            ("\u{7}", "\\u{7}"),
+            ("\r", "\\u{d}"),
+            ("\u{202e}", "\\u{202e}"),
+            ("\u{2066}", "\\u{2066}"),
+            ("\u{85}", "\\u{85}"),
+            ("\u{e0041}", "\\u{e0041}"),
+            ("\u{200b}", "\\u{200b}"),
+            ("\u{feff}", "\\u{feff}"),
+        ];
+        let mut tail: Vec<u8> = Vec::new();
+        for &(raw, _) in &hostile {
+            tail.extend_from_slice(b"a");
+            tail.extend_from_slice(raw.as_bytes());
+            tail.extend_from_slice(b"b\n");
+        }
+        tail.extend_from_slice(b"bad \xff\xc1 bytes\n");
+        runner_evidence::record(
+            &runner_evidence_store_path(&world.state_store),
+            &RunnerFailureRecord::from_failure(
+                &ended.transaction_id,
+                &ended.command_id,
+                &ended.target,
+                &canary_failure(&tail),
+                9,
+            ),
+        )?;
+        let printed = printed_status(&world)?;
+        for &(raw, escaped) in &hostile {
+            assert!(!printed.contains(raw), "{escaped} reached the terminal raw");
+            assert!(printed.contains(&format!("a{escaped}b")), "{escaped} missing: {printed}");
+        }
+        assert!(printed.contains("bad \\xff\\xc1 bytes"), "{printed}");
+        let section = printed.find("    failed step").context("no evidence section")?;
+        assert!(printed[section..].is_ascii(), "non-ASCII reached the terminal: {printed}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_prints_the_unreadable_store_line_escaped() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        tick_until_ended(&world)?;
+        let evidence = runner_evidence_store_path(&world.state_store);
+        // The decode error of this store quotes the stored subject kind.
+        let mut bytes = std::fs::read(&evidence)?;
+        let at = bytes
+            .windows(4)
+            .position(|window| window == b"step")
+            .context("no step marker in the evidence store")?;
+        bytes[at..at + 4].copy_from_slice(b"\x1b[2J");
+        std::fs::write(&evidence, bytes)?;
+        let printed = printed_status(&world)?;
+        assert_eq!(printed.matches("runner evidence unreadable").count(), 1, "{printed}");
+        assert!(!printed.contains('\u{1b}'), "an escape byte reached the terminal");
+        assert!(printed.contains("\\u{1b}[2J"), "{printed}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_journal_line_names_a_displaced_set_aside_store_by_time_only() -> Result<()> {
+        let (transaction, _) = terminal_transaction_with_command("ghostlight")?;
+        let failure = canary_failure(RUNNER_CANARY.as_bytes());
+        let path = Path::new("/var/lib/gamecult/idunn/runner-evidence.cc");
+        let first = runner_failure_journal_line(
+            &transaction,
+            &failure,
+            path,
+            &Ok(Kept::SetAside { replaced: None }),
+        );
+        assert!(first.contains("was set aside as"), "{first}");
+        assert!(!first.contains("replacing"), "{first}");
+        let second = runner_failure_journal_line(
+            &transaction,
+            &failure,
+            path,
+            &Ok(Kept::SetAside { replaced: Some(1234) }),
+        );
+        assert!(
+            second.contains("replacing an earlier set-aside store last written at unix millis 1234"),
+            "{second}"
+        );
+        assert!(!second.contains(RUNNER_CANARY));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_store_types_are_unchanged_by_a_runner_failure() -> Result<()> {
+        let (world, _tools) = failing_runner_world()?;
+        tick_until_ended(&world)?;
+        // The store a rolled-back Idunn reads: it refuses any foreign type.
+        ControlSnapshot::read(&world.state_store)?;
+        let mut transactions = 0;
+        for store in [world.state_store.clone(), history_store_path(&world.state_store)] {
+            for envelope in SingleFileMessagePackBackingStore::new(&store).pull_all_read_only_snapshot()? {
+                assert!(!envelope.r#type.contains("runner_failure"), "{}", envelope.r#type);
+                if envelope.r#type == DeploymentTransaction::TYPE {
+                    transactions += 1;
+                    assert_eq!(envelope.schema_id.as_deref(), Some("idunn.deployment_transaction.v4"));
+                }
+            }
+        }
+        assert_eq!(transactions, 1, "the failed transaction is in neither store");
+        Ok(())
+    }
+
+    /// The records control.cc holds re-encode byte for byte. The hex was
+    /// captured at base 804ed75, before this cut touched anything: a runner
+    /// failure adds no field, no type and no schema to the control store.
+    #[test]
+    fn control_records_encode_exactly_as_they_did_at_base() -> Result<()> {
+        let command = DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: "up-service".into(),
+            kind: CommandKind::Deploy,
+            selector: "service".into(),
+            requested_by: "test".into(),
+            requested_at_unix_millis: 100,
+        };
+        let mut transaction = DeploymentTransaction::new(&command, "service".into(), 0, None, 100)?;
+        transaction.transaction_id = "tx-pinned".into();
+        transaction.last_error = Some("runner step test-daemon on runner rust exited with exit status 3".into());
+        transaction.pre_fencing_abort = Some(PreFencingAbort {
+            error: "runner step test-daemon on runner rust exited with exit status 3".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Complete,
+        });
+        let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let command_hex = hex(&command_envelope(&command, 100)?.payload);
+        let transaction_hex = hex(&transaction_envelope(&transaction, 100)?.payload);
+        assert_eq!(command_hex, PINNED_COMMAND_HEX, "command bytes changed");
+        assert_eq!(transaction_hex, PINNED_TRANSACTION_HEX, "transaction bytes changed");
+        Ok(())
+    }
+
+    const PINNED_COMMAND_HEX: &str = "96bb6964756e6e2e6465706c6f796d656e745f636f6d6d616e642e7632aa75702d73657276696365a66465706c6f79a773657276696365a47465737464";
+    const PINNED_TRANSACTION_HEX: &str = "dc0025bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7634a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0";
+    // END runner-failure-evidence tests
 }

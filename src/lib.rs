@@ -7,4 +7,5 @@ pub mod host_actuator;
 #[cfg(unix)]
 pub mod launcher;
 mod incident;
+mod runner_evidence;
 pub mod provisioning;
