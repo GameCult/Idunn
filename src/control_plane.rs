@@ -24784,7 +24784,10 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     /// The unrouted recipe with two steps ahead of its build, and no external
     /// input: the second step, `test-daemon`, is the one the fake docker fails.
     fn two_step_recipe() -> String {
-        let recipe = unrouted_recipe();
+        let recipe = unrouted_recipe().replace(
+            "capability = \"service.runtime\"",
+            &format!("capability = \"{ODIN_RENDEZVOUS_CAPABILITY}\""),
+        );
         let (head, rest) = recipe
             .split_once("[[external_inputs]]")
             .expect("the recipe declares an external input");
@@ -24876,11 +24879,16 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         for text in [error.as_str(), abort.error.as_str(), &format!("{ended:?}")] {
             assert!(!text.contains(RUNNER_CANARY), "runner output reached a record: {text}");
         }
-        let control = std::fs::read(&world.state_store)?;
-        assert!(
-            !control.windows(RUNNER_CANARY.len()).any(|window| window == RUNNER_CANARY.as_bytes()),
-            "runner output reached control.cc"
-        );
+        // The terminal transaction has moved to history.cc: both stores.
+        for store in [world.state_store.clone(), history_store_path(&world.state_store)] {
+            let bytes = std::fs::read(&store)?;
+            assert!(!bytes.is_empty(), "{} is empty", store.display());
+            assert!(
+                !bytes.windows(RUNNER_CANARY.len()).any(|window| window == RUNNER_CANARY.as_bytes()),
+                "runner output reached {}",
+                store.display()
+            );
+        }
         // Kept: in the private store, tails of both streams, and on status.
         let evidence = runner_evidence_store_path(&world.state_store);
         assert_eq!(std::fs::metadata(&evidence)?.permissions().mode() & 0o777, 0o600);
@@ -24976,15 +24984,17 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         tick_until_ended(&world)?;
         // The store a rolled-back Idunn reads: it refuses any foreign type.
         ControlSnapshot::read(&world.state_store)?;
-        let envelopes =
-            SingleFileMessagePackBackingStore::new(&world.state_store).pull_all_read_only_snapshot()?;
-        assert!(!envelopes.is_empty());
-        for envelope in &envelopes {
-            assert!(!envelope.r#type.contains("runner_failure"), "{}", envelope.r#type);
-            if envelope.r#type == DeploymentTransaction::TYPE {
-                assert_eq!(envelope.schema_id.as_deref(), Some("idunn.deployment_transaction.v4"));
+        let mut transactions = 0;
+        for store in [world.state_store.clone(), history_store_path(&world.state_store)] {
+            for envelope in SingleFileMessagePackBackingStore::new(&store).pull_all_read_only_snapshot()? {
+                assert!(!envelope.r#type.contains("runner_failure"), "{}", envelope.r#type);
+                if envelope.r#type == DeploymentTransaction::TYPE {
+                    transactions += 1;
+                    assert_eq!(envelope.schema_id.as_deref(), Some("idunn.deployment_transaction.v4"));
+                }
             }
         }
+        assert_eq!(transactions, 1, "the failed transaction is in neither store");
         Ok(())
     }
 
