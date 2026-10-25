@@ -284,3 +284,111 @@ Idunn's body changes only through gamecult-ops
 `scripts/install-idunn-yggdrasil-release.sh` (stage `idunn` only; unit and
 bindings unchanged). After it, Vili's Hands reruns from step 4 of
 `motion-pipeline:cut_report:cut-vili-admission.h4`'s undone list.
+
+## Cut `runner-failure-evidence`
+
+Spec `idunn-deploy-provenance:cut_spec:cut-runner-failure-evidence.r1`, at
+`804ed75` (origin/main, live on Yggdrasil). It serves the StreamPixels-area
+Self: `idunn up vili` (command `up-4866467c-ee98-4a2b-b4a9-a008d7c44acd`,
+transaction `tx-a04b68c7-c742-4d7d-8220-8aa08b9febae`, 2026-10-25 00:50-00:55
+UTC) failed in Sealing with `Docker runner exited with exit status: 1: ` and
+nobody could tell which recipe step failed.
+
+### Body facts (source read at `804ed75`; host read-only, 2026-10-25)
+
+- R1. The runner is `docker run --rm` (`src/drivers.rs:2088-2090`), launched by
+  `DockerRunnerDriver::docker` (`:2173-2195`) with stdin null and
+  `Command::output()`: stdout and stderr are each buffered whole in the
+  daemon's memory, unbounded. On a non-zero exit the error is
+  `"Docker runner exited with {status}: {stderr}"`; stdout is dropped. The
+  container is gone the moment it exits, so `docker ps -a` and `docker logs`
+  hold nothing.
+- R2. The empty message: the failing process wrote nothing to stderr, and
+  stdout, the only stream that carried its report, is discarded at
+  `:2182-2193`. The same interpolation echoes whatever a step does write to
+  stderr into `last_error`, `pre_fencing_abort.error` and
+  `completion.error` (`bounded_detail`, 2048 bytes), and from there into
+  `idunn up`'s `deployment failed:` line and `idunn status`.
+- R3. No step identity reaches the error. `materialize` (`:2368-2391`) loops
+  over `declaration.steps` and calls `run_in_workspace` with argv only;
+  `step.id` is used only in the environment precondition. External inputs
+  (`curl` in the runner, `:2247-2258`) fail through the same helper with the
+  same anonymous message.
+- R4. Which step failed on 2026-10-25, inferred from the failed transaction's
+  staging root, which survives (926 MiB,
+  `/var/lib/gamecult/idunn/staging/tx-a04b68c7-.../`): in `.runner-node-build`,
+  `node_modules/.package-lock.json` was written at 00:51:24 (so
+  `install-vili-dependencies`, `npm ci`, finished), nothing outside
+  `node_modules` is newer, and `release/vili` (the next step's output) is
+  absent; the python workspace holds only fetched inputs. The failing step was
+  `test-daemon` (`node --test ... scripts/test-vili-daemon.mjs`), whose test
+  reporter writes to stdout: exactly the stream R1 discards. Inference from
+  residue, not from output.
+- R5. The failure path: `resume_one_transaction` (`src/control_plane.rs:6291-6320`)
+  sends a pre-fence error to `begin_pre_fencing_abort` (`:9916-9935`), which
+  persists `bounded_detail(format!("{error:#}"))`. Nothing reaches the journal
+  on this path: the idunn-yggdrasil journal for 00:45-01:10 holds only
+  provider-exclusion lines.
+- R6. Stores. `control.cc` (root 0640) holds commands, transactions
+  (`idunn.deployment_transaction.v4`, keys 0-36), generations, supervision and
+  expiry requests; `ControlSnapshot::read` refuses any other type
+  (`:3420`). Records must re-encode byte-exactly (`decode_record`,
+  `:3717-3727`), so a new transaction field is a schema bump and a v4 lift
+  (`:4100-4110`). Terminal transactions move verbatim to `history.cc`
+  (`:4366-4396`; 39.8 MB on the host), which status reads for `--command`.
+  `incidents.cc` lives in the published projection directory and by its own
+  doc (`src/incident.rs:1-11`) carries no free text and is never `control.cc`,
+  because a type added there stops continuity for every target on a rollback.
+- R7. The daemon runs as root (`User=root`). Runner secrets reach the
+  container as read-only file mounts named by env (`:2041-2047`), so any text
+  a step derives from them can land in its output.
+- R8. Staging residue: 475 transaction roots, 55 GiB under
+  `/var/lib/gamecult/idunn/staging`; a failed Sealing leaves its workspaces
+  because `materialize` returns before `remove_tree_inside`.
+
+### Decision
+
+The failure becomes a typed value at the runner, `RunnerStepFailure`: the
+subject (recipe step or external input, by id), the runner id, the exit code or
+signal, and the last 8 KiB of stdout and of stderr with each stream's total
+byte count. Its `Display` carries the subject and status, never output.
+Capture streams both pipes through bounded tails, so a verbose build no longer
+buffers whole in the daemon.
+
+The tail lives in a new private store, `runner-evidence.cc`, beside
+`control.cc` (mode 0600), one record per transaction
+(`idunn.runner_failure.v1`), newest 32 kept by the writer. Not in the
+transaction record: that is a v5 bump whose rollback makes every older Idunn
+refuse its control store (R6), the scar `incident.rs` already names. Not in
+`incidents.cc`: published, and free text is barred there. Not in the journal:
+journal readers are a wider set than root, so the journal line names the
+transaction, the subject, the status and the store, and no output.
+
+No redaction. Matching secret bytes would make the daemon read every secret,
+and still misses any encoding, prefix or transform of one; a claimed redaction
+that leaks is worse than a stated rule. The rule instead is the reader set: the
+store's only readers (root) can already read every secret the runner was
+given.
+
+Keeping the failed container (dropping `--rm`) is worse: its output then lives
+in Docker's json-file log, unbounded, untyped, outside Idunn's state and
+readable by the docker group; containers accumulate with no owner to reap them;
+`docker system prune` erases the evidence; and nothing ties a container to the
+transaction in `idunn status`.
+
+### Authority
+
+Owner: the runner decides what failed and keeps the bounded tail; the engine's
+pre-fence failure path is the one writer of `runner-evidence.cc`.
+`last_error`, `pre_fencing_abort.error` and `completion.error` keep only the
+failure's `Display`. Forbidden writers: the `stderr` interpolation in
+`DockerRunnerDriver::docker`. Retention is by count inside the writer, so the
+store needs no external owner; staging roots (R8) stay with
+`ghostlight-verse:follow_up:idunn-generation-retention`.
+
+### Deploy
+
+Idunn's body changes only through gamecult-ops
+`scripts/install-idunn-yggdrasil-release.sh` (stage `idunn` only; unit and
+bindings unchanged). The next failed Sealing then shows its step and tail on
+`sudo idunn status --command <id>`.
