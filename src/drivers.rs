@@ -605,7 +605,9 @@ pub trait WorkloadPort {
     ///
     /// Idunn launches candidates as transient units with `Restart=no`, so a
     /// unit that has failed, or that systemd no longer knows, will not come
-    /// back on its own. Past the fence every error is otherwise treated as
+    /// back on its own. Those units are collected once they fail
+    /// (`INCARNATION_UNIT_LIFECYCLE`), so a failed candidate usually reads as
+    /// forgotten rather than failed. Past the fence every error is otherwise treated as
     /// resumable and retried forever, which is right while a candidate can
     /// still recover and a trap once it cannot.
     fn is_permanently_stopped(&self, observation: &WorkloadObservation) -> Result<bool>;
@@ -2574,6 +2576,13 @@ impl RunnerPort for DockerRunnerDriver {
     }
 }
 
+/// How every incarnation unit lives and dies. It runs once (`Restart=no`)
+/// and systemd forgets it once it is inactive or failed (`--collect`): the
+/// outcome is Idunn's to record in its own store, and a failed transient unit
+/// left loaded is only clutter that marks the host degraded.
+const INCARNATION_UNIT_LIFECYCLE: [&str; 3] =
+    ["--collect", "--property=Type=exec", "--property=Restart=no"];
+
 /// systemd owns process execution. This driver lowers one validated launch
 /// contract into a transient unit and then proves the native process and
 /// executable that systemd actually started. It does not decide admission,
@@ -3764,8 +3773,9 @@ impl SystemdTransientWorkloadDriver {
             OsString::from("--no-ask-password"),
             OsString::from("--expand-environment=no"),
             OsString::from(format!("--unit={unit}")),
-            OsString::from("--property=Type=exec"),
-            OsString::from("--property=Restart=no"),
+        ];
+        args.extend(INCARNATION_UNIT_LIFECYCLE.map(OsString::from));
+        args.extend([
             OsString::from("--property=KillMode=mixed"),
             OsString::from("--property=DynamicUser=yes"),
             OsString::from("--property=SupplementaryGroups="),
@@ -3801,7 +3811,7 @@ impl SystemdTransientWorkloadDriver {
             OsString::from(format!("--working-directory={}", installed.display())),
             OsString::from(format!("--property=ReadOnlyPaths={}", installed.display())),
             OsString::from(format!("--property=ReadOnlyPaths={}", bundle.display())),
-        ];
+        ]);
         for open_file in parent_only_open_files {
             args.push(OsString::from(format!("--property=OpenFile={open_file}")));
         }
@@ -9940,6 +9950,16 @@ Content-Le".to_vec()), |_| {}),
             .map_err(|_| anyhow!("route readiness test server panicked"))??;
         drop(stream?);
         Ok(())
+    }
+
+    /// An incarnation unit runs once and is collected when it ends, so a
+    /// failed candidate does not stay loaded and mark the host degraded.
+    /// Collection is safe because a forgotten unit already reads as
+    /// permanently stopped (the test below).
+    #[test]
+    fn incarnation_units_run_once_and_are_collected() {
+        assert!(INCARNATION_UNIT_LIFECYCLE.contains(&"--collect"));
+        assert!(INCARNATION_UNIT_LIFECYCLE.contains(&"--property=Restart=no"));
     }
 
     /// Admission audit, claim 3: `is_permanently_stopped` now lets the
