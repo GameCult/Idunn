@@ -381,6 +381,8 @@ pub(crate) enum Via {
 pub(crate) enum Refused {
     AlwaysRefused { unit: String, via: Via },
     Braked,
+    /// The order's principal or issuing uid is not the steward bound now.
+    NotSteward,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +421,9 @@ impl Outcome {
                 }
             ),
             Outcome::Refused(Refused::Braked) => "refused: braked".into(),
+            Outcome::Refused(Refused::NotSteward) => {
+                "refused: the issuer is not the current steward".into()
+            }
             Outcome::Lost => "lost: the orders service restarted mid-run".into(),
             Outcome::Submitted { command_id } => {
                 format!("submitted deployment {}", escape(command_id.as_bytes()))
@@ -865,6 +870,11 @@ pub(crate) fn execute(ctx: &Ctx, order_id: &str) -> Result<()> {
     if ledger.start_of(order_id).is_some() || ledger.outcome_of(order_id).is_some() {
         return Ok(());
     }
+    // One gate for a fresh order and a recovered one: who may order is what the
+    // binding says now, not what it said when the order was accepted.
+    if order.principal != ctx.principal || order.issuer_uid != ctx.steward_uid {
+        return conclude(ctx, order_id, Outcome::Refused(Refused::NotSteward), b"", b"");
+    }
     if order.operation.validate().is_err() {
         return conclude(
             ctx,
@@ -895,7 +905,7 @@ pub(crate) fn execute(ctx: &Ctx, order_id: &str) -> Result<()> {
             }
         }
     }
-    if !ctx.brake.clear(&order.principal) {
+    if !ctx.brake.clear(&ctx.principal) {
         return conclude(ctx, order_id, Outcome::Refused(Refused::Braked), b"", b"");
     }
     let uuid = order_uuid(order_id);
@@ -1010,7 +1020,12 @@ fn deploy_finished(state: &str) -> bool {
     !matches!(state, "queued" | "running")
 }
 
-fn due_posts(ctx: &Ctx, ledger: &Ledger) -> Vec<Due> {
+/// What is owed to the room. `deploy_state` is a deployment command's derived
+/// state and detail, read from the control store by the caller.
+fn due_posts(
+    ledger: &Ledger,
+    deploy_state: &dyn Fn(&str) -> Result<(&'static str, String)>,
+) -> Vec<Due> {
     let mut due = Vec::new();
     for order in &ledger.orders {
         let id = &order.order_id;
@@ -1029,7 +1044,7 @@ fn due_posts(ctx: &Ctx, ledger: &Ledger) -> Vec<Due> {
         };
         let mut line = record.outcome.describe();
         if let Outcome::Submitted { command_id } = &record.outcome {
-            match command_state(&ctx.state_store, command_id) {
+            match deploy_state(command_id) {
                 Ok((state, detail)) if deploy_finished(state) => {
                     line = format!("{line}: {state} {}", escape(detail.as_bytes()));
                 }
@@ -1053,7 +1068,8 @@ fn due_posts(ctx: &Ctx, ledger: &Ledger) -> Vec<Due> {
 pub(crate) fn post_pass(ctx: &Ctx) -> Result<usize> {
     let ledger = ctx.store.ledger()?;
     let mut sent = 0;
-    for due in due_posts(ctx, &ledger) {
+    let deploy_state = |command_id: &str| command_state(&ctx.state_store, command_id);
+    for due in due_posts(&ledger, &deploy_state) {
         let transaction = format!("idunn-{}-{}", due.order_id, due.kind.as_str());
         let event_id = ctx.homeserver.post(&transaction, &due.text)?;
         ctx.store.put(
@@ -1173,7 +1189,9 @@ pub(crate) fn handle(
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let peer = ctx.peers.peer(stream)?;
-    if peer.uid != ctx.steward_uid {
+    // The steward may order and read; root, the operator, may only read.
+    let steward = peer.uid == ctx.steward_uid;
+    if !steward && peer.uid != 0 {
         eprintln!("steward socket: refused a peer that is not the steward");
         return refuse(stream, "peer", Code::Unauthorized);
     }
@@ -1185,6 +1203,10 @@ pub(crate) fn handle(
         return refuse(stream, "frame", Code::Malformed);
     };
     match request {
+        Request::Order(_) if !steward => {
+            eprintln!("steward socket: refused an order from a peer that is not the steward");
+            refuse(stream, "peer", Code::Unauthorized)
+        }
         Request::Order(request) => {
             let checked =
                 validate_reason(&request.reason).and_then(|()| request.operation.validate());
@@ -1368,17 +1390,27 @@ impl Systemd for HostSystemd {
     }
 }
 
-/// The last `.service` or `.scope` in a process's cgroup path names its issuer.
+/// A system service or scope names the issuer: the first unit under
+/// `system.slice` in the peer's cgroup path. A peer cannot choose it. Slices
+/// above it are the manager's, and what a delegated subtree adds below it is
+/// ignored. Any other path (a user manager's, a bare directory) is `unknown`.
 fn unit_from_cgroup(text: &str) -> String {
     let line = text
         .lines()
         .find(|line| line.starts_with("0::") || line.contains(":name=systemd:"))
         .unwrap_or_default();
     let path = line.rsplit_once(':').map_or("", |(_, path)| path);
-    path.rsplit('/')
-        .find(|segment| segment.ends_with(".service") || segment.ends_with(".scope"))
-        .filter(|segment| segment.len() <= UNIT_LIMIT)
-        .map_or_else(|| "unknown".to_owned(), str::to_owned)
+    let unit = path.strip_prefix("/system.slice/").and_then(|under| {
+        for segment in under.split('/') {
+            if segment.ends_with(".slice") {
+                continue;
+            }
+            let unit = segment.ends_with(".service") || segment.ends_with(".scope");
+            return (unit && segment.len() <= UNIT_LIMIT).then_some(segment);
+        }
+        None
+    });
+    unit.map_or_else(|| "unknown".to_owned(), str::to_owned)
 }
 
 /// Kernel peer credentials (`SO_PEERCRED`) and the peer's cgroup.
@@ -1440,6 +1472,8 @@ pub(crate) struct Synapse {
     pub(crate) address: std::net::SocketAddr,
     pub(crate) room: String,
     pub(crate) token_file: PathBuf,
+    /// The whole wait for a reply, however slowly it drips.
+    pub(crate) reply_within: Duration,
 }
 
 fn percent_encode(text: &str) -> String {
@@ -1474,15 +1508,26 @@ impl Homeserver for Synapse {
         );
         let mut socket = std::net::TcpStream::connect_timeout(&self.address, Duration::from_secs(5))
             .context("the homeserver is unreachable")?;
-        socket.set_read_timeout(Some(Duration::from_secs(10)))?;
-        socket.set_write_timeout(Some(Duration::from_secs(10)))?;
+        socket.set_write_timeout(Some(self.reply_within))?;
         socket.write_all(head.as_bytes())?;
         socket.write_all(&body)?;
+        let deadline = std::time::Instant::now() + self.reply_within;
         let mut reply = Vec::new();
-        socket
-            .take(RESPONSE_FRAME_LIMIT as u64)
-            .read_to_end(&mut reply)
-            .context("the homeserver reply was cut short")?;
+        let mut chunk = [0u8; 4096];
+        while reply.len() < RESPONSE_FRAME_LIMIT {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|left| !left.is_zero())
+                .context("the homeserver reply was too slow")?;
+            socket.set_read_timeout(Some(remaining))?;
+            let count = socket
+                .read(&mut chunk)
+                .context("the homeserver reply was cut short")?;
+            if count == 0 {
+                break;
+            }
+            reply.extend_from_slice(&chunk[..count]);
+        }
         let split = reply
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -1664,7 +1709,9 @@ fn vital(name: &'static str, work: impl FnOnce() + Send + 'static) {
         .expect("a thread can be spawned");
 }
 
-fn bind_socket(path: &Path) -> Result<UnixListener> {
+/// The socket belongs to the steward and no one else may open it; the peer
+/// credential check on every connection stays the lock.
+fn bind_socket(path: &Path, steward_uid: u32) -> Result<UnixListener> {
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         use std::os::unix::fs::FileTypeExt;
         ensure!(
@@ -1674,12 +1721,20 @@ fn bind_socket(path: &Path) -> Result<UnixListener> {
         std::fs::remove_file(path).context("removing a stale socket")?;
     }
     let listener = UnixListener::bind(path).context("binding the steward socket")?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+    std::os::unix::fs::chown(path, Some(steward_uid), None)
+        .context("giving the steward socket to the steward")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .context("setting the steward socket mode")?;
     Ok(listener)
 }
 
+/// Files this service creates in Idunn's own stores (a deploy order writes
+/// `control.cc`) take Idunn's umask, whatever the unit that runs it sets.
+const IDUNN_UMASK: libc::mode_t = 0o027;
+
 pub(crate) fn serve(options: ServeOptions) -> Result<()> {
+    // SAFETY: umask only sets the process file-mode mask; it cannot fail.
+    unsafe { libc::umask(IDUNN_UMASK) };
     let binding = load_binding(&options.steward_binding)?;
     let credentials = std::env::var_os("CREDENTIALS_DIRECTORY")
         .map(PathBuf::from)
@@ -1698,11 +1753,12 @@ pub(crate) fn serve(options: ServeOptions) -> Result<()> {
             address: binding.address()?,
             room: binding.room.clone(),
             token_file: credentials.join(&binding.token_credential),
+            reply_within: Duration::from_secs(10),
         }),
     });
     ctx.store.prepare()?;
     let pending = recover(&ctx)?;
-    let listener = bind_socket(&options.socket)?;
+    let listener = bind_socket(&options.socket, ctx.steward_uid)?;
     let (queue, orders) = mpsc::channel::<String>();
     for order_id in pending {
         queue.send(order_id)?;
@@ -1945,10 +2001,12 @@ mod tests {
         }
     }
 
-    struct FakeBrake(AtomicBool);
+    /// Whether the brake is clear, and the principals it was asked about.
+    struct FakeBrake(AtomicBool, Mutex<Vec<String>>);
 
     impl BrakeCheck for FakeBrake {
-        fn clear(&self, _principal: &str) -> bool {
+        fn clear(&self, principal: &str) -> bool {
+            self.1.lock().unwrap().push(principal.into());
             self.0.load(Ordering::SeqCst)
         }
     }
@@ -1988,7 +2046,7 @@ mod tests {
                 ..RunReport::default()
             }),
         });
-        let brake = Arc::new(FakeBrake(AtomicBool::new(true)));
+        let brake = Arc::new(FakeBrake(AtomicBool::new(true), Mutex::new(Vec::new())));
         let home = Arc::new(FakeHome::default());
         let (queue, orders) = mpsc::channel();
         let ctx = Ctx {
@@ -2424,7 +2482,7 @@ mod tests {
             .filter(|record| matches!(record.outcome, Outcome::Refused(_)))
             .count();
         assert_eq!(refusals, direct.len() * 4 + 8 + 6);
-        let due = due_posts(&h.ctx, &ledger);
+        let due = due_posts(&ledger, &|command_id| command_state(&h.ctx.state_store, command_id));
         let results = due
             .iter()
             .filter(|due| due.kind == PostKind::Result && due.text.contains("always-refused"))
@@ -2891,7 +2949,7 @@ mod tests {
         .unwrap();
         assert_eq!(String::from_utf8(again).unwrap().lines().count(), 1);
         // The result post waits for the transactions: queued is not finished.
-        let due = due_posts(&h.ctx, &ledger);
+        let due = due_posts(&ledger, &|command_id| command_state(&h.ctx.state_store, command_id));
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].kind, PostKind::Accepted);
         assert!(!deploy_finished("queued") && !deploy_finished("running"));
@@ -2948,7 +3006,7 @@ mod tests {
         assert_eq!(record.stdout_tail.len(), TAIL_BYTES);
         assert!(!format!("{record:?}").contains("secret-looking"));
         // Neither the post nor the journal text carries a tail.
-        let results: Vec<_> = due_posts(&h.ctx, &ledger)
+        let results: Vec<_> = due_posts(&ledger, &|command_id| command_state(&h.ctx.state_store, command_id))
             .into_iter()
             .filter(|due| due.kind == PostKind::Result)
             .collect();
@@ -3088,20 +3146,30 @@ mod tests {
             unit_from_cgroup("0::/system.slice/claude-connector.service\n"),
             "claude-connector.service"
         );
+        // What a delegated subtree adds below the unit is the peer's to name.
         assert_eq!(
-            unit_from_cgroup("0::/system.slice/huginn@eureka.service/sub/leaf\n"),
+            unit_from_cgroup("0::/system.slice/huginn@eureka.service/idunn-yggdrasil.service/leaf\n"),
             "huginn@eureka.service"
         );
         assert_eq!(
-            unit_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"),
-            "session-3.scope"
+            unit_from_cgroup("0::/system.slice/system-getty.slice/getty@tty1.service\n"),
+            "getty@tty1.service"
         );
         assert_eq!(
-            unit_from_cgroup("12:cpu:/x\n1:name=systemd:/system.slice/a.service\n"),
-            "a.service"
+            unit_from_cgroup("12:cpu:/x\n1:name=systemd:/system.slice/a.scope\n"),
+            "a.scope"
         );
-        assert_eq!(unit_from_cgroup("0::/\n"), "unknown");
-        assert_eq!(unit_from_cgroup(""), "unknown");
+        // A user manager's units, and paths no manager made, name no one.
+        for path in [
+            "0::/user.slice/user-985.slice/user@985.service/app.slice/idunn-yggdrasil.service\n",
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+            "0::/system.slice/not-a-unit/idunn-yggdrasil.service\n",
+            "0::/system.slice/\n",
+            "0::/\n",
+            "",
+        ] {
+            assert_eq!(unit_from_cgroup(path), "unknown", "{path}");
+        }
     }
 
     #[test]
@@ -3223,6 +3291,7 @@ mod tests {
             address,
             room: "!room:example.org".into(),
             token_file,
+            reply_within: Duration::from_secs(10),
         };
         assert_eq!(synapse.post("txn-1", "hello \"quoted\"").unwrap(), "$ev1");
         let request = requests.recv().unwrap();
@@ -3238,7 +3307,8 @@ mod tests {
             Synapse {
                 address,
                 room: "!r:e".into(),
-                token_file: directory.path().join("absent")
+                token_file: directory.path().join("absent"),
+                reply_within: Duration::from_secs(10),
             }
             .post("t", "x")
             .is_err()
@@ -3355,5 +3425,526 @@ mod tests {
         ] {
             assert!(parse(&refused).is_err(), "{refused:?} parsed");
         }
+    }
+
+    #[test]
+    fn an_order_runs_only_under_the_steward_bound_now() {
+        let mut h = harness();
+        let first = h.accept(h.issue_unit(Verb::Restart, "nginx.service"));
+        let second = h.accept(h.issue_unit(Verb::Restart, "ssh.socket"));
+        // The binding changes while both wait: another uid, then another
+        // principal with the old uid. Each is refused with a record, before
+        // the brake is asked and before anything runs.
+        h.ctx.steward_uid = STEWARD + 7;
+        execute(&h.ctx, &first).unwrap();
+        h.ctx.steward_uid = STEWARD;
+        h.ctx.principal = "void".into();
+        execute(&h.ctx, &second).unwrap();
+        for id in [&first, &second] {
+            assert_eq!(h.outcome(id), Outcome::Refused(Refused::NotSteward));
+            assert!(h.ctx.store.ledger().unwrap().start_of(id).is_none());
+        }
+        assert!(h.runs().is_empty());
+        assert!(h.brake.1.lock().unwrap().is_empty(), "a revoked steward's brake is never the gate");
+        // The refusal is posted like any other.
+        let ledger = h.ctx.store.ledger().unwrap();
+        let due = due_posts(&ledger, &|command_id| command_state(&h.ctx.state_store, command_id));
+        assert!(due.iter().any(|due| due.kind == PostKind::Result
+            && due.text.contains("refused: the issuer is not the current steward")));
+        // The other direction: an order the bound steward issued after the
+        // rebinding, and a recovered one under an unchanged binding, run and
+        // are gated by the bound principal's brake.
+        let third = h.accept(h.issue_unit(Verb::Restart, "cron.service"));
+        let resumed = harness();
+        let waiting = resumed.accept(resumed.issue_unit(Verb::Restart, "nginx.service"));
+        assert_eq!(recover(&resumed.ctx).unwrap(), std::slice::from_ref(&waiting));
+        execute(&resumed.ctx, &waiting).unwrap();
+        execute(&h.ctx, &third).unwrap();
+        assert_eq!(resumed.outcome(&waiting), Outcome::Ran);
+        assert_eq!(h.outcome(&third), Outcome::Ran);
+        assert_eq!(*h.brake.1.lock().unwrap(), ["void".to_owned()]);
+        assert_eq!(*resumed.brake.1.lock().unwrap(), ["eureka".to_owned()]);
+    }
+
+    #[test]
+    fn root_reads_orders_and_never_issues_one() {
+        let mut h = harness();
+        let id = h.accept(h.issue_unit(Verb::Restart, "nginx.service"));
+        h.ctx.peers = Arc::new(FakePeers(0));
+        let refused = Response::Refused(Refusal::new("peer", Code::Unauthorized));
+        assert_eq!(h.issue_unit(Verb::Restart, "cron.service"), refused);
+        let Response::Show(view) = h.ask(&Request::Show(ShowRequest { id: id.clone() })) else {
+            panic!("root could not read an order");
+        };
+        assert_eq!(view.order.order_id, id);
+        let Response::List(lines) = h.ask(&Request::List) else {
+            panic!("root could not list orders");
+        };
+        assert_eq!(lines.len(), 1, "root's refused order left no record");
+        h.ctx.peers = Arc::new(FakePeers(STEWARD + 1));
+        assert_eq!(h.ask(&Request::Show(ShowRequest { id })), refused);
+    }
+
+    #[test]
+    fn every_order_posts_once_in_its_turn() {
+        let h = harness();
+        let ids: Vec<String> = ["nginx.service", "ssh.socket", "cron.service"]
+            .into_iter()
+            .map(|unit| h.accept(h.issue_unit(Verb::Restart, unit)))
+            .collect();
+        for id in &ids {
+            execute(&h.ctx, id).unwrap();
+        }
+        assert_eq!(post_pass(&h.ctx).unwrap(), 6, "an accepted and a result post for each");
+        assert_eq!(post_pass(&h.ctx).unwrap(), 0);
+        let sent = h.home.sent.lock().unwrap().clone();
+        let mut keys: Vec<_> = sent.iter().map(|(txn, _)| txn.clone()).collect();
+        keys.sort();
+        let mut expected: Vec<String> = ids
+            .iter()
+            .flat_map(|id| [format!("idunn-{id}-accepted"), format!("idunn-{id}-result")])
+            .collect();
+        expected.sort();
+        assert_eq!(keys, expected);
+        // An order accepted later is posted by the next pass alone.
+        let late = h.accept(h.issue_unit(Verb::Restart, "mind-heartbeat.service"));
+        assert_eq!(post_pass(&h.ctx).unwrap(), 1);
+        execute(&h.ctx, &late).unwrap();
+        assert_eq!(post_pass(&h.ctx).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_deploys_result_is_posted_once_its_command_has_finished() {
+        let h = harness();
+        let id = h.accept(h.issue(Operation::Deploy {
+            selector: "vili".into(),
+        }));
+        execute(&h.ctx, &id).unwrap();
+        let ledger = h.ctx.store.ledger().unwrap();
+        let results = |state: Option<(&'static str, &str)>| {
+            let owed = due_posts(&ledger, &|_| match state {
+                Some((state, detail)) => Ok((state, detail.to_owned())),
+                None => Err(anyhow!("the command cannot be read")),
+            });
+            owed.into_iter().filter(|due| due.kind == PostKind::Result).collect::<Vec<_>>()
+        };
+        assert!(results(Some(("queued", ""))).is_empty());
+        assert!(results(Some(("running", "vili:Sealing"))).is_empty());
+        assert!(results(None).is_empty());
+        for state in ["succeeded", "failed"] {
+            let owed = results(Some((state, "vili")));
+            assert_eq!(owed.len(), 1, "{state}");
+            assert!(owed[0].text.contains(&format!("{state} vili")), "{}", owed[0].text);
+            assert!(owed[0].text.contains("submitted deployment up-"));
+        }
+    }
+
+    #[test]
+    fn intake_gives_up_on_a_peer_that_sends_no_frame() {
+        let h = harness();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        // Half a length prefix, then nothing: the connection must end by itself.
+        client.write_all(&[0, 0]).unwrap();
+        let (done, ended) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = handle(&h.ctx, &mut server, &h.queue);
+            let _ = done.send(result.is_ok());
+            h
+        });
+        let answered = ended
+            .recv_timeout(Duration::from_secs(20))
+            .expect("intake never gave up on a silent peer");
+        assert!(answered, "a silent peer is refused as malformed, not left as an error");
+        let h = worker.join().unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<Response>(&read_frame(&mut client, RESPONSE_FRAME_LIMIT).unwrap()).unwrap(),
+            Response::Refused(Refusal::new("frame", Code::Malformed))
+        );
+        assert!(!h.ctx.store.path().exists());
+    }
+
+    #[test]
+    fn serve_options_are_read_from_every_flag() {
+        let parse = |line: &[&str]| parse_serve(line.iter().map(|word| (*word).to_owned()));
+        let defaults = parse(&["serve"]).unwrap();
+        assert_eq!(defaults.store, PathBuf::from(DEFAULT_STORE));
+        assert_eq!(defaults.steward_binding, PathBuf::from(DEFAULT_BINDING));
+        assert_eq!(defaults.socket, PathBuf::from(DEFAULT_SOCKET));
+        let given = parse(&[
+            "serve",
+            "--state-store",
+            "/a/control.cc",
+            "--store",
+            "/b",
+            "--steward-binding",
+            "/c.toml",
+            "--socket",
+            "/d.sock",
+        ])
+        .unwrap();
+        assert_eq!(
+            given,
+            ServeOptions {
+                state_store: "/a/control.cc".into(),
+                store: "/b".into(),
+                steward_binding: "/c.toml".into(),
+                socket: "/d.sock".into(),
+            }
+        );
+        assert!(parse(&["serve", "--store"]).is_err());
+        assert!(parse(&["serve", "--other", "/x"]).is_err());
+        assert!(parse(&["start"]).is_err());
+    }
+
+    #[test]
+    fn the_steward_user_is_a_real_user_and_never_root() {
+        assert!(user_uid("root").is_err());
+        assert!(user_uid("no-such-user-here").is_err());
+        assert!(user_uid("bad\0name").is_err());
+        assert_eq!(user_uid("nobody").unwrap(), 65534);
+    }
+
+    #[test]
+    fn the_orders_directory_is_made_private() {
+        let directory = TempDir::new().unwrap();
+        let store = OrderStore::new(&directory.path().join("orders"));
+        store.prepare().unwrap();
+        let mode = std::fs::metadata(directory.path().join("orders")).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn the_socket_belongs_to_the_steward_alone() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("steward.sock");
+        let me = std::fs::metadata(directory.path()).unwrap().uid();
+        let _listener = bind_socket(&path, me).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!((metadata.mode() & 0o777, metadata.uid()), (0o600, me));
+        // A stale socket is replaced; anything else in the way is not.
+        let _again = bind_socket(&path, me).unwrap();
+        let other = directory.path().join("other");
+        std::fs::write(&other, "x").unwrap();
+        assert!(bind_socket(&other, me).is_err());
+    }
+
+    #[test]
+    fn synapse_gives_up_on_a_reply_that_never_ends() {
+        let directory = TempDir::new().unwrap();
+        let token_file = directory.path().join("token");
+        std::fs::write(&token_file, "tok-123\n").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            // The first connection stays silent; the second drips a byte at a time.
+            for (index, stream) in listener.incoming().enumerate() {
+                let Ok(mut socket) = stream else { continue };
+                thread::spawn(move || {
+                    let mut chunk = [0u8; 4096];
+                    let _ = socket.read(&mut chunk);
+                    for byte in b"HTTP/1.0 200 OK\r\n".iter().cycle().take(200) {
+                        if index == 0 || socket.write_all(&[*byte]).is_err() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(40));
+                    }
+                    thread::sleep(Duration::from_secs(5));
+                });
+            }
+        });
+        let synapse = Synapse {
+            address,
+            room: "!r:e".into(),
+            token_file,
+            reply_within: Duration::from_millis(600),
+        };
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let error = synapse.post("t", "x").unwrap_err();
+            assert!(started.elapsed() < Duration::from_secs(3), "{error:#}");
+            assert!(!format!("{error:#}").contains("tok-123"));
+        }
+    }
+
+    /// The whole service, as root, against fake `systemctl`, `systemd-run`
+    /// and a loopback homeserver, with the steward connecting from another
+    /// uid. It runs only where the test process is root (the verify container).
+    #[test]
+    fn serve_end_to_end_as_root() {
+        // SAFETY: geteuid reads the process credentials.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("serve_end_to_end_as_root: skipped, not root");
+            return;
+        }
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().to_owned();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let systemctl = format!(
+            "#!/bin/sh\necho \"$@\" >> {0}/systemctl.log\nfor a; do last=$a; done\n\
+             case \"$*\" in *InvocationID*) echo inv-fake;; *show*) printf 'Id=%s\\nNames=%s\\n' \"$last\" \"$last\";; esac\n",
+            root.display()
+        );
+        let run = format!(
+            "#!/bin/sh\necho \"$@\" >> {0}/run.log\nif [ -e {0}/fail ]; then echo boom >&2; exit 3; fi\nexit 0\n",
+            root.display()
+        );
+        for (name, text) in [("systemctl", systemctl), ("systemd-run", run)] {
+            let path = bin.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let credentials = root.join("cred");
+        std::fs::create_dir(&credentials).unwrap();
+        std::fs::write(credentials.join("idunn-matrix-token"), "tok-1\n").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (posted, posts) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for (index, stream) in listener.incoming().enumerate() {
+                let Ok(mut socket) = stream else { continue };
+                let mut received = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let text = String::from_utf8_lossy(&received).into_owned();
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text
+                            .lines()
+                            .find_map(|line| line.strip_prefix("Content-Length: "))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if received.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                    let count = socket.read(&mut chunk).unwrap_or(0);
+                    if count == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&chunk[..count]);
+                }
+                let _ = posted.send(String::from_utf8_lossy(&received).into_owned());
+                let _ = socket.write_all(
+                    format!("HTTP/1.0 200 OK\r\n\r\n{{\"event_id\":\"$e{index}\"}}").as_bytes(),
+                );
+            }
+        });
+        let binding = root.join("steward.toml");
+        std::fs::write(
+            &binding,
+            format!(
+                "principal = \"eureka\"\nuser = \"nobody\"\nmind_control = \"/bin/true\"\n\
+                 room = \"!abc:example.org\"\nhomeserver = \"http://{address}\"\n\
+                 token_credential = \"idunn-matrix-token\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let run_directory = root.join("run");
+        std::fs::create_dir(&run_directory).unwrap();
+        std::fs::set_permissions(&run_directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = run_directory.join("steward.sock");
+        let store = root.join("orders");
+        let control = root.join("state").join("control.cc");
+        // SAFETY: the only test that reads these variables is this one; PATH
+        // keeps its old entries.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()),
+            );
+            std::env::set_var("CREDENTIALS_DIRECTORY", &credentials);
+        }
+        let options = ServeOptions {
+            state_store: control.clone(),
+            store: store.clone(),
+            steward_binding: binding,
+            socket: socket.clone(),
+        };
+        // The unit's umask must not decide the modes of what the service writes.
+        // SAFETY: umask only sets the process file-mode mask.
+        let before = unsafe { libc::umask(0o117) };
+        let (ended, serve_end) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            let result = serve(options);
+            let _ = ended.send(format!("{result:?}"));
+        });
+        for _ in 0..100 {
+            if socket.exists() || serve_end.try_recv().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        // SAFETY: as above.
+        unsafe { libc::umask(before) };
+        assert!(socket.exists(), "serve never bound its socket");
+        let metadata = std::fs::metadata(&socket).unwrap();
+        assert_eq!((metadata.mode() & 0o777, metadata.uid()), (0o600, 65534));
+        // Root is not the steward: it may read, it may not order.
+        let unit = |name: &str| {
+            Request::Order(OrderRequest {
+                operation: Operation::UnitAction {
+                    verb: Verb::Restart,
+                    unit: name.into(),
+                },
+                reason: "end to end".into(),
+            })
+        };
+        let as_root = |request: &Request| {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            write_frame(&mut stream, request).unwrap();
+            rmp_serde::from_slice::<Response>(&read_frame(&mut stream, RESPONSE_FRAME_LIMIT).unwrap()).unwrap()
+        };
+        assert_eq!(
+            as_root(&unit("nginx.service")),
+            Response::Refused(Refusal::new("peer", Code::Unauthorized))
+        );
+        assert_eq!(as_root(&Request::List), Response::List(Vec::new()));
+        let orders = OrderStore::new(&store);
+        let finished = |order_id: &str| {
+            for _ in 0..200 {
+                if let Some(record) = orders.ledger().unwrap().outcome_of(order_id) {
+                    return record.clone();
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            panic!("{order_id} never concluded");
+        };
+        // The steward is uid 65534 with gid 0: a service that read the gid for
+        // the uid would take it for root.
+        let first = steward_asks(&socket, &unit("nginx.service"));
+        let Response::Accepted { order_id: first } = first else {
+            panic!("the steward was not accepted: {first:?}");
+        };
+        assert_eq!(finished(&first).outcome, Outcome::Ran);
+        std::fs::write(root.join("fail"), "").unwrap();
+        let Response::Accepted { order_id: second } = steward_asks(&socket, &unit("cron.service")) else {
+            panic!("the second order was not accepted");
+        };
+        let failed = finished(&second);
+        assert_eq!(
+            failed.outcome,
+            Outcome::Failed {
+                exit_code: Some(3),
+                signal: None
+            }
+        );
+        assert_eq!(failed.stderr_tail, b"boom\n");
+        let deploy = Request::Order(OrderRequest {
+            operation: Operation::Deploy {
+                selector: "vili".into(),
+            },
+            reason: "end to end".into(),
+        });
+        let Response::Accepted { order_id: third } = steward_asks(&socket, &deploy) else {
+            panic!("the deploy was not accepted");
+        };
+        assert!(matches!(finished(&third).outcome, Outcome::Submitted { .. }));
+        let ledger = orders.ledger().unwrap();
+        let stored = ledger.orders.iter().find(|order| order.order_id == first).unwrap();
+        assert_eq!((stored.issuer_uid, stored.issuer_invocation.as_str()), (65534, "inv-fake"));
+        // What the service called, exactly.
+        let run_log = std::fs::read_to_string(root.join("run.log")).unwrap();
+        assert!(
+            run_log.contains(&format!(
+                "--unit idunn-order-{} --wait --pipe --collect -p RuntimeMaxSec=15min -- systemctl restart -- nginx.service",
+                order_uuid(&first)
+            )),
+            "{run_log}"
+        );
+        let systemctl_log = std::fs::read_to_string(root.join("systemctl.log")).unwrap();
+        assert!(
+            systemctl_log.contains(&format!("show --no-pager --property={} -- nginx.service", show_properties())),
+            "{systemctl_log}"
+        );
+        // Every record is posted; the deploy's result waits for its command.
+        let mut seen = Vec::new();
+        while seen.len() < 5 {
+            seen.push(posts.recv_timeout(Duration::from_secs(30)).expect("five posts within 30 s"));
+        }
+        for (id, kinds) in [
+            (&first, ["accepted", "result"].as_slice()),
+            (&second, &["accepted", "result"]),
+            (&third, &["accepted"]),
+        ] {
+            for kind in kinds {
+                let wanted = format!("/send/m.room.message/idunn-{id}-{kind} HTTP/1.0");
+                assert!(seen.iter().any(|post| post.contains(&wanted)), "no post {wanted}");
+            }
+        }
+        // Modes: the store is private, and the deploy wrote control.cc under
+        // Idunn's umask, not the 0117 the process was started with.
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o777;
+        assert_eq!((mode(&store), mode(&store.join("orders.cc"))), (0o700, 0o600));
+        assert_eq!(mode(&control), 0o640);
+    }
+
+    /// One request as the steward: uid 65534 and gid 0, from a forked child
+    /// that only makes system calls.
+    fn steward_asks(socket: &Path, request: &Request) -> Response {
+        let body = rmp_serde::to_vec_named(request).unwrap();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        // SAFETY: plain data.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (index, byte) in socket.as_os_str().as_encoded_bytes().iter().enumerate() {
+            address.sun_path[index] = *byte as libc::c_char;
+        }
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` holds two descriptors.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the child allocates nothing and ends with _exit.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: only system calls on buffers made before the fork.
+            unsafe {
+                libc::close(fds[0]);
+                if libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgid(0) != 0
+                    || libc::setuid(65534) != 0
+                {
+                    libc::_exit(2);
+                }
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if libc::connect(
+                    fd,
+                    (&address as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                ) != 0
+                {
+                    libc::_exit(3);
+                }
+                let mut offset = 0usize;
+                while offset < frame.len() {
+                    let count = libc::write(fd, frame.as_ptr().add(offset).cast(), frame.len() - offset);
+                    if count <= 0 {
+                        libc::_exit(4);
+                    }
+                    offset += count as usize;
+                }
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let count = libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len());
+                    if count <= 0 {
+                        break;
+                    }
+                    libc::write(fds[1], buffer.as_ptr().cast(), count as usize);
+                }
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: the parent's copy of the write end.
+        unsafe { libc::close(fds[1]) };
+        let mut reply = Vec::new();
+        // SAFETY: `fds[0]` is an open descriptor this function now owns.
+        let mut pipe = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]) };
+        pipe.read_to_end(&mut reply).unwrap();
+        let mut status = 0;
+        // SAFETY: `pid` is our child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status}");
+        rmp_serde::from_slice(&read_frame(&mut reply.as_slice(), RESPONSE_FRAME_LIMIT).unwrap()).unwrap()
     }
 }
