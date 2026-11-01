@@ -3658,11 +3658,20 @@ mod tests {
             token_file,
             reply_within: Duration::from_millis(600),
         };
+        let synapse = Arc::new(synapse);
         for _ in 0..2 {
             let started = std::time::Instant::now();
-            let error = synapse.post("t", "x").unwrap_err();
-            assert!(started.elapsed() < Duration::from_secs(3), "{error:#}");
-            assert!(!format!("{error:#}").contains("tok-123"));
+            let (done, ended) = mpsc::channel();
+            let poster = Arc::clone(&synapse);
+            thread::spawn(move || {
+                let _ = done.send(poster.post("t", "x").map_err(|error| format!("{error:#}")));
+            });
+            let error = ended
+                .recv_timeout(Duration::from_secs(4))
+                .expect("the post never gave up")
+                .unwrap_err();
+            assert!(started.elapsed() < Duration::from_secs(3), "{error}");
+            assert!(!error.contains("tok-123"));
         }
     }
 
