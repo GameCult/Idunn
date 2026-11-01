@@ -213,11 +213,6 @@ impl Verb {
             .into_iter()
             .find(|verb| verb.as_str() == word)
     }
-
-    /// Verbs systemd propagates down the dependency graph.
-    fn propagates(self) -> bool {
-        matches!(self, Verb::Stop | Verb::Restart)
-    }
 }
 
 /// The closed set of things an order can ask for.
@@ -259,8 +254,21 @@ impl Operation {
         let apt_environment = vec![("DEBIAN_FRONTEND".to_owned(), "noninteractive".to_owned())];
         match self {
             Operation::PackageInstall { packages } => {
-                let mut install: Vec<String> = words(&["apt-get", "install", "-y", "-q", "--"]);
-                install.extend(packages.iter().cloned());
+                // Never a removal, never a pattern: each name selects exactly
+                // itself, and apt aborts rather than displace an installed package.
+                let mut install: Vec<String> =
+                    words(&["apt-get", "install", "-y", "-q", "--no-remove", "--"]);
+                let mut present: Vec<String> = words(&["dpkg", "-s", "--"]);
+                for package in packages {
+                    let (name, version) = package.split_once('=').unwrap_or((package, ""));
+                    install.push(match version {
+                        "" => format!("?exact-name({name})"),
+                        version => format!("?exact-name({name})={version}"),
+                    });
+                    present.push(name.to_owned());
+                }
+                // An exact name that matches nothing installs nothing and exits 0,
+                // so the last step fails unless every named package is installed.
                 vec![
                     Step {
                         argv: words(&["apt-get", "update", "-q"]),
@@ -269,6 +277,10 @@ impl Operation {
                     Step {
                         argv: install,
                         environment: apt_environment,
+                    },
+                    Step {
+                        argv: present,
+                        environment: Vec::new(),
                     },
                 ]
             }
@@ -595,14 +607,45 @@ impl OrderStore {
 
 // ------------------------------------------------------------------ ports --
 
+/// Which way systemd moves along a dependency edge when an order is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    /// Units a start brings up with this one.
+    Pulls,
+    /// Units a start stops: the unit's `Conflicts=` and the units that conflict with it.
+    Conflicts,
+    /// Units a stop takes down with this one.
+    Stops,
+}
+
+/// The `systemctl show` properties the closure reads, and the way each one
+/// moves. This is the only list: the request and the parse both read it.
+const EDGES: [(&str, Edge); 13] = [
+    ("Requires", Edge::Pulls),
+    ("Requisite", Edge::Pulls),
+    ("BindsTo", Edge::Pulls),
+    ("Wants", Edge::Pulls),
+    ("Upholds", Edge::Pulls),
+    ("Conflicts", Edge::Conflicts),
+    ("ConflictedBy", Edge::Conflicts),
+    ("RequiredBy", Edge::Stops),
+    ("BoundBy", Edge::Stops),
+    ("RequisiteOf", Edge::Stops),
+    ("ConsistsOf", Edge::Stops),
+    ("PropagatesStopTo", Edge::Stops),
+    ("StopPropagatedFrom", Edge::Stops),
+];
+
 /// What `systemctl show` says about one unit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UnitFacts {
     pub(crate) id: String,
     pub(crate) names: Vec<String>,
-    pub(crate) required_by: Vec<String>,
-    pub(crate) bound_by: Vec<String>,
-    pub(crate) consists_of: Vec<String>,
+    pub(crate) not_found: bool,
+    pub(crate) running: bool,
+    pub(crate) pulls: Vec<String>,
+    pub(crate) conflicts: Vec<String>,
+    pub(crate) stops: Vec<String>,
 }
 
 impl UnitFacts {
@@ -610,12 +653,20 @@ impl UnitFacts {
         std::iter::once(&self.id).chain(self.names.iter())
     }
 
-    /// The units systemd stops with this one.
-    fn dependents(&self) -> impl Iterator<Item = &String> {
-        self.required_by
-            .iter()
-            .chain(self.bound_by.iter())
-            .chain(self.consists_of.iter())
+    fn along(&self, edge: Edge) -> &[String] {
+        match edge {
+            Edge::Pulls => &self.pulls,
+            Edge::Conflicts => &self.conflicts,
+            Edge::Stops => &self.stops,
+        }
+    }
+
+    fn along_mut(&mut self, edge: Edge) -> &mut Vec<String> {
+        match edge {
+            Edge::Pulls => &mut self.pulls,
+            Edge::Conflicts => &mut self.conflicts,
+            Edge::Stops => &mut self.stops,
+        }
     }
 }
 
@@ -673,40 +724,95 @@ fn refused(unit: &str, via: Via) -> Refused {
     }
 }
 
+/// The units systemd would touch for one order, read from `systemctl show`.
+struct Transaction<'a> {
+    systemd: &'a dyn Systemd,
+    facts: BTreeMap<String, UnitFacts>,
+}
+
+impl Transaction<'_> {
+    fn facts(&mut self, unit: &str) -> Result<&UnitFacts> {
+        if !self.facts.contains_key(unit) {
+            ensure!(
+                self.facts.len() < CLOSURE_LIMIT,
+                "the units an order would reach are too many to check"
+            );
+            let facts = self.systemd.show(unit)?;
+            ensure!(!facts.not_found, "systemd has no such unit to check");
+            self.facts.insert(unit.to_owned(), facts);
+        }
+        Ok(&self.facts[unit])
+    }
+
+    /// Every unit reached from `seeds` along `edge`, seeds included.
+    fn reach(&mut self, seeds: &BTreeSet<String>, edge: Edge) -> Result<BTreeSet<String>> {
+        let mut reached = BTreeSet::new();
+        let mut queue: VecDeque<String> = seeds.iter().cloned().collect();
+        while let Some(next) = queue.pop_front() {
+            if !reached.insert(next.clone()) {
+                continue;
+            }
+            queue.extend(self.facts(&next)?.along(edge).iter().cloned());
+        }
+        Ok(reached)
+    }
+
+    /// Every unit a start of `started` stops through `Conflicts=`, and what
+    /// that stop takes down with it.
+    fn conflicted(&mut self, started: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+        let mut seeds = BTreeSet::new();
+        for unit in started {
+            seeds.extend(self.facts(unit)?.along(Edge::Conflicts).iter().cloned());
+        }
+        self.reach(&seeds, Edge::Stops)
+    }
+}
+
 /// Would `verb` on `unit` reach an always-refused unit: by its name, by an
-/// alias it resolves from, or, for the verbs systemd propagates, by the units
-/// systemd stops with it. Resolution reads systemd before anything runs.
+/// alias it resolves from, or through the transaction systemd builds for it.
+/// A start pulls in what the unit requires or wants and stops what conflicts;
+/// a stop takes down what depends on the unit; a restart does both. A unit
+/// the transaction would stop is refused when it is refused; a unit it would
+/// start is refused when it is refused and not running. Every unit in the
+/// closure must be one systemd can show.
 fn refusal_for(systemd: &dyn Systemd, unit: &str, verb: Verb) -> Result<Option<Refused>> {
     if is_refused_name(unit) {
         return Ok(Some(refused(unit, Via::Name)));
     }
-    let facts = systemd.show(unit)?;
-    if let Some(name) = facts.identities().find(|name| is_refused_name(name)) {
+    let mut transaction = Transaction {
+        systemd,
+        facts: BTreeMap::new(),
+    };
+    if let Some(name) = transaction
+        .facts(unit)?
+        .identities()
+        .find(|name| is_refused_name(name))
+    {
         return Ok(Some(refused(name, Via::Alias)));
     }
-    if !verb.propagates() {
-        return Ok(None);
+    let root = BTreeSet::from([unit.to_owned()]);
+    let mut stopped = BTreeSet::new();
+    let mut started = BTreeSet::new();
+    match verb {
+        Verb::Reload => {}
+        Verb::Start => started = transaction.reach(&root, Edge::Pulls)?,
+        Verb::Stop => stopped = transaction.reach(&root, Edge::Stops)?,
+        Verb::Restart => {
+            stopped = transaction.reach(&root, Edge::Stops)?;
+            started = transaction.reach(&stopped, Edge::Pulls)?;
+        }
     }
-    let mut seen: BTreeSet<String> = facts.identities().cloned().collect();
-    seen.insert(unit.to_owned());
-    let mut queue: VecDeque<String> = facts.dependents().cloned().collect();
-    while let Some(next) = queue.pop_front() {
-        if is_refused_name(&next) {
-            return Ok(Some(refused(&next, Via::Propagation)));
+    stopped.extend(transaction.conflicted(&started)?);
+    for (units, only_if_stopped) in [(&stopped, false), (&started, true)] {
+        for member in units {
+            let facts = transaction.facts(member)?;
+            if only_if_stopped && facts.running {
+                continue;
+            }
+            if let Some(name) = facts.identities().find(|name| is_refused_name(name)) {
+                return Ok(Some(refused(name, Via::Propagation)));
+            }
         }
-        if !seen.insert(next.clone()) {
-            continue;
-        }
-        ensure!(
-            seen.len() <= CLOSURE_LIMIT,
-            "the units a stop would reach are too many to check"
-        );
-        let facts = systemd.show(&next)?;
-        if let Some(name) = facts.identities().find(|name| is_refused_name(name)) {
-            return Ok(Some(refused(name, Via::Propagation)));
-        }
-        seen.extend(facts.identities().cloned());
-        queue.extend(facts.dependents().cloned());
     }
     Ok(None)
 }
@@ -1148,8 +1254,39 @@ pub(crate) fn handle(
 /// `systemctl` and `systemd-run`, found by name.
 pub(crate) struct HostSystemd;
 
+/// The names in one `systemctl show` list value. systemd quotes a name that
+/// holds a backslash and doubles the backslash inside the quotes.
 fn parse_names(value: &str) -> Vec<String> {
-    value.split_whitespace().map(str::to_owned).collect()
+    let mut names = Vec::new();
+    let mut current = String::new();
+    let (mut quoted, mut open, mut escaped) = (false, false, false);
+    for character in value.chars() {
+        match character {
+            _ if escaped => {
+                current.push(character);
+                escaped = false;
+            }
+            '\\' if quoted => escaped = true,
+            '"' => {
+                quoted = !quoted;
+                open = true;
+            }
+            _ if character.is_whitespace() && !quoted => {
+                if open {
+                    names.push(std::mem::take(&mut current));
+                    open = false;
+                }
+            }
+            _ => {
+                current.push(character);
+                open = true;
+            }
+        }
+    }
+    if open {
+        names.push(current);
+    }
+    names
 }
 
 fn parse_show(output: &str) -> Result<UnitFacts> {
@@ -1161,10 +1298,15 @@ fn parse_show(output: &str) -> Result<UnitFacts> {
         match key {
             "Id" => facts.id = value.to_owned(),
             "Names" => facts.names = parse_names(value),
-            "RequiredBy" => facts.required_by = parse_names(value),
-            "BoundBy" => facts.bound_by = parse_names(value),
-            "ConsistsOf" => facts.consists_of = parse_names(value),
-            _ => {}
+            "LoadState" => facts.not_found = value == "not-found",
+            "ActiveState" => {
+                facts.running = matches!(value, "active" | "activating" | "reloading");
+            }
+            _ => {
+                if let Some((_, edge)) = EDGES.iter().find(|(property, _)| *property == key) {
+                    facts.along_mut(*edge).extend(parse_names(value));
+                }
+            }
         }
     }
     ensure!(!facts.id.is_empty(), "systemctl named no unit");
@@ -1173,14 +1315,15 @@ fn parse_show(output: &str) -> Result<UnitFacts> {
 
 impl Systemd for HostSystemd {
     fn show(&self, unit: &str) -> Result<UnitFacts> {
+        let properties = ["Id", "Names", "LoadState", "ActiveState"]
+            .into_iter()
+            .chain(EDGES.iter().map(|(property, _)| *property))
+            .collect::<Vec<_>>()
+            .join(",");
         let output = Command::new("systemctl")
-            .args([
-                "show",
-                "--no-pager",
-                "--property=Id,Names,RequiredBy,BoundBy,ConsistsOf",
-                "--",
-                unit,
-            ])
+            .args(["show", "--no-pager"])
+            .arg(format!("--property={properties}"))
+            .args(["--", unit])
             .stdin(Stdio::null())
             .output()
             .context("running systemctl show")?;
@@ -1750,8 +1893,23 @@ mod tests {
     const STEWARD: u32 = 1000;
     const CANARY: &str = "CANARY-7f3a91";
 
+    /// What `systemctl show` prints for a loaded, active unit with no edges,
+    /// plus the given properties (a given key replaces its default).
+    fn show_text(id: &str, properties: &[(&str, &str)]) -> String {
+        let mut text = format!("Id={id}\n");
+        for (key, default) in [("Names", id), ("LoadState", "loaded"), ("ActiveState", "active")] {
+            if !properties.iter().any(|(given, _)| *given == key) {
+                text += &format!("{key}={default}\n");
+            }
+        }
+        for (key, value) in properties {
+            text += &format!("{key}={value}\n");
+        }
+        text
+    }
+
     struct FakeSystemd {
-        units: Mutex<BTreeMap<String, UnitFacts>>,
+        units: Mutex<BTreeMap<String, String>>,
         runs: Mutex<Vec<(String, Step)>>,
         report: Mutex<RunReport>,
     }
@@ -1759,11 +1917,7 @@ mod tests {
     impl Systemd for FakeSystemd {
         fn show(&self, unit: &str) -> Result<UnitFacts> {
             let known = self.units.lock().unwrap().get(unit).cloned();
-            Ok(known.unwrap_or_else(|| UnitFacts {
-                id: unit.into(),
-                names: vec![unit.into()],
-                ..UnitFacts::default()
-            }))
+            parse_show(&known.unwrap_or_else(|| show_text(unit, &[])))
         }
 
         fn invocation(&self, _unit: &str) -> Option<String> {
@@ -1907,8 +2061,13 @@ mod tests {
             self.systemd.runs.lock().unwrap().clone()
         }
 
-        fn describe_unit(&self, name: &str, facts: UnitFacts) {
-            self.systemd.units.lock().unwrap().insert(name.into(), facts);
+        /// Tell the fake `systemctl show` what it prints for `name`.
+        fn describe_unit(&self, name: &str, text: String) {
+            self.systemd.units.lock().unwrap().insert(name.into(), text);
+        }
+
+        fn describe(&self, name: &str, properties: &[(&str, &str)]) {
+            self.describe_unit(name, show_text(name, properties));
         }
     }
 
@@ -2065,19 +2224,52 @@ mod tests {
         execute(&h.ctx, &id).unwrap();
         assert_eq!(h.outcome(&id), Outcome::Ran);
         let runs = h.runs();
-        assert_eq!(runs.len(), 2);
+        assert_eq!(runs.len(), 3);
         assert_eq!(runs[0].1.argv, ["apt-get", "update", "-q"]);
-        let mut install = vec!["apt-get", "install", "-y", "-q", "--"];
-        install.extend(good);
+        // Each name selects exactly itself and apt may remove nothing.
+        let mut install = vec!["apt-get".to_owned(), "install".into(), "-y".into(), "-q".into()];
+        install.extend(["--no-remove".to_owned(), "--".into()]);
+        install.extend(good.iter().map(|spec| match spec.split_once('=') {
+            Some((name, version)) => format!("?exact-name({name})={version}"),
+            None => format!("?exact-name({spec})"),
+        }));
         assert_eq!(runs[1].1.argv, install);
+        assert!(install.contains(&"?exact-name(libstdc++6)".to_owned()));
+        assert!(install.contains(&"?exact-name(nginx)=1.24.0-2ubuntu7".to_owned()));
+        // The last step fails unless every named package is installed.
+        let mut present = vec!["dpkg".to_owned(), "-s".into(), "--".into()];
+        present.extend(good.iter().map(|spec| spec.split('=').next().unwrap().to_owned()));
+        assert_eq!(runs[2].1.argv, present);
         for (unit, step) in &runs {
             assert!(unit.starts_with("idunn-order-"));
+            let apt = step.argv[0] == "apt-get";
             assert_eq!(
                 step.environment,
-                [("DEBIAN_FRONTEND".to_owned(), "noninteractive".to_owned())]
+                if apt {
+                    vec![("DEBIAN_FRONTEND".to_owned(), "noninteractive".to_owned())]
+                } else {
+                    Vec::new()
+                }
             );
         }
         assert_ne!(runs[0].0, runs[1].0, "each step is its own transient unit");
+        assert_ne!(runs[1].0, runs[2].0, "each step is its own transient unit");
+
+        // A package whose name apt would read as a regex or a conflict is
+        // exactly itself and never a removal.
+        for spec in ["cowsa.", "iptables-persistent", "a.", "nginx+"] {
+            let argv = Operation::PackageInstall { packages: vec![spec.into()] }.steps()[1].argv.clone();
+            assert_eq!(argv[4..], ["--no-remove", "--", &format!("?exact-name({spec})")]);
+        }
+        // A step that failed ends the order: the absent package is a failure.
+        *h.systemd.report.lock().unwrap() = RunReport {
+            exit_code: Some(1),
+            ..RunReport::default()
+        };
+        let absent = h.accept(h.issue(Operation::PackageInstall { packages: vec!["cowsay".into()] }));
+        execute(&h.ctx, &absent).unwrap();
+        assert!(matches!(h.outcome(&absent), Outcome::Failed { exit_code: Some(1), .. }));
+        assert_eq!(h.runs().len(), 4, "the update failed, so nothing else ran");
     }
 
     #[test]
@@ -2121,74 +2313,28 @@ mod tests {
         let h = harness();
         h.describe_unit(
             "backup-name.service",
-            UnitFacts {
-                id: "idunn-yggdrasil.service".into(),
-                names: vec!["idunn-yggdrasil.service".into(), "backup-name.service".into()],
-                ..UnitFacts::default()
-            },
+            show_text(
+                "idunn-yggdrasil.service",
+                &[("Names", "idunn-yggdrasil.service backup-name.service")],
+            ),
         );
-        h.describe_unit(
+        h.describe(
             "quiet-alias.service",
-            UnitFacts {
-                id: "quiet-alias.service".into(),
-                names: vec!["quiet-alias.service".into(), "mind-persona@void.service".into()],
-                ..UnitFacts::default()
-            },
+            &[("Names", "quiet-alias.service mind-persona@void.service")],
         );
         // fuse <- wrapper <- (bound by) mind-self@eureka
-        h.describe_unit(
-            "fuse.service",
-            UnitFacts {
-                id: "fuse.service".into(),
-                names: vec!["fuse.service".into()],
-                required_by: vec!["wrapper.service".into()],
-                ..UnitFacts::default()
-            },
-        );
-        h.describe_unit(
-            "wrapper.service",
-            UnitFacts {
-                id: "wrapper.service".into(),
-                names: vec!["wrapper.service".into()],
-                bound_by: vec!["mind-self@eureka.service".into()],
-                ..UnitFacts::default()
-            },
-        );
-        h.describe_unit(
-            "stack.target",
-            UnitFacts {
-                id: "stack.target".into(),
-                names: vec!["stack.target".into()],
-                consists_of: vec!["mind-persona@void.service".into()],
-                ..UnitFacts::default()
-            },
-        );
+        h.describe("fuse.service", &[("RequiredBy", "wrapper.service")]);
+        h.describe("wrapper.service", &[("BoundBy", "mind-self@eureka.service")]);
+        h.describe("stack.target", &[("ConsistsOf", "mind-persona@void.service")]);
         // A cycle that reaches an alias of a refused unit on its second hop.
-        h.describe_unit(
-            "loop-a.service",
-            UnitFacts {
-                id: "loop-a.service".into(),
-                names: vec!["loop-a.service".into()],
-                required_by: vec!["loop-b.service".into()],
-                ..UnitFacts::default()
-            },
-        );
-        h.describe_unit(
-            "loop-b.service",
-            UnitFacts {
-                id: "loop-b.service".into(),
-                names: vec!["loop-b.service".into()],
-                required_by: vec!["loop-a.service".into(), "hidden.service".into()],
-                ..UnitFacts::default()
-            },
-        );
+        h.describe("loop-a.service", &[("RequiredBy", "loop-b.service")]);
+        h.describe("loop-b.service", &[("RequiredBy", "loop-a.service hidden.service")]);
         h.describe_unit(
             "hidden.service",
-            UnitFacts {
-                id: "idunn-orders.service".into(),
-                names: vec!["idunn-orders.service".into(), "hidden.service".into()],
-                ..UnitFacts::default()
-            },
+            show_text(
+                "idunn-orders.service",
+                &[("Names", "idunn-orders.service hidden.service")],
+            ),
         );
 
         let direct = [
@@ -2260,7 +2406,7 @@ mod tests {
             }
         }
         assert!(h.runs().is_empty(), "no systemd verb ran for any refused order");
-        // start and reload propagate nothing, so the same units are not refused.
+        // start and reload take nothing down, so the same units are not refused.
         for verb in [Verb::Start, Verb::Reload] {
             let id = h.accept(h.issue_unit(verb, "fuse.service"));
             execute(&h.ctx, &id).unwrap();
@@ -2282,6 +2428,248 @@ mod tests {
         assert_eq!(results, refusals);
         // A refused order never started.
         assert!(ledger.starts.len() == 2);
+    }
+
+    /// Yggdrasil's `systemctl show` shapes (systemd 257, 2026-11-01), cut down
+    /// to the units an order can reach: seven refused units all conflict with
+    /// shutdown.target, and the shutdown services require it.
+    fn yggdrasil(h: &Harness, idunn_running: bool) {
+        let state = if idunn_running { "active" } else { "inactive" };
+        let refused = [
+            "idunn-yggdrasil.service",
+            "idunn-orders.service",
+            "idunn-vili-e0ada640.service",
+            "mind-self@eureka.service",
+            "mind-persona@void.service",
+        ];
+        h.describe(
+            "shutdown.target",
+            &[
+                ("ActiveState", "inactive"),
+                (
+                    "RequiredBy",
+                    "systemd-soft-reboot.service systemd-reboot.service systemd-poweroff.service",
+                ),
+                (
+                    "ConflictedBy",
+                    "nginx.service idunn-yggdrasil.service idunn-orders.service \
+                     idunn-vili-e0ada640.service mind-self@eureka.service mind-persona@void.service",
+                ),
+            ],
+        );
+        for refused in refused {
+            h.describe(
+                refused,
+                &[
+                    ("Requires", "sysinit.target system.slice -.mount"),
+                    ("Wants", "tmp.mount network-online.target"),
+                    ("Conflicts", "shutdown.target"),
+                    ("ActiveState", if refused == "idunn-yggdrasil.service" { state } else { "inactive" }),
+                ],
+            );
+        }
+        h.describe("nginx.service", &[("Wants", "network-online.target"), ("Conflicts", "shutdown.target")]);
+        for (service, target) in [
+            ("systemd-poweroff.service", "poweroff.target"),
+            ("systemd-reboot.service", "reboot.target"),
+            ("systemd-soft-reboot.service", "soft-reboot.target"),
+        ] {
+            h.describe(
+                service,
+                &[
+                    ("Requires", "shutdown.target final.target system.slice umount.target"),
+                    ("RequiredBy", target),
+                    ("ActiveState", "inactive"),
+                ],
+            );
+        }
+        for (target, service) in [
+            ("poweroff.target", "systemd-poweroff.service"),
+            ("reboot.target", "systemd-reboot.service"),
+            ("soft-reboot.target", "systemd-soft-reboot.service"),
+        ] {
+            h.describe(target, &[("Requires", service), ("ActiveState", "inactive")]);
+        }
+        h.describe(
+            "umount.target",
+            &[
+                ("ActiveState", "inactive"),
+                ("RequiredBy", "systemd-poweroff.service systemd-reboot.service"),
+                ("ConflictedBy", "boot-efi.mount boot.mount \"blockdev@dev-vda2.target\""),
+            ],
+        );
+        h.describe(
+            "multi-user.target",
+            &[
+                ("Requires", "basic.target"),
+                ("Wants", "cron.service ssh.service idunn-yggdrasil.service"),
+                ("Conflicts", "shutdown.target rescue.target rescue.service"),
+            ],
+        );
+        h.describe(
+            "voidbot.service",
+            &[
+                ("Requires", "docker.service -.mount sysinit.target system.slice"),
+                ("Wants", "idunn-yggdrasil.service network-online.target"),
+                ("Conflicts", "shutdown.target"),
+            ],
+        );
+    }
+
+    fn outcome_of_unit(h: &Harness, verb: Verb, unit: &str) -> Outcome {
+        let id = h.accept(h.issue_unit(verb, unit));
+        execute(&h.ctx, &id).unwrap();
+        h.outcome(&id)
+    }
+
+    fn hit(outcome: &Outcome) -> Option<&str> {
+        match outcome {
+            Outcome::Refused(Refused::AlwaysRefused { unit, via: Via::Propagation }) => Some(unit.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_transaction_that_reaches_a_refused_unit_is_refused() {
+        let h = harness();
+        yggdrasil(&h, true);
+        // The targets and services that power the host down reach every refused
+        // unit through Conflicts=, however many requirements away.
+        for (verb, unit) in [
+            (Verb::Start, "shutdown.target"),
+            (Verb::Start, "poweroff.target"),
+            (Verb::Restart, "poweroff.target"),
+            (Verb::Start, "reboot.target"),
+            (Verb::Restart, "reboot.target"),
+            (Verb::Start, "soft-reboot.target"),
+            (Verb::Start, "systemd-soft-reboot.service"),
+            (Verb::Restart, "systemd-poweroff.service"),
+        ] {
+            let outcome = outcome_of_unit(&h, verb, unit);
+            assert!(hit(&outcome).is_some(), "{verb:?} {unit} was {outcome:?}");
+        }
+        assert!(h.runs().is_empty(), "no refused order ran anything");
+        // A stop of shutdown.target takes down what requires it and runs no start.
+        let outcome = outcome_of_unit(&h, Verb::Stop, "shutdown.target");
+        assert_eq!(outcome, Outcome::Ran);
+
+        // A start that wants a refused unit that is stopped would start it.
+        h.describe("idunn-yggdrasil.service", &[("ActiveState", "inactive"), ("Conflicts", "shutdown.target")]);
+        for (verb, unit) in [
+            (Verb::Start, "multi-user.target"),
+            (Verb::Restart, "multi-user.target"),
+            (Verb::Start, "voidbot.service"),
+            (Verb::Restart, "voidbot.service"),
+        ] {
+            let outcome = outcome_of_unit(&h, verb, unit);
+            assert_eq!(hit(&outcome), Some("idunn-yggdrasil.service"), "{verb:?} {unit}");
+        }
+        // The same orders start nothing while the refused unit runs.
+        h.describe("idunn-yggdrasil.service", &[("ActiveState", "active"), ("Conflicts", "shutdown.target")]);
+        for (verb, unit) in [
+            (Verb::Start, "multi-user.target"),
+            (Verb::Restart, "voidbot.service"),
+            (Verb::Start, "voidbot.service"),
+        ] {
+            assert_eq!(outcome_of_unit(&h, verb, unit), Outcome::Ran, "{verb:?} {unit}");
+        }
+        // A unit that wants only what is not refused runs, and so does a target
+        // that unmounts nothing a refused unit requires.
+        for verb in [Verb::Start, Verb::Restart, Verb::Stop, Verb::Reload] {
+            assert_eq!(outcome_of_unit(&h, verb, "nginx.service"), Outcome::Ran);
+        }
+        assert_eq!(outcome_of_unit(&h, Verb::Start, "umount.target"), Outcome::Ran);
+    }
+
+    #[test]
+    fn the_closure_follows_every_edge_and_every_hop() {
+        let h = harness();
+        // Start: three hops of Wants/Requires/Requisite/BindsTo/Upholds to a
+        // stopped refused unit.
+        h.describe("hop-1.service", &[("Wants", "hop-2.service")]);
+        h.describe("hop-2.service", &[("Requires", "hop-3.service")]);
+        h.describe("hop-3.service", &[("Requisite", "hop-4.service")]);
+        h.describe("hop-4.service", &[("BindsTo", "hop-5.service")]);
+        h.describe("hop-5.service", &[("Upholds", "idunn-orders.service")]);
+        h.describe("idunn-orders.service", &[("ActiveState", "inactive")]);
+        let outcome = outcome_of_unit(&h, Verb::Start, "hop-1.service");
+        assert_eq!(hit(&outcome), Some("idunn-orders.service"));
+        // Conflicts of a pulled-in unit stop it and what requires it: the
+        // conflict, then two hops of reverse requirement, to a refused unit.
+        h.describe("rival.service", &[("Conflicts", "victim.service")]);
+        h.describe("victim.service", &[("RequiredBy", "mid.service")]);
+        h.describe("mid.service", &[("BoundBy", "mind-self@eureka.service")]);
+        h.describe("pulls-rival.service", &[("Requires", "rival.service")]);
+        for unit in ["rival.service", "pulls-rival.service"] {
+            let outcome = outcome_of_unit(&h, Verb::Start, unit);
+            assert_eq!(hit(&outcome), Some("mind-self@eureka.service"), "{unit}");
+        }
+        // The reverse Conflicts edge: a unit conflicted by a refused one.
+        h.describe("incumbent.service", &[("ConflictedBy", "mind-persona@void.service")]);
+        let outcome = outcome_of_unit(&h, Verb::Start, "incumbent.service");
+        assert_eq!(hit(&outcome), Some("mind-persona@void.service"));
+        // Stop and restart: every stop edge, one at a time.
+        for (property, reached) in [
+            ("RequiredBy", "idunn-vili-x.service"),
+            ("BoundBy", "idunn-vili-x.service"),
+            ("RequisiteOf", "idunn-vili-x.service"),
+            ("ConsistsOf", "idunn-vili-x.service"),
+            ("PropagatesStopTo", "mind-persona@void.service"),
+            ("StopPropagatedFrom", "mind-persona@void.service"),
+        ] {
+            let name = format!("edge-{property}.service");
+            h.describe(&name, &[(property, reached)]);
+            for verb in [Verb::Stop, Verb::Restart] {
+                let outcome = outcome_of_unit(&h, verb, &name);
+                assert_eq!(hit(&outcome), Some(reached), "{verb:?} {property}");
+            }
+        }
+        // A restart starts what its stopped dependents pull in.
+        h.describe("base.service", &[("RequiredBy", "dependent.service")]);
+        h.describe("dependent.service", &[("Wants", "idunn-orders.service")]);
+        let outcome = outcome_of_unit(&h, Verb::Restart, "base.service");
+        assert_eq!(hit(&outcome), Some("idunn-orders.service"));
+        assert_eq!(outcome_of_unit(&h, Verb::Stop, "base.service"), Outcome::Ran);
+        assert_eq!(outcome_of_unit(&h, Verb::Reload, "base.service"), Outcome::Ran);
+    }
+
+    #[test]
+    fn a_quoted_name_in_a_dependency_list_is_the_name_it_quotes() {
+        let h = harness();
+        // systemctl show quotes a name with a backslash and doubles the backslash.
+        h.describe(
+            "huginn.service",
+            &[("RequiredBy", "\"mind-self@foo\\\\x2dbar.service\"")],
+        );
+        let outcome = outcome_of_unit(&h, Verb::Stop, "huginn.service");
+        assert_eq!(hit(&outcome), Some("mind-self@foo\\x2dbar.service"));
+        h.describe("quiet.service", &[("Wants", "\"idunn-a\\\\x2db.service\" other.service")]);
+        h.describe("idunn-a\\x2db.service", &[("ActiveState", "inactive")]);
+        let outcome = outcome_of_unit(&h, Verb::Start, "quiet.service");
+        assert_eq!(hit(&outcome), Some("idunn-a\\x2db.service"));
+        assert!(h.runs().is_empty());
+    }
+
+    #[test]
+    fn a_unit_systemd_cannot_show_is_a_failure_not_a_leaf() {
+        let h = harness();
+        h.describe("ghost.service", &[("LoadState", "not-found")]);
+        h.describe("pulls-ghost.service", &[("Wants", "ghost.service")]);
+        h.describe("needed-by-ghost.service", &[("RequiredBy", "ghost.service")]);
+        for (verb, unit) in [
+            (Verb::Start, "ghost.service"),
+            (Verb::Start, "pulls-ghost.service"),
+            (Verb::Stop, "needed-by-ghost.service"),
+            (Verb::Restart, "needed-by-ghost.service"),
+        ] {
+            let id = h.accept(h.issue_unit(verb, unit));
+            execute(&h.ctx, &id).unwrap();
+            assert!(
+                matches!(h.outcome(&id), Outcome::Failed { exit_code: None, signal: None }),
+                "{verb:?} {unit}"
+            );
+        }
+        assert!(h.runs().is_empty());
     }
 
     #[test]
@@ -2715,16 +3103,40 @@ mod tests {
     #[test]
     fn systemctl_show_output_is_read_into_facts() {
         let facts = parse_show(
-            "Id=a.service\nNames=a.service b.service\nRequiredBy=c.service\n\
-             BoundBy=\nConsistsOf=d.target e.service\nOther=x\n",
+            "Id=a.service\nNames=a.service b.service\nLoadState=loaded\nActiveState=inactive\n\
+             Requires=r.service \"q\\\\x2dr.slice\" -.mount\nRequisite=t.service\nWants=w.service\n\
+             BindsTo=b.service\nUpholds=u.service\nConflicts=x.target\nConflictedBy=y.service\n\
+             RequiredBy=c.service\nBoundBy=\nRequisiteOf=ro.service\nConsistsOf=d.target e.service\n\
+             PropagatesStopTo=p.service\nStopPropagatedFrom=f.service\nOther=x\n",
         )
         .unwrap();
         assert_eq!(facts.id, "a.service");
         assert_eq!(facts.names, ["a.service", "b.service"]);
-        assert_eq!(facts.required_by, ["c.service"]);
-        assert!(facts.bound_by.is_empty());
-        assert_eq!(facts.consists_of, ["d.target", "e.service"]);
+        assert!(!facts.not_found && !facts.running);
+        // A quoted name holds one backslash, not two and not a quote mark.
+        assert_eq!(
+            facts.pulls,
+            ["r.service", "q\\x2dr.slice", "-.mount", "t.service", "w.service", "b.service", "u.service"]
+        );
+        assert_eq!(facts.conflicts, ["x.target", "y.service"]);
+        assert_eq!(
+            facts.stops,
+            ["c.service", "ro.service", "d.target", "e.service", "p.service", "f.service"]
+        );
         assert!(parse_show("Names=a.service\n").is_err());
+        let gone = parse_show("Id=\\x22a.service\\x22.service\nLoadState=not-found\n").unwrap();
+        assert!(gone.not_found);
+        for (state, running) in [
+            ("active", true),
+            ("activating", true),
+            ("reloading", true),
+            ("inactive", false),
+            ("deactivating", false),
+            ("failed", false),
+        ] {
+            let facts = parse_show(&format!("Id=a.service\nActiveState={state}\n")).unwrap();
+            assert_eq!(facts.running, running, "{state}");
+        }
     }
 
     #[test]
