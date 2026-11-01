@@ -2836,11 +2836,11 @@ mod tests {
             .unwrap();
         let pending = recover(&h.ctx).unwrap();
         assert_eq!(h.outcome(&id), Outcome::Lost);
-        assert_eq!(pending, [waiting.clone()], "an order that never started waits");
+        assert_eq!(pending, std::slice::from_ref(&waiting), "an order that never started waits");
         execute(&h.ctx, &id).unwrap();
         assert!(h.runs().is_empty(), "a Lost order makes no systemd call");
         // Recovery is idempotent, and a finished order is not run again.
-        assert_eq!(recover(&h.ctx).unwrap(), [waiting.clone()]);
+        assert_eq!(recover(&h.ctx).unwrap(), std::slice::from_ref(&waiting));
         execute(&h.ctx, &waiting).unwrap();
         execute(&h.ctx, &waiting).unwrap();
         assert_eq!(h.runs().len(), 1);
@@ -2995,7 +2995,7 @@ mod tests {
             format!("{CANARY}*.service"),
             format!("{CANARY}/../idunn-orders.service"),
             format!("idunn-{CANARY};x.service"),
-            format!("{CANARY}"),
+            CANARY.to_string(),
         ] {
             note(h.issue_unit(Verb::Restart, &unit));
         }
@@ -3162,7 +3162,7 @@ mod tests {
             0o600
         );
         let foreign = typed_envelope("k", "idunn.other", "idunn.other.v1", &1u8, 1).unwrap();
-        SingleFileMessagePackBackingStore::new(&h.ctx.store.path())
+        SingleFileMessagePackBackingStore::new(h.ctx.store.path())
             .compare_exchange(
                 &[CultCacheExpectedEnvelope {
                     r#type: "idunn.other".into(),
