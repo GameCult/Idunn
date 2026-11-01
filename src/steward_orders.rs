@@ -3573,8 +3573,25 @@ mod tests {
 
     #[test]
     fn a_record_under_another_schema_is_not_read() {
-        let put = |h: &Harness, schema: &str, key: &str| match schema {
-            _ if schema.contains("start") => h.ctx.store.put(
+        let put = |h: &Harness, kind: &str, schema: &str, key: &str| match kind {
+            "order" => h.ctx.store.put(
+                key,
+                schema,
+                &OrderRecord {
+                    schema_version: schema.into(),
+                    order_id: key.into(),
+                    principal: "eureka".into(),
+                    issuer_uid: 1,
+                    issuer_unit: "u.service".into(),
+                    issuer_invocation: String::new(),
+                    issued_at_unix_millis: 1,
+                    operation: Operation::Deploy {
+                        selector: "vili".into(),
+                    },
+                    reason: "r".into(),
+                },
+            ),
+            "start" => h.ctx.store.put(
                 key,
                 schema,
                 &StartRecord {
@@ -3584,7 +3601,7 @@ mod tests {
                     actuation: "idunn-order-x".into(),
                 },
             ),
-            _ if schema.contains("outcome") => h.ctx.store.put(
+            "outcome" => h.ctx.store.put(
                 key,
                 schema,
                 &OutcomeRecord {
@@ -3607,17 +3624,18 @@ mod tests {
                 },
             ),
         };
-        for (current, key) in [
-            (START_SCHEMA, "ord-a"),
-            (OUTCOME_SCHEMA, "ord-a"),
-            (POST_SCHEMA, "ord-a:accepted"),
+        for (kind, current, key) in [
+            ("order", ORDER_SCHEMA, "ord-a"),
+            ("start", START_SCHEMA, "ord-a"),
+            ("outcome", OUTCOME_SCHEMA, "ord-a"),
+            ("post", POST_SCHEMA, "ord-a:accepted"),
         ] {
             let h = harness();
-            assert!(put(&h, current, key).unwrap());
+            assert!(put(&h, kind, current, key).unwrap());
             assert!(h.ctx.store.ledger().is_ok(), "{current} is read");
             let h = harness();
             let other = current.replace(".v1", ".v0");
-            assert!(put(&h, &other, key).unwrap());
+            assert!(put(&h, kind, &other, key).unwrap());
             assert!(h.ctx.store.ledger().is_err(), "{other} is not read");
         }
     }
