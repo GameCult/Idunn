@@ -21,7 +21,7 @@
 //! field and a code. A refused unit that a record names was resolved by
 //! systemd and passed the unit grammar.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
