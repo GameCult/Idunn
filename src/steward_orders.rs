@@ -3776,8 +3776,6 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(100));
         }
-        // SAFETY: as above.
-        unsafe { libc::umask(before) };
         assert!(socket.exists(), "serve never bound its socket");
         let metadata = std::fs::metadata(&socket).unwrap();
         assert_eq!((metadata.mode() & 0o777, metadata.uid()), (0o600, 65534));
@@ -3877,7 +3875,10 @@ mod tests {
         // Idunn's umask, not the 0117 the process was started with.
         let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o777;
         assert_eq!((mode(&store), mode(&store.join("orders.cc"))), (0o700, 0o600));
-        assert_eq!(mode(&control), 0o640);
+        let control_mode = mode(&control);
+        // SAFETY: umask only sets the process file-mode mask.
+        unsafe { libc::umask(before) };
+        assert_eq!(control_mode, 0o640);
     }
 
     /// One request as the steward: uid 65534 and gid 0, from a forked child
