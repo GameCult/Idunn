@@ -91,9 +91,12 @@ match themselves, and a last step fails the order unless every named package
 is installed.
 
 An order runs once, after the steward's uid is checked and the instance's
-brake check (`mind-control --instance <principal> check`) exits 0; an order
-that had started when the service died is recorded as lost and never run
-again. No order releases a brake. Acceptance and result are posted to
+brake check (`mind-control --instance <principal> check`) exits 0. The check
+that the order's principal and uid are the bound steward's runs again at every
+execution, so an order accepted before `steward.toml` changed is refused and
+recorded, not run. The socket belongs to the steward user alone (mode 0600);
+root may `show` and `list` orders but never issue one. An order that had
+started when the service died is recorded as lost and never run again. No order releases a brake. Acceptance and result are posted to
 `#operator` as a retried projection of `orders.cc`: a chat outage delays the
 posts and not the orders. A refusal names the field and a code, never the value
 it refused.
