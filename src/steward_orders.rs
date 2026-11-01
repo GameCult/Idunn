@@ -1289,6 +1289,15 @@ fn parse_names(value: &str) -> Vec<String> {
     names
 }
 
+/// The properties one `systemctl show` is asked for: identity, state, edges.
+fn show_properties() -> String {
+    ["Id", "Names", "LoadState", "ActiveState"]
+        .into_iter()
+        .chain(EDGES.iter().map(|(property, _)| *property))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn parse_show(output: &str) -> Result<UnitFacts> {
     let mut facts = UnitFacts::default();
     for line in output.lines() {
@@ -1315,14 +1324,9 @@ fn parse_show(output: &str) -> Result<UnitFacts> {
 
 impl Systemd for HostSystemd {
     fn show(&self, unit: &str) -> Result<UnitFacts> {
-        let properties = ["Id", "Names", "LoadState", "ActiveState"]
-            .into_iter()
-            .chain(EDGES.iter().map(|(property, _)| *property))
-            .collect::<Vec<_>>()
-            .join(",");
         let output = Command::new("systemctl")
             .args(["show", "--no-pager"])
-            .arg(format!("--property={properties}"))
+            .arg(format!("--property={}", show_properties()))
             .args(["--", unit])
             .stdin(Stdio::null())
             .output()
@@ -3124,6 +3128,17 @@ mod tests {
             ["c.service", "ro.service", "d.target", "e.service", "p.service", "f.service"]
         );
         assert!(parse_show("Names=a.service\n").is_err());
+        // The request asks for exactly the properties the parse reads.
+        assert_eq!(
+            show_properties(),
+            "Id,Names,LoadState,ActiveState,Requires,Requisite,BindsTo,Wants,Upholds,\
+             Conflicts,ConflictedBy,RequiredBy,BoundBy,RequisiteOf,ConsistsOf,\
+             PropagatesStopTo,StopPropagatedFrom"
+        );
+        // A backslash outside quotes is a backslash; inside, it escapes one character.
+        assert_eq!(parse_names("a\\b c\\\\d"), ["a\\b", "c\\\\d"]);
+        assert_eq!(parse_names("\"a\\\"b\" \"\" c"), ["a\"b", "", "c"]);
+        assert!(parse_names("   ").is_empty());
         let gone = parse_show("Id=\\x22a.service\\x22.service\nLoadState=not-found\n").unwrap();
         assert!(gone.not_found);
         for (state, running) in [
