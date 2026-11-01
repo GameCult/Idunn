@@ -2880,7 +2880,7 @@ mod tests {
         let id = h.accept(h.issue_unit(Verb::Restart, "nginx.service"));
         execute(&h.ctx, &id).unwrap();
         assert_eq!(h.outcome(&id), Outcome::Refused(Refused::Braked));
-        // The brake is released by someone else; the refused order stays refused.
+        // Someone else clears the brake; the refused order stays refused.
         h.brake.0.store(true, Ordering::SeqCst);
         execute(&h.ctx, &id).unwrap();
         assert!(h.runs().is_empty());
