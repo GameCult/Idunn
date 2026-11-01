@@ -366,7 +366,7 @@ pub(crate) fn show_status(
 /// printable ASCII and tab pass; every other code point is a visible
 /// `\u{..}` escape and every invalid UTF-8 byte a `\x..` escape. A newline
 /// inside a line is escaped too: this function writes the only ones.
-fn emit(out: &mut impl std::io::Write, lines: &[Vec<u8>]) -> std::io::Result<()> {
+pub(crate) fn emit(out: &mut impl std::io::Write, lines: &[Vec<u8>]) -> std::io::Result<()> {
     for line in lines {
         out.write_all(escape(line).as_bytes())?;
         out.write_all(b"\n")?;
@@ -374,7 +374,7 @@ fn emit(out: &mut impl std::io::Write, lines: &[Vec<u8>]) -> std::io::Result<()>
     Ok(())
 }
 
-fn escape(bytes: &[u8]) -> String {
+pub(crate) fn escape(bytes: &[u8]) -> String {
     let mut shown = String::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
         for character in chunk.valid().chars() {

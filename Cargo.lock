@@ -482,6 +482,7 @@ dependencies = [
  "libc",
  "rmp-serde",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "toml",
