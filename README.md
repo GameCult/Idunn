@@ -66,7 +66,7 @@ It has its own store, `orders.cc`, and its own binding, `steward.toml`; the
 survival daemon takes no order. There is still no command string:
 
 ```bash
-idunn order package-install <pkg>[=version]... --reason TEXT   # apt-get update, then install
+idunn order package-install <pkg>[=version]... --reason TEXT   # apt-get update, install named packages, check them
 idunn order unit <start|stop|restart|reload> <unit> --reason TEXT
 idunn order deploy <service|profile:name> --reason TEXT        # the same commit as `idunn up`
 idunn order show <id>                                          # status and output tails
@@ -75,9 +75,20 @@ idunn order list
 
 A unit order may act on any unit except Idunn's own (`idunn-*`) and the minds'
 own (`mind-self@*`, `mind-persona@*`). That set is compiled into the binary and
-read from no configuration. A name, an alias that resolves to one of them, or a
-`stop` or `restart` whose dependents systemd would stop with it is refused,
-recorded and posted. Slices, scopes and globs are not units an order can name.
+read from no configuration. An order is refused, recorded and posted when its
+name, an alias it resolves from, or the transaction systemd would build for it
+reaches one of them: a start pulls in what the unit requires or wants (a
+refused unit that is already running is left alone) and stops what conflicts
+with it, a stop takes down what depends on it, and a restart does both. The
+transaction is read from `systemctl show`, so `start poweroff.target` is refused
+because every refused unit conflicts with `shutdown.target`, not because
+targets are banned. A unit `systemctl show` cannot resolve fails the order.
+Slices, scopes and globs are not units an order can name.
+
+A package order installs the packages it names and nothing else: apt runs with
+`--no-remove`, each name is passed as an exact-name pattern so `.` and `+`
+match themselves, and a last step fails the order unless every named package
+is installed.
 
 An order runs once, after the steward's uid is checked and the instance's
 brake check (`mind-control --instance <principal> check`) exits 0; an order
