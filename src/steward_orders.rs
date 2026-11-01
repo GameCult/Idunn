@@ -1690,6 +1690,16 @@ pub(crate) fn parse_serve(mut args: impl Iterator<Item = String>) -> Result<Serv
     Ok(options)
 }
 
+/// Seconds between post passes: two when the last pass went through, and
+/// doubling for each failed pass in a row up to a minute.
+fn post_pause(failures: u32) -> u64 {
+    if failures == 0 {
+        2
+    } else {
+        (2u64 << failures.min(5)).min(60)
+    }
+}
+
 /// Run a thread whose end ends the service: systemd restarts it, and the
 /// start recovery settles what it left.
 fn vital(name: &'static str, work: impl FnOnce() + Send + 'static) {
@@ -1775,18 +1785,14 @@ pub(crate) fn serve(options: ServeOptions) -> Result<()> {
     vital("poster", move || {
         let mut failures = 0u32;
         loop {
-            let pause = match post_pass(&poster) {
-                Ok(_) => {
-                    failures = 0;
-                    2
-                }
+            match post_pass(&poster) {
+                Ok(_) => failures = 0,
                 Err(error) => {
                     failures = failures.saturating_add(1);
                     eprintln!("steward orders: posting is delayed: {error:#}");
-                    (2u64 << failures.min(5)).min(60)
                 }
-            };
-            thread::sleep(Duration::from_secs(pause));
+            }
+            thread::sleep(Duration::from_secs(post_pause(failures)));
         }
     });
     for stream in listener.incoming() {
@@ -2077,6 +2083,7 @@ mod tests {
     impl Harness {
         fn exchange(&self, write: impl FnOnce(&mut UnixStream)) -> Response {
             let (mut client, mut server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             write(&mut client);
             handle(&self.ctx, &mut server, &self.queue).unwrap();
             let bytes = read_frame(&mut client, RESPONSE_FRAME_LIMIT).unwrap();
@@ -3543,6 +3550,7 @@ mod tests {
     fn intake_gives_up_on_a_peer_that_sends_no_frame() {
         let h = harness();
         let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         // Half a length prefix, then nothing: the connection must end by itself.
         client.write_all(&[0, 0]).unwrap();
         let (done, ended) = mpsc::channel();
@@ -3561,6 +3569,63 @@ mod tests {
             Response::Refused(Refusal::new("frame", Code::Malformed))
         );
         assert!(!h.ctx.store.path().exists());
+    }
+
+    #[test]
+    fn a_record_under_another_schema_is_not_read() {
+        let put = |h: &Harness, schema: &str, key: &str| match schema {
+            _ if schema.contains("start") => h.ctx.store.put(
+                key,
+                schema,
+                &StartRecord {
+                    schema_version: schema.into(),
+                    order_id: key.into(),
+                    started_at_unix_millis: 1,
+                    actuation: "idunn-order-x".into(),
+                },
+            ),
+            _ if schema.contains("outcome") => h.ctx.store.put(
+                key,
+                schema,
+                &OutcomeRecord {
+                    schema_version: schema.into(),
+                    order_id: key.into(),
+                    ended_at_unix_millis: 1,
+                    outcome: Outcome::Lost,
+                    stdout_tail: Vec::new(),
+                    stderr_tail: Vec::new(),
+                },
+            ),
+            _ => h.ctx.store.put(
+                key,
+                schema,
+                &PostRecord {
+                    schema_version: schema.into(),
+                    post_key: key.into(),
+                    event_id: "$e".into(),
+                    posted_at_unix_millis: 1,
+                },
+            ),
+        };
+        for (current, key) in [
+            (START_SCHEMA, "ord-a"),
+            (OUTCOME_SCHEMA, "ord-a"),
+            (POST_SCHEMA, "ord-a:accepted"),
+        ] {
+            let h = harness();
+            assert!(put(&h, current, key).unwrap());
+            assert!(h.ctx.store.ledger().is_ok(), "{current} is read");
+            let h = harness();
+            let other = current.replace(".v1", ".v0");
+            assert!(put(&h, &other, key).unwrap());
+            assert!(h.ctx.store.ledger().is_err(), "{other} is not read");
+        }
+    }
+
+    #[test]
+    fn posts_are_retried_after_a_widening_pause() {
+        let pauses: Vec<u64> = (0..9).map(post_pause).collect();
+        assert_eq!(pauses, [2, 4, 8, 16, 32, 60, 60, 60, 60]);
     }
 
     #[test]
@@ -3692,7 +3757,7 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let systemctl = format!(
             "#!/bin/sh\necho \"$@\" >> {0}/systemctl.log\nfor a; do last=$a; done\n\
-             case \"$*\" in *InvocationID*) echo inv-fake;; *show*) printf 'Id=%s\\nNames=%s\\n' \"$last\" \"$last\";; esac\n",
+             case \"$*\" in *InvocationID*quiet*) ;; *InvocationID*broken*) echo junk; exit 1;; *InvocationID*) echo inv-fake;; *show*) printf 'Id=%s\\nNames=%s\\n' \"$last\" \"$last\";; esac\n",
             root.display()
         );
         let run = format!(
@@ -3800,6 +3865,7 @@ mod tests {
         };
         let as_root = |request: &Request| {
             let mut stream = UnixStream::connect(&socket).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             write_frame(&mut stream, request).unwrap();
             rmp_serde::from_slice::<Response>(&read_frame(&mut stream, RESPONSE_FRAME_LIMIT).unwrap()).unwrap()
         };
@@ -3851,6 +3917,10 @@ mod tests {
         let ledger = orders.ledger().unwrap();
         let stored = ledger.orders.iter().find(|order| order.order_id == first).unwrap();
         assert_eq!((stored.issuer_uid, stored.issuer_invocation.as_str()), (65534, "inv-fake"));
+        // An invocation id is what a succeeding systemctl prints, if anything.
+        assert_eq!(HostSystemd.invocation("quiet.service"), None);
+        assert_eq!(HostSystemd.invocation("broken.service"), None);
+        assert_eq!(HostSystemd.invocation("some.service").as_deref(), Some("inv-fake"));
         // What the service called, exactly.
         let run_log = std::fs::read_to_string(root.join("run.log")).unwrap();
         assert!(
@@ -3868,7 +3938,7 @@ mod tests {
         // Every record is posted; the deploy's result waits for its command.
         let mut seen = Vec::new();
         while seen.len() < 5 {
-            seen.push(posts.recv_timeout(Duration::from_secs(30)).expect("five posts within 30 s"));
+            seen.push(posts.recv_timeout(Duration::from_secs(15)).expect("five posts within 15 s"));
         }
         for (id, kinds) in [
             (&first, ["accepted", "result"].as_slice()),
@@ -3911,6 +3981,7 @@ mod tests {
             // SAFETY: only system calls on buffers made before the fork.
             unsafe {
                 libc::close(fds[0]);
+                libc::alarm(10);
                 if libc::setgroups(0, std::ptr::null()) != 0
                     || libc::setgid(0) != 0
                     || libc::setuid(65534) != 0
