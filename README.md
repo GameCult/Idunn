@@ -58,6 +58,35 @@ idunn status --command <id>
 the bindings, so `idunn up profile:full-gamecult` brings up everything bound
 into that profile.
 
+### Steward orders
+
+A second root unit from the same binary, `idunn-orders` (`idunn orders serve`),
+takes typed orders from one steward Mind over `/run/idunn-orders/steward.sock`.
+It has its own store, `orders.cc`, and its own binding, `steward.toml`; the
+survival daemon takes no order. There is still no command string:
+
+```bash
+idunn order package-install <pkg>[=version]... --reason TEXT   # apt-get update, then install
+idunn order unit <start|stop|restart|reload> <unit> --reason TEXT
+idunn order deploy <service|profile:name> --reason TEXT        # the same commit as `idunn up`
+idunn order show <id>                                          # status and output tails
+idunn order list
+```
+
+A unit order may act on any unit except Idunn's own (`idunn-*`) and the minds'
+own (`mind-self@*`, `mind-persona@*`). That set is compiled into the binary and
+read from no configuration. A name, an alias that resolves to one of them, or a
+`stop` or `restart` whose dependents systemd would stop with it is refused,
+recorded and posted. Slices, scopes and globs are not units an order can name.
+
+An order runs once, after the steward's uid is checked and the instance's
+brake check (`mind-control --instance <principal> check`) exits 0; an order
+that had started when the service died is recorded as lost and never run
+again. No order releases a brake. Acceptance and result are posted to
+`#operator` as a retried projection of `orders.cc`: a chat outage delays the
+posts and not the orders. A refusal names the field and a code, never the value
+it refused.
+
 ## Authority
 
 **Owner.** Deployment admission, and the continuity of installed bodies.

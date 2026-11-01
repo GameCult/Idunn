@@ -1,0 +1,48 @@
+[Unit]
+Description=Idunn steward orders: typed package, unit and deploy orders from the steward
+# Deliberately no After= or Requires= on any managed target, Synapse or
+# idunn-yggdrasil: orders are how an operator repairs those, so none of them
+# may be a condition of this unit starting. Posts are a retried projection and
+# wait for Synapse on their own.
+
+[Service]
+Type=simple
+
+# Root, from the same binary as idunn-yggdrasil, with its own store and socket.
+# idunn-yggdrasil keeps its no-imperative-input invariant and its write set:
+# no order code runs in `idunn serve`.
+#
+# The unit name matches idunn-*, which is in the always-refused set, so no
+# order can stop or restart this service.
+User=root
+# The socket is created root:idunn-steward 0660 (UMask below). The steward user
+# is the only peer the service answers: it checks SO_PEERCRED on every
+# connection, so the group is a second door held shut, not the lock.
+Group=idunn-steward
+ExecStart=/usr/local/bin/idunn orders serve \
+  --store /var/lib/gamecult/idunn-orders \
+  --state-store /var/lib/gamecult/idunn/control.cc \
+  --steward-binding /etc/gamecult/idunn/steward.toml \
+  --socket /run/idunn-orders/steward.sock
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+UMask=0117
+
+RuntimeDirectory=idunn-orders
+RuntimeDirectoryMode=0750
+
+# The Synapse access token of @idunn, copied from a root-only file, and read
+# through $CREDENTIALS_DIRECTORY; the service names it in steward.toml.
+LoadCredential=idunn-matrix-token:/etc/gamecult/idunn/matrix-token
+
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+# Its own order store, and the control store a deploy order commits a command
+# to. Transient units started with systemd-run run in the manager's namespace,
+# so packages and units are not limited by this list.
+ReadWritePaths=/var/lib/gamecult/idunn-orders /var/lib/gamecult/idunn
+
+[Install]
+WantedBy=multi-user.target
