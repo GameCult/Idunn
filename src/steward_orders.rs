@@ -3938,7 +3938,7 @@ mod tests {
         // Every record is posted; the deploy's result waits for its command.
         let mut seen = Vec::new();
         while seen.len() < 5 {
-            seen.push(posts.recv_timeout(Duration::from_secs(15)).expect("five posts within 15 s"));
+            seen.push(posts.recv_timeout(Duration::from_secs(10)).expect("five posts within 10 s"));
         }
         for (id, kinds) in [
             (&first, ["accepted", "result"].as_slice()),
