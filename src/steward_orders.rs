@@ -2838,11 +2838,12 @@ mod tests {
             assert_eq!(outcome_of_unit(&h, verb, "quiet-actions.service"), Outcome::Ran, "{verb:?}");
         }
         // An action this check does not know is not checked, so it does not run.
+        let ran = h.runs().len();
         h.describe("odd-action.service", &[("SuccessAction", "implode")]);
         let id = h.accept(h.issue_unit(Verb::Start, "odd-action.service"));
         execute(&h.ctx, &id).unwrap();
         assert!(matches!(h.outcome(&id), Outcome::Failed { exit_code: None, signal: None }));
-        assert!(h.runs().is_empty());
+        assert_eq!(h.runs().len(), ran);
     }
 
     #[test]
@@ -2882,14 +2883,6 @@ mod tests {
         // A boot unit that is already running is left alone by a start.
         h.describe("journald.service", &[("DefaultDependencies", "no")]);
         assert_eq!(outcome_of_unit(&h, Verb::Start, "journald.service"), Outcome::Ran);
-    }
-
-    #[test]
-    fn show_asks_for_every_property_the_refusal_reads() {
-        let asked = show_properties();
-        for property in ["DefaultDependencies", "SuccessAction", "FailureAction", "StartLimitAction", "JobTimeoutAction", "OnFailure", "OnSuccess"] {
-            assert!(asked.split(',').any(|asked| asked == property), "{property}");
-        }
     }
 
     #[test]
@@ -3379,8 +3372,9 @@ mod tests {
         // The request asks for exactly the properties the parse reads.
         assert_eq!(
             show_properties(),
-            "Id,Names,LoadState,ActiveState,Requires,Requisite,BindsTo,Wants,Upholds,\
-             Conflicts,ConflictedBy,RequiredBy,BoundBy,RequisiteOf,ConsistsOf,\
+            "Id,Names,LoadState,ActiveState,DefaultDependencies,SuccessAction,FailureAction,\
+             StartLimitAction,JobTimeoutAction,OnFailure,OnSuccess,Requires,Requisite,BindsTo,\
+             Wants,Upholds,Conflicts,ConflictedBy,RequiredBy,BoundBy,RequisiteOf,ConsistsOf,\
              PropagatesStopTo,StopPropagatedFrom"
         );
         // A backslash outside quotes is a backslash; inside, it escapes one character.
