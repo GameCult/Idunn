@@ -2847,6 +2847,31 @@ mod tests {
     }
 
     #[test]
+    fn every_emergency_action_runs_the_target_it_names() {
+        for (action, target) in [
+            ("none", None),
+            ("", None),
+            ("reboot", Some("reboot.target")),
+            ("reboot-force", Some("reboot.target")),
+            ("reboot-immediate", Some("reboot.target")),
+            ("poweroff", Some("poweroff.target")),
+            ("poweroff-force", Some("poweroff.target")),
+            ("poweroff-immediate", Some("poweroff.target")),
+            ("halt", Some("halt.target")),
+            ("halt-force", Some("halt.target")),
+            ("kexec", Some("kexec.target")),
+            ("kexec-immediate", Some("kexec.target")),
+            ("soft-reboot", Some("soft-reboot.target")),
+            ("soft-reboot-force", Some("soft-reboot.target")),
+            ("exit", Some("exit.target")),
+            ("exit-force", Some("exit.target")),
+        ] {
+            assert_eq!(action_target(action).unwrap(), target, "{action}");
+        }
+        assert!(action_target("implode").is_err());
+    }
+
+    #[test]
     fn a_stopped_boot_or_recovery_unit_is_never_started() {
         let h = harness();
         yggdrasil(&h, true);
