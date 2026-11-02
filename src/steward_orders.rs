@@ -21,7 +21,6 @@
 //! field and a code. A refused unit that a record names was resolved by
 //! systemd and passed the unit grammar.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -391,12 +390,16 @@ pub(crate) enum Via {
     Host,
     OnEnd,
     Bound,
+    Upholds,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Refused {
     AlwaysRefused { unit: String, via: Via },
+    /// The unit only wraps `member` (`ConsistsOf=`): a stop, restart or reload
+    /// of the wrapper exits 0 and leaves the member alone.
+    Wrapper { member: String },
     Braked,
     /// The order's principal or issuing uid is not the steward bound now.
     NotSteward,
@@ -437,7 +440,12 @@ impl Outcome {
                     Via::Host => "host",
                     Via::OnEnd => "on-end",
                     Via::Bound => "bound",
+                    Via::Upholds => "upholds",
                 }
+            ),
+            Outcome::Refused(Refused::Wrapper { member }) => format!(
+                "refused: wrapper unit, it only wraps {}",
+                escape(member.as_bytes())
             ),
             Outcome::Refused(Refused::Braked) => "refused: braked".into(),
             Outcome::Refused(Refused::NotSteward) => {
@@ -650,6 +658,12 @@ pub(crate) struct UnitFacts {
     /// The units bound to this one at runtime (`BoundBy=`): systemd stops
     /// them when this unit stops, whatever the job mode.
     pub(crate) bound_by: Vec<String>,
+    /// The units this one upholds (`Upholds=`): systemd starts them in a full
+    /// transaction whenever this unit is active, whatever the job mode.
+    pub(crate) upholds: Vec<String>,
+    /// The units this one groups (`ConsistsOf=`): the verbs reach them only
+    /// through propagation, which the job mode removes.
+    pub(crate) consists_of: Vec<String>,
 }
 
 impl UnitFacts {
@@ -715,7 +729,8 @@ fn refused(unit: &str, via: Via) -> Refused {
 /// Would `verb` on `unit` be refused. systemd builds the transaction and the
 /// order tells it to build one job (`--job-mode=ignore-requirements`), so this
 /// reads only what that job mode cannot remove from the one named unit: the
-/// name it answers to, what fires when it ends, and who is bound to it.
+/// name it answers to, what fires when it ends, who is bound to it, what it upholds and
+/// what it only wraps.
 fn refusal_for(systemd: &dyn Systemd, unit: &str, verb: Verb) -> Result<Option<Refused>> {
     if is_refused_name(unit) {
         return Ok(Some(refused(unit, Via::Name)));
@@ -737,6 +752,16 @@ fn refusal_for(systemd: &dyn Systemd, unit: &str, verb: Verb) -> Result<Option<R
         && let Some(bound) = facts.bound_by.first()
     {
         return Ok(Some(refused(bound, Via::Bound)));
+    }
+    if matches!(verb, Verb::Start | Verb::Restart) && !facts.upholds.is_empty() {
+        return Ok(Some(refused(unit, Via::Upholds)));
+    }
+    if verb != Verb::Start
+        && let Some(member) = facts.consists_of.first()
+    {
+        return Ok(Some(Refused::Wrapper {
+            member: member.clone(),
+        }));
     }
     Ok(None)
 }
@@ -1231,13 +1256,13 @@ fn parse_names(value: &str) -> Vec<String> {
 }
 
 /// The properties one `systemctl show` is asked for: identity, what fires at
-/// the unit's end, and who is bound to it.
+/// the unit's end, who is bound to it, and what it upholds or groups.
 fn show_properties() -> String {
     ["Id", "Names", "LoadState"]
         .into_iter()
         .chain(ACTIONS)
         .chain(ON_END)
-        .chain(["BoundBy"])
+        .chain(["BoundBy", "Upholds", "ConsistsOf"])
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1253,6 +1278,8 @@ fn parse_show(output: &str) -> Result<UnitFacts> {
             "Names" => facts.names = parse_names(value),
             "LoadState" => facts.not_found = value == "not-found",
             "BoundBy" => facts.bound_by = parse_names(value),
+            "Upholds" => facts.upholds = parse_names(value),
+            "ConsistsOf" => facts.consists_of = parse_names(value),
             _ if ACTIONS.contains(&key) => {
                 if !matches!(value, "" | "none") {
                     facts.on_end.push(key.to_owned());
@@ -2544,6 +2571,91 @@ mod tests {
     }
 
     #[test]
+    fn a_unit_that_upholds_others_is_refused_where_it_would_start() {
+        let h = harness();
+        h.describe("holder.service", &[("Upholds", "held.service")]);
+        for verb in [Verb::Start, Verb::Restart] {
+            assert_eq!(
+                outcome_of_unit(&h, verb, "holder.service"),
+                Outcome::Refused(Refused::AlwaysRefused {
+                    unit: "holder.service".into(),
+                    via: Via::Upholds
+                }),
+                "{verb:?}"
+            );
+        }
+        assert!(h.runs().is_empty());
+        for verb in [Verb::Stop, Verb::Reload] {
+            assert_eq!(outcome_of_unit(&h, verb, "holder.service"), Outcome::Ran, "{verb:?}");
+        }
+    }
+
+    #[test]
+    fn a_wrapper_unit_is_refused_where_the_verb_would_touch_nothing() {
+        let h = harness();
+        h.describe("wrapper.service", &[("ConsistsOf", "member@1.service member@2.service")]);
+        for verb in [Verb::Stop, Verb::Restart, Verb::Reload] {
+            assert_eq!(
+                outcome_of_unit(&h, verb, "wrapper.service"),
+                Outcome::Refused(Refused::Wrapper { member: "member@1.service".into() }),
+                "{verb:?}"
+            );
+        }
+        assert!(h.runs().is_empty());
+        assert_eq!(outcome_of_unit(&h, Verb::Start, "wrapper.service"), Outcome::Ran);
+    }
+
+    #[test]
+    fn empty_dependency_lists_name_no_one() {
+        let h = harness();
+        // systemctl prints every property it is asked for, empty or not.
+        h.describe(
+            "alone.service",
+            &[("BoundBy", ""), ("Upholds", ""), ("ConsistsOf", "")],
+        );
+        for verb in all_verbs() {
+            assert_eq!(outcome_of_unit(&h, verb, "alone.service"), Outcome::Ran, "{verb:?}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_reads_the_named_unit_once_and_a_refused_name_not_at_all() {
+        let h = harness();
+        h.describe("base.service", &[("BoundBy", "first.service")]);
+        h.describe("idunn-ghost.service", &[("LoadState", "not-found")]);
+        assert!(hit(&outcome_of_unit(&h, Verb::Stop, "base.service"), Via::Bound).is_some());
+        assert_eq!(h.systemd.shows.lock().unwrap().clone(), ["base.service"]);
+        h.systemd.shows.lock().unwrap().clear();
+        assert_eq!(
+            hit(&outcome_of_unit(&h, Verb::Stop, "idunn-ghost.service"), Via::Name),
+            Some("idunn-ghost.service")
+        );
+        assert!(h.systemd.shows.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn each_refusal_is_posted_under_its_own_reason() {
+        for (via, word) in [
+            (Via::Name, "name"),
+            (Via::Alias, "alias"),
+            (Via::Host, "host"),
+            (Via::OnEnd, "on-end"),
+            (Via::Bound, "bound"),
+            (Via::Upholds, "upholds"),
+        ] {
+            assert_eq!(
+                Outcome::Refused(Refused::AlwaysRefused { unit: "u.service".into(), via })
+                    .describe(),
+                format!("refused: always-refused unit u.service reached by {word}")
+            );
+        }
+        assert_eq!(
+            Outcome::Refused(Refused::Wrapper { member: "m.service".into() }).describe(),
+            "refused: wrapper unit, it only wraps m.service"
+        );
+    }
+
+    #[test]
     fn a_unit_systemd_cannot_show_is_a_failure_not_a_leaf() {
         let h = harness();
         h.describe("ghost.service", &[("LoadState", "not-found")]);
@@ -3004,7 +3116,7 @@ mod tests {
             "Id=a.service\nNames=a.service b.service\nLoadState=loaded\nActiveState=active\n\
              SuccessAction=none\nFailureAction=reboot-force\nStartLimitAction=\nJobTimeoutAction=none\n\
              OnFailure=f.service g.service\nOnSuccess=\nBoundBy=\"q\\\\x2dr.service\" s.service\n\
-             Requires=r.service\nConflicts=x.service\nOther=x\n",
+             Upholds=u.service\nConsistsOf=m.service n.service\nRequires=r.service\nConflicts=x.service\nOther=x\n",
         )
         .unwrap();
         assert_eq!(facts.id, "a.service");
@@ -3013,12 +3125,14 @@ mod tests {
         assert_eq!(facts.on_end, ["FailureAction", "OnFailure", "OnFailure"]);
         // A quoted name holds one backslash, not two and not a quote mark.
         assert_eq!(facts.bound_by, ["q\\x2dr.service", "s.service"]);
+        assert_eq!(facts.upholds, ["u.service"]);
+        assert_eq!(facts.consists_of, ["m.service", "n.service"]);
         assert!(parse_show("Names=a.service\n").is_err());
         // The request asks for exactly the properties the parse reads.
         assert_eq!(
             show_properties(),
             "Id,Names,LoadState,SuccessAction,FailureAction,StartLimitAction,JobTimeoutAction,\
-             OnFailure,OnSuccess,BoundBy"
+             OnFailure,OnSuccess,BoundBy,Upholds,ConsistsOf"
         );
         // A backslash outside quotes is a backslash; inside, it escapes one character.
         assert_eq!(parse_names("a\\b c\\\\d"), ["a\\b", "c\\\\d"]);

@@ -73,11 +73,16 @@ idunn order show <id>                                          # status and outp
 idunn order list
 ```
 
-A unit order acts on exactly the unit it names: every verb runs
+A unit order submits exactly one job, for the unit it names: every verb runs
 `systemctl <verb> --job-mode=ignore-requirements -- <unit>`, so systemd builds a
 transaction of one job. It does not start what the unit requires or restart what
 is part of it: order the dependency first, and order `postgresql@16-main.service`
-rather than the `postgresql.service` wrapper. Targets are not orderable. A unit
+rather than the `postgresql.service` wrapper. Targets are not orderable. The job is one; what the unit does afterwards is
+not: systemd still runs full transactions of its own for `Restart=` after a
+failure, for a `StopWhenUnneeded=` dependency left without a user, and for a
+`Conflicts=` partner of a unit that fails, so an ordered stop of a unit
+that something restarts does not last, and a start of a `Restart=always`
+unit can report failure and be active seconds later. A unit
 order may act on any unit except Idunn's own (`idunn-*`) and the minds' own
 (`mind-self@*`, `mind-persona@*`), and the units that end or take the host
 (`systemd-suspend`, `systemd-hibernate`, `systemd-hybrid-sleep`,
@@ -88,7 +93,11 @@ when it has an emergency action (`SuccessAction=`, `FailureAction=`,
 `StartLimitAction=`, `JobTimeoutAction=`) other than `none` or an `OnFailure=`
 or `OnSuccess=` unit (not for a reload); or, for a stop or restart, when another
 unit is `BoundBy=` it, because systemd stops that unit with it whatever the job
-mode. A unit `systemctl show` cannot resolve fails the order. Slices, scopes,
+mode; for a start or restart, when it has an `Upholds=` unit, which systemd
+starts in a full transaction whatever the job mode; or, for a stop, restart or
+reload, when it has a `ConsistsOf=` member, a wrapper such as
+`postgresql.service` whose verbs would exit 0 and touch nothing. A unit
+`systemctl show` cannot resolve fails the order. Slices, scopes,
 targets and globs are not units an order can name.
 
 A package order installs the packages it names and nothing else: apt runs with
