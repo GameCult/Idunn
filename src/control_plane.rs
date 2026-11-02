@@ -2934,6 +2934,10 @@ enum Command {
         recipe: PathBuf,
         binding: Option<PathBuf>,
     },
+    #[cfg(unix)]
+    OrdersServe(crate::steward_orders::ServeOptions),
+    #[cfg(unix)]
+    Order(crate::steward_orders::OrderCommand),
 }
 
 pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
@@ -2973,6 +2977,10 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             requested_by,
         } => expire(&state_store, &command_id, &requested_by),
         Command::Validate { recipe, binding } => validate(&recipe, binding.as_deref()),
+        #[cfg(unix)]
+        Command::OrdersServe(options) => crate::steward_orders::serve(options),
+        #[cfg(unix)]
+        Command::Order(order) => crate::steward_orders::run_order(order),
     }
 }
 
@@ -3025,6 +3033,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command> {
         "cancel" => parse_cancel(args),
         "expire" => parse_expire(args),
         "validate" => parse_validate(args),
+        #[cfg(unix)]
+        "orders" => crate::steward_orders::parse_serve(args).map(Command::OrdersServe),
+        #[cfg(unix)]
+        "order" => crate::steward_orders::parse_order(args).map(Command::Order),
         "--help" | "-h" | "help" => bail!(usage()),
         _ => bail!("unknown Idunn command {command:?}\n\n{}", usage()),
     }
@@ -4730,20 +4742,21 @@ fn resolve_selector(
     Ok(targets)
 }
 
-fn submit(
+/// The one commit primitive for a deployment command: `idunn up` and a steward
+/// deploy order both write theirs here. Returns the commit time.
+pub(crate) fn commit_deployment_command(
     store_path: &Path,
+    command_id: &str,
     selector: &str,
     requested_by: &str,
-    wait: bool,
-    timeout_seconds: u64,
-) -> Result<()> {
+) -> Result<u64> {
     if let Some(parent) = store_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let now = now_millis()?;
     let command = DeploymentCommand {
         schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
-        command_id: format!("up-{}", Uuid::new_v4()),
+        command_id: command_id.into(),
         kind: CommandKind::Deploy,
         selector: selector.into(),
         requested_by: requested_by.into(),
@@ -4761,7 +4774,33 @@ fn submit(
         )?,
         "deployment command id collided"
     );
-    println!("{}", command.command_id);
+    Ok(now)
+}
+
+/// A command's present state as `idunn status --command` derives it, for the
+/// steward order poster: `queued` and `running` are not terminal.
+#[cfg(unix)]
+pub(crate) fn command_state(
+    state_store: &Path,
+    command_id: &str,
+) -> Result<(&'static str, String)> {
+    let snapshot = ControlSnapshot::read(state_store)?;
+    let archived = read_history_transactions(state_store);
+    let mut transactions = snapshot.transaction_for_command(command_id);
+    transactions.extend(archived.iter().filter(|value| value.command_id == command_id));
+    Ok(derived_command_status(&transactions))
+}
+
+fn submit(
+    store_path: &Path,
+    selector: &str,
+    requested_by: &str,
+    wait: bool,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let command_id = format!("up-{}", Uuid::new_v4());
+    let now = commit_deployment_command(store_path, &command_id, selector, requested_by)?;
+    println!("{command_id}");
     if !wait {
         return Ok(());
     }
@@ -4772,10 +4811,10 @@ fn submit(
             snapshot
                 .commands
                 .iter()
-                .any(|stored| stored.value.command_id == command.command_id),
+                .any(|stored| stored.value.command_id == command_id),
             "submitted deployment command disappeared"
         );
-        let transactions = snapshot.transaction_for_command(&command.command_id);
+        let transactions = snapshot.transaction_for_command(&command_id);
         if !transactions.is_empty() && transactions.iter().all(|value| value.is_terminal()) {
             if let Some(error) =
                 transactions
@@ -4800,7 +4839,7 @@ fn submit(
     }
 }
 
-fn status(
+pub(crate) fn status(
     out: &mut impl Write,
     store_path: &Path,
     incident_store: &Path,
@@ -10592,7 +10631,13 @@ fn required<'a, T>(value: &'a Option<T>, label: &str) -> Result<&'a T> {
     value.as_ref().with_context(|| format!("{label} is absent"))
 }
 
-fn now_millis() -> Result<u64> {
+/// The control store `idunn up` and `idunn serve` use unless told otherwise.
+#[cfg(unix)]
+pub(crate) fn default_state_store() -> PathBuf {
+    RuntimeOptions::default().state_store
+}
+
+pub(crate) fn now_millis() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock predates Unix epoch")?
@@ -10612,12 +10657,12 @@ fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn string_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
+pub(crate) fn string_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
     args.next()
         .ok_or_else(|| anyhow!("{name} requires a value"))
 }
 
-fn path_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
+pub(crate) fn path_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(string_value(args, name)?))
 }
 
@@ -10633,7 +10678,7 @@ fn u64_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u64>
         .with_context(|| format!("{name} requires a u64"))
 }
 
-fn require_selector(value: &str) -> Result<()> {
+pub(crate) fn require_selector(value: &str) -> Result<()> {
     let value = value.strip_prefix("profile:").unwrap_or(value);
     require_id(value, "deployment selector")
 }
@@ -10757,7 +10802,10 @@ fn usage() -> &'static str {
      idunn status [--state-store PATH] [--incident-store PATH] [--command ID]\n\
      idunn cancel <command-id> [--state-store PATH]\n\
      idunn expire <command-id> [--state-store PATH]\n\
-     idunn validate --recipe PATH [--binding PATH]\n\n\
+     idunn validate --recipe PATH [--binding PATH]\n\
+     idunn orders serve [--store DIR] [--steward-binding PATH] [--socket PATH]\n\
+     idunn order <package-install PKG... | unit VERB UNIT | deploy SELECTOR> --reason TEXT\n\
+     idunn order show ID | idunn order list\n\n\
      Recipes describe capability and process requirements. Idunn seals exact\n\
      source and artifacts, admits one incarnation, and delegates execution to\n\
      systemd and routing mechanics to the configured proxy."
@@ -11969,9 +12017,45 @@ mod tests {
             vec!["serve", "--swarm-profile", "yggdrasil-local"],
             vec!["serve", "--restart-command", "bad"],
             vec!["validate-runtime-admission"],
+            vec!["order", "unit", "restart", "nginx.service", "--reason", "r", "--command", "sh -c bad"],
+            vec!["order", "unit", "restart", "nginx.service", "--reason", "r", "--shell"],
+            vec!["order", "run", "sh", "--reason", "r"],
+            vec!["order", "package-install", "git-lfs", "--reason", "r", "--deploy-command", "x"],
+            vec!["order", "unit", "restart", "nginx.service", "extra", "--reason", "r"],
+            vec!["order", "deploy", "vili", "--reason", "r", "--requested-by", "someone"],
+            vec!["orders", "serve", "--allow-units", "nginx.service"],
+            vec!["orders", "run"],
         ] {
             assert!(parse(arguments.into_iter().map(str::to_owned)).is_err());
         }
+        // The declarative order forms parse, and only as order commands.
+        #[cfg(unix)]
+        for arguments in [
+            vec!["order", "unit", "restart", "nginx.service", "--reason", "r"],
+            vec!["order", "package-install", "git-lfs", "--reason", "r"],
+            vec!["order", "deploy", "vili", "--reason", "r"],
+            vec!["order", "list"],
+            vec!["orders", "serve"],
+        ] {
+            let parsed = parse(arguments.into_iter().map(str::to_owned)).unwrap();
+            assert!(matches!(parsed, Command::Order(_) | Command::OrdersServe(_)));
+        }
+    }
+
+    #[test]
+    fn deployment_commit_primitive_is_shared_and_never_overwrites() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = temp.path().join("control.cc");
+        commit_deployment_command(&store, "up-one", "vili", "steward:eureka order ord-1")?;
+        let snapshot = ControlSnapshot::read(&store)?;
+        assert_eq!(snapshot.commands.len(), 1);
+        let command = &snapshot.commands[0].value;
+        assert_eq!(command.command_id, "up-one");
+        assert_eq!(command.selector, "vili");
+        assert_eq!(command.requested_by, "steward:eureka order ord-1");
+        assert!(commit_deployment_command(&store, "up-one", "other", "x").is_err());
+        assert_eq!(ControlSnapshot::read(&store)?.commands.len(), 1);
+        Ok(())
     }
 
     #[test]

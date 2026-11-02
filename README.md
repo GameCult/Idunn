@@ -58,6 +58,64 @@ idunn status --command <id>
 the bindings, so `idunn up profile:full-gamecult` brings up everything bound
 into that profile.
 
+### Steward orders
+
+A second root unit from the same binary, `idunn-orders` (`idunn orders serve`),
+takes typed orders from one steward Mind over `/run/idunn-orders/steward.sock`.
+It has its own store, `orders.cc`, and its own binding, `steward.toml`; the
+survival daemon takes no order. There is still no command string:
+
+```bash
+idunn order package-install <pkg>[=version]... --reason TEXT   # apt-get update, install named packages, check them
+idunn order unit <start|stop|restart|reload> <unit> --reason TEXT
+idunn order deploy <service|profile:name> --reason TEXT        # the same commit as `idunn up`
+idunn order show <id>                                          # status and output tails
+idunn order list
+```
+
+A unit order submits exactly one job, for the unit it names: every verb runs
+`systemctl <verb> --job-mode=ignore-requirements -- <unit>`, so systemd builds a
+transaction of one job. It does not start what the unit requires or restart what
+is part of it: order the dependency first, and order `postgresql@16-main.service`
+rather than the `postgresql.service` wrapper. Targets are not orderable. The job is one; what the unit does afterwards is
+not: systemd still runs full transactions of its own for `Restart=` after a
+failure, for a `StopWhenUnneeded=` dependency left without a user, and for a
+`Conflicts=` partner of a unit that fails, so an ordered stop of a unit
+that something restarts does not last, and a start of a `Restart=always`
+unit can report failure and be active seconds later. A unit
+order may act on any unit except Idunn's own (`idunn-*`) and the minds' own
+(`mind-self@*`, `mind-persona@*`), and the units that end or take the host
+(`systemd-suspend`, `systemd-hibernate`, `systemd-hybrid-sleep`,
+`systemd-suspend-then-hibernate`, `rescue`, `emergency`). That set is compiled
+into the binary and read from no configuration. An order is refused, recorded
+and posted when the ordered unit, or an alias it resolves from, is one of them;
+when it has an emergency action (`SuccessAction=`, `FailureAction=`,
+`StartLimitAction=`, `JobTimeoutAction=`) other than `none` or an `OnFailure=`
+or `OnSuccess=` unit (not for a reload); or, for a stop or restart, when another
+unit is `BoundBy=` it, because systemd stops that unit with it whatever the job
+mode; for a start or restart, when it has an `Upholds=` unit, which systemd
+starts in a full transaction whatever the job mode; or, for a stop, restart or
+reload, when it has a `ConsistsOf=` member, a wrapper such as
+`postgresql.service` whose verbs would exit 0 and touch nothing. A unit
+`systemctl show` cannot resolve fails the order. Slices, scopes,
+targets and globs are not units an order can name.
+
+A package order installs the packages it names and nothing else: apt runs with
+`--no-remove`, each name is passed as an exact-name pattern so `.` and `+`
+match themselves, and a last step fails the order unless every named package
+is installed.
+
+An order runs once, after the steward's uid is checked and the instance's
+brake check (`mind-control --instance <principal> check`) exits 0. The check
+that the order's principal and uid are the bound steward's runs again at every
+execution, so an order accepted before `steward.toml` changed is refused and
+recorded, not run. The socket belongs to the steward user alone (mode 0600);
+root may `show` and `list` orders but never issue one. An order that had
+started when the service died is recorded as lost and never run again. No order releases a brake. Acceptance and result are posted to
+`#operator` as a retried projection of `orders.cc`: a chat outage delays the
+posts and not the orders. A refusal names the field and a code, never the value
+it refused.
+
 ## Authority
 
 **Owner.** Deployment admission, and the continuity of installed bodies.
