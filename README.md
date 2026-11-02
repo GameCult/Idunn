@@ -73,24 +73,23 @@ idunn order show <id>                                          # status and outp
 idunn order list
 ```
 
-A unit order may act on any unit except Idunn's own (`idunn-*`) and the minds'
-own (`mind-self@*`, `mind-persona@*`). That set is compiled into the binary and
-read from no configuration. An order is refused, recorded and posted when its
-name, an alias it resolves from, or the transaction systemd would build for it
-reaches one of them: a start pulls in what the unit requires or wants (a
-refused unit that is already running is left alone) and stops what conflicts
-with it, a stop takes down what depends on it, and a restart does both. The
-transaction is read from `systemctl show`, so `start poweroff.target` is refused
-because every refused unit conflicts with `shutdown.target`, not because
-targets are banned. The units a start or stop ends or times out are followed too:
-the target each of `SuccessAction=`, `FailureAction=`, `StartLimitAction=` and
-`JobTimeoutAction=` runs (`reboot`, `poweroff`, `halt`, `kexec`, `soft-reboot`,
-`exit`, with `-force` and `-immediate`), and the units `OnFailure=` and
-`OnSuccess=` name, with what each pulls in; an action it does not know fails the
-order. A start refuses a stopped `DefaultDependencies=no` unit (boot and recovery
-machinery, such as `rescue.service`, which ends by isolating the default
-target), whatever pulls it in. A unit `systemctl show` cannot resolve fails the order.
-Slices, scopes and globs are not units an order can name.
+A unit order acts on exactly the unit it names: every verb runs
+`systemctl <verb> --job-mode=ignore-requirements -- <unit>`, so systemd builds a
+transaction of one job. It does not start what the unit requires or restart what
+is part of it: order the dependency first, and order `postgresql@16-main.service`
+rather than the `postgresql.service` wrapper. Targets are not orderable. A unit
+order may act on any unit except Idunn's own (`idunn-*`) and the minds' own
+(`mind-self@*`, `mind-persona@*`), and the units that end or take the host
+(`systemd-suspend`, `systemd-hibernate`, `systemd-hybrid-sleep`,
+`systemd-suspend-then-hibernate`, `rescue`, `emergency`). That set is compiled
+into the binary and read from no configuration. An order is refused, recorded
+and posted when the ordered unit, or an alias it resolves from, is one of them;
+when it has an emergency action (`SuccessAction=`, `FailureAction=`,
+`StartLimitAction=`, `JobTimeoutAction=`) other than `none` or an `OnFailure=`
+or `OnSuccess=` unit (not for a reload); or, for a stop or restart, when another
+unit is `BoundBy=` it, because systemd stops that unit with it whatever the job
+mode. A unit `systemctl show` cannot resolve fails the order. Slices, scopes,
+targets and globs are not units an order can name.
 
 A package order installs the packages it names and nothing else: apt runs with
 `--no-remove`, each name is passed as an exact-name pattern so `.` and `+`

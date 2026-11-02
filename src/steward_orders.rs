@@ -3742,7 +3742,7 @@ mod tests {
         let run_log = std::fs::read_to_string(root.join("run.log")).unwrap();
         assert!(
             run_log.contains(&format!(
-                "--unit idunn-order-{} --wait --pipe --collect -p RuntimeMaxSec=15min -- systemctl restart -- nginx.service",
+                "--unit idunn-order-{} --wait --pipe --collect -p RuntimeMaxSec=15min -- systemctl restart --job-mode=ignore-requirements -- nginx.service",
                 order_uuid(&first)
             )),
             "{run_log}"
