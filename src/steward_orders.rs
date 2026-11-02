@@ -374,6 +374,10 @@ pub(crate) enum Via {
     Name,
     Alias,
     Propagation,
+    /// A unit the order would start from a stopped state that is boot or
+    /// recovery machinery (`DefaultDependencies=no`): such a unit can end by
+    /// isolating a target, which no dependency edge describes.
+    EarlyBoot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +422,7 @@ impl Outcome {
                     Via::Name => "name",
                     Via::Alias => "alias",
                     Via::Propagation => "propagation",
+                    Via::EarlyBoot => "early-boot",
                 }
             ),
             Outcome::Refused(Refused::Braked) => "refused: braked".into(),
@@ -641,6 +646,32 @@ const EDGES: [(&str, Edge); 13] = [
     ("StopPropagatedFrom", Edge::Stops),
 ];
 
+/// The properties naming what systemd does when a unit ends or its job times
+/// out: each holds an emergency action (`reboot`, `poweroff-force`, ...).
+const ACTIONS: [&str; 4] = ["SuccessAction", "FailureAction", "StartLimitAction", "JobTimeoutAction"];
+
+/// The properties naming units systemd starts when a unit ends.
+const ON_END: [&str; 2] = ["OnFailure", "OnSuccess"];
+
+/// The target an emergency action runs, `None` for `none`. An action this
+/// check does not know is an error: the unit is not checked, so not run.
+fn action_target(action: &str) -> Result<Option<&'static str>> {
+    let base = ["-force", "-immediate"]
+        .iter()
+        .find_map(|suffix| action.strip_suffix(suffix))
+        .unwrap_or(action);
+    Ok(match base {
+        "" | "none" => None,
+        "reboot" => Some("reboot.target"),
+        "poweroff" => Some("poweroff.target"),
+        "halt" => Some("halt.target"),
+        "kexec" => Some("kexec.target"),
+        "soft-reboot" => Some("soft-reboot.target"),
+        "exit" => Some("exit.target"),
+        _ => bail!("a unit has an emergency action this check does not know"),
+    })
+}
+
 /// What `systemctl show` says about one unit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UnitFacts {
@@ -648,6 +679,11 @@ pub(crate) struct UnitFacts {
     pub(crate) names: Vec<String>,
     pub(crate) not_found: bool,
     pub(crate) running: bool,
+    /// `DefaultDependencies=no`: boot, recovery and shutdown machinery.
+    pub(crate) early_boot: bool,
+    /// What systemd starts when this unit ends or times out: the targets of
+    /// its emergency actions and its `OnFailure=` and `OnSuccess=` units.
+    pub(crate) fires: Vec<String>,
     pub(crate) pulls: Vec<String>,
     pub(crate) conflicts: Vec<String>,
     pub(crate) stops: Vec<String>,
@@ -762,6 +798,27 @@ impl Transaction<'_> {
         Ok(reached)
     }
 
+    /// Every unit the emergency actions and `OnFailure=`/`OnSuccess=` of
+    /// `touched` would start, with what each pulls in, and in turn what those
+    /// that are not running would set off. A touched unit ends, so it fires.
+    fn fired(&mut self, touched: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+        let mut fired = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let mut queue: VecDeque<String> = touched.iter().cloned().collect();
+        while let Some(unit) = queue.pop_front() {
+            if !seen.insert(unit.clone()) {
+                continue;
+            }
+            let seeds: BTreeSet<String> = self.facts(&unit)?.fires.iter().cloned().collect();
+            for reached in self.reach(&seeds, Edge::Pulls)? {
+                if fired.insert(reached.clone()) && !self.facts(&reached)?.running {
+                    queue.push_back(reached);
+                }
+            }
+        }
+        Ok(fired)
+    }
+
     /// Every unit a start of `started` stops through `Conflicts=`, and what
     /// that stop takes down with it.
     fn conflicted(&mut self, started: &BTreeSet<String>) -> Result<BTreeSet<String>> {
@@ -807,6 +864,13 @@ fn refusal_for(systemd: &dyn Systemd, unit: &str, verb: Verb) -> Result<Option<R
             started = transaction.reach(&stopped, Edge::Pulls)?;
         }
     }
+    let mut touched = stopped.clone();
+    for member in &started {
+        if !transaction.facts(member)?.running {
+            touched.insert(member.clone());
+        }
+    }
+    started.extend(transaction.fired(&touched)?);
     stopped.extend(transaction.conflicted(&started)?);
     for (units, only_if_stopped) in [(&stopped, false), (&started, true)] {
         for member in units {
@@ -816,6 +880,9 @@ fn refusal_for(systemd: &dyn Systemd, unit: &str, verb: Verb) -> Result<Option<R
             }
             if let Some(name) = facts.identities().find(|name| is_refused_name(name)) {
                 return Ok(Some(refused(name, Via::Propagation)));
+            }
+            if only_if_stopped && facts.early_boot {
+                return Ok(Some(refused(&facts.id, Via::EarlyBoot)));
             }
         }
     }
@@ -1313,8 +1380,10 @@ fn parse_names(value: &str) -> Vec<String> {
 
 /// The properties one `systemctl show` is asked for: identity, state, edges.
 fn show_properties() -> String {
-    ["Id", "Names", "LoadState", "ActiveState"]
+    ["Id", "Names", "LoadState", "ActiveState", "DefaultDependencies"]
         .into_iter()
+        .chain(ACTIONS)
+        .chain(ON_END)
         .chain(EDGES.iter().map(|(property, _)| *property))
         .collect::<Vec<_>>()
         .join(",")
@@ -1333,6 +1402,9 @@ fn parse_show(output: &str) -> Result<UnitFacts> {
             "ActiveState" => {
                 facts.running = matches!(value, "active" | "activating" | "reloading");
             }
+            "DefaultDependencies" => facts.early_boot = value == "no",
+            _ if ACTIONS.contains(&key) => facts.fires.extend(action_target(value)?.map(str::to_owned)),
+            _ if ON_END.contains(&key) => facts.fires.extend(parse_names(value)),
             _ => {
                 if let Some((_, edge)) = EDGES.iter().find(|(property, _)| *property == key) {
                     facts.along_mut(*edge).extend(parse_names(value));
@@ -2717,6 +2789,107 @@ mod tests {
         let outcome = outcome_of_unit(&h, Verb::Start, "quiet.service");
         assert_eq!(hit(&outcome), Some("idunn-a\\x2db.service"));
         assert!(h.runs().is_empty());
+    }
+
+    #[test]
+    fn a_unit_whose_end_reboots_the_host_is_refused_by_its_properties() {
+        let h = harness();
+        yggdrasil(&h, true);
+        // Each emergency action property alone, in each of systemd's spellings,
+        // on a unit no name list knows: every verb that starts or stops it.
+        for (property, action) in [
+            ("SuccessAction", "reboot"),
+            ("FailureAction", "reboot"),
+            ("StartLimitAction", "poweroff-force"),
+            ("JobTimeoutAction", "reboot-immediate"),
+            ("SuccessAction", "poweroff"),
+        ] {
+            let name = format!("storagetm-{property}.service");
+            h.describe(&name, &[(property, action), ("ActiveState", "inactive")]);
+            for verb in [Verb::Start, Verb::Restart, Verb::Stop] {
+                let outcome = outcome_of_unit(&h, verb, &name);
+                assert!(hit(&outcome).is_some(), "{verb:?} {property}={action} {outcome:?}");
+            }
+        }
+        // OnFailure= and OnSuccess= start the units they name, and what those
+        // set off in turn.
+        for property in ["OnFailure", "OnSuccess"] {
+            let name = format!("handled-{property}.service");
+            h.describe(&name, &[(property, "reboot.target"), ("ActiveState", "inactive")]);
+            let outcome = outcome_of_unit(&h, Verb::Start, &name);
+            assert!(hit(&outcome).is_some(), "{property} {outcome:?}");
+        }
+        h.describe("on-failure-chain.service", &[("OnFailure", "handler.service"), ("ActiveState", "inactive")]);
+        h.describe("handler.service", &[("FailureAction", "reboot"), ("ActiveState", "inactive")]);
+        let outcome = outcome_of_unit(&h, Verb::Start, "on-failure-chain.service");
+        assert!(hit(&outcome).is_some(), "{outcome:?}");
+        // A unit a start pulls in fires its action too.
+        h.describe("pulls-storagetm.service", &[("Wants", "storagetm.service")]);
+        h.describe("storagetm.service", &[("SuccessAction", "reboot"), ("ActiveState", "inactive")]);
+        let outcome = outcome_of_unit(&h, Verb::Start, "pulls-storagetm.service");
+        assert!(hit(&outcome).is_some(), "{outcome:?}");
+        // A running unit the order does not stop is not ended by it, and an
+        // action of none ends nothing.
+        h.describe("pulls-running.service", &[("Wants", "running-action.service")]);
+        h.describe("running-action.service", &[("SuccessAction", "reboot")]);
+        assert_eq!(outcome_of_unit(&h, Verb::Start, "pulls-running.service"), Outcome::Ran);
+        h.describe("quiet-actions.service", &[("SuccessAction", "none"), ("FailureAction", "none"), ("OnFailure", "")]);
+        for verb in [Verb::Start, Verb::Restart, Verb::Stop] {
+            assert_eq!(outcome_of_unit(&h, verb, "quiet-actions.service"), Outcome::Ran, "{verb:?}");
+        }
+        // An action this check does not know is not checked, so it does not run.
+        h.describe("odd-action.service", &[("SuccessAction", "implode")]);
+        let id = h.accept(h.issue_unit(Verb::Start, "odd-action.service"));
+        execute(&h.ctx, &id).unwrap();
+        assert!(matches!(h.outcome(&id), Outcome::Failed { exit_code: None, signal: None }));
+        assert!(h.runs().is_empty());
+    }
+
+    #[test]
+    fn a_stopped_boot_or_recovery_unit_is_never_started() {
+        let h = harness();
+        yggdrasil(&h, true);
+        // rescue.service ends by isolating default.target, which stops every
+        // unit outside it; no edge says so, its DefaultDependencies=no does.
+        h.describe(
+            "rescue.service",
+            &[("DefaultDependencies", "no"), ("ActiveState", "inactive")],
+        );
+        h.describe("rescue.target", &[("Requires", "rescue.service"), ("ActiveState", "inactive")]);
+        h.describe("pulls-rescue.service", &[("Wants", "rescue.target")]);
+        for (verb, unit) in [
+            (Verb::Start, "rescue.service"),
+            (Verb::Restart, "rescue.service"),
+            (Verb::Start, "rescue.target"),
+            (Verb::Restart, "rescue.target"),
+            (Verb::Start, "pulls-rescue.service"),
+        ] {
+            let outcome = outcome_of_unit(&h, verb, unit);
+            assert!(
+                matches!(
+                    outcome,
+                    Outcome::Refused(Refused::AlwaysRefused { ref unit, via: Via::EarlyBoot })
+                        if unit == "rescue.service"
+                ),
+                "{verb:?} {unit} was {outcome:?}"
+            );
+        }
+        assert!(h.runs().is_empty());
+        // Stopping it, or starting one whose defaults are on, is an ordinary order.
+        assert_eq!(outcome_of_unit(&h, Verb::Stop, "rescue.service"), Outcome::Ran);
+        h.describe("ordinary.service", &[("DefaultDependencies", "yes"), ("ActiveState", "inactive")]);
+        assert_eq!(outcome_of_unit(&h, Verb::Start, "ordinary.service"), Outcome::Ran);
+        // A boot unit that is already running is left alone by a start.
+        h.describe("journald.service", &[("DefaultDependencies", "no")]);
+        assert_eq!(outcome_of_unit(&h, Verb::Start, "journald.service"), Outcome::Ran);
+    }
+
+    #[test]
+    fn show_asks_for_every_property_the_refusal_reads() {
+        let asked = show_properties();
+        for property in ["DefaultDependencies", "SuccessAction", "FailureAction", "StartLimitAction", "JobTimeoutAction", "OnFailure", "OnSuccess"] {
+            assert!(asked.split(',').any(|asked| asked == property), "{property}");
+        }
     }
 
     #[test]
