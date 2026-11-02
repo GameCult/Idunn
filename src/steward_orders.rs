@@ -3027,7 +3027,6 @@ mod tests {
         let gone = parse_show("Id=\\x22a.service\\x22.service\nLoadState=not-found\n").unwrap();
         assert!(gone.not_found);
     }
-    }
 
     #[test]
     fn the_store_refuses_a_second_record_and_a_foreign_document() {
@@ -3845,5 +3844,122 @@ mod tests {
         unsafe { libc::waitpid(pid, &mut status, 0) };
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status}");
         rmp_serde::from_slice(&read_frame(&mut reply.as_slice(), RESPONSE_FRAME_LIMIT).unwrap()).unwrap()
+    }
+
+    fn host_refusal(verb: Verb, unit: &str) -> Option<Refused> {
+        refusal_for(&HostSystemd, unit, verb).unwrap_or_else(|error| panic!("{unit}: {error}"))
+    }
+
+    #[test]
+    #[ignore = "reads the real unit set of a systemd host; run on Yggdrasil, read-only"]
+    fn real_host_unit_set() {
+        for name in [
+            "bifrost", "forgejo", "forgejo-eureka", "nginx", "matrix-synapse", "redis-server",
+            "huginn", "huginn@void", "mind-heartbeat", "heimdall", "ssh", "docker", "containerd",
+            "postgresql@16-main", "claude-connector", "persona-matrix-mouth", "voidbot",
+            "wg-quick@wg-gamecult", "cron", "apt-daily",
+        ] {
+            let unit = format!("{name}.service");
+            for verb in all_verbs() {
+                assert_eq!(host_refusal(verb, &unit), None, "{verb:?} {unit}");
+            }
+        }
+        for name in [
+            "initrd-cleanup", "initrd-parse-etc", "initrd-switch-root", "system-update-cleanup",
+            "systemd-battery-check", "systemd-exit", "systemd-fsck-root", "systemd-halt",
+            "systemd-kexec", "systemd-poweroff", "systemd-reboot", "systemd-soft-reboot",
+            "systemd-storagetm",
+        ] {
+            let unit = format!("{name}.service");
+            for verb in [Verb::Start, Verb::Stop, Verb::Restart] {
+                assert_eq!(
+                    host_refusal(verb, &unit),
+                    Some(refused(&unit, Via::OnEnd)),
+                    "{verb:?} {unit}"
+                );
+            }
+        }
+        for unit in HOST_NAMES {
+            for verb in all_verbs() {
+                assert_eq!(host_refusal(verb, unit), Some(refused(unit, Via::Host)), "{verb:?} {unit}");
+            }
+        }
+        for unit in [
+            "systemd-networkd.service",
+            "user-runtime-dir@1000.service",
+            "user-runtime-dir@105.service",
+            "user-runtime-dir@978.service",
+        ] {
+            assert_eq!(host_refusal(Verb::Start, unit), None, "{unit}");
+            assert!(
+                matches!(
+                    host_refusal(Verb::Stop, unit),
+                    Some(Refused::AlwaysRefused { via: Via::Bound, .. })
+                ),
+                "{unit}"
+            );
+        }
+        let listing = Command::new("systemctl")
+            .args(["list-units", "--all", "--plain", "--no-legend", "--no-pager", "--full"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+        let units: Vec<&str> = listing
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|unit| validate_unit(unit).is_ok())
+            .collect();
+        for verb in all_verbs() {
+            let mut counts = BTreeMap::new();
+            for unit in &units {
+                let key = match refusal_for(&HostSystemd, unit, verb) {
+                    Ok(None) => "ok".to_owned(),
+                    Ok(Some(Refused::AlwaysRefused { via, .. })) => format!("{via:?}"),
+                    Ok(Some(other)) => format!("{other:?}"),
+                    Err(_) => "unresolved".to_owned(),
+                };
+                *counts.entry(key).or_insert(0usize) += 1;
+            }
+            println!("{verb:?} over {} units: {counts:?}", units.len());
+        }
+    }
+
+    #[test]
+    #[ignore = "starts throwaway units in the user manager; run on Yggdrasil"]
+    fn one_job_argv_against_a_real_manager() {
+        let directory = PathBuf::from(std::env::var("HOME").unwrap()).join(".config/systemd/user");
+        std::fs::create_dir_all(&directory).unwrap();
+        let (a, b) = ("onejob-probe-a.service", "onejob-probe-b.service");
+        let body = "[Service]\nExecStart=/bin/sleep 600\n";
+        std::fs::write(directory.join(a), body).unwrap();
+        std::fs::write(directory.join(b), format!("[Unit]\nConflicts={a}\n{body}")).unwrap();
+        let user = |args: &[&str]| {
+            let output = Command::new("systemctl").arg("--user").args(args).output().unwrap();
+            (output.status.success(), String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+        let outcome = std::panic::catch_unwind(|| {
+            let one_job = |verb: Verb, unit: &str| {
+                let step = Operation::UnitAction { verb, unit: unit.into() }.steps().remove(0);
+                let mut argv = step.argv.clone();
+                argv.insert(1, "--user".into());
+                let status = Command::new(&argv[0]).args(&argv[1..]).status().unwrap();
+                assert!(status.success(), "{verb:?} {unit}");
+            };
+            assert!(user(&["daemon-reload"]).0);
+            // A start of b leaves a running, though b conflicts with it.
+            assert!(user(&["start", a]).0);
+            one_job(Verb::Start, b);
+            assert_eq!(user(&["is-active", a]).1, "active", "start stopped a");
+            assert_eq!(user(&["is-active", b]).1, "active", "start left b down");
+            // A restart of b, with both running, leaves a running.
+            one_job(Verb::Restart, b);
+            assert_eq!(user(&["is-active", a]).1, "active", "restart stopped a");
+            assert_eq!(user(&["is-active", b]).1, "active", "restart left b down");
+        });
+        user(&["stop", a, b]);
+        std::fs::remove_file(directory.join(a)).unwrap();
+        std::fs::remove_file(directory.join(b)).unwrap();
+        user(&["daemon-reload"]);
+        outcome.unwrap();
     }
 }
