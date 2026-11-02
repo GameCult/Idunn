@@ -82,7 +82,14 @@ refused unit that is already running is left alone) and stops what conflicts
 with it, a stop takes down what depends on it, and a restart does both. The
 transaction is read from `systemctl show`, so `start poweroff.target` is refused
 because every refused unit conflicts with `shutdown.target`, not because
-targets are banned. A unit `systemctl show` cannot resolve fails the order.
+targets are banned. The units a start or stop ends or times out are followed too:
+the target each of `SuccessAction=`, `FailureAction=`, `StartLimitAction=` and
+`JobTimeoutAction=` runs (`reboot`, `poweroff`, `halt`, `kexec`, `soft-reboot`,
+`exit`, with `-force` and `-immediate`), and the units `OnFailure=` and
+`OnSuccess=` name, with what each pulls in; an action it does not know fails the
+order. A start refuses a stopped `DefaultDependencies=no` unit (boot and recovery
+machinery, such as `rescue.service`, which ends by isolating the default
+target), whatever pulls it in. A unit `systemctl show` cannot resolve fails the order.
 Slices, scopes and globs are not units an order can name.
 
 A package order installs the packages it names and nothing else: apt runs with
