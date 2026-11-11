@@ -245,7 +245,7 @@ button has been removed from the machine.
 
 A local swarm daemon started with
 `--rudp-health-bind 0.0.0.0:17870` lets host-local and explicitly configured peers
-can publish to the configured Idunn health endpoint. It accepts raw
+publish to the configured Idunn health endpoint. It accepts raw
 `idunn.daemon_health` document puts on the canonical CNR0 RUDP `schema` channel
 and writes them into the keepalive store. That is daemon-owned health
 publication, not restart/deploy authority. On Windows, UDP reset reports from
