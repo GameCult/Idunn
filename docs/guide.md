@@ -112,22 +112,12 @@ cargo run --release --bin idunn -- --daemon demo --rudp-health-bind <idunn-rudp-
 `--rudp-health-bind` is explicit. Bare one-daemon Idunn does not open a
 localhost health ingress.
 
-Install the local Starfire boot watchdog:
-
-```powershell
-.\scripts\install-idunn-startup.ps1
-```
-
-That task starts one `idunn.exe` swarm supervisor at user logon. The Rust
-runtime owns the target catalog for Odin, Stonks, Muninn, the enforced
+The Rust runtime owns the target catalog for Odin, Stonks, Muninn, the enforced
 Yggdrasil source artifact lanes, and the Nightwing display services. The
 current Mimir dashboard is observed but not restarted until its restart
-authority is named.
-
-It also starts `idunn-swarm-deployment-coverage`, which watches the deployment
-target catalog in `scripts/idunn-deployment-targets.ps1`. A repo/service is not
-allowed to vanish into shrug-space: it is either enforced by Idunn, explicitly
-blocked with the missing authority named, external-owned, or not a runtime.
+authority is named. A repo/service is not allowed to vanish into shrug-space:
+it is either enforced by Idunn, explicitly blocked with the missing authority
+named, external-owned, or not a runtime.
 
 To record that a daemon has not published health, run a manual target without a
 matching `idunn.daemon_health` RUDP publication:
@@ -185,12 +175,7 @@ Idunn should not guess private service truth. A daemon should publish:
 If that information is missing, Idunn should fail closed and create an operator
 alarm instead of improvising.
 
-For the repo swarm, deployment ownership begins with catalog coverage. Use:
-
-```powershell
-.\scripts\show-idunn-deployment-targets.ps1
-.\scripts\health-idunn-swarm-deployment-coverage.cmd
-```
+For the repo swarm, deployment ownership begins with catalog coverage.
 
 The enforced targets are Nightwing Gjallar plus the Yggdrasil source artifact
 lanes whose ops runbooks can produce and verify deployment manifests. Each
@@ -258,9 +243,9 @@ surface, then let Idunn run the rollout. Direct script execution without
 `IDUNN_ACTUATOR=1` fails on purpose; the little hand reaching for the deploy
 button has been removed from the machine.
 
-`scripts/start-idunn-local.ps1` launches the local swarm with
-`--rudp-health-bind 0.0.0.0:17870` so host-local and explicitly configured peers
-can publish to the configured Idunn health endpoint. It accepts raw
+A local swarm daemon started with
+`--rudp-health-bind 0.0.0.0:17870` lets host-local and explicitly configured peers
+publish to the configured Idunn health endpoint. It accepts raw
 `idunn.daemon_health` document puts on the canonical CNR0 RUDP `schema` channel
 and writes them into the keepalive store. That is daemon-owned health
 publication, not restart/deploy authority. On Windows, UDP reset reports from
