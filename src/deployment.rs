@@ -45,7 +45,12 @@ pub struct TargetDeclaration {
     #[serde(default)]
     pub external_inputs: Vec<ExternalInput>,
     pub artifacts: Vec<ArtifactOutput>,
-    pub service: ServiceDeclaration,
+    /// A running workload. Exactly one of `service` and `static_release`.
+    #[serde(default)]
+    pub service: Option<ServiceDeclaration>,
+    /// A sealed tree that is published by repointing a link, with no process.
+    #[serde(default)]
+    pub static_release: Option<StaticReleaseDeclaration>,
     #[serde(default)]
     pub state: Option<StateDeclaration>,
     #[serde(default)]
@@ -124,6 +129,15 @@ pub struct ArtifactOutput {
 pub enum ArtifactSource {
     RunnerOutput,
     WorktreeTree,
+}
+
+/// A target that is a sealed tree and nothing else: Idunn installs the release
+/// and repoints the binding's current link at it. `artifact` names the tree a
+/// web server reads through that link.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticReleaseDeclaration {
+    pub artifact: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,20 +489,42 @@ pub struct DockerRunnerBinding {
 pub enum WorkloadBinding {
     SystemdTransient(SystemdWorkloadBinding),
     HostActuator(HostWorkloadBinding),
+    /// No process: a release directory and the link that names the current one.
+    StaticRelease(StaticReleaseBinding),
 }
+
+static NO_ENVIRONMENT: BTreeMap<String, String> = BTreeMap::new();
 
 impl WorkloadBinding {
     pub fn systemd(&self) -> Result<&SystemdWorkloadBinding> {
         match self {
             Self::SystemdTransient(binding) => Ok(binding),
             Self::HostActuator(_) => bail!("workload is host-actuator, not systemd-transient"),
+            Self::StaticRelease(_) => bail!("workload is a static release, not systemd-transient"),
+        }
+    }
+
+    pub fn static_release(&self) -> Result<&StaticReleaseBinding> {
+        match self {
+            Self::StaticRelease(binding) => Ok(binding),
+            _ => bail!("workload is not a static release"),
+        }
+    }
+
+    /// Where Idunn installs sealed releases on its own host: the one thing a
+    /// systemd workload and a static release share.
+    pub fn release_root(&self) -> Result<&Path> {
+        match self {
+            Self::SystemdTransient(binding) => Ok(&binding.release_root),
+            Self::StaticRelease(binding) => Ok(&binding.release_root),
+            Self::HostActuator(_) => bail!("a host-actuator workload installs on its own host"),
         }
     }
 
     pub fn host(&self) -> Result<&HostWorkloadBinding> {
         match self {
             Self::HostActuator(binding) => Ok(binding),
-            Self::SystemdTransient(_) => bail!("workload is systemd-transient, not host-actuator"),
+            _ => bail!("workload is not host-actuator"),
         }
     }
 
@@ -496,6 +532,7 @@ impl WorkloadBinding {
         match self {
             Self::SystemdTransient(binding) => binding.state_root.is_some(),
             Self::HostActuator(binding) => binding.state_root.is_some(),
+            Self::StaticRelease(_) => false,
         }
     }
 
@@ -503,6 +540,7 @@ impl WorkloadBinding {
         match self {
             Self::SystemdTransient(binding) => &binding.environment,
             Self::HostActuator(binding) => &binding.environment,
+            Self::StaticRelease(_) => &NO_ENVIRONMENT,
         }
     }
 
@@ -510,6 +548,7 @@ impl WorkloadBinding {
         match self {
             Self::SystemdTransient(binding) => binding.secret_files.keys().collect(),
             Self::HostActuator(binding) => binding.secret_files.keys().collect(),
+            Self::StaticRelease(_) => Vec::new(),
         }
     }
 
@@ -517,6 +556,7 @@ impl WorkloadBinding {
         match self {
             Self::SystemdTransient(binding) => &binding.argument_bindings,
             Self::HostActuator(binding) => &binding.argument_bindings,
+            Self::StaticRelease(_) => &NO_ENVIRONMENT,
         }
     }
 
@@ -546,6 +586,49 @@ impl WorkloadBinding {
                 .environment()
                 .contains_key(RUNTIME_PRESENCE_IDENTITY_BINDING),
             "runtime presence identity must be a secret source, not environment"
+        );
+        Ok(())
+    }
+}
+
+/// A static release on the Idunn host. `current_link` is the symlink a web
+/// server's root reads through; Idunn repoints it at one sealed release.
+/// `carry` names one operator-owned file (a per-site config) that Idunn copies
+/// into each release as `destination` when it flips: the copy sits beside the
+/// artifacts, outside every sealed digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticReleaseBinding {
+    pub release_root: PathBuf,
+    pub current_link: PathBuf,
+    pub carry: StaticCarryBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticCarryBinding {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+}
+
+impl StaticReleaseBinding {
+    fn validate(&self) -> Result<()> {
+        require_absolute_path(&self.release_root, "static release root")?;
+        require_absolute_path(&self.current_link, "static current link")?;
+        require_absolute_path(&self.carry.source, "static carry source")?;
+        require_leaf_path(&self.carry.destination, "static carry destination")?;
+        ensure!(
+            !paths_overlap(&self.current_link, &self.release_root),
+            "static current link and release root overlap"
+        );
+        ensure!(
+            !self.carry.source.starts_with(&self.release_root),
+            "static carry source is inside the release root"
+        );
+        ensure!(
+            self.carry.source != self.current_link
+                && !self.carry.source.starts_with(&self.current_link),
+            "static carry source is the current link"
         );
         Ok(())
     }
@@ -977,57 +1060,76 @@ impl TargetDeclaration {
             "target declaration uses no runner classes"
         );
 
-        ensure!(
-            artifact_ids.contains(self.service.executable_artifact.as_str()),
-            "service executable artifact is not declared"
-        );
-        for artifact in &self.service.required_adjacent_artifacts {
+        match (&self.service, &self.static_release) {
+            (Some(service), None) => {
+                ensure!(
+                    artifact_ids.contains(service.executable_artifact.as_str()),
+                    "service executable artifact is not declared"
+                );
+                for artifact in &service.required_adjacent_artifacts {
+                    ensure!(
+                        artifact_ids.contains(artifact.as_str()),
+                        "adjacent service artifact {artifact} is not declared"
+                    );
+            }
+            for argument in &service.arguments {
+                validate_launch_argument(argument)?;
+            }
+            require_capability(&service.health.contract, "health contract")?;
+            for name in &service.required_environment {
+                require_environment_name(name)?;
+            }
             ensure!(
-                artifact_ids.contains(artifact.as_str()),
-                "adjacent service artifact {artifact} is not declared"
+                service
+                    .required_environment
+                    .contains(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT),
+                "service does not require the standard Idunn runtime bundle"
             );
-        }
-        for argument in &self.service.arguments {
-            validate_launch_argument(argument)?;
-        }
-        require_capability(&self.service.health.contract, "health contract")?;
-        for name in &self.service.required_environment {
-            require_environment_name(name)?;
-        }
-        ensure!(
-            self.service
-                .required_environment
-                .contains(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT),
-            "service does not require the standard Idunn runtime bundle"
-        );
-        ensure!(
-            self.service
-                .required_environment
-                .contains(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT)
-                == self.service.route_required,
-            "routed services must require exactly one Idunn-owned candidate bind"
-        );
-        ensure!(
-            !self
-                .service
-                .required_environment
-                .contains(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT)
-                || self.service.route_required,
-            "only routed services may require the Idunn-owned member bind"
-        );
-        ensure!(
-            self.service
-                .required_environment
-                .contains(IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT)
-                == self.write_lease_required(),
-            "state-writing services must require exactly one Idunn-owned process write lease"
-        );
-        for name in &self.service.optional_environment {
-            require_environment_name(name)?;
             ensure!(
-                !self.service.required_environment.contains(name),
-                "service environment {name} is both required and optional"
+                service
+                    .required_environment
+                    .contains(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT)
+                    == service.route_required,
+                "routed services must require exactly one Idunn-owned candidate bind"
             );
+            ensure!(
+                !service
+                    .required_environment
+                    .contains(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT)
+                    || service.route_required,
+                "only routed services may require the Idunn-owned member bind"
+            );
+            ensure!(
+                service
+                    .required_environment
+                    .contains(IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT)
+                    == self.write_lease_required(),
+                "state-writing services must require exactly one Idunn-owned process write lease"
+            );
+            for name in &service.optional_environment {
+                require_environment_name(name)?;
+                ensure!(
+                    !service.required_environment.contains(name),
+                    "service environment {name} is both required and optional"
+                );
+            }
+
+            }
+            (None, Some(static_release)) => {
+                ensure!(
+                    artifact_ids.contains(static_release.artifact.as_str()),
+                    "static release artifact is not declared"
+                );
+                ensure!(
+                    self.state.is_none()
+                        && self.provides.is_empty()
+                        && self.dependencies.is_empty()
+                        && self.conflicts.is_empty(),
+                    "a static release declares no state, capability, dependency or conflict"
+                );
+            }
+            (Some(_), Some(_)) => bail!("target declares both a service and a static release"),
+            (None, None) => bail!("target declares neither a service nor a static release"),
         }
 
         if let Some(state) = &self.state {
@@ -1142,6 +1244,14 @@ impl TargetDeclaration {
             require_value(&conflict.reason, "conflict reason")?;
         }
         Ok(())
+    }
+
+    /// The service of a service target. A static release has none, and a code
+    /// path that asks for one has been reached by the wrong kind of target.
+    pub fn service(&self) -> Result<&ServiceDeclaration> {
+        self.service
+            .as_ref()
+            .context("target declares no service")
     }
 
     pub fn write_lease_required(&self) -> bool {
@@ -1336,6 +1446,29 @@ impl OperatorBinding {
                     self.placement.nodes.contains(&workload.host),
                     "placement does not name the workload host"
                 );
+                return self.validate_shared_tail();
+            }
+            WorkloadBinding::StaticRelease(workload) => {
+                workload.validate()?;
+                ensure!(
+                    self.process_write_lease.is_none() && self.route.is_none(),
+                    "a static release has no write lease or route"
+                );
+                ensure!(
+                    self.rollout.strategy == RolloutStrategy::CandidateThenPromote,
+                    "a static release rolls out candidate-then-promote: it never stops an incumbent"
+                );
+                for authority in [
+                    &self.brakes.deployment_store,
+                    &self.brakes.lifecycle_store,
+                    &self.runtime_identity.trust_anchor_store,
+                ] {
+                    ensure!(
+                        !paths_overlap(authority, &workload.release_root)
+                            && !paths_overlap(authority, &workload.current_link),
+                        "static release path overlaps an Idunn authority path"
+                    );
+                }
                 return self.validate_shared_tail();
             }
             WorkloadBinding::SystemdTransient(workload) => {
@@ -1565,6 +1698,11 @@ impl OperatorBinding {
             self.target == declaration.target,
             "binding target does not match declaration"
         );
+        ensure!(
+            declaration.static_release.is_some()
+                == matches!(self.workload, WorkloadBinding::StaticRelease(_)),
+            "a static release declaration needs a static-release workload, and only it"
+        );
         let bound_gitlinks: BTreeSet<_> = self.repository.gitlinks.keys().cloned().collect();
         ensure!(
             bound_gitlinks == declaration.required_gitlinks,
@@ -1676,6 +1814,19 @@ impl OperatorBinding {
                 input.id
             );
         }
+        let Some(service) = declaration.service.as_ref() else {
+            let WorkloadBinding::StaticRelease(workload) = &self.workload else {
+                bail!("a static release declaration needs a static-release workload");
+            };
+            ensure!(
+                declaration
+                    .artifacts
+                    .iter()
+                    .all(|artifact| artifact.destination != workload.carry.destination),
+                "static carry destination collides with an artifact destination"
+            );
+            return Ok(());
+        };
         let workload_names: BTreeSet<&String> = self
             .workload
             .environment()
@@ -1702,7 +1853,7 @@ impl OperatorBinding {
         if host_workload {
             available_environment.insert(IDUNN_ACTIVATION_CREDENTIAL_ENVIRONMENT.into());
         }
-        if declaration.service.route_required {
+        if service.route_required {
             available_environment.insert(IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT.into());
             if self.route.as_ref().is_some_and(|route| route.member.is_some()) {
                 available_environment.insert(IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT.into());
@@ -1712,16 +1863,14 @@ impl OperatorBinding {
             available_environment.insert(IDUNN_PROCESS_WRITE_LEASE_ENVIRONMENT.into());
         }
         ensure!(
-            declaration
-                .service
+            service
                 .required_environment
                 .is_subset(&available_environment),
             "operator service environment omits a required launch input"
         );
-        let declared_environment: BTreeSet<_> = declaration
-            .service
+        let declared_environment: BTreeSet<_> = service
             .required_environment
-            .union(&declaration.service.optional_environment)
+            .union(&service.optional_environment)
             .cloned()
             .collect();
         // On the Idunn host the presence identity reaches the workload as a
@@ -1741,8 +1890,7 @@ impl OperatorBinding {
             available_environment.is_subset(&declared_environment),
             "operator service environment contains an undeclared launch input"
         );
-        let required_arguments: BTreeSet<_> = declaration
-            .service
+        let required_arguments: BTreeSet<_> = service
             .arguments
             .iter()
             .filter_map(|argument| match argument {
@@ -1758,6 +1906,7 @@ impl OperatorBinding {
                 .as_ref()
                 .map(|path| path.display().to_string()),
             WorkloadBinding::HostActuator(workload) => workload.state_root.clone(),
+            WorkloadBinding::StaticRelease(_) => None,
         };
         match (
             state_root.as_deref(),
@@ -1780,8 +1929,8 @@ impl OperatorBinding {
             "operator argument bindings do not exactly match the launch contract"
         );
         match (
-            declaration.service.route_required,
-            declaration.service.transport,
+            service.route_required,
+            service.transport,
             self.route.as_ref(),
         ) {
             (true, ServiceTransport::Http, Some(route))
@@ -2344,7 +2493,7 @@ nodes = ["yggdrasil"]
             )
             .is_err()
         );
-        assert!(recipe.service.route_required);
+        assert!(recipe.service().unwrap().route_required);
     }
 
     #[test]
@@ -2831,5 +2980,172 @@ max_connections = {value}"),
             "odin.verse-topology.v2",
             "v2",
         ));
+    }
+
+    /// A static release: a vite-style tree published by repointing a link.
+    pub(crate) const STATIC_RECIPE: &str = r#"
+schema = "gamecult.idunn.target_declaration.v1"
+target = "service"
+source_stamp_environment = "SERVICE_BUILD_COMMIT"
+
+[[steps]]
+id = "build"
+phase = "build"
+runner = "rust"
+argv = ["true"]
+
+[[artifacts]]
+id = "dist"
+source_kind = "worktree-tree"
+source = "dist"
+destination = "dist"
+
+[static_release]
+artifact = "dist"
+"#;
+
+    /// `@SITE@` stands for the stand-in site tree a test lays out.
+    pub(crate) const STATIC_BINDING: &str = r#"
+schema = "gamecult.idunn.operator_binding.v2"
+target = "service"
+
+[repository]
+origin = "https://github.com/GameCult/Service.git"
+admitted_ref = "refs/heads/main"
+minimum_revision = "1111111111111111111111111111111111111111"
+selection = "ref-head"
+checkout = "/srv/build/Service"
+recipe_path = "deployment/idunn/recipe.toml"
+
+[runners.rust]
+driver = "docker"
+image = "rust@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb"
+user = "1000:1000"
+affordances = ["source-read", "artifact-write"]
+allowed_programs = ["true"]
+memory_mebibytes = 1024
+cpu_quota_percent = 100
+pids_limit = 128
+tmpfs_mebibytes = 64
+
+[workload]
+driver = "static-release"
+release_root = "@SITE@/releases"
+current_link = "@SITE@/www/current"
+
+[workload.carry]
+source = "@SITE@/config/site.json"
+destination = "config.json"
+
+[runtime_identity]
+runtime_id = "site-yggdrasil"
+expected_signer_identity_id = "site-runtime-signer"
+trust_anchor_store = "@SITE@/trust/site.cc"
+
+[brakes]
+deployment_store = "@SITE@/authority/deployment-brake.cc"
+lifecycle_store = "@SITE@/authority/lifecycle-brake.cc"
+
+[rollout]
+strategy = "candidate-then-promote"
+drain_seconds = 1
+retain_releases = 2
+
+[placement]
+desired_replicas = 1
+nodes = ["yggdrasil"]
+"#;
+
+    fn static_binding(replace: &[(&str, &str)]) -> String {
+        let mut text = STATIC_BINDING.replace("@SITE@", "/srv/site");
+        for (from, to) in replace {
+            assert!(text.contains(from), "the fixture lost {from}");
+            text = text.replace(from, to);
+        }
+        text
+    }
+
+    #[test]
+    fn static_recipe_and_binding_admit() {
+        let recipe = TargetDeclaration::parse(STATIC_RECIPE).unwrap();
+        let binding = OperatorBinding::parse(&static_binding(&[])).unwrap();
+        binding.admit(&recipe).unwrap();
+        assert!(recipe.service().is_err());
+        assert_eq!(binding.workload.release_root().unwrap(), Path::new("/srv/site/releases"));
+    }
+
+    #[test]
+    fn static_recipe_declares_exactly_one_of_service_and_static_release() {
+        let both = format!("{RECIPE}\n[static_release]\nartifact = \"daemon\"\n");
+        let error = TargetDeclaration::parse(&both).unwrap_err();
+        assert!(format!("{error:#}").contains("both a service and a static release"));
+        let neither = STATIC_RECIPE.replace("[static_release]\nartifact = \"dist\"\n", "");
+        let error = TargetDeclaration::parse(&neither).unwrap_err();
+        assert!(format!("{error:#}").contains("neither a service nor a static release"));
+        let unknown = STATIC_RECIPE.replace("artifact = \"dist\"", "artifact = \"nope\"");
+        assert!(TargetDeclaration::parse(&unknown).is_err());
+    }
+
+    #[test]
+    fn static_release_refuses_a_workload_contract() {
+        for extra in [
+            "\n[[provides]]\ncapability = \"site.runtime\"\nschema = \"site.v1\"\ncompatibility = \"v1\"\n",
+            "\n[[conflicts]]\ncapability = \"site.old\"\nreason = \"replaced\"\n",
+            "\n[state]\nschema_generation = \"v1\"\n\n[[state.slots]]\nid = \"world\"\nrelative_path = \"world.cc\"\nkind = \"cultcache-file\"\nschema = \"site.v1\"\nwriter = \"none\"\nrecovery = \"preserve\"\nstartup = \"open-at-start\"\n",
+        ] {
+            let error = TargetDeclaration::parse(&format!("{STATIC_RECIPE}{extra}")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("a static release declares no state"),
+                "{extra}: {error:#}"
+            );
+        }
+        for (from, to, refusal) in [
+            ("[rollout]", "[route]\ndriver = \"nginx-stream-tcp\"\nroute_id = \"r\"\nstable_endpoint = \"http://127.0.0.1:18830\"\nprivate_host = \"127.0.0.1\"\nprivate_port_start = 18831\nprivate_port_end = 18839\nconfig_path = \"/etc/nginx/r.conf\"\nreload_unit = \"nginx.service\"\n\n[rollout]", "no write lease or route"),
+            ("[rollout]", "[process_write_lease]\nrecord_path = \"/srv/site/lease.cc\"\n\n[rollout]", "no write lease or route"),
+            ("retain_releases = 2", "retain_releases = 1", "retain at least current and prior"),
+            ("candidate-then-promote", "stop-then-start", "never stops an incumbent"),
+        ] {
+            let error = OperatorBinding::parse(&static_binding(&[(from, to)])).unwrap_err();
+            assert!(format!("{error:#}").contains(refusal), "{to}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn static_release_and_service_recipes_need_their_own_binding_kind() {
+        let static_recipe = TargetDeclaration::parse(STATIC_RECIPE).unwrap();
+        let service_recipe = TargetDeclaration::parse(RECIPE).unwrap();
+        let static_binding = OperatorBinding::parse(&static_binding(&[])).unwrap();
+        let service_binding = OperatorBinding::parse(BINDING).unwrap();
+        assert!(static_binding.admit(&service_recipe).is_err());
+        assert!(service_binding.admit(&static_recipe).is_err());
+    }
+
+    #[test]
+    fn static_carry_destination_must_not_be_an_artifact_destination() {
+        let recipe = TargetDeclaration::parse(STATIC_RECIPE).unwrap();
+        let binding =
+            OperatorBinding::parse(&static_binding(&[("destination = \"config.json\"", "destination = \"dist\"")]))
+                .unwrap();
+        let error = binding.admit(&recipe).unwrap_err();
+        assert!(format!("{error:#}").contains("collides with an artifact destination"));
+        for destination in ["a/b", "../b", "/b", ""] {
+            let line = format!("destination = \"{destination}\"");
+            assert!(
+                OperatorBinding::parse(&static_binding(&[("destination = \"config.json\"", &line)])).is_err(),
+                "{destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_carry_source_and_link_stay_out_of_the_release_root() {
+        for (from, to) in [
+            ("source = \"/srv/site/config/site.json\"", "source = \"/srv/site/releases/site.json\""),
+            ("current_link = \"/srv/site/www/current\"", "current_link = \"/srv/site/releases/current\""),
+            ("source = \"/srv/site/config/site.json\"", "source = \"site.json\""),
+            ("release_root = \"/srv/site/releases\"", "release_root = \"/srv/site/www\""),
+        ] {
+            assert!(OperatorBinding::parse(&static_binding(&[(from, to)])).is_err(), "{to}");
+        }
     }
 }

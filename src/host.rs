@@ -631,11 +631,11 @@ impl Actuator {
         workload: &HostWorkloadBinding,
         installed: &Path,
     ) -> Result<(PathBuf, Vec<String>)> {
-        let artifact = release_artifact(declaration, &declaration.service.executable_artifact)?;
+        let artifact = release_artifact(declaration, &declaration.service()?.executable_artifact)?;
         let executable = installed.join(&artifact.destination);
         ensure!(executable.is_file(), "sealed service executable is absent");
         let mut arguments = Vec::new();
-        for argument in &declaration.service.arguments {
+        for argument in &declaration.service()?.arguments {
             arguments.push(match argument {
                 LaunchArgument::Literal { value } => value.clone(),
                 LaunchArgument::Binding { name } => workload

@@ -171,6 +171,57 @@ different semantic capability.
 `gamecult-ops` publishes these fleet bindings and provisions host substrate. It
 does not own application build or deployment programs.
 
+## Static release
+
+A target whose product is a sealed tree, with no process to run (a built web
+front end), declares `[static_release] artifact = "<id>"` in place of
+`[service]`, and its binding declares `driver = "static-release"` with a
+`release_root`, a `current_link` and one `[workload.carry]`. It is the same
+transaction as any deployment, in three phases: Sealing (source, build, seal,
+install: unchanged), Starting (the one external change, behind the deployment
+brake) and Complete. It never enters Warming through Committing, has no
+Expected projection, no activation and no workload, publishes nothing to
+Odin, and its Complete creates no admitted generation, so continuity never
+supervises it. It declares no state, capabilities, dependencies, conflicts,
+route or write lease, and its rollout is `candidate-then-promote` with at least
+two retained releases.
+
+What Starting does, in three durable steps recorded as `flip` on the
+transaction: the release to name and the release the link names now are
+written first; then Idunn copies the operator's carry source into
+`<release_root>/<sealed release id>/<carry.destination>` (mode 0444) and
+renames a fresh symlink over `current_link`; then it observes the link naming
+the release and completes. A failure before the rename ends the transaction
+through the ordinary pre-fencing abort with `current_link` untouched. A crash
+resumes at the recorded intent and repeats the flip, which is harmless.
+
+The carry is a copy of one per-site file (for example `config.json`) taken at
+flip time. It sits beside the artifacts, never inside one, so it is outside
+every sealed digest: changing the site file changes no release id, and the
+sha256 of the bytes carried is provenance on the transaction
+(`flip.carried_sha256`), beside the brake bytes and the requester. The
+destination is a single leaf name that no artifact uses. The web server reads
+`current_link/<artifact destination>` for the tree and `current_link/<carry
+destination>` for the carried file (a one-time root edit of the vhost, an
+`alias` for the carried file beside the root for the tree). A missing or
+non-regular carry source fails the deployment before anything moves.
+
+What `current_link` names is observed from the symlink and confirmed by the
+latest Admitted static transaction's `flip.release_id`; it is stored nowhere
+else. A rollback is a flip back to `flip.previous_release_id`: release
+directories stay, and Idunn prunes none. The brake is read exactly as for a
+service, naming the binding's runtime id and the sealed release id. Release ids are per transaction, so
+redeploying an unchanged tarball with a changed site file is a new release that
+carries the new file, never an in-place re-carry of an existing one: the carry
+is part of a release. If `current_link` is replaced by a directory or by a link
+that names nothing under the release root after the flip was recorded, the
+transaction keeps retrying with backoff: `idunn status --command <id>` shows the
+error as "waiting on ...", operator cancel is refused (Starting, not held), and
+the fix is by hand (restore the link or remove the directory); it then
+completes. A bounded retry is follow-up work. A new
+upstream tarball enters as a recipe `external_input` with a pinned url and
+sha256, so each release is a recipe commit whose pin is its provenance.
+
 ## Typed deployment state
 
 Mutable control-plane state will be CultCache. Runtime integration must use

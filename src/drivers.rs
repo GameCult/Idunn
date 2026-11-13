@@ -25,7 +25,8 @@ use crate::deployment::{
     IDUNN_RUNTIME_CANDIDATE_BIND_ENVIRONMENT, IDUNN_RUNTIME_MEMBER_BIND_ENVIRONMENT,
     LaunchArgument, OperatorBinding,
     RUNTIME_PRESENCE_IDENTITY_BINDING, RUNTIME_PRESENCE_IDENTITY_FD_NAME, RouteBinding,
-    RouteDriver, SourceSelectionPolicy, TargetDeclaration, WorkloadNetwork,
+    RouteDriver, SourceSelectionPolicy, StaticReleaseBinding, TargetDeclaration,
+    WorkloadNetwork,
 };
 use crate::deployment_plan::{
     ArtifactReceipt, CompiledDeploymentPlan, ExternalInputMaterializationReceipt, GitlinkTreeFact,
@@ -622,6 +623,239 @@ pub trait WorkloadPort {
         observation: &WorkloadObservation,
         admitted_at_unix_millis: u64,
     ) -> Result<bool>;
+}
+
+/// The largest per-site file a static release will carry.
+const STATIC_CARRY_LIMIT_BYTES: u64 = 1024 * 1024;
+
+/// What the flip landed: the digest of the exact bytes now inside the release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticFlip {
+    pub carried_sha256: String,
+}
+
+/// A flip that was refused before the link moved. It is the only error that may
+/// end a static transaction before fencing: once the rename has happened,
+/// nothing may say the flip did not.
+#[derive(Debug)]
+pub(crate) struct FlipRefused(pub(crate) String);
+
+impl std::fmt::Display for FlipRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FlipRefused {}
+
+/// The one external change a static release makes: copy the operator's site
+/// file into an installed release and repoint the current link at it. The port
+/// decides nothing; the engine decides when, and records what it reports.
+pub trait StaticReleasePort {
+    /// The sealed release id the current link names: `None` when the link does
+    /// not exist yet, an error when it names anything but a release under the
+    /// binding's release root.
+    fn observe_current(&self, binding: &StaticReleaseBinding) -> Result<Option<String>>;
+
+    /// Copy the carry into `release_id` and repoint the link at it. Nothing
+    /// moves unless the carry source was read, so a missing site file leaves
+    /// the link where it was. Repeating it is harmless.
+    ///
+    /// An error is `FlipRefused` exactly when the link did not move; the rename
+    /// is the last fallible step, and what follows it cannot fail the flip.
+    fn carry_and_flip(&self, binding: &StaticReleaseBinding, release_id: &str)
+    -> Result<StaticFlip>;
+
+    /// The digest of the carry already inside an installed release: what a
+    /// resumed flip records when an earlier attempt landed.
+    fn carried_sha256(&self, binding: &StaticReleaseBinding, release_id: &str) -> Result<String>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FilesystemStaticRelease;
+
+#[cfg(unix)]
+impl StaticReleasePort for FilesystemStaticRelease {
+    fn observe_current(&self, binding: &StaticReleaseBinding) -> Result<Option<String>> {
+        let metadata = match fs::symlink_metadata(&binding.current_link) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reading current link {}", binding.current_link.display())
+                });
+            }
+        };
+        ensure!(
+            metadata.file_type().is_symlink(),
+            "current {} is not a symlink",
+            binding.current_link.display()
+        );
+        let target = fs::read_link(&binding.current_link)?;
+        let target = if target.is_absolute() {
+            target
+        } else {
+            binding
+                .current_link
+                .parent()
+                .context("current link has no parent")?
+                .join(target)
+        };
+        ensure!(
+            target.parent() == Some(binding.release_root.as_path()),
+            "current link names {}, which is not a release under {}",
+            target.display(),
+            binding.release_root.display()
+        );
+        let id = target
+            .file_name()
+            .and_then(OsStr::to_str)
+            .context("current link names no release")?;
+        require_sha256_id(id, "release named by the current link")?;
+        Ok(Some(id.to_owned()))
+    }
+
+    fn carried_sha256(&self, binding: &StaticReleaseBinding, release_id: &str) -> Result<String> {
+        require_sha256_id(release_id, "release carrying the site file")?;
+        let carried = binding
+            .release_root
+            .join(release_id)
+            .join(&binding.carry.destination);
+        ensure!(
+            fs::symlink_metadata(&carried)?.is_file(),
+            "carried {} is not a regular file",
+            carried.display()
+        );
+        let mut hasher = Sha256::new();
+        hash_file_exact(&carried, fs::metadata(&carried)?.len(), &mut hasher)?;
+        Ok(format!("sha256-{:x}", hasher.finalize()))
+    }
+
+    fn carry_and_flip(
+        &self,
+        binding: &StaticReleaseBinding,
+        release_id: &str,
+    ) -> Result<StaticFlip> {
+        use std::os::unix::fs::{OpenOptionsExt, symlink};
+
+        // Everything up to and including the rename can refuse, and only that
+        // refuses: the link has not moved when `FlipRefused` is returned.
+        let refuse = |error: anyhow::Error| anyhow::Error::new(FlipRefused(format!("{error:#}")));
+        let staged = (|| -> Result<(PathBuf, PathBuf, String)> {
+            require_sha256_id(release_id, "release to flip to")?;
+            let release = binding.release_root.join(release_id);
+            let release_metadata = fs::symlink_metadata(&release)
+                .with_context(|| format!("installed release {}", release.display()))?;
+            ensure!(
+                release_metadata.is_dir(),
+                "installed release {} is not a directory",
+                release.display()
+            );
+            let link_parent = binding
+                .current_link
+                .parent()
+                .context("current link has no parent")?;
+            match fs::symlink_metadata(&binding.current_link) {
+                Ok(metadata) => ensure!(
+                    metadata.file_type().is_symlink(),
+                    "current {} is not a symlink and will not be replaced",
+                    binding.current_link.display()
+                ),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("reading current link"),
+            }
+
+            let source = &binding.carry.source;
+            let source_metadata = fs::symlink_metadata(source)
+                .with_context(|| format!("reading carry source {}", source.display()))?;
+            ensure!(
+                source_metadata.is_file(),
+                "carry source {} is not a regular file",
+                source.display()
+            );
+            ensure!(
+                source_metadata.len() <= STATIC_CARRY_LIMIT_BYTES,
+                "carry source {} is larger than {STATIC_CARRY_LIMIT_BYTES} bytes",
+                source.display()
+            );
+            let mut bytes = Vec::new();
+            fs::File::open(source)?
+                .take(STATIC_CARRY_LIMIT_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 <= STATIC_CARRY_LIMIT_BYTES,
+                "carry source {} grew past {STATIC_CARRY_LIMIT_BYTES} bytes",
+                source.display()
+            );
+            let carried_sha256 = format!("sha256-{:x}", Sha256::digest(&bytes));
+
+            let carried = release.join(&binding.carry.destination);
+            let temporary_carry = release.join(format!(".carry-{}", Uuid::new_v4()));
+            let written = (|| -> Result<()> {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o444)
+                    .open(&temporary_carry)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                fs::rename(&temporary_carry, &carried)?;
+                fs::File::open(&release)?.sync_all()?;
+                Ok(())
+            })();
+            if let Err(error) = written {
+                let _ = fs::remove_file(&temporary_carry);
+                return Err(error)
+                    .with_context(|| format!("carrying the site file into {}", release.display()));
+            }
+
+            // A link is renamed over, never edited: a reader sees the old
+            // release or the new one. A temporary link a crashed flip left is
+            // replaced.
+            let temporary_link = link_parent.join(format!(
+                ".{}.flip",
+                binding
+                    .current_link
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .context("current link has no name")?
+            ));
+            if fs::symlink_metadata(&temporary_link).is_ok() {
+                fs::remove_file(&temporary_link).context("removing a stale flip link")?;
+            }
+            symlink(&release, &temporary_link).context("creating the flip link")?;
+            Ok((temporary_link, release, carried_sha256))
+        })()
+        .map_err(refuse)?;
+        let (temporary_link, _, carried_sha256) = staged;
+        if let Err(error) = fs::rename(&temporary_link, &binding.current_link) {
+            let _ = fs::remove_file(&temporary_link);
+            return Err(refuse(
+                anyhow::Error::new(error).context("repointing the current link"),
+            ));
+        }
+        // The link has moved and nothing below can say it did not. The parent
+        // directory sync is durability only, so it is best-effort.
+        if let Some(parent) = binding.current_link.parent() {
+            let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
+        }
+        Ok(StaticFlip { carried_sha256 })
+    }
+}
+
+#[cfg(not(unix))]
+impl StaticReleasePort for FilesystemStaticRelease {
+    fn observe_current(&self, _: &StaticReleaseBinding) -> Result<Option<String>> {
+        bail!("a static release flip requires Unix symlinks")
+    }
+
+    fn carry_and_flip(&self, _: &StaticReleaseBinding, _: &str) -> Result<StaticFlip> {
+        bail!("a static release flip requires Unix symlinks")
+    }
+
+    fn carried_sha256(&self, _: &StaticReleaseBinding, _: &str) -> Result<String> {
+        bail!("a static release flip requires Unix symlinks")
+    }
 }
 
 pub trait TopologyPort {
@@ -2903,7 +3137,7 @@ impl SystemdTransientWorkloadDriver {
     ) -> Result<InstalledReleaseObservation> {
         release.release.validate_against(plan)?;
         let (_, binding) = plan.parsed_inputs()?;
-        let release_root = &binding.workload.systemd()?.release_root;
+        let release_root = binding.workload.release_root()?;
         fs::create_dir_all(release_root)
             .with_context(|| format!("creating release root {}", release_root.display()))?;
         let installed = release_root.join(&release.release.sealed_release_id);
@@ -2955,8 +3189,7 @@ impl SystemdTransientWorkloadDriver {
                 && installed.root
                     == binding
                         .workload
-                        .systemd()?
-                        .release_root
+                        .release_root()?
                         .join(&release.sealed_release_id),
             "installed release observation belongs to another sealed release"
         );
@@ -3435,11 +3668,11 @@ impl SystemdTransientWorkloadDriver {
         installed: &Path,
     ) -> Result<Vec<OsString>> {
         let executable_artifact =
-            release_artifact(declaration, &declaration.service.executable_artifact)?;
+            release_artifact(declaration, &declaration.service()?.executable_artifact)?;
         let executable = installed.join(&executable_artifact.destination);
         ensure!(executable.is_file(), "sealed service executable is absent");
         let mut command = vec![executable.into_os_string()];
-        for argument in &declaration.service.arguments {
+        for argument in &declaration.service()?.arguments {
             command.push(match argument {
                 LaunchArgument::Literal { value } => value.into(),
                 LaunchArgument::Binding { name } => binding.workload.systemd()?.argument_bindings
@@ -3734,7 +3967,7 @@ impl SystemdTransientWorkloadDriver {
     ) -> Result<()> {
         ensure!(
             declaration
-                .service
+                .service()?
                 .required_environment
                 .contains(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT),
             "target does not declare the standard Idunn runtime bundle"
@@ -3757,7 +3990,7 @@ impl SystemdTransientWorkloadDriver {
             parent_only_open_file_properties(parent_only_file_descriptors)?;
         let environment = self.launch_environment(binding, bundle, expected, unit)?;
         let executable_artifact =
-            release_artifact(declaration, &declaration.service.executable_artifact)?;
+            release_artifact(declaration, &declaration.service()?.executable_artifact)?;
         let executable = installed.join(&executable_artifact.destination);
         ensure!(executable.is_file(), "sealed service executable is absent");
         let unit_description = format!(
@@ -3967,7 +4200,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
         let (declaration, binding) = plan.parsed_inputs()?;
         self.validate_writable_bindings(&binding)?;
         let executable_artifact =
-            release_artifact(&declaration, &declaration.service.executable_artifact)?;
+            release_artifact(&declaration, &declaration.service()?.executable_artifact)?;
         let executable = installed.root.join(&executable_artifact.destination);
         let unit = self.unit_name(
             &binding.workload.systemd()?.unit_prefix,
@@ -8524,7 +8757,7 @@ fn require_git_sha(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn require_sha256_id(value: &str, label: &str) -> Result<()> {
+pub(crate) fn require_sha256_id(value: &str, label: &str) -> Result<()> {
     let digest = value
         .strip_prefix("sha256-")
         .with_context(|| format!("{label} has no sha256 prefix"))?;
@@ -16698,4 +16931,167 @@ processes 9
         Ok(())
     }
     // END runner-failure-evidence tests
+
+    // ---------------------------------------------------------------------
+    // A static release flips on a stand-in site tree: releases/, a www/ that
+    // holds the current link, and the operator's per-site config. Nothing here
+    // is a real site.
+    // ---------------------------------------------------------------------
+
+    #[cfg(unix)]
+    struct StandInSite {
+        _temp: tempfile::TempDir,
+        binding: StaticReleaseBinding,
+    }
+
+    #[cfg(unix)]
+    const RELEASE_A: &str = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[cfg(unix)]
+    const RELEASE_B: &str = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Two installed releases, each a fake vite build with compressed twins,
+    /// and a site config the operator owns.
+    #[cfg(unix)]
+    fn stand_in_site() -> Result<StandInSite> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        for release in [RELEASE_A, RELEASE_B] {
+            let dist = root.join("releases").join(release).join("dist");
+            fs::create_dir_all(dist.join("assets"))?;
+            fs::write(dist.join("index.html"), format!("<html>{release}</html>"))?;
+            fs::write(dist.join("index.html.br"), b"br")?;
+            fs::write(dist.join("index.html.gz"), b"gz")?;
+            fs::write(dist.join("assets/app.js"), b"app")?;
+        }
+        fs::create_dir_all(root.join("www"))?;
+        fs::create_dir_all(root.join("config"))?;
+        fs::write(root.join("config/site.json"), br#"{"api":"https://example.test"}"#)?;
+        Ok(StandInSite {
+            binding: StaticReleaseBinding {
+                release_root: root.join("releases"),
+                current_link: root.join("www/current"),
+                carry: crate::deployment::StaticCarryBinding {
+                    source: root.join("config/site.json"),
+                    destination: "config.json".into(),
+                },
+            },
+            _temp: temp,
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_flip_carries_the_site_file_and_names_the_release() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let site = stand_in_site()?;
+        let port = FilesystemStaticRelease;
+        assert_eq!(port.observe_current(&site.binding)?, None, "no link before the first flip");
+
+        let flip = port.carry_and_flip(&site.binding, RELEASE_A)?;
+        assert_eq!(port.observe_current(&site.binding)?.as_deref(), Some(RELEASE_A));
+        let carried = site.binding.current_link.join("config.json");
+        let bytes = fs::read(&carried)?;
+        assert_eq!(bytes, fs::read(&site.binding.carry.source)?);
+        assert_eq!(flip.carried_sha256, format!("sha256-{:x}", Sha256::digest(&bytes)));
+        assert_eq!(fs::metadata(&carried)?.permissions().mode() & 0o777, 0o444);
+        assert!(fs::symlink_metadata(&carried)?.is_file(), "the carry is a copy, never a link");
+        // The web root reads the release's own tree through the link.
+        assert_eq!(fs::read(site.binding.current_link.join("dist/index.html.br"))?, b"br");
+
+        // The site file changes between releases: the second release carries
+        // the new bytes and the first keeps the ones it was flipped with.
+        fs::write(&site.binding.carry.source, br#"{"api":"https://other.test"}"#)?;
+        let second = port.carry_and_flip(&site.binding, RELEASE_B)?;
+        assert_ne!(second.carried_sha256, flip.carried_sha256);
+        assert_eq!(port.observe_current(&site.binding)?.as_deref(), Some(RELEASE_B));
+        assert_eq!(fs::read(&carried)?, br#"{"api":"https://other.test"}"#);
+        assert_eq!(
+            fs::read(site.binding.release_root.join(RELEASE_A).join("config.json"))?,
+            br#"{"api":"https://example.test"}"#
+        );
+        // Rolling back is the same flip to the release the link named before.
+        port.carry_and_flip(&site.binding, RELEASE_A)?;
+        assert_eq!(port.observe_current(&site.binding)?.as_deref(), Some(RELEASE_A));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_missing_site_config_fails_before_the_link_moves() -> Result<()> {
+        let site = stand_in_site()?;
+        let port = FilesystemStaticRelease;
+        port.carry_and_flip(&site.binding, RELEASE_A)?;
+        fs::remove_file(&site.binding.carry.source)?;
+        let error = port.carry_and_flip(&site.binding, RELEASE_B).unwrap_err();
+        assert!(format!("{error:#}").contains("carry source"), "{error:#}");
+        assert!(error.downcast_ref::<FlipRefused>().is_some(), "a pre-rename refusal is typed");
+        assert_eq!(port.observe_current(&site.binding)?.as_deref(), Some(RELEASE_A));
+        assert!(
+            !site.binding.release_root.join(RELEASE_B).join("config.json").exists(),
+            "a failed flip wrote its carry"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_refuses_a_site_file_that_is_not_a_plain_small_file() -> Result<()> {
+        let site = stand_in_site()?;
+        let port = FilesystemStaticRelease;
+        let source = site.binding.carry.source.clone();
+        fs::remove_file(&source)?;
+        fs::write(source.with_extension("real"), b"{}")?;
+        std::os::unix::fs::symlink(source.with_extension("real"), &source)?;
+        assert!(port.carry_and_flip(&site.binding, RELEASE_A).is_err(), "a linked site file was carried");
+        fs::remove_file(&source)?;
+        fs::write(&source, vec![b'x'; STATIC_CARRY_LIMIT_BYTES as usize + 1])?;
+        assert!(port.carry_and_flip(&site.binding, RELEASE_A).is_err(), "an oversize site file was carried");
+        assert_eq!(port.observe_current(&site.binding)?, None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_replaces_a_stale_flip_link_a_crash_left() -> Result<()> {
+        let site = stand_in_site()?;
+        let port = FilesystemStaticRelease;
+        let stale = site.binding.current_link.with_file_name(".current.flip");
+        std::os::unix::fs::symlink("/nowhere", &stale)?;
+        port.carry_and_flip(&site.binding, RELEASE_A)?;
+        assert_eq!(port.observe_current(&site.binding)?.as_deref(), Some(RELEASE_A));
+        assert!(fs::symlink_metadata(&stale).is_err(), "the stale flip link survived");
+        // Repeating the flip, as a resumed transaction does, changes nothing.
+        port.carry_and_flip(&site.binding, RELEASE_A)?;
+        assert_eq!(port.observe_current(&site.binding)?.as_deref(), Some(RELEASE_A));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_will_not_replace_or_trust_what_is_not_its_link() -> Result<()> {
+        let site = stand_in_site()?;
+        let port = FilesystemStaticRelease;
+        // A real directory where the link belongs is left alone.
+        fs::create_dir(&site.binding.current_link)?;
+        let error = port.carry_and_flip(&site.binding, RELEASE_A).unwrap_err();
+        assert!(error.downcast_ref::<FlipRefused>().is_some(), "{error:#}");
+        assert!(site.binding.current_link.is_dir());
+        assert!(
+            !site.binding.release_root.join(RELEASE_A).join("config.json").exists(),
+            "a refused flip wrote its carry"
+        );
+        assert!(port.observe_current(&site.binding).is_err());
+        fs::remove_dir(&site.binding.current_link)?;
+        // A link that names something outside the release root has no release
+        // to roll back to, and Idunn says so instead of guessing.
+        std::os::unix::fs::symlink("/usr", &site.binding.current_link)?;
+        let error = port.observe_current(&site.binding).unwrap_err();
+        assert!(format!("{error:#}").contains("not a release under"), "{error:#}");
+        // A release that was never installed is not flipped to.
+        fs::remove_file(&site.binding.current_link)?;
+        let missing = format!("sha256-{}", "c".repeat(64));
+        assert!(port.carry_and_flip(&site.binding, &missing).is_err());
+        assert_eq!(port.observe_current(&site.binding)?, None);
+        Ok(())
+    }
 }
