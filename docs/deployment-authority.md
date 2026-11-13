@@ -254,6 +254,14 @@ as it is at rollback time, and its sha256 is recorded in the rollback's own
 flip evidence (it may differ from the original release's; the copy inside the
 rolled-back-to release is replaced). Nothing prunes release directories.
 
+`CommandKind::Rollback` is stored in the existing v5 command and transaction
+records with no schema change; an Idunn at 9f15cee or earlier cannot decode
+them, so this is forward-only, like v5 itself. The newest flip is ordered by
+`flipped_at` wall clock, and the observed-link check makes a clock step refuse
+the rollback rather than mis-flip. A rollback cannot be cancelled, like a static
+deploy. A rollback is also refused when the previous release was deployed under
+a different release root or current link than the newest one.
+
 ## Typed deployment state
 
 Mutable control-plane state will be CultCache. Runtime integration must use

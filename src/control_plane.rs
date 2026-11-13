@@ -7099,6 +7099,15 @@ impl Engine {
             .rev()
             .find(|transaction| transaction.flip.as_ref().is_some_and(|f| f.release_id == previous))
             .with_context(|| format!("no record of a transaction that flipped the previous release {previous}"))?;
+        // The prior plan is reused verbatim, but the link was observed through
+        // the newest plan's binding: they must be the same release root and link.
+        let prior_binding = required(&prior.plan, "previous release plan")?.parsed_inputs()?.1;
+        let prior_workload = prior_binding.workload.static_release()?;
+        ensure!(
+            prior_workload.release_root == workload.release_root
+                && prior_workload.current_link == workload.current_link,
+            "the previous release was deployed under a different release root or current link than the newest; rollback does not cross bindings"
+        );
         self.static_release.verify_installed(
             workload,
             required(&prior.sealed_release, "previous sealed release")?,
@@ -26740,6 +26749,48 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         command("rollback-1", CommandKind::Rollback).validate()?;
         assert!(command("up-1", CommandKind::Rollback).validate().is_err());
         assert!(command("rollback-1", CommandKind::Deploy).validate().is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_drift_after_freezing_ends_before_fencing_with_current_untouched() -> Result<()> {
+        let w = static_world()?;
+        let (first, second) = w.two_deploys()?;
+        let id = w.submit_rollback("rollback-1")?;
+        let waiting = w.run_to_brake(&id)?;
+        // Frozen and intact; now the previous release drifts before Starting.
+        std::fs::write(w.release_dir(&first).join("dist/index.html"), b"tampered")?;
+        w.release_brake(&waiting)?;
+        w.tick_until(&id, "the rollback end", |t| t.is_terminal())?;
+        let ended = latest_id(&w.world, &id)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the drifted rollback did not fail before fencing: {ended:?}");
+        };
+        assert!(error.contains("differs from its sealed receipt"), "{error}");
+        assert!(ended.flip.is_none());
+        assert_eq!(w.current_release().as_deref(), Some(second.as_str()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_refuses_a_previous_release_deployed_under_another_binding() -> Result<()> {
+        let w = static_world()?;
+        w.two_deploys()?;
+        let snapshot = ControlSnapshot::read(&w.world.state_store)?;
+        let mut history = read_history_transactions(&w.world.state_store);
+        // The older transaction's plan names another release root.
+        let older = history
+            .iter_mut()
+            .min_by_key(|t| t.created_at_unix_millis)
+            .context("no history")?;
+        let plan = older.plan.as_mut().context("no plan")?;
+        let text = String::from_utf8(plan.binding_blob.clone())?;
+        assert!(text.contains("/releases\""));
+        plan.binding_blob = text.replace("/releases\"", "/releases-old\"").into_bytes();
+        let error = w.world.engine.rollback_source(&snapshot, &history, "service").unwrap_err();
+        assert!(format!("{error:#}").contains("does not cross bindings"), "{error:#}");
         Ok(())
     }
     // END static-release tests
