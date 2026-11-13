@@ -318,6 +318,27 @@ runtime's record, another owner, an unsearchable or non-directory parent) reads
 as unreadable and fails closed; the wait note carries the
 `idunn-provision deployment-brake-clear` command that replaces it.
 
+A binding may name a second stop, the target's steward:
+
+```toml
+[brakes.steward]
+user = "mind-streampixels"            # a login, never root
+store = "/var/lib/gamecult/idunn-steward/streampixels/deployment-brake.cc"
+```
+
+Deploys admit only when every stop admits. The steward's store is read as owned
+by that user's uid, so the file owner proves who wrote it (`by` is also the
+uid's login name, written by the verb). Idunn never writes it and no key,
+group or ACL is involved: the steward needs write access to its store
+directory only, and engages or clears with the same `idunn-provision
+deployment-brake-engage|clear --store <path>`. The operator's store is a
+separate stop the steward cannot clear; the wait note names each holding
+stop. A steward store owned by another uid, or a user that does not resolve to
+a non-root uid, is unreadable and fails closed; the steward replaces its own
+store with `deployment-brake-clear`. The operator reads a steward's store with
+`deployment-brake-status --owner-user <login>`. The binding is stored in the
+plan, so editing the stanza applies to deploys planned afterwards.
+
 Record v6 (`deployment_admitted_at_unix_millis`, key 38) is forward-only: an
 Idunn that predates v6 cannot read a migrated `control.cc`, so, as for v5 (see
 `route-continuity-cut.md`, "An older Idunn refuses the v5 store"), take a
