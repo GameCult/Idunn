@@ -53,6 +53,11 @@ In:
   (`heimdall-discord-launch.md`, `idunn-host-raven.md`, the StreamPixels
   runbook).
 
+- A static release (a sealed tree published by repointing a link, with no
+  workload): its transaction records `flip` (release, previous release, the
+  sha256 of the carried per-site file) beside the brake bytes. See
+  `deployment-authority.md`, "Static release".
+
 Out:
 
 - `idunn-reincarnation`. This campaign is mapped after that campaign's cut 2

@@ -39,12 +39,12 @@ use crate::deployment_plan::{
     SealedRelease, WARMING_DEADLINE_SECONDS, compile_deployment_plan,
 };
 use crate::drivers::{
-    ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FrozenSourceReceipt,
-    GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
+    ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FilesystemStaticRelease,
+    FrozenSourceReceipt, GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
     LockContended, ProcessIdentity, RouteActuation, RouteActuationGate, RouteActuationRefused, RouteActuators,
     RouteObservation, RoutePreflightReceipt, RunnerPort, RunnerStepFailure, SourcePort,
-    SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
-    WriteLeasePort,
+    StaticReleasePort, SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
+    WriteLeasePort, require_sha256_id,
 };
 use crate::incident::{CloseReason, IncidentCondition, IncidentStore, render_incidents};
 use crate::runner_evidence::{
@@ -632,6 +632,50 @@ impl RoutingEvidence {
                 ..
             } => Some(*promoted_at_unix_millis),
         }
+    }
+}
+
+/// The one external change a static release makes, recorded before it runs and
+/// completed after it lands. `release_id` is the sealed release the current link
+/// is to name and `previous_release_id` the one it named before (the release a
+/// rollback deploys again). Both land in the record before the link moves, so a
+/// crash between the rename and the Complete write resumes at this record,
+/// repeats the harmless flip and observes the link. `carried_sha256` and
+/// `flipped_at_unix_millis` are set together, once the carry and the link landed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlipEvidence {
+    release_id: String,
+    previous_release_id: Option<String>,
+    carry_source: PathBuf,
+    carried_sha256: Option<String>,
+    flipped_at_unix_millis: Option<u64>,
+}
+
+impl FlipEvidence {
+    fn landed(&self) -> bool {
+        self.carried_sha256.is_some()
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        require_sha256_id(&self.release_id, "flip release")?;
+        if let Some(previous) = &self.previous_release_id {
+            require_sha256_id(previous, "flip previous release")?;
+            ensure!(previous != &self.release_id, "flip names its own release as previous");
+        }
+        ensure!(
+            self.carry_source.is_absolute(),
+            "flip carry source is not absolute"
+        );
+        match (&self.carried_sha256, self.flipped_at_unix_millis) {
+            (None, None) => {}
+            (Some(sha256), Some(at)) => {
+                require_sha256_id(sha256, "flip carried digest")?;
+                ensure!(at > 0, "flip has no time");
+            }
+            _ => bail!("flip carries a digest or a time but not both"),
+        }
+        Ok(())
     }
 }
 
@@ -1708,6 +1752,10 @@ struct DeploymentTransaction {
     phase_deadline: Option<PhaseDeadline>,
     #[cultcache(key = 36)]
     lease_adoption: Option<LeaseAdoptionEvidence>,
+    /// A static release's carry and flip. Absent on every record that
+    /// predates it, which decodes as None: no schema bump (precedent key 34).
+    #[cultcache(key = 37, default)]
+    flip: Option<FlipEvidence>,
 }
 
 /// The note a deployment keeps while another transaction owns its target.
@@ -1939,6 +1987,28 @@ impl DeploymentTransaction {
         }
     }
 
+    /// Whether this transaction publishes a static release: it has no workload,
+    /// no Expected and no admitted generation, and its one external change is
+    /// the flip. Derived from the plan's binding, never stored.
+    fn is_static(&self) -> bool {
+        self.plan
+            .as_ref()
+            .and_then(|plan| plan.parsed_inputs().ok())
+            .is_some_and(|(_, binding)| matches!(binding.workload, WorkloadBinding::StaticRelease(_)))
+    }
+
+    /// The runtime and the sealed release a deployment brake release must name.
+    /// One reading for both kinds of target: the binding's runtime identity and
+    /// the sealed release, which a service's Expected projection copies.
+    fn brake_subject(&self) -> Result<(String, String)> {
+        let plan = required(&self.plan, "transaction plan")?;
+        let release = required(&self.sealed_release, "sealed release")?;
+        Ok((
+            plan.parsed_inputs()?.1.runtime_identity.runtime_id,
+            release.sealed_release_id.clone(),
+        ))
+    }
+
     /// Whether this transaction's binding declares stop-then-start. A
     /// transaction without a plan yet cannot, so it reads as false.
     fn rollout_stops_incumbent_first(&self) -> bool {
@@ -1994,6 +2064,7 @@ impl DeploymentTransaction {
             post_commit_cleanup: None,
             phase_deadline: None,
             lease_adoption: None,
+            flip: None,
         };
         transaction.validate()?;
         Ok(transaction)
@@ -2158,6 +2229,81 @@ impl DeploymentTransaction {
             || self.pre_fencing_abort.is_some()
             || self.post_fencing_abort.is_some();
         self.readiness_disagreement().filter(|_| !finishing)
+    }
+
+    /// What a static release transaction may hold. It never runs a workload, so
+    /// every piece of evidence of one is absent, and it uses three phases:
+    /// Sealing, Starting (the flip, behind the brake) and Complete.
+    fn validate_static(&self) -> Result<()> {
+        ensure!(
+            self.command_kind == CommandKind::Deploy,
+            "a static release has no continuity"
+        );
+        ensure!(
+            self.expected.is_none()
+                && self.expected_publication_sha256.is_none()
+                && self.lifecycle_authorized_at_unix_millis.is_none()
+                && self.activation.is_none()
+                && self.workload.is_none()
+                && self.activation_publication_sha256.is_none()
+                && self.latest_odin_observation.is_none()
+                && self.warming.is_none()
+                && self.route_preflight.is_none()
+                && self.isolation.is_none()
+                && self.fencing.is_none()
+                && self.leasing.is_none()
+                && self.ready.is_none()
+                && self.routing.is_none()
+                && self.lease_adoption.is_none(),
+            "a static release transaction carries evidence of a running workload"
+        );
+        ensure!(
+            matches!(
+                self.phase,
+                DeploymentPhase::Sealing | DeploymentPhase::Starting | DeploymentPhase::Complete
+            ),
+            "a static release never enters {:?}",
+            self.phase
+        );
+        if self.phase >= DeploymentPhase::Starting {
+            ensure!(
+                self.plan.is_some()
+                    && self.sealed_release.is_some()
+                    && self.installed_release.is_some()
+                    && self.frozen_source.is_some()
+                    && self.deployment_authorization.is_some(),
+                "static release entered Starting without sealed release evidence and brake consumption"
+            );
+        } else {
+            ensure!(
+                self.flip.is_none() && self.deployment_authorization.is_none(),
+                "static release flipped or consumed the brake before Starting"
+            );
+        }
+        if self.phase == DeploymentPhase::Complete {
+            ensure!(
+                self.flip.as_ref().is_some_and(FlipEvidence::landed),
+                "completed static release has no landed flip"
+            );
+            ensure!(
+                self.pre_fencing_abort.is_none() && self.post_commit_cleanup.is_some(),
+                "admitted transaction lacks exclusive post-commit cleanup evidence"
+            );
+            ensure!(
+                matches!(
+                    &self.completion,
+                    Some(TransactionCompletion::Admitted { generation_id })
+                        if generation_id == &format!("generation-{}", self.transaction_id)
+                ),
+                "successful Complete transaction lacks its admission receipt"
+            );
+        } else {
+            ensure!(
+                self.completion.is_none() && self.post_commit_cleanup.is_none(),
+                "non-Complete transaction has completion or post-commit state"
+            );
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -2346,6 +2492,17 @@ impl DeploymentTransaction {
         if let Some(authorization) = &self.deployment_authorization {
             authorization.validate_shape()?;
         }
+        let is_static = self.is_static();
+        if let Some(flip) = &self.flip {
+            ensure!(is_static, "a flip belongs to a static release transaction");
+            flip.validate_shape()?;
+            if let Some(release) = &self.sealed_release {
+                ensure!(
+                    flip.release_id == release.sealed_release_id,
+                    "flip names another release than the sealed one"
+                );
+            }
+        }
         if let Some(abort) = &self.pre_fencing_abort {
             require_detail(&abort.error, "pre-fencing abort error")?;
             ensure!(
@@ -2464,111 +2621,116 @@ impl DeploymentTransaction {
                 ),
                 "non-failure branch carries failure completion"
             );
-            if self.phase >= DeploymentPhase::Starting {
-                ensure!(
-                    self.plan.is_some()
-                        && self.sealed_release.is_some()
-                        && self.installed_release.is_some()
-                        && self.expected.is_some(),
-                    "Starting transaction lacks sealed release evidence"
-                );
-                // Expected is published as Starting's first step, after the
-                // brake; from the activation onward it must be there.
-                ensure!(
-                    self.expected_publication_sha256.is_some()
-                        || (self.activation.is_none() && self.phase == DeploymentPhase::Starting),
-                    "started transaction has not published its Expected"
-                );
-                match self.command_kind {
-                    CommandKind::Deploy => ensure!(
-                        self.frozen_source.is_some() && self.deployment_authorization.is_some(),
-                        "deployment entered Starting without frozen source and brake consumption"
-                    ),
-                    CommandKind::Continuity => ensure!(
-                        self.lifecycle_authorized_at_unix_millis.is_some()
-                            && self.deployment_authorization.is_none(),
-                        "continuity entered Starting without its lifecycle gate"
-                    ),
-                }
-            }
-            if self.phase >= DeploymentPhase::Warming {
-                ensure!(
-                    self.activation.is_some()
-                        && self.workload.is_some()
-                        && self.activation_publication_sha256.is_some(),
-                    "Warming transaction lacks observed activation"
-                );
-            }
-            if self.phase >= DeploymentPhase::Fencing {
-                ensure!(
-                    self.warming.is_some() && self.isolation.is_some(),
-                    "Fencing transaction lacks warming or isolation evidence"
-                );
-                ensure!(
-                    self.expected
-                        .as_ref()
-                        .and_then(|expected| expected.route.as_ref())
-                        .is_some()
-                        == self.route_preflight.is_some(),
-                    "route preflight does not match routed Expected"
-                );
-                if let Some(preflight) = &self.route_preflight {
-                    preflight.validate()?;
-                }
-            }
-            if self.phase >= DeploymentPhase::Leasing {
-                ensure!(self.fencing.is_some(), "Leasing lacks fencing evidence");
-            }
-            if self.phase >= DeploymentPhase::AwaitingReady {
-                ensure!(
-                    matches!(
-                        self.leasing.as_ref(),
-                        Some(LeasingEvidence::SkippedStateless)
-                            | Some(LeasingEvidence::Granted { .. })
-                    ),
-                    "AwaitingReady lacks finalized lease evidence"
-                );
-            }
-            if self.phase >= DeploymentPhase::Routing {
-                ensure!(self.ready.is_some(), "Routing lacks Ready evidence");
-            }
-            if self.phase >= DeploymentPhase::Committing {
-                ensure!(self.routing.is_some(), "Committing lacks routing evidence");
-            }
-            if let Some(RoutingEvidence::Promoted {
-                observation,
-                promoted_at_unix_millis,
-            }) = &self.routing
-            {
-                observation.validate()?;
-                ensure!(*promoted_at_unix_millis > 0, "route promotion has no time");
-            }
-            if self.phase == DeploymentPhase::Complete {
-                ensure!(
-                    matches!(
-                        self.completion,
-                        Some(TransactionCompletion::Admitted { .. })
-                    ),
-                    "successful Complete transaction lacks admission receipt"
-                );
-                ensure!(
-                    self.pre_fencing_abort.is_none() && self.post_commit_cleanup.is_some(),
-                    "admitted transaction lacks exclusive post-commit cleanup evidence"
-                );
-                let TransactionCompletion::Admitted { generation_id } =
-                    self.completion.as_ref().unwrap()
-                else {
-                    unreachable!()
-                };
-                ensure!(
-                    generation_id == &format!("generation-{}", self.transaction_id),
-                    "admission completion names another transaction generation"
-                );
+            if is_static {
+                self.validate_static()?;
             } else {
-                ensure!(
-                    self.completion.is_none() && self.post_commit_cleanup.is_none(),
-                    "non-Complete transaction has completion or post-commit state"
-                );
+                if self.phase >= DeploymentPhase::Starting {
+                    ensure!(
+                        self.plan.is_some()
+                            && self.sealed_release.is_some()
+                            && self.installed_release.is_some()
+                            && self.expected.is_some(),
+                        "Starting transaction lacks sealed release evidence"
+                    );
+                    // Expected is published as Starting's first step, after the
+                    // brake; from the activation onward it must be there.
+                    ensure!(
+                        self.expected_publication_sha256.is_some()
+                            || (self.activation.is_none() && self.phase == DeploymentPhase::Starting),
+                        "started transaction has not published its Expected"
+                    );
+                    match self.command_kind {
+                        CommandKind::Deploy => ensure!(
+                            self.frozen_source.is_some() && self.deployment_authorization.is_some(),
+                            "deployment entered Starting without frozen source and brake consumption"
+                        ),
+                        CommandKind::Continuity => ensure!(
+                            self.lifecycle_authorized_at_unix_millis.is_some()
+                                && self.deployment_authorization.is_none(),
+                            "continuity entered Starting without its lifecycle gate"
+                        ),
+                    }
+                }
+                if self.phase >= DeploymentPhase::Warming {
+                    ensure!(
+                        self.activation.is_some()
+                            && self.workload.is_some()
+                            && self.activation_publication_sha256.is_some(),
+                        "Warming transaction lacks observed activation"
+                    );
+                }
+                if self.phase >= DeploymentPhase::Fencing {
+                    ensure!(
+                        self.warming.is_some() && self.isolation.is_some(),
+                        "Fencing transaction lacks warming or isolation evidence"
+                    );
+                    ensure!(
+                        self.expected
+                            .as_ref()
+                            .and_then(|expected| expected.route.as_ref())
+                            .is_some()
+                            == self.route_preflight.is_some(),
+                        "route preflight does not match routed Expected"
+                    );
+                    if let Some(preflight) = &self.route_preflight {
+                        preflight.validate()?;
+                    }
+                }
+                if self.phase >= DeploymentPhase::Leasing {
+                    ensure!(self.fencing.is_some(), "Leasing lacks fencing evidence");
+                }
+                if self.phase >= DeploymentPhase::AwaitingReady {
+                    ensure!(
+                        matches!(
+                            self.leasing.as_ref(),
+                            Some(LeasingEvidence::SkippedStateless)
+                                | Some(LeasingEvidence::Granted { .. })
+                        ),
+                        "AwaitingReady lacks finalized lease evidence"
+                    );
+                }
+                if self.phase >= DeploymentPhase::Routing {
+                    ensure!(self.ready.is_some(), "Routing lacks Ready evidence");
+                }
+                if self.phase >= DeploymentPhase::Committing {
+                    ensure!(self.routing.is_some(), "Committing lacks routing evidence");
+                }
+                if let Some(RoutingEvidence::Promoted {
+                    observation,
+                    promoted_at_unix_millis,
+                }) = &self.routing
+                {
+                    observation.validate()?;
+                    ensure!(*promoted_at_unix_millis > 0, "route promotion has no time");
+                }
+                if self.phase == DeploymentPhase::Complete {
+                    ensure!(
+                        matches!(
+                            self.completion,
+                            Some(TransactionCompletion::Admitted { .. })
+                        ),
+                        "successful Complete transaction lacks admission receipt"
+                    );
+                    ensure!(
+                        self.pre_fencing_abort.is_none() && self.post_commit_cleanup.is_some(),
+                        "admitted transaction lacks exclusive post-commit cleanup evidence"
+                    );
+                    let TransactionCompletion::Admitted { generation_id } =
+                        self.completion.as_ref().unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    ensure!(
+                        generation_id == &format!("generation-{}", self.transaction_id),
+                        "admission completion names another transaction generation"
+                    );
+                } else {
+                    ensure!(
+                        self.completion.is_none() && self.post_commit_cleanup.is_none(),
+                        "non-Complete transaction has completion or post-commit state"
+                    );
+                }
+        
             }
         }
         if let Some(cleanup) = &self.post_commit_cleanup {
@@ -3882,6 +4044,7 @@ impl LegacyDeploymentTransaction {
             post_fencing_abort: self.post_fencing_abort,
             phase_deadline: None,
             lease_adoption: None,
+            flip: None,
         }
     }
 }
@@ -4891,9 +5054,9 @@ pub(crate) fn status(
                     "    target {} phase {:?}",
                     transaction.target, transaction.phase
                 )?;
-                if let Some(expected) = &transaction.expected {
-                    writeln!(out, "    runtime {}", expected.runtime_id)?;
-                    writeln!(out, "    release {}", expected.sealed_release_id)?;
+                if let Ok((runtime_id, sealed_release_id)) = transaction.brake_subject() {
+                    writeln!(out, "    runtime {runtime_id}")?;
+                    writeln!(out, "    release {sealed_release_id}")?;
                 }
                 writeln!(
                     out,
@@ -5164,11 +5327,17 @@ struct Engine {
     source: Arc<dyn SourcePort>,
     docker_runner: DockerRunnerDriver,
     systemd_workload: Arc<dyn WorkloadPort>,
+    /// The one external change a static release makes.
+    static_release: Arc<dyn StaticReleasePort>,
     host_actuators: Option<SharedHostActuatorHub>,
     /// A test world that serves no host actuator runs a host-actuator
     /// binding's workload through this port instead.
     #[cfg(test)]
     host_workload: Mutex<Option<Arc<dyn WorkloadPort>>>,
+    /// A test world that cannot assign runner workspaces (that wants root)
+    /// seals through this runner instead of the Docker one.
+    #[cfg(test)]
+    runner_stand_in: Mutex<Option<Arc<dyn RunnerPort>>>,
     history_report: ReportOnce,
     /// One `ReportOnce` per faulting record, so one wedged transaction says
     /// its fault once and never drowns another's.
@@ -5292,9 +5461,12 @@ impl Engine {
             source,
             docker_runner: DockerRunnerDriver::default(),
             systemd_workload,
+            static_release: Arc::new(FilesystemStaticRelease),
             host_actuators,
             #[cfg(test)]
             host_workload: Mutex::default(),
+            #[cfg(test)]
+            runner_stand_in: Mutex::default(),
             history_report: ReportOnce::default(),
             fault_reports: Mutex::default(),
             resume_backoff: Mutex::default(),
@@ -5545,6 +5717,22 @@ impl Engine {
     /// is of one kind; the binding validated that.
     fn runner_for(&self, plan: &CompiledDeploymentPlan) -> Result<Box<dyn RunnerPort + '_>> {
         let (_, binding) = plan.parsed_inputs()?;
+        #[cfg(test)]
+        if let Some(runner) = self.runner_stand_in.lock().expect("runner mutex").clone() {
+            struct Shared(Arc<dyn RunnerPort>);
+            impl RunnerPort for Shared {
+                fn materialize(
+                    &self,
+                    source: &crate::drivers::FrozenSource,
+                    plan: &CompiledDeploymentPlan,
+                    staging_root: &Path,
+                    sealed_at_unix_millis: u64,
+                ) -> Result<crate::drivers::MaterializedRelease> {
+                    self.0.materialize(source, plan, staging_root, sealed_at_unix_millis)
+                }
+            }
+            return Ok(Box::new(Shared(runner)));
+        }
         Ok(match &binding.workload {
             WorkloadBinding::SystemdTransient(_) | WorkloadBinding::StaticRelease(_) => {
                 Box::new(self.docker_runner.clone())
@@ -5659,13 +5847,12 @@ impl Engine {
                     &record,
                     operator_anchor.as_ref().expect("read directly above"),
                 )?;
-                let expected = required(&transaction.expected, "authorized Expected projection")?;
+                let (runtime_id, sealed_release_id) = transaction.brake_subject()?;
                 ensure!(
-                    record.authorized_release_id.as_deref()
-                        == Some(expected.sealed_release_id.as_str())
+                    record.authorized_release_id.as_deref() == Some(sealed_release_id.as_str())
                         && record.authorized_deployment_id.as_deref()
                             == Some(transaction.transaction_id.as_str())
-                        && record.runtime_id == expected.runtime_id,
+                        && record.runtime_id == runtime_id,
                     "durable deployment authorization names another release or transaction"
                 );
             }
@@ -7358,8 +7545,12 @@ impl Engine {
                 &providers,
             )?;
             // Idunn infers no way to prove readiness. A recipe that declares
-            // none is refused here, before anything is frozen, built or installed.
-            plan.readiness_class()?;
+            // none is refused here, before anything is frozen, built or
+            // installed. A static release proves nothing to anyone: it runs
+            // nothing, and its flip is observed on disk.
+            if !matches!(loaded.binding.workload, WorkloadBinding::StaticRelease(_)) {
+                plan.readiness_class()?;
+            }
             return self.persist_same_phase(current, |next| {
                 next.plan = Some(plan);
                 next.updated_at_unix_millis = now;
@@ -7382,9 +7573,10 @@ impl Engine {
             });
         }
 
+        let is_static = current.value.is_static();
         if current.value.sealed_release.is_none()
             || current.value.installed_release.is_none()
-            || current.value.expected.is_none()
+            || (current.value.expected.is_none() && !is_static)
         {
             ensure!(
                 current.value.command_kind == CommandKind::Deploy,
@@ -7401,11 +7593,13 @@ impl Engine {
                 now,
             )?;
             let installed = self.workload_for(plan)?.install(plan, &materialized)?;
-            let expected = materialized.release.expected_projection(plan)?;
+            let expected = (!is_static)
+                .then(|| materialized.release.expected_projection(plan))
+                .transpose()?;
             return self.persist_same_phase(current, |next| {
                 next.sealed_release = Some(materialized.release);
                 next.installed_release = Some(installed);
-                next.expected = Some(expected);
+                next.expected = expected;
                 next.updated_at_unix_millis = now;
                 next.last_error = None;
                 Ok(())
@@ -7449,6 +7643,9 @@ impl Engine {
     }
 
     fn advance_starting(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
+        if current.value.is_static() {
+            return self.advance_static(current);
+        }
         let expected = required(&current.value.expected, "Expected projection")?;
         let plan = required(&current.value.plan, "transaction plan")?;
         let release = required(&current.value.sealed_release, "sealed release")?;
@@ -7532,6 +7729,66 @@ impl Engine {
         next.enter_phase(DeploymentPhase::Warming, now_millis()?);
         next.last_error = None;
         replace_transaction(&self.options.state_store, current, &next)
+    }
+
+    /// A static release's Starting: its one external change, in three durable
+    /// steps. The intent (the release to name and the one named now) lands
+    /// first; then the carry and the flip, whose facts land second; then the
+    /// link is observed naming the release and the transaction completes. The
+    /// flip is one rename and repeating it is harmless, so a crash anywhere
+    /// resumes at the record, and a failure before the rename leaves the
+    /// current link exactly as it was, which is what the pre-fencing abort
+    /// this error takes says.
+    fn advance_static(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
+        let plan = required(&current.value.plan, "transaction plan")?;
+        let release = required(&current.value.sealed_release, "sealed release")?;
+        let binding = plan.parsed_inputs()?.1;
+        let workload = binding.workload.static_release()?;
+        let now = now_millis()?;
+        let Some(flip) = &current.value.flip else {
+            let previous_release_id = self.static_release.observe_current(workload)?;
+            let release_id = release.sealed_release_id.clone();
+            return self.persist_same_phase(current, |next| {
+                next.flip = Some(FlipEvidence {
+                    release_id,
+                    previous_release_id,
+                    carry_source: workload.carry.source.clone(),
+                    carried_sha256: None,
+                    flipped_at_unix_millis: None,
+                });
+                next.updated_at_unix_millis = now;
+                Ok(())
+            });
+        };
+        if !flip.landed() {
+            let landed = self
+                .static_release
+                .carry_and_flip(workload, &flip.release_id)?;
+            return self.persist_same_phase(current, |next| {
+                let flip = next.flip.as_mut().expect("flip intent read above");
+                flip.carried_sha256 = Some(landed.carried_sha256);
+                flip.flipped_at_unix_millis = Some(now);
+                next.updated_at_unix_millis = now;
+                Ok(())
+            });
+        }
+        ensure!(
+            self.static_release.observe_current(workload)?.as_deref() == Some(flip.release_id.as_str()),
+            "the current link does not name the release this transaction flipped to"
+        );
+        let mut complete = current.value.clone();
+        complete.enter_phase(DeploymentPhase::Complete, now);
+        complete.last_error = None;
+        complete.completion = Some(TransactionCompletion::Admitted {
+            generation_id: format!("generation-{}", current.value.transaction_id),
+        });
+        complete.post_commit_cleanup = Some(PostCommitCleanup {
+            incumbent: IncumbentCleanupEvidence::SkippedNoIncumbent,
+            source: SourceCleanupEvidence::Pending,
+        });
+        complete.retime(now);
+        complete.validate()?;
+        replace_transaction(&self.options.state_store, current, &complete)
     }
 
     fn advance_warming(&self, current: &Stored<DeploymentTransaction>) -> Result<()> {
@@ -8645,7 +8902,7 @@ impl Engine {
         current: &Stored<DeploymentTransaction>,
         now: u64,
     ) -> Result<Option<DeploymentAuthorization>> {
-        let expected = required(&current.value.expected, "Expected projection")?;
+        let (runtime_id, sealed_release_id) = current.value.brake_subject()?;
         let plan = required(&current.value.plan, "transaction plan")?;
         let binding = plan.parsed_inputs()?.1;
         let Some((record, canonical_bytes)) =
@@ -8659,8 +8916,8 @@ impl Engine {
         if evaluate_idunn_deployment_brake(
             IdunnDeploymentBrakeObservation::Present(&record),
             &anchor,
-            &expected.runtime_id,
-            &expected.sealed_release_id,
+            &runtime_id,
+            &sealed_release_id,
             &current.value.transaction_id,
             now,
         )
@@ -13397,6 +13654,18 @@ mod tests {
         transaction_id: &str,
         now: u64,
     ) -> Result<DeploymentAuthorization> {
+        released_brake(world, &expected.runtime_id, &expected.sealed_release_id, transaction_id, now)
+    }
+
+    /// The release receipt for one runtime, release and transaction: all a
+    /// brake release names, so a target with no Expected can be released too.
+    fn released_brake(
+        world: &EngineFixture,
+        runtime_id: &str,
+        sealed_release_id: &str,
+        transaction_id: &str,
+        now: u64,
+    ) -> Result<DeploymentAuthorization> {
         use cultnet_rs::{
             IDUNN_DEPLOYMENT_BRAKE_AUTHORITY, IDUNN_DEPLOYMENT_BRAKE_ID,
             IDUNN_DEPLOYMENT_BRAKE_SCOPE, IDUNN_DEPLOYMENT_RELEASE_PURPOSE,
@@ -13417,7 +13686,7 @@ mod tests {
             schema_version: IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into(),
             brake_id: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
             authority: IDUNN_DEPLOYMENT_BRAKE_AUTHORITY.into(),
-            runtime_id: expected.runtime_id.clone(),
+            runtime_id: runtime_id.to_owned(),
             status: "released".into(),
             scope: IDUNN_DEPLOYMENT_BRAKE_SCOPE.into(),
             reason: "test rollout".into(),
@@ -13425,7 +13694,7 @@ mod tests {
             expires_at_unix_millis: Some(now + 600_000),
             authorization_id: Some(authorization_id.clone()),
             authorization_purpose: Some(IDUNN_DEPLOYMENT_RELEASE_PURPOSE.into()),
-            authorized_release_id: Some(expected.sealed_release_id.clone()),
+            authorized_release_id: Some(sealed_release_id.to_owned()),
             authorized_deployment_id: Some(transaction_id.to_owned()),
             authorized_by: Some(signer.trust_anchor()?.identity_id),
             authorization_issued_at_unix_millis: Some(now),
@@ -20210,7 +20479,6 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     /// source resolves `recipe`. One scheduler tick admits its plan or refuses it.
     fn sealing_world(recipe: &str) -> Result<EngineFixture> {
         use crate::deployment_plan::tests::BINDING;
-        let mut world = EngineFixture::with_workload(Arc::new(StillWorkload))?;
         let (binding_head, binding_tail) = BINDING
             .split_once("[route]")
             .context("binding has no route table")?;
@@ -20221,15 +20489,32 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 .context("binding has no brakes table")?
                 .1
         );
+        sealing_world_with(recipe, |_| binding, Arc::new(StillWorkload))
+    }
+
+    /// `sealing_world` over any binding (given the world's root, which a
+    /// binding that names paths needs) and any workload port.
+    fn sealing_world_with(
+        recipe: &str,
+        binding: impl FnOnce(&Path) -> String,
+        workload: Arc<dyn WorkloadPort>,
+    ) -> Result<EngineFixture> {
+        let mut world = EngineFixture::with_workload(workload)?;
         std::fs::create_dir_all(world.root.join("bindings"))?;
-        std::fs::write(world.root.join("bindings/service.toml"), binding)?;
+        std::fs::write(world.root.join("bindings/service.toml"), binding(&world.root))?;
         world.engine.source = Arc::new(FixedSource {
             recipe: recipe.to_owned(),
         });
+        enqueue_deploy(&world, "up-service")?;
+        Ok(world)
+    }
+
+    /// A Deploy command for target `service` and its transaction, still Sealing.
+    fn enqueue_deploy(world: &EngineFixture, command_id: &str) -> Result<()> {
         let now = now_millis()?;
         let command = DeploymentCommand {
             schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
-            command_id: "up-service".into(),
+            command_id: command_id.into(),
             kind: CommandKind::Deploy,
             selector: "service".into(),
             requested_by: "test".into(),
@@ -20256,7 +20541,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 ],
             )?
         );
-        Ok(world)
+        Ok(())
     }
 
     fn unrouted_recipe() -> String {
@@ -25254,4 +25539,379 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     const PINNED_COMMAND_HEX: &str = "96bb6964756e6e2e6465706c6f796d656e745f636f6d6d616e642e7632aa75702d73657276696365a66465706c6f79a773657276696365a47465737464";
     const PINNED_TRANSACTION_HEX: &str = "dc0025bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7634a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0";
     // END runner-failure-evidence tests
+
+    // BEGIN static-release tests
+    // A static release over a stand-in site tree: the real engine, the real
+    // Sealing path over a fake docker, the real filesystem flip, and an install
+    // that copies instead of hardening (hardening wants root). Nothing here
+    // is a real site.
+
+    /// Installs the sealed release by copying it where the binding says.
+    struct InstallingWorkload;
+
+    impl WorkloadPort for InstallingWorkload {
+        fn install(
+            &self,
+            plan: &CompiledDeploymentPlan,
+            release: &crate::drivers::MaterializedRelease,
+        ) -> Result<crate::drivers::InstalledReleaseObservation> {
+            let (_, binding) = plan.parsed_inputs()?;
+            let release_root = binding.workload.release_root()?;
+            std::fs::create_dir_all(release_root)?;
+            let root = release_root.join(&release.release.sealed_release_id);
+            crate::drivers::copy_tree(&release.root, &root)?;
+            Ok(crate::drivers::InstalledReleaseObservation {
+                sealed_release_id: release.release.sealed_release_id.clone(),
+                root,
+            })
+        }
+        fn prepare_activation(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &IdunnExpectedIncarnationRecord,
+            _: IdunnRuntimeActivationLaunch,
+        ) -> Result<IdunnRuntimeActivationRecord> {
+            bail!("a static release prepares no activation")
+        }
+        fn start_prepared(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &SealedRelease,
+            _: &crate::drivers::InstalledReleaseObservation,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+        ) -> Result<WorkloadObservation> {
+            bail!("a static release starts nothing")
+        }
+        fn discard_prepared(
+            &self,
+            _: &CompiledDeploymentPlan,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+        ) -> Result<()> {
+            bail!("a static release discards nothing")
+        }
+        fn observe(
+            &self,
+            _: &IdunnExpectedIncarnationRecord,
+            _: &IdunnRuntimeActivationRecord,
+            _: &WorkloadObservation,
+        ) -> Result<WorkloadObservation> {
+            bail!("a static release observes no workload")
+        }
+        fn stop(&self, _: &WorkloadObservation) -> Result<()> {
+            bail!("a static release stops nothing")
+        }
+        fn is_permanently_stopped(&self, _: &WorkloadObservation) -> Result<bool> {
+            bail!("a static release has no workload to be dead")
+        }
+        fn lost_to_host_reboot(&self, _: &WorkloadObservation, _: u64) -> Result<bool> {
+            bail!("a static release has no workload to lose")
+        }
+    }
+
+    /// The real artifact sealing over the frozen tree, without the Docker
+    /// step and the root-only workspace ownership that go with it.
+    struct SealingRunner {
+        tree: PathBuf,
+    }
+
+    impl RunnerPort for SealingRunner {
+        fn materialize(
+            &self,
+            _: &crate::drivers::FrozenSource,
+            plan: &CompiledDeploymentPlan,
+            staging_parent: &Path,
+            sealed_at_unix_millis: u64,
+        ) -> Result<crate::drivers::MaterializedRelease> {
+            let (declaration, _) = plan.parsed_inputs()?;
+            let staging_root = staging_parent.join(format!("stand-in-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&staging_root)?;
+            let mut artifacts = Vec::new();
+            for artifact in &declaration.artifacts {
+                artifacts.push(crate::drivers::seal_artifact(
+                    artifact,
+                    &self.tree,
+                    &self.tree.join(&artifact.source),
+                    &staging_root,
+                )?);
+            }
+            Ok(crate::drivers::MaterializedRelease {
+                release: SealedRelease::new(plan, artifacts, Vec::new(), sealed_at_unix_millis)?,
+                root: staging_root,
+            })
+        }
+    }
+
+    const SITE_CONFIG_ONE: &[u8] = br#"{"api":"https://one.test"}"#;
+    const SITE_CONFIG_TWO: &[u8] = br#"{"api":"https://two.test"}"#;
+
+    struct StaticWorld {
+        world: EngineFixture,
+        _tools: TempDir,
+        site: PathBuf,
+    }
+
+    impl StaticWorld {
+        fn site_config(&self) -> PathBuf {
+            self.site.join("config/site.json")
+        }
+
+        fn current_link(&self) -> PathBuf {
+            self.site.join("www/current")
+        }
+
+        fn current_release(&self) -> Option<String> {
+            std::fs::read_link(self.current_link())
+                .ok()
+                .and_then(|target| target.file_name().map(|name| name.to_string_lossy().into_owned()))
+        }
+
+        /// Scheduler ticks until `done`, or fails when the budget is spent.
+        fn tick_until(
+            &self,
+            id: &str,
+            what: &str,
+            done: impl Fn(&DeploymentTransaction) -> bool,
+        ) -> Result<()> {
+            for _ in 0..24 {
+                self.world.engine.resume_backoff.lock().unwrap().clear();
+                let _ = self.world.engine.run_scheduler_tick();
+                if done(&latest_id(&self.world, id)?) {
+                    return Ok(());
+                }
+            }
+            let last = latest_id(&self.world, id)?;
+            bail!("never reached {what}: phase {:?} completion {:?} error {:?}", last.phase, last.completion, last.last_error)
+        }
+
+        /// The Deploy command's transaction, by command id.
+        fn transaction_of(&self, command_id: &str) -> Result<String> {
+            Ok(ControlSnapshot::read(&self.world.state_store)?
+                .transactions
+                .into_iter()
+                .find(|stored| stored.value.command_id == command_id)
+                .context("no transaction for the command")?
+                .value
+                .transaction_id)
+        }
+
+        /// The operator releases the brake for this exact transaction.
+        fn release_brake(&self, transaction: &DeploymentTransaction) -> Result<()> {
+            let (runtime_id, release_id) = transaction.brake_subject()?;
+            let authorization = released_brake(
+                &self.world,
+                &runtime_id,
+                &release_id,
+                &transaction.transaction_id,
+                now_millis()?,
+            )?;
+            let store = self.site.join("authority/deployment-brake.cc");
+            let record: IdunnDeploymentBrakeRecord =
+                rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
+            let backing = SingleFileMessagePackBackingStore::new(&store);
+            let current = backing
+                .pull_all_read_only_snapshot()
+                .ok()
+                .and_then(|entries| entries.into_iter().next());
+            ensure!(backing.compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
+                    key: record.brake_id.clone(),
+                    current,
+                }],
+                &[CultCacheEnvelope {
+                    key: record.brake_id.clone(),
+                    r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
+                    payload: authorization.canonical_brake_bytes.clone(),
+                    stored_at: rfc3339_millis(now_millis()?)?,
+                    schema_id: Some(IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into()),
+                }],
+            )?);
+            Ok(())
+        }
+
+        /// Run a Deploy up to the brake and say where it waits.
+        fn run_to_brake(&self, id: &str) -> Result<DeploymentTransaction> {
+            self.tick_until(id, "the brake", |t| t.installed_release.is_some())?;
+            for _ in 0..2 {
+                self.world.engine.resume_backoff.lock().unwrap().clear();
+                let _ = self.world.engine.run_scheduler_tick();
+            }
+            let waiting = latest_id(&self.world, id)?;
+            assert_eq!(waiting.phase, DeploymentPhase::Sealing, "{waiting:?}");
+            assert!(waiting.deployment_authorization.is_none());
+            Ok(waiting)
+        }
+    }
+
+    /// A target world: the static recipe over a fixed vite-like tree, a runner
+    /// that seals it, and a stand-in site beside it.
+    #[cfg(unix)]
+    fn static_world() -> Result<StaticWorld> {
+        use crate::deployment::tests::{STATIC_BINDING, STATIC_RECIPE};
+        let tools = TempDir::new()?;
+        let tree = tools.path().join("tree");
+        std::fs::create_dir_all(tree.join("dist/assets"))?;
+        std::fs::write(tree.join("dist/index.html"), b"<html>site</html>")?;
+        std::fs::write(tree.join("dist/index.html.br"), b"br")?;
+        std::fs::write(tree.join("dist/index.html.gz"), b"gz")?;
+        std::fs::write(tree.join("dist/assets/app.js"), b"app")?;
+        let mut site = PathBuf::new();
+        let mut world = sealing_world_with(
+            STATIC_RECIPE,
+            |root| {
+                site = root.join("site");
+                STATIC_BINDING.replace("@SITE@", &site.display().to_string())
+            },
+            Arc::new(InstallingWorkload),
+        )?;
+        std::fs::create_dir_all(site.join("www"))?;
+        std::fs::create_dir_all(site.join("config"))?;
+        std::fs::write(site.join("config/site.json"), SITE_CONFIG_ONE)?;
+        *world.engine.runner_stand_in.lock().unwrap() =
+            Some(Arc::new(SealingRunner { tree: tree.clone() }));
+        world.engine.source = Arc::new(TreeSource { recipe: STATIC_RECIPE.into(), root: tree });
+        Ok(StaticWorld { world, _tools: tools, site })
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        sha256_id(bytes)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_waits_at_the_brake_then_flips_and_completes_without_a_workload() -> Result<()> {
+        let w = static_world()?;
+        let id = w.transaction_of("up-service")?;
+        let waiting = w.run_to_brake(&id)?;
+        let sealed = waiting.sealed_release.clone().context("no sealed release")?;
+        let release_dir = w.site.join("releases").join(&sealed.sealed_release_id);
+        assert!(release_dir.join("dist/index.html.br").is_file(), "the release is installed");
+        // At the brake nothing external has changed: no link, no carry.
+        assert_eq!(w.current_release(), None);
+        assert!(!release_dir.join("config.json").exists());
+        assert!(waiting.expected.is_none() && waiting.flip.is_none());
+        // Status names what a brake release must name, though no Expected exists.
+        let printed = printed_status(&w.world)?;
+        assert!(printed.contains("runtime site-yggdrasil"), "{printed}");
+        assert!(printed.contains(&format!("release {}", sealed.sealed_release_id)), "{printed}");
+
+        // The site file changes while the deployment waits: the sealed release
+        // does not, because the carry lives outside every artifact digest.
+        std::fs::write(w.site_config(), SITE_CONFIG_TWO)?;
+        w.release_brake(&waiting)?;
+        w.tick_until(&id, "completion", |t| t.is_terminal())?;
+
+        let done = latest_id(&w.world, &id)?;
+        assert_eq!(
+            done.sealed_release.as_ref().map(|release| &release.sealed_release_id),
+            Some(&sealed.sealed_release_id),
+            "a changed site file changed the sealed release"
+        );
+        let (installed_sha, _) = crate::drivers::digest_artifact(&release_dir.join("dist"))?;
+        assert_eq!(format!("sha256-{installed_sha}"), sealed.artifacts[0].sha256);
+        assert_eq!(
+            done.completion,
+            Some(TransactionCompletion::Admitted {
+                generation_id: format!("generation-{}", done.transaction_id)
+            })
+        );
+        let flip = done.flip.as_ref().context("no flip evidence")?;
+        assert_eq!(flip.release_id, sealed.sealed_release_id);
+        assert_eq!(flip.previous_release_id, None);
+        assert_eq!(flip.carried_sha256.as_deref(), Some(sha256_of(SITE_CONFIG_TWO).as_str()));
+        assert_eq!(flip.carry_source, w.site_config());
+        assert!(done.deployment_authorization.is_some(), "the brake was not consumed");
+        assert_eq!(w.current_release().as_deref(), Some(sealed.sealed_release_id.as_str()));
+        let carried = w.current_link().join("config.json");
+        assert_eq!(std::fs::read(&carried)?, SITE_CONFIG_TWO);
+        assert!(std::fs::symlink_metadata(&carried)?.is_file(), "the carry must be a copy, not a link to the site file");
+
+        // A static release runs nothing: no workload evidence, no admitted
+        // generation, no route program was touched.
+        assert!(
+            done.expected.is_none()
+                && done.activation.is_none()
+                && done.workload.is_none()
+                && done.warming.is_none()
+                && done.isolation.is_none()
+                && done.fencing.is_none()
+                && done.leasing.is_none()
+                && done.ready.is_none()
+                && done.routing.is_none()
+                && done.expected_publication_sha256.is_none()
+        );
+        assert!(ControlSnapshot::read(&w.world.state_store)?.admitted_for("service").is_none());
+        assert_eq!(w.world.route_stubs.count(""), 0, "the static path ran a host program");
+        assert!(done.is_terminal(), "the post-commit cleanup did not finish: {done:?}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_second_deploy_records_the_release_it_replaced() -> Result<()> {
+        let w = static_world()?;
+        let first = w.run_to_brake(&w.transaction_of("up-service")?)?;
+        w.release_brake(&first)?;
+        w.tick_until(&first.transaction_id, "the first completion", |t| t.is_terminal())?;
+        let first_done = latest_id(&w.world, &first.transaction_id)?;
+        let first_release = first_done.flip.context("no first flip")?.release_id;
+        assert_eq!(w.current_release().as_deref(), Some(first_release.as_str()));
+
+        enqueue_deploy(&w.world, "up-service-2")?;
+        let second_id = w.transaction_of("up-service-2")?;
+        let second = w.run_to_brake(&second_id)?;
+        // The first deployment's brake release names the first transaction
+        // and cannot release the second.
+        assert_eq!(w.current_release().as_deref(), Some(first_release.as_str()));
+        w.release_brake(&second)?;
+        w.tick_until(&second_id, "the second completion", |t| t.is_terminal())?;
+        let second_done = latest_id(&w.world, &second_id)?;
+        let flip = second_done.flip.context("no second flip")?;
+        assert_eq!(flip.previous_release_id.as_deref(), Some(first_release.as_str()));
+        assert_ne!(flip.release_id, first_release);
+        assert_eq!(w.current_release().as_deref(), Some(flip.release_id.as_str()));
+        // The first release is still on disk: rollback is a flip back to it.
+        assert!(w.site.join("releases").join(&first_release).join("dist/index.html").is_file());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_failed_flip_leaves_current_and_ends_before_fencing() -> Result<()> {
+        let w = static_world()?;
+        let first = w.run_to_brake(&w.transaction_of("up-service")?)?;
+        w.release_brake(&first)?;
+        w.tick_until(&first.transaction_id, "the first completion", |t| t.is_terminal())?;
+        let incumbent = w.current_release().context("no incumbent release")?;
+
+        enqueue_deploy(&w.world, "up-service-2")?;
+        let second_id = w.transaction_of("up-service-2")?;
+        let second = w.run_to_brake(&second_id)?;
+        // The operator's site file vanishes before the flip.
+        std::fs::remove_file(w.site_config())?;
+        w.release_brake(&second)?;
+        w.tick_until(&second_id, "the second end", |t| t.is_terminal())?;
+
+        let ended = latest_id(&w.world, &second_id)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the flip did not end before fencing: {ended:?}");
+        };
+        assert!(error.contains("carry source"), "{error}");
+        assert_eq!(w.current_release().as_deref(), Some(incumbent.as_str()), "a failed flip moved current");
+        assert!(ended.is_terminal(), "the abort cleanup did not finish");
+        let abort = ended.pre_fencing_abort.as_ref().context("no pre-fencing abort")?;
+        assert!(abort.is_complete());
+        let flip = ended.flip.as_ref().context("the intent was not recorded before the act")?;
+        assert_eq!(flip.previous_release_id.as_deref(), Some(incumbent.as_str()));
+        assert!(!flip.landed(), "a failed flip claims it landed");
+        assert!(
+            !w.site.join("releases").join(&flip.release_id).join("config.json").exists(),
+            "a failed flip left a carry"
+        );
+        Ok(())
+    }
+
+    // END static-release tests
 }
