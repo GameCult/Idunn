@@ -1455,6 +1455,27 @@ impl OperatorBinding {
                     && steward.store != self.brakes.lifecycle_store,
                 "steward brake store is identical to another brake store"
             );
+            // The steward owns its store's directory, so it could unlink any
+            // file there. Every other authority store must therefore live
+            // outside that directory, and the steward's directory must be
+            // clear of every directory an operator store lives in.
+            let steward_dir = steward.store.parent().unwrap_or(&steward.store);
+            let others = [
+                Some(&self.brakes.deployment_store),
+                Some(&self.brakes.lifecycle_store),
+                Some(&self.runtime_identity.trust_anchor_store),
+                self.process_write_lease.as_ref().map(|lease| &lease.record_path),
+                self.repository.release_authority_store.as_ref(),
+            ];
+            for other in others.into_iter().flatten() {
+                let other_dir = other.parent().unwrap_or(other);
+                ensure!(
+                    !paths_overlap(steward_dir, other_dir),
+                    "steward brake directory {} is shared with or nested in the directory of Idunn authority {}: the steward owns its directory and could remove that file",
+                    steward_dir.display(),
+                    other.display()
+                );
+            }
         }
         self.workload.validate_launch_environment()?;
         let workload = match &self.workload {
@@ -3124,6 +3145,24 @@ nodes = ["yggdrasil"]
         ] {
             assert!(OperatorBinding::parse(&with(&bad)).is_err(), "{bad}");
         }
+        // A steward directory shared with, or enclosing, an operator store
+        // lets the steward unlink a root-owned file: refused.
+        for (deployment, steward_store) in [
+            ("/var/lib/gamecult/steward-x/op.cc", "/var/lib/gamecult/steward-x/s.cc"),
+            ("/var/lib/gamecult/steward-x/sub/op.cc", "/var/lib/gamecult/steward-x/s.cc"),
+            ("/var/lib/gamecult/op.cc", "/var/lib/gamecult/steward-x/s.cc"),
+        ] {
+            let shared = BINDING
+                .replace("/var/lib/gamecult/idunn-authority/test-service-deployment-brake.cc", deployment)
+                .replace("\n[rollout]", &format!("\n[brakes.steward]\nuser = \"mind\"\nstore = \"{steward_store}\"\n\n[rollout]"));
+            assert!(OperatorBinding::parse(&shared).is_err(), "{deployment} {steward_store}");
+        }
+        // Disjoint directories are the one admitted shape.
+        let disjoint = BINDING.replace(
+            "\n[rollout]",
+            "\n[brakes.steward]\nuser = \"mind\"\nstore = \"/var/lib/gamecult/steward-x/s.cc\"\n\n[rollout]",
+        );
+        OperatorBinding::parse(&disjoint).unwrap();
         // steward_store_overlap_with_workload_path_refused
         let overlapping = BINDING
             .replace("\n[rollout]", &format!("\n[brakes.steward]\nuser = \"mind\"\nstore = \"{store}\"\n\n[rollout]"))

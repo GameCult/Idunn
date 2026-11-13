@@ -130,27 +130,68 @@ impl Stop {
     }
 }
 
+/// One stop a binding names, with how to name it in a wait note.
+pub(crate) struct NamedStop {
+    pub(crate) label: String,
+    /// The login the file system proves wrote the store: the steward user, whose
+    /// uid owns the file. None for the operator's store, whose record carries
+    /// only the verb's own claim of `by`.
+    pub(crate) proven_writer: Option<String>,
+    pub(crate) stop: Stop,
+}
+
+impl NamedStop {
+    /// The wait-note line for a stop that does not admit; None when it admits.
+    /// A steward stop is named by the proven owner, never by the record's `by`.
+    pub(crate) fn note(&self) -> Option<String> {
+        let label = &self.label;
+        match &self.stop {
+            Stop::Absent | Stop::Clear(_) => None,
+            Stop::Engaged(held) => Some(match &self.proven_writer {
+                Some(_) => format!("{label} engaged: {}", held.reason),
+                None => format!("{label} engaged by {}: {}", held.by, held.reason),
+            }),
+            Stop::Unreadable(why) => Some(format!("{label} is unreadable and fails closed: {why}")),
+        }
+    }
+}
+
 /// Every stop a binding names, each with the words that identify its store in
 /// a wait note: the operator's, then the steward's when the binding names one.
 /// Deployments admit iff every one admits. The operator's store is read as
 /// owned by this process's uid; the steward's as owned by the steward user's
 /// uid, so the file system proves who wrote it. A steward that does not
 /// resolve to a non-root uid is an unreadable stop, never an absent one.
-pub(crate) fn read_stops(brakes: &BrakeBinding, runtime_id: &str) -> Vec<(String, Stop)> {
-    let mut stops = vec![(
-        "deployment brake".to_string(),
-        read_stop(&brakes.deployment_store, runtime_id, process_uid()),
-    )];
+pub(crate) fn read_stops(brakes: &BrakeBinding, runtime_id: &str) -> Vec<NamedStop> {
+    let mut stops = vec![NamedStop {
+        label: "deployment brake".to_string(),
+        proven_writer: None,
+        stop: read_stop(&brakes.deployment_store, runtime_id, process_uid()),
+    }];
     if let Some(steward) = &brakes.steward {
         let label = format!("steward {} deployment brake", steward.user);
         let stop = match crate::steward_orders::user_uid(&steward.user) {
-            Ok(uid) => read_stop(&steward.store, runtime_id, uid),
+            Ok(uid) => read_stop_with_remedy(&steward.store, runtime_id, uid, |path| {
+                // Only the owner uid can mend it: a clear run as root leaves a
+                // root-owned file, which this reader refuses again.
+                format!(
+                    "only {} (the store's owner uid) can repair it, by running as that user: \
+                     idunn-provision deployment-brake-clear --store {} --runtime-id {runtime_id} \
+                     --reason <text>; a clear run as root stays unreadable",
+                    steward.user,
+                    path.display()
+                )
+            }),
             Err(why) => Stop::Unreadable(format!(
                 "{why:#}; the binding's steward user {} must be a non-root login",
                 steward.user
             )),
         };
-        stops.push((label, stop));
+        stops.push(NamedStop {
+            label,
+            proven_writer: Some(steward.user.clone()),
+            stop,
+        });
     }
     stops
 }
@@ -264,15 +305,26 @@ fn read_checked(path: &Path, runtime_id: &str, owner: u32) -> Result<Option<Depl
 }
 
 pub(crate) fn read_stop(path: &Path, runtime_id: &str, expected_owner_uid: u32) -> Stop {
+    read_stop_with_remedy(path, runtime_id, expected_owner_uid, |path| {
+        format!(
+            "to replace it run: idunn-provision deployment-brake-clear \
+             --store {} --runtime-id {runtime_id} --reason <text> (or deployment-brake-engage)",
+            path.display()
+        )
+    })
+}
+
+fn read_stop_with_remedy(
+    path: &Path,
+    runtime_id: &str,
+    expected_owner_uid: u32,
+    remedy: impl FnOnce(&Path) -> String,
+) -> Stop {
     match read_checked(path, runtime_id, expected_owner_uid) {
         Ok(None) => Stop::Absent,
         Ok(Some(record)) if record.state == StopState::Clear => Stop::Clear(record),
         Ok(Some(record)) => Stop::Engaged(record),
-        Err(error) => Stop::Unreadable(format!(
-            "{error:#}; to replace it run: idunn-provision deployment-brake-clear \
-             --store {} --runtime-id {runtime_id} --reason <text> (or deployment-brake-engage)",
-            path.display()
-        )),
+        Err(error) => Stop::Unreadable(format!("{error:#}; {}", remedy(path))),
     }
 }
 
@@ -424,14 +476,15 @@ mod tests {
         }
     }
 
-    fn admits_all(stops: &[(String, Stop)]) -> bool {
-        stops.iter().all(|(_, stop)| stop.admits())
+    fn admits_all(stops: &[NamedStop]) -> bool {
+        stops.iter().all(|named| named.stop.admits())
     }
 
     #[test]
     fn the_steward_store_is_a_second_stop_and_the_operator_store_is_one_it_cannot_clear() -> Result<()> {
         let me = process_uid();
         if me == 0 {
+            eprintln!("SKIPPED: a steward is never root, and this run is root");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -443,13 +496,17 @@ mod tests {
         replace_stop(steward, "runtime", StopState::Engaged, "steward freeze", 10)?;
         let stops = read_stops(&binding, "runtime");
         assert!(!admits_all(&stops));
-        assert!(matches!(&stops[1], (label, Stop::Engaged(held))
-            if label.starts_with("steward ") && held.reason == "steward freeze" && held.by == login_name(me)?));
+        assert!(matches!(&stops[1].stop, Stop::Engaged(held) if held.reason == "steward freeze"));
+        // The note names the proven owner, and never the record's claimed `by`.
+        assert_eq!(
+            stops[1].note().unwrap(),
+            format!("steward {} deployment brake engaged: steward freeze", login_name(me)?)
+        );
         // Both engaged, then the steward clears its own: the operator's holds.
         replace_stop(operator, "runtime", StopState::Engaged, "operator hold", 11)?;
         replace_stop(steward, "runtime", StopState::Clear, "steward thaw", 12)?;
         let stops = read_stops(&binding, "runtime");
-        assert!(matches!(&stops[0].1, Stop::Engaged(_)) && matches!(&stops[1].1, Stop::Clear(_)));
+        assert!(matches!(&stops[0].stop, Stop::Engaged(_)) && matches!(&stops[1].stop, Stop::Clear(_)));
         assert!(!admits_all(&stops));
         // The other order: operator clear, steward engaged still halts.
         replace_stop(operator, "runtime", StopState::Clear, "operator thaw", 13)?;
@@ -468,14 +525,21 @@ mod tests {
         // Steward is "nobody" (a real non-root user that is not the writer);
         // the file is written by this process, so even a Clear record fails.
         if me == 65534 || user_missing("nobody") {
+            eprintln!("SKIPPED: needs a user `nobody` other than the caller");
             return Ok(());
         }
         let binding = binding_with_steward(dir.path(), "nobody");
         let steward = &binding.steward.as_ref().unwrap().store;
         replace_stop(steward, "runtime", StopState::Clear, "forged clear", 10)?;
         let stops = read_stops(&binding, "runtime");
-        assert!(matches!(&stops[1].1, Stop::Unreadable(why) if why.contains("is owned by uid")
+        assert!(matches!(&stops[1].stop, Stop::Unreadable(why) if why.contains("is owned by uid")
+            && why.contains("only nobody (the store's owner uid) can repair it")
+            && why.contains("stays unreadable")
             && why.contains("idunn-provision deployment-brake-clear")));
+        // The operator's stop keeps the operator's remedy.
+        replace_stop(&binding.deployment_store, "other-runtime", StopState::Clear, "x", 11)?;
+        assert!(matches!(&read_stops(&binding, "runtime")[0].stop, Stop::Unreadable(why)
+            if why.contains("to replace it run:") && !why.contains("only ")));
         assert!(!admits_all(&stops));
         Ok(())
     }
@@ -490,7 +554,7 @@ mod tests {
         for user in ["no-such-login-zz", "root"] {
             let binding = binding_with_steward(dir.path(), user);
             let stops = read_stops(&binding, "runtime");
-            assert!(matches!(&stops[1].1, Stop::Unreadable(_)), "{user}");
+            assert!(matches!(&stops[1].stop, Stop::Unreadable(_)), "{user}");
             assert!(!admits_all(&stops));
         }
         Ok(())
