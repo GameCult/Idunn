@@ -666,6 +666,11 @@ pub trait StaticReleasePort {
     fn carry_and_flip(&self, binding: &StaticReleaseBinding, release_id: &str)
     -> Result<StaticFlip>;
 
+    /// The release is installed where the binding says and every artifact in it
+    /// still digests to its sealed receipt. A rollback reuses a release sealed
+    /// long ago, so this is the check that it is still what was released.
+    fn verify_installed(&self, binding: &StaticReleaseBinding, release: &SealedRelease) -> Result<()>;
+
     /// The digest of the carry already inside an installed release: what a
     /// resumed flip records when an earlier attempt landed.
     fn carried_sha256(&self, binding: &StaticReleaseBinding, release_id: &str) -> Result<String>;
@@ -713,6 +718,27 @@ impl StaticReleasePort for FilesystemStaticRelease {
             .context("current link names no release")?;
         require_sha256_id(id, "release named by the current link")?;
         Ok(Some(id.to_owned()))
+    }
+
+    fn verify_installed(&self, binding: &StaticReleaseBinding, release: &SealedRelease) -> Result<()> {
+        let root = binding.release_root.join(&release.sealed_release_id);
+        ensure!(
+            fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.is_dir()),
+            "release {} is no longer installed under {}",
+            release.sealed_release_id,
+            binding.release_root.display()
+        );
+        for artifact in &release.artifacts {
+            let (sha256, size_bytes) = digest_artifact(&root.join(&artifact.destination))
+                .with_context(|| format!("digesting installed artifact {}", artifact.artifact_id))?;
+            ensure!(
+                format!("sha256-{sha256}") == artifact.sha256 && size_bytes == artifact.size_bytes,
+                "installed artifact {} of release {} differs from its sealed receipt",
+                artifact.artifact_id,
+                release.sealed_release_id
+            );
+        }
+        Ok(())
     }
 
     fn carried_sha256(&self, binding: &StaticReleaseBinding, release_id: &str) -> Result<String> {
@@ -854,6 +880,10 @@ impl StaticReleasePort for FilesystemStaticRelease {
     }
 
     fn carried_sha256(&self, _: &StaticReleaseBinding, _: &str) -> Result<String> {
+        bail!("a static release flip requires Unix symlinks")
+    }
+
+    fn verify_installed(&self, _: &StaticReleaseBinding, _: &SealedRelease) -> Result<()> {
         bail!("a static release flip requires Unix symlinks")
     }
 }

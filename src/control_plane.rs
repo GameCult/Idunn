@@ -143,9 +143,11 @@ struct DeploymentCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum CommandKind {
+pub(crate) enum CommandKind {
     Deploy,
     Continuity,
+    /// Flip a static release's current link back to the release it replaced.
+    Rollback,
 }
 
 impl DeploymentCommand {
@@ -163,8 +165,13 @@ impl DeploymentCommand {
         );
         match self.kind {
             CommandKind::Deploy => ensure!(
-                !self.command_id.starts_with("continuity-"),
-                "operator deployment uses the continuity command namespace"
+                !self.command_id.starts_with("continuity-")
+                    && !self.command_id.starts_with("rollback-"),
+                "operator deployment uses a reserved command namespace"
+            ),
+            CommandKind::Rollback => ensure!(
+                self.command_id.starts_with("rollback-") && !self.selector.starts_with("profile:"),
+                "rollback command identity or selector is invalid"
             ),
             CommandKind::Continuity => ensure!(
                 self.command_id.starts_with("continuity-")
@@ -2108,8 +2115,8 @@ impl DeploymentTransaction {
         let issued = leasing.and_then(LeasingEvidence::issued_lease).is_some();
         match self.command_kind {
             CommandKind::Continuity => PhaseEnd::RetryForward,
-            CommandKind::Deploy if issued => PhaseEnd::OperatorRequired,
-            CommandKind::Deploy => PhaseEnd::Abort {
+            CommandKind::Deploy | CommandKind::Rollback if issued => PhaseEnd::OperatorRequired,
+            CommandKind::Deploy | CommandKind::Rollback => PhaseEnd::Abort {
                 lease_not_adopted: granted && self.lease_adoption.is_none(),
             },
         }
@@ -2232,13 +2239,25 @@ impl DeploymentTransaction {
         Ok(transaction)
     }
 
+    /// A rollback: the release that was flipped before, reused exactly (its
+    /// plan, sealed release and installed release are the prior transaction's),
+    /// with no source to freeze and nothing to build.
+    fn from_rollback(command: &DeploymentCommand, prior: &DeploymentTransaction, now: u64) -> Result<Self> {
+        let mut transaction = Self::new(command, prior.target.clone(), 0, None, now)?;
+        transaction.plan = prior.plan.clone();
+        transaction.sealed_release = prior.sealed_release.clone();
+        transaction.installed_release = prior.installed_release.clone();
+        transaction.validate()?;
+        Ok(transaction)
+    }
+
     /// Whether an abort owes the projection a reconciliation. A deployment
     /// published its own Expected key. A continuity shares the admitted key,
     /// whose Expected is never withdrawn, so it owes only the demotion of the
     /// activation it issued.
     fn abort_topology_reconciliation(&self) -> CleanupEvidence {
         let owes = match self.command_kind {
-            CommandKind::Deploy => self.expected_publication_sha256.is_some(),
+            CommandKind::Deploy | CommandKind::Rollback => self.expected_publication_sha256.is_some(),
             CommandKind::Continuity => self.activation.is_some(),
         };
         if owes {
@@ -2383,8 +2402,14 @@ impl DeploymentTransaction {
     /// Sealing, Starting (the flip, behind the brake) and Complete.
     fn validate_static(&self) -> Result<()> {
         ensure!(
-            self.command_kind == CommandKind::Deploy,
+            self.command_kind != CommandKind::Continuity,
             "a static release has no continuity"
+        );
+        // A deploy sealed its own source; a rollback reuses a release already
+        // sealed and installed, so it never froze one.
+        ensure!(
+            self.command_kind != CommandKind::Rollback || self.frozen_source.is_none(),
+            "a rollback never freezes a source"
         );
         ensure!(
             self.expected.is_none()
@@ -2417,7 +2442,7 @@ impl DeploymentTransaction {
                 self.plan.is_some()
                     && self.sealed_release.is_some()
                     && self.installed_release.is_some()
-                    && self.frozen_source.is_some()
+                    && (self.command_kind == CommandKind::Rollback || self.frozen_source.is_some())
                     && self.deployment_authorization.is_some(),
                 "static release entered Starting without sealed release evidence and brake consumption"
             );
@@ -2687,7 +2712,7 @@ impl DeploymentTransaction {
                     (
                         CommandKind::Deploy,
                         CleanupEvidence::Pending | CleanupEvidence::Complete
-                    ) | (CommandKind::Continuity, CleanupEvidence::Skipped)
+                    ) | (CommandKind::Continuity | CommandKind::Rollback, CleanupEvidence::Skipped)
                 ) || (self.command_kind == CommandKind::Deploy
                     && abort.source_cleanup == CleanupEvidence::Skipped
                     && self.plan.is_none()
@@ -2796,6 +2821,7 @@ impl DeploymentTransaction {
                             self.frozen_source.is_some() && self.deployment_authorization.is_some(),
                             "deployment entered Starting without frozen source and brake consumption"
                         ),
+                        CommandKind::Rollback => bail!("a rollback is a static release transaction"),
                         CommandKind::Continuity => ensure!(
                             self.lifecycle_authorized_at_unix_millis.is_some()
                                 && self.deployment_authorization.is_none(),
@@ -2909,7 +2935,7 @@ impl DeploymentTransaction {
                     (CommandKind::Deploy, SourceCleanupEvidence::Pending)
                         | (CommandKind::Deploy, SourceCleanupEvidence::Complete)
                         | (
-                            CommandKind::Continuity,
+                            CommandKind::Continuity | CommandKind::Rollback,
                             SourceCleanupEvidence::SkippedContinuity
                         )
                 ),
@@ -3223,6 +3249,7 @@ impl Default for RuntimeOptions {
 enum Command {
     Serve(RuntimeOptions),
     Up {
+        kind: CommandKind,
         selector: String,
         requested_by: String,
         state_store: PathBuf,
@@ -3258,6 +3285,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     match parse(args)? {
         Command::Serve(options) => serve(options),
         Command::Up {
+            kind,
             selector,
             requested_by,
             state_store,
@@ -3265,6 +3293,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             timeout_seconds,
         } => submit(
             &state_store,
+            kind,
             &selector,
             &requested_by,
             wait,
@@ -3342,8 +3371,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command> {
     let command = args.next().ok_or_else(|| anyhow!(usage()))?;
     match command.as_str() {
         "serve" => parse_serve(args),
-        "up" => parse_up(args),
+        "up" => parse_up(args, CommandKind::Deploy),
         "status" => parse_status(args),
+        "rollback" => parse_up(args, CommandKind::Rollback),
         "cancel" => parse_cancel(args),
         "expire" => parse_expire(args),
         "validate" => parse_validate(args),
@@ -3417,11 +3447,17 @@ fn parse_serve(mut args: impl Iterator<Item = String>) -> Result<Command> {
     Ok(Command::Serve(options))
 }
 
-fn parse_up(mut args: impl Iterator<Item = String>) -> Result<Command> {
+/// `idunn up <selector>` and `idunn rollback <target>`: both only write a command.
+fn parse_up(mut args: impl Iterator<Item = String>, kind: CommandKind) -> Result<Command> {
+    let verb = if kind == CommandKind::Rollback { "rollback" } else { "up" };
     let selector = args
         .next()
-        .ok_or_else(|| anyhow!("idunn up requires a service or profile selector"))?;
+        .ok_or_else(|| anyhow!("idunn {verb} requires a service{} selector", if kind == CommandKind::Rollback { "" } else { " or profile" }))?;
     require_selector(&selector)?;
+    ensure!(
+        kind != CommandKind::Rollback || !selector.starts_with("profile:"),
+        "a rollback names one target, not a profile"
+    );
     let mut state_store = RuntimeOptions::default().state_store;
     let mut requested_by = env::var("SUDO_USER")
         .or_else(|_| env::var("USER"))
@@ -3436,12 +3472,13 @@ fn parse_up(mut args: impl Iterator<Item = String>) -> Result<Command> {
             "--no-wait" => wait = false,
             "--timeout-seconds" => timeout_seconds = u64_value(&mut args, &argument)?,
             "--help" | "-h" => bail!(usage()),
-            _ => bail!("unknown Idunn up option {argument:?}"),
+            _ => bail!("unknown Idunn {verb} option {argument:?}"),
         }
     }
     ensure!(timeout_seconds > 0, "--timeout-seconds must be positive");
     require_value(&requested_by, "deployment requester")?;
     Ok(Command::Up {
+        kind,
         selector,
         requested_by,
         state_store,
@@ -3818,7 +3855,7 @@ impl ControlSnapshot {
                 "multiple transactions own the incumbent slot of one target"
             );
             let (seen, kind) = match transaction.value.command_kind {
-                CommandKind::Deploy => (&mut live_deploys, "deployments"),
+                CommandKind::Deploy | CommandKind::Rollback => (&mut live_deploys, "deployments"),
                 CommandKind::Continuity => (&mut live_continuities, "continuity transactions"),
             };
             ensure!(seen.insert(target), "multiple live {kind} for one target");
@@ -5078,6 +5115,7 @@ fn resolve_selector(
 /// deploy order both write theirs here. Returns the commit time.
 pub(crate) fn commit_deployment_command(
     store_path: &Path,
+    kind: CommandKind,
     command_id: &str,
     selector: &str,
     requested_by: &str,
@@ -5089,7 +5127,7 @@ pub(crate) fn commit_deployment_command(
     let command = DeploymentCommand {
         schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
         command_id: command_id.into(),
-        kind: CommandKind::Deploy,
+        kind,
         selector: selector.into(),
         requested_by: requested_by.into(),
         requested_at_unix_millis: now,
@@ -5125,13 +5163,15 @@ pub(crate) fn command_state(
 
 fn submit(
     store_path: &Path,
+    kind: CommandKind,
     selector: &str,
     requested_by: &str,
     wait: bool,
     timeout_seconds: u64,
 ) -> Result<()> {
-    let command_id = format!("up-{}", Uuid::new_v4());
-    let now = commit_deployment_command(store_path, &command_id, selector, requested_by)?;
+    let prefix = if kind == CommandKind::Rollback { "rollback" } else { "up" };
+    let command_id = format!("{prefix}-{}", Uuid::new_v4());
+    let now = commit_deployment_command(store_path, kind, &command_id, selector, requested_by)?;
     println!("{command_id}");
     if !wait {
         return Ok(());
@@ -5548,7 +5588,7 @@ struct EngineRouteGate<'a> {
 impl RouteActuationGate for EngineRouteGate<'_> {
     fn admit(&self, requested: RouteActuation) -> Result<()> {
         let kind = match self.command {
-            CommandKind::Deploy => requested,
+            CommandKind::Deploy | CommandKind::Rollback => requested,
             CommandKind::Continuity => RouteActuation::Survival,
         };
         self.engine.charge_route_actuation(self.target, kind)
@@ -6827,7 +6867,7 @@ impl Engine {
             .commands
             .iter()
             .filter(|stored| {
-                stored.value.kind == CommandKind::Deploy
+                stored.value.kind != CommandKind::Continuity
                     && !live_commands.contains(&stored.value.command_id)
             })
             .collect::<Vec<_>>();
@@ -6897,6 +6937,9 @@ impl Engine {
         snapshot: &ControlSnapshot,
         command: &Stored<DeploymentCommand>,
     ) -> Result<bool> {
+        if command.value.kind == CommandKind::Rollback {
+            return self.freeze_rollback(snapshot, command);
+        }
         let bindings = match load_bindings(&self.options.bindings_dir) {
             Ok(bindings) => bindings,
             Err(error) => {
@@ -6931,7 +6974,7 @@ impl Engine {
             .transactions
             .iter()
             .filter(|stored| {
-                stored.value.command_kind == CommandKind::Deploy && stored.value.is_live()
+                stored.value.command_kind != CommandKind::Continuity && stored.value.is_live()
             })
             .map(|stored| stored.value.target.as_str())
             .collect::<BTreeSet<_>>();
@@ -6970,6 +7013,106 @@ impl Engine {
             "queued command lost its ordered transaction creation CAS"
         );
         Ok(true)
+    }
+
+    /// Freeze a rollback command into its one transaction, or record why it
+    /// cannot be one. The previous release is derived from what was flipped
+    /// (control.cc and history.cc) and the link as observed, never stored.
+    fn freeze_rollback(
+        &self,
+        snapshot: &ControlSnapshot,
+        command: &Stored<DeploymentCommand>,
+    ) -> Result<bool> {
+        let target = command.value.selector.as_str();
+        if snapshot
+            .on_target(target)
+            .any(|stored| stored.value.command_kind != CommandKind::Continuity && stored.value.is_live())
+        {
+            return Ok(false);
+        }
+        let Some(history) = self.history_for_decision() else {
+            return Ok(false);
+        };
+        let now = now_millis()?;
+        let transaction = match self.rollback_source(snapshot, &history, target) {
+            Ok(prior) => DeploymentTransaction::from_rollback(&command.value, &prior, now)?,
+            Err(error) => DeploymentTransaction::rejected(&command.value, error, now)?,
+        };
+        ensure!(
+            SingleFileMessagePackBackingStore::new(&self.options.state_store).compare_exchange(
+                &[CultCacheExpectedEnvelope {
+                    r#type: DeploymentTransaction::TYPE.into(),
+                    key: transaction.transaction_id.clone(),
+                    current: None,
+                }],
+                &[transaction_envelope(&transaction, now)?],
+            )?,
+            "rollback command lost its transaction creation CAS"
+        );
+        Ok(true)
+    }
+
+    /// The transaction that flipped the release before the newest one, when the
+    /// link still names the newest and that previous release is intact.
+    fn rollback_source(
+        &self,
+        snapshot: &ControlSnapshot,
+        history: &[DeploymentTransaction],
+        target: &str,
+    ) -> Result<DeploymentTransaction> {
+        let mut flipped = snapshot
+            .transactions
+            .iter()
+            .map(|stored| &stored.value)
+            .chain(history)
+            .filter(|transaction| {
+                transaction.target == target
+                    && matches!(transaction.completion, Some(TransactionCompletion::Admitted { .. }))
+                    && transaction.flip.as_ref().is_some_and(FlipEvidence::landed)
+                    && transaction.is_static()
+            })
+            .collect::<Vec<_>>();
+        flipped.sort_by_key(|transaction| {
+            (
+                transaction.flip.as_ref().and_then(|flip| flip.flipped_at_unix_millis),
+                transaction.created_at_unix_millis,
+            )
+        });
+        let newest = flipped
+            .last()
+            .with_context(|| format!("target {target} has no completed static release to roll back from"))?;
+        let flip = newest.flip.as_ref().expect("filtered to landed flips");
+        let previous = flip.previous_release_id.clone().with_context(|| {
+            format!("no previous release: {} is the first release {target} was flipped to", flip.release_id)
+        })?;
+        let binding = required(&newest.plan, "newest release plan")?.parsed_inputs()?.1;
+        let workload = binding.workload.static_release()?;
+        let observed = self.static_release.observe_current(workload)?;
+        ensure!(
+            observed.as_deref() == Some(flip.release_id.as_str()),
+            "current names {} but the newest flip was to {}; rollback does not guess",
+            observed.as_deref().unwrap_or("nothing"),
+            flip.release_id
+        );
+        let prior = flipped
+            .iter()
+            .rev()
+            .find(|transaction| transaction.flip.as_ref().is_some_and(|f| f.release_id == previous))
+            .with_context(|| format!("no record of a transaction that flipped the previous release {previous}"))?;
+        // The prior plan is reused verbatim, but the link was observed through
+        // the newest plan's binding: they must be the same release root and link.
+        let prior_binding = required(&prior.plan, "previous release plan")?.parsed_inputs()?.1;
+        let prior_workload = prior_binding.workload.static_release()?;
+        ensure!(
+            prior_workload.release_root == workload.release_root
+                && prior_workload.current_link == workload.current_link,
+            "the previous release was deployed under a different release root or current link than the newest; rollback does not cross bindings"
+        );
+        self.static_release.verify_installed(
+            workload,
+            required(&prior.sealed_release, "previous sealed release")?,
+        )?;
+        Ok((*prior).clone())
     }
 
     fn supervise_one_admitted_generation(&self) -> Result<bool> {
@@ -7782,7 +7925,7 @@ impl Engine {
         let now = now_millis()?;
         let mut next = current.value.clone();
         match current.value.command_kind {
-            CommandKind::Deploy => {
+            CommandKind::Deploy | CommandKind::Rollback => {
                 let Some(authorization) = self.deployment_authorization(current, now)? else {
                     return self.record_gate_wait(
                         current,
@@ -7916,6 +8059,9 @@ impl Engine {
         let workload = binding.workload.static_release()?;
         let now = now_millis()?;
         let Some(flip) = &current.value.flip else {
+            // Nothing has moved yet, so a refusal here ends the transaction
+            // honestly: the release is still what was sealed, or it is not.
+            self.static_release.verify_installed(workload, release)?;
             let previous_release_id = self.static_release.observe_current(workload)?;
             let release_id = release.sealed_release_id.clone();
             return self.persist_same_phase(current, |next| {
@@ -7966,7 +8112,10 @@ impl Engine {
         });
         complete.post_commit_cleanup = Some(PostCommitCleanup {
             incumbent: IncumbentCleanupEvidence::SkippedNoIncumbent,
-            source: SourceCleanupEvidence::Pending,
+            source: match current.value.command_kind {
+                CommandKind::Rollback => SourceCleanupEvidence::SkippedContinuity,
+                _ => SourceCleanupEvidence::Pending,
+            },
         });
         complete.retime(now);
         complete.validate()?;
@@ -8807,7 +8956,7 @@ impl Engine {
             },
             source: match commit_current.value.command_kind {
                 CommandKind::Deploy => SourceCleanupEvidence::Pending,
-                CommandKind::Continuity => SourceCleanupEvidence::SkippedContinuity,
+                CommandKind::Continuity | CommandKind::Rollback => SourceCleanupEvidence::SkippedContinuity,
             },
         };
         let mut complete = commit_current.value.clone();
@@ -10127,7 +10276,7 @@ impl Engine {
     fn settle_before_handover(&self, current: &Stored<DeploymentTransaction>) -> Result<bool> {
         let held = &current.value;
         match held.command_kind {
-            CommandKind::Deploy => {
+            CommandKind::Deploy | CommandKind::Rollback => {
                 if self.rebase_onto_admitted(current)? {
                     return Ok(true);
                 }
@@ -10188,11 +10337,11 @@ impl Engine {
             // Lost to a concurrent writer: the next step reads the new world.
             (Handover::Took | Handover::Lost, _) => Ok(()),
             // Wait, never abort: a pre-fencing error would end the deployment.
-            (Handover::OwnedBy(owner), CommandKind::Deploy) => {
+            (Handover::OwnedBy(owner), CommandKind::Deploy | CommandKind::Rollback) => {
                 self.wait_for_owner(current, &owner)
             }
             // The next step rebases onto the generation now admitted.
-            (Handover::Moved, CommandKind::Deploy) => Ok(()),
+            (Handover::Moved, CommandKind::Deploy | CommandKind::Rollback) => Ok(()),
             (Handover::OwnedBy(owner), CommandKind::Continuity) => {
                 bail!("continuity superseded: target {target} is owned by {owner}")
             }
@@ -10828,7 +10977,7 @@ fn reconcile_failed_candidate_projection(
 ) -> Result<()> {
     let expected = required(&transaction.expected, "failed Expected projection")?;
     match transaction.command_kind {
-        CommandKind::Deploy => topology
+        CommandKind::Deploy | CommandKind::Rollback => topology
             .withdraw_incarnation(
                 expected,
                 provider_anchor,
@@ -10932,7 +11081,7 @@ where
     F: FnOnce() -> Result<()>,
 {
     match command_kind {
-        CommandKind::Deploy => validation(),
+        CommandKind::Deploy | CommandKind::Rollback => validation(),
         CommandKind::Continuity => Ok(()),
     }
 }
@@ -11245,6 +11394,7 @@ fn usage() -> &'static str {
      idunn serve [runtime options] [--host-actuator-bind ADDR]\n\
      idunn up <service|profile:name> [--state-store PATH] [--no-wait]\n\
      idunn status [--state-store PATH] [--incident-store PATH] [--command ID]\n\
+     idunn rollback <static-target> [--state-store PATH] [--no-wait]\n\
      idunn cancel <command-id> [--state-store PATH]\n\
      idunn expire <command-id> [--state-store PATH]\n\
      idunn validate --recipe PATH [--binding PATH]\n\
@@ -11302,6 +11452,7 @@ mod tests {
             command_id: match kind {
                 CommandKind::Deploy => "up-test".into(),
                 CommandKind::Continuity => "continuity-test".into(),
+                CommandKind::Rollback => "rollback-test".into(),
             },
             kind,
             selector: "ghostlight".into(),
@@ -12491,14 +12642,14 @@ mod tests {
     fn deployment_commit_primitive_is_shared_and_never_overwrites() -> Result<()> {
         let temp = TempDir::new()?;
         let store = temp.path().join("control.cc");
-        commit_deployment_command(&store, "up-one", "vili", "steward:eureka order ord-1")?;
+        commit_deployment_command(&store, CommandKind::Deploy, "up-one", "vili", "steward:eureka order ord-1")?;
         let snapshot = ControlSnapshot::read(&store)?;
         assert_eq!(snapshot.commands.len(), 1);
         let command = &snapshot.commands[0].value;
         assert_eq!(command.command_id, "up-one");
         assert_eq!(command.selector, "vili");
         assert_eq!(command.requested_by, "steward:eureka order ord-1");
-        assert!(commit_deployment_command(&store, "up-one", "other", "x").is_err());
+        assert!(commit_deployment_command(&store, CommandKind::Deploy, "up-one", "other", "x").is_err());
         assert_eq!(ControlSnapshot::read(&store)?.commands.len(), 1);
         Ok(())
     }
@@ -14036,6 +14187,7 @@ mod tests {
             match kind {
                 CommandKind::Deploy => "up",
                 CommandKind::Continuity => "continuity",
+                CommandKind::Rollback => "rollback",
             },
             if incumbent.is_some() { "-again" } else { "" }
         );
@@ -14074,6 +14226,7 @@ mod tests {
             CommandKind::Continuity => {
                 transaction.lifecycle_authorized_at_unix_millis = Some(now);
             }
+            CommandKind::Rollback => unreachable!("service fixtures have no rollback"),
             CommandKind::Deploy => {
                 transaction.frozen_source = Some(FrozenSourceReceipt {
                     transaction_id: transaction.transaction_id.clone(),
@@ -21845,6 +21998,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 command_id: match kind {
                     CommandKind::Deploy => "up-service",
                     CommandKind::Continuity => "continuity-service",
+                    CommandKind::Rollback => "rollback-service",
                 }
                 .into(),
                 kind,
@@ -21858,6 +22012,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 CommandKind::Continuity => {
                     transaction.lifecycle_authorized_at_unix_millis = Some(now);
                 }
+                CommandKind::Rollback => unreachable!("service fixtures have no rollback"),
                 CommandKind::Deploy => {
                     transaction.frozen_source = Some(FrozenSourceReceipt {
                         transaction_id: transaction.transaction_id.clone(),
@@ -25930,13 +26085,79 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
 
         /// The Deploy command's transaction, by command id.
         fn transaction_of(&self, command_id: &str) -> Result<String> {
-            Ok(ControlSnapshot::read(&self.world.state_store)?
+            let live = ControlSnapshot::read(&self.world.state_store)?
                 .transactions
                 .into_iter()
-                .find(|stored| stored.value.command_id == command_id)
-                .context("no transaction for the command")?
-                .value
-                .transaction_id)
+                .map(|stored| stored.value);
+            live.chain(read_history_transactions(&self.world.state_store))
+                .find(|transaction| transaction.command_id == command_id)
+                .map(|transaction| transaction.transaction_id)
+                .context("no transaction for the command")
+        }
+
+        /// A full deploy through the brake, on the stand-in site.
+        fn deploy(&self, command_id: &str) -> Result<DeploymentTransaction> {
+            if command_id != "up-service" {
+                enqueue_deploy(&self.world, command_id)?;
+            }
+            let id = self.transaction_of(command_id)?;
+            let waiting = self.run_to_brake(&id)?;
+            self.release_brake(&waiting)?;
+            self.tick_until(&id, "the deploy end", |t| t.is_terminal())?;
+            latest_id(&self.world, &id)
+        }
+
+        /// Submit a rollback command and tick until the daemon freezes it.
+        fn submit_rollback(&self, command_id: &str) -> Result<String> {
+            commit_deployment_command(
+                &self.world.state_store,
+                CommandKind::Rollback,
+                command_id,
+                "service",
+                "operator",
+            )?;
+            for _ in 0..24 {
+                self.world.engine.resume_backoff.lock().unwrap().clear();
+                let _ = self.world.engine.run_scheduler_tick();
+                if let Ok(id) = self.transaction_of(command_id) {
+                    return Ok(id);
+                }
+            }
+            bail!("the rollback command was never frozen")
+        }
+
+        /// Roll back through the brake to the end.
+        fn rollback(&self, command_id: &str) -> Result<DeploymentTransaction> {
+            let id = self.submit_rollback(command_id)?;
+            let waiting = self.run_to_brake(&id)?;
+            self.release_brake(&waiting)?;
+            self.tick_until(&id, "the rollback end", |t| t.is_terminal())?;
+            latest_id(&self.world, &id)
+        }
+
+        fn release_dir(&self, release_id: &str) -> PathBuf {
+            self.site.join("releases").join(release_id)
+        }
+
+        /// Two deploys (config one, then two): current is the second release.
+        fn two_deploys(&self) -> Result<(String, String)> {
+            let first = self.deploy("up-service")?.flip.context("no first flip")?.release_id;
+            std::fs::write(self.site_config(), SITE_CONFIG_TWO)?;
+            let second = self.deploy("up-service-2")?.flip.context("no second flip")?.release_id;
+            assert_eq!(self.current_release().as_deref(), Some(second.as_str()));
+            Ok((first, second))
+        }
+
+        /// The terminal rejection a refused rollback is recorded as.
+        fn refusal_of(&self, command_id: &str) -> Result<String> {
+            let id = self.submit_rollback(command_id)?;
+            self.tick_until(&id, "the refusal", |t| t.is_terminal())?;
+            let refused = latest_id(&self.world, &id)?;
+            let Some(TransactionCompletion::FailedBeforeFencing { error }) = refused.completion else {
+                bail!("the rollback was not refused: {refused:?}");
+            };
+            assert!(refused.plan.is_none() && refused.flip.is_none());
+            Ok(error)
         }
 
         /// The operator releases the brake for this exact transaction.
@@ -26215,6 +26436,14 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         ) -> Result<String> {
             self.inner.carried_sha256(binding, release_id)
         }
+
+        fn verify_installed(
+            &self,
+            binding: &crate::deployment::StaticReleaseBinding,
+            release: &SealedRelease,
+        ) -> Result<()> {
+            self.inner.verify_installed(binding, release)
+        }
     }
 
     /// Drive the first Deploy through the brake to its end.
@@ -26349,6 +26578,219 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         assert!(printed.contains(&format!("waiting on {reason}")), "{printed}");
         let refused = cancel(&w.world.state_store, "up-service", "operator").unwrap_err();
         assert!(format!("{refused:#}").contains("can only be cancelled"), "{refused:#}");
+        Ok(())
+    }
+
+    const SITE_CONFIG_THREE: &[u8] = br#"{"api":"https://three.test"}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_flips_back_as_a_new_brake_gated_transaction() -> Result<()> {
+        let w = static_world()?;
+        let (first, second) = w.two_deploys()?;
+        let second_carry = std::fs::read(w.release_dir(&second).join("config.json"))?;
+        std::fs::write(w.site_config(), SITE_CONFIG_THREE)?;
+
+        let id = w.submit_rollback("rollback-1")?;
+        let waiting = w.run_to_brake(&id)?;
+        // At the brake: a new transaction of its own, nothing moved, nothing frozen.
+        assert_eq!(waiting.command_kind, CommandKind::Rollback);
+        assert!(waiting.frozen_source.is_none() && waiting.expected.is_none() && waiting.flip.is_none());
+        assert_eq!(waiting.sealed_release.as_ref().map(|r| r.sealed_release_id.as_str()), Some(first.as_str()));
+        assert_eq!(w.current_release().as_deref(), Some(second.as_str()), "a braked rollback moved current");
+        assert_eq!(std::fs::read(w.release_dir(&second).join("config.json"))?, second_carry);
+        let printed = {
+            let mut out = Vec::new();
+            status(&mut out, &w.world.state_store, &w.world.engine.options.incident_store, Some("rollback-1"))?;
+            String::from_utf8(out)?
+        };
+        assert!(printed.contains(&format!("release {first}")), "{printed}");
+
+        w.release_brake(&waiting)?;
+        w.tick_until(&id, "the rollback end", |t| t.is_terminal())?;
+        let done = latest_id(&w.world, &id)?;
+        assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
+        let flip = done.flip.as_ref().context("no flip")?;
+        assert_eq!((flip.release_id.as_str(), flip.previous_release_id.as_deref()), (first.as_str(), Some(second.as_str())));
+        // The carry is re-applied from the site file as it is now.
+        assert_eq!(flip.carried_sha256.as_deref(), Some(sha256_of(SITE_CONFIG_THREE).as_str()));
+        assert_eq!(w.current_release().as_deref(), Some(first.as_str()));
+        assert_eq!(std::fs::read(w.current_link().join("config.json"))?, SITE_CONFIG_THREE);
+        assert!(done.deployment_authorization.is_some(), "the brake was not consumed");
+        // Negatives: no source, no source cleanup, no generation, no pruning.
+        assert!(done.frozen_source.is_none());
+        assert_eq!(
+            done.post_commit_cleanup.as_ref().map(|c| c.source),
+            Some(SourceCleanupEvidence::SkippedContinuity)
+        );
+        assert!(ControlSnapshot::read(&w.world.state_store)?.admitted_for("service").is_none());
+        assert!(w.release_dir(&first).is_dir() && w.release_dir(&second).is_dir());
+        assert_eq!(w.world.route_stubs.count(""), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_of_a_rollback_flips_back() -> Result<()> {
+        let w = static_world()?;
+        let (first, second) = w.two_deploys()?;
+        let one = w.rollback("rollback-1")?;
+        assert_eq!(w.current_release().as_deref(), Some(first.as_str()));
+        assert!(matches!(one.completion, Some(TransactionCompletion::Admitted { .. })));
+        let two = w.rollback("rollback-2")?;
+        let flip = two.flip.as_ref().context("no flip")?;
+        assert_eq!((flip.release_id.as_str(), flip.previous_release_id.as_deref()), (second.as_str(), Some(first.as_str())));
+        assert_eq!(w.current_release().as_deref(), Some(second.as_str()));
+        // A third goes back again: the latest flip always names what it displaced.
+        w.rollback("rollback-3")?;
+        assert_eq!(w.current_release().as_deref(), Some(first.as_str()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_with_no_previous_release_is_a_typed_refusal() -> Result<()> {
+        let w = static_world()?;
+        let first = w.deploy("up-service")?.flip.context("no flip")?.release_id;
+        let error = w.refusal_of("rollback-1")?;
+        assert!(error.contains("no previous release"), "{error}");
+        assert_eq!(w.current_release().as_deref(), Some(first.as_str()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_refuses_when_current_is_not_the_newest_flip() -> Result<()> {
+        let w = static_world()?;
+        let (first, second) = w.two_deploys()?;
+        // The operator pointed current at the older release by hand.
+        std::fs::remove_file(w.current_link())?;
+        std::os::unix::fs::symlink(w.release_dir(&first), w.current_link())?;
+        let error = w.refusal_of("rollback-1")?;
+        assert!(error.contains("rollback does not guess") && error.contains(&second), "{error}");
+        assert_eq!(w.current_release().as_deref(), Some(first.as_str()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_refuses_a_previous_release_that_is_gone_or_drifted() -> Result<()> {
+        let w = static_world()?;
+        let (first, second) = w.two_deploys()?;
+        // Drift: a file in the previous release changed after it was sealed.
+        let page = w.release_dir(&first).join("dist/index.html");
+        std::fs::write(&page, b"tampered")?;
+        let error = w.refusal_of("rollback-1")?;
+        assert!(error.contains("differs from its sealed receipt"), "{error}");
+        // Gone: the directory was removed.
+        std::fs::remove_dir_all(w.release_dir(&first))?;
+        let error = w.refusal_of("rollback-2")?;
+        assert!(error.contains("no longer installed"), "{error}");
+        assert_eq!(w.current_release().as_deref(), Some(second.as_str()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_with_a_missing_site_file_fails_before_the_link_moves() -> Result<()> {
+        let w = static_world()?;
+        let (first, second) = w.two_deploys()?;
+        let id = w.submit_rollback("rollback-1")?;
+        let waiting = w.run_to_brake(&id)?;
+        // The operator moved the site file (the plan's carry source is the old one).
+        std::fs::remove_file(w.site_config())?;
+        w.release_brake(&waiting)?;
+        w.tick_until(&id, "the rollback end", |t| t.is_terminal())?;
+        let ended = latest_id(&w.world, &id)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the rollback did not fail before fencing: {ended:?}");
+        };
+        assert!(error.contains("carry source"), "{error}");
+        assert_eq!(w.current_release().as_deref(), Some(second.as_str()), "a failed rollback moved current");
+        assert!(!ended.flip.as_ref().is_some_and(FlipEvidence::landed));
+        assert!(w.release_dir(&first).is_dir());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_error_after_the_rename_still_completes() -> Result<()> {
+        let mut w = static_world()?;
+        let port = FaultyPort::new(false, 0);
+        w.world.engine.static_release = port.clone();
+        let (first, _) = w.two_deploys()?;
+        port.flip_fault_after_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        let done = w.rollback("rollback-1")?;
+        assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
+        assert!(done.pre_fencing_abort.is_none());
+        assert_eq!(w.current_release().as_deref(), Some(first.as_str()));
+        assert!(done.flip.as_ref().is_some_and(FlipEvidence::landed));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rollback_reads_one_target_and_refuses_a_profile() -> Result<()> {
+        let parsed = parse(["rollback", "site", "--no-wait", "--requested-by", "me"].into_iter().map(str::to_owned))?;
+        let Command::Up { kind, selector, requested_by, wait, .. } = parsed else {
+            bail!("expected a rollback command");
+        };
+        assert_eq!((kind, selector.as_str(), requested_by.as_str(), wait), (CommandKind::Rollback, "site", "me", false));
+        assert!(parse(["rollback", "profile:all"].into_iter().map(str::to_owned)).is_err());
+        assert!(parse(["rollback"].into_iter().map(str::to_owned)).is_err());
+        assert!(usage().contains("idunn rollback <static-target>"));
+        let command = |id: &str, kind| DeploymentCommand {
+            schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
+            command_id: id.into(),
+            kind,
+            selector: "site".into(),
+            requested_by: "me".into(),
+            requested_at_unix_millis: 100,
+        };
+        command("rollback-1", CommandKind::Rollback).validate()?;
+        assert!(command("up-1", CommandKind::Rollback).validate().is_err());
+        assert!(command("rollback-1", CommandKind::Deploy).validate().is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_drift_after_freezing_ends_before_fencing_with_current_untouched() -> Result<()> {
+        let w = static_world()?;
+        let (first, second) = w.two_deploys()?;
+        let id = w.submit_rollback("rollback-1")?;
+        let waiting = w.run_to_brake(&id)?;
+        // Frozen and intact; now the previous release drifts before Starting.
+        std::fs::write(w.release_dir(&first).join("dist/index.html"), b"tampered")?;
+        w.release_brake(&waiting)?;
+        w.tick_until(&id, "the rollback end", |t| t.is_terminal())?;
+        let ended = latest_id(&w.world, &id)?;
+        let Some(TransactionCompletion::FailedBeforeFencing { error }) = &ended.completion else {
+            bail!("the drifted rollback did not fail before fencing: {ended:?}");
+        };
+        assert!(error.contains("differs from its sealed receipt"), "{error}");
+        assert!(ended.flip.is_none());
+        assert_eq!(w.current_release().as_deref(), Some(second.as_str()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_rollback_refuses_a_previous_release_deployed_under_another_binding() -> Result<()> {
+        let w = static_world()?;
+        w.two_deploys()?;
+        let snapshot = ControlSnapshot::read(&w.world.state_store)?;
+        let mut history = read_history_transactions(&w.world.state_store);
+        // The older transaction's plan names another release root.
+        let older = history
+            .iter_mut()
+            .min_by_key(|t| t.created_at_unix_millis)
+            .context("no history")?;
+        let plan = older.plan.as_mut().context("no plan")?;
+        let text = String::from_utf8(plan.binding_blob.clone())?;
+        assert!(text.contains("/releases\""));
+        plan.binding_blob = text.replace("/releases\"", "/releases-old\"").into_bytes();
+        let error = w.world.engine.rollback_source(&snapshot, &history, "service").unwrap_err();
+        assert!(format!("{error:#}").contains("does not cross bindings"), "{error:#}");
         Ok(())
     }
     // END static-release tests

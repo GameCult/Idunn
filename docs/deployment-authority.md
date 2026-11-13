@@ -222,6 +222,46 @@ completes. A bounded retry is follow-up work. A new
 upstream tarball enters as a recipe `external_input` with a pinned url and
 sha256, so each release is a recipe commit whose pin is its provenance.
 
+### Rollback
+
+`idunn rollback <target> [--state-store PATH] [--no-wait]` writes a
+`rollback-` command and nothing else. The daemon freezes it into one new
+transaction (`CommandKind::Rollback`) that reuses the previous release exactly:
+the plan, sealed release and installed release are copied from the transaction
+that flipped it, so there is no source, no build and no source cleanup, and it
+creates no admitted generation. It starts at Sealing with that evidence and
+reaches the same deployment brake as a deploy, which the operator releases for
+the rollback transaction's id and the previous sealed release id; then
+`advance_static` flips, with the same three durable steps, the same
+nothing-aborts-after-the-rename rule and the same stuck-flip behavior.
+
+The previous release is derived, never stored: the newest Admitted static
+transaction for the target (control.cc and history.cc) names the release
+`current` must point at (`flip.release_id`) and the one it displaced
+(`flip.previous_release_id`); the newest transaction that flipped that release
+supplies the evidence. A rollback of a rollback therefore flips forward again.
+The command is refused, recorded as a rejected transaction, when the target has
+no completed static release, when the newest release is the first one, when
+`current` does not name the newest flip, when the previous release directory is
+gone, or when an artifact in it no longer digests to its sealed receipt. A
+failed check at flip time ends the transaction before fencing with `current`
+untouched.
+
+The rollback reuses the old plan verbatim, so its binding snapshot, brake path
+and carry source are the old ones: if the operator moved the site file the
+rollback fails before the link moves. The carry is re-applied from the site file
+as it is at rollback time, and its sha256 is recorded in the rollback's own
+flip evidence (it may differ from the original release's; the copy inside the
+rolled-back-to release is replaced). Nothing prunes release directories.
+
+`CommandKind::Rollback` is stored in the existing v5 command and transaction
+records with no schema change; an Idunn at 9f15cee or earlier cannot decode
+them, so this is forward-only, like v5 itself. The newest flip is ordered by
+`flipped_at` wall clock, and the observed-link check makes a clock step refuse
+the rollback rather than mis-flip. A rollback cannot be cancelled, like a static
+deploy. A rollback is also refused when the previous release was deployed under
+a different release root or current link than the newest one.
+
 ## Typed deployment state
 
 Mutable control-plane state will be CultCache. Runtime integration must use
