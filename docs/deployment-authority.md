@@ -299,6 +299,31 @@ names both content addresses and the executable artifact digest. Present and
 Ready remain Odin-owned correlations over independently verified runtime
 evidence; the deployment-plan module deliberately does not model them.
 
+## The deployment stop
+
+`src/brake.rs` is the only reader and writer of the stop. A stop halts work
+that has not crossed an irreversible step, and it is read again at each such
+step: Sealing (`advance_sealing`), the static flip intent (`advance_static`) and
+the entry into Fencing for a deploy (`advance_warming`). An engaged stop there
+makes the transaction wait with a note naming who engaged it and why; nothing
+aborts and nothing moves. After the flip intent is recorded, or once a deploy
+has fenced, the transaction runs to its end: a stop halts before the
+irreversible step, never mid-fence or mid-flip. Continuity is never gated.
+The sequence of a stop record is positive and advances by one per verb; nothing
+reads it for authority, so it is not validated further.
+
+Absent means the store file is missing in an existing directory. Anything else
+Idunn cannot judge (a symlink, a zero-length or undecodable file, another
+runtime's record, another owner, an unsearchable or non-directory parent) reads
+as unreadable and fails closed; the wait note carries the
+`idunn-provision deployment-brake-clear` command that replaces it.
+
+Record v6 (`deployment_admitted_at_unix_millis`, key 38) is forward-only: an
+Idunn that predates v6 cannot read a migrated `control.cc`, so, as for v5 (see
+`route-continuity-cut.md`, "An older Idunn refuses the v5 store"), take a
+byte-compared pre-install backup of `control.cc` and `history.cc` with Idunn
+stopped, and roll back by restoring the backup, never by swapping the binary.
+
 ## Initial drivers and replaceable boundary
 
 The first Yggdrasil implementation uses:

@@ -1160,7 +1160,7 @@ target's generation or to its `TargetSupervision` ends that target's iteration:
 - **Why no existing owner can serve:**
   - The generation does not exist for a first deploy (the ruling).
   - The transaction dies with each attempt.
-  - Brakes are operator-signed and are not Idunn's to write.
+  - The deployment brake is a stop that a steward or the operator writes (`src/brake.rs`); Idunn writes no brake.
 - **What it replaces:** two carry compensators, `for_new_incarnation` and the backoff copy in
   `from_transaction`, plus a history scan.
 

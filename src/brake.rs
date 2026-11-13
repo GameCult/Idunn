@@ -189,14 +189,40 @@ fn check_file(path: &Path, _: u32) -> Result<()> {
     Ok(())
 }
 
+/// Absent means exactly this: the final component does not exist and its
+/// parent is an existing directory. Every other failure to look (permission,
+/// a parent that is a file, a symlink loop) is a store this runtime cannot
+/// judge, and fails closed.
+fn is_absent(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+            let parent = parent.unwrap_or_else(|| Path::new("."));
+            ensure!(
+                std::fs::metadata(parent).is_ok_and(|m| m.is_dir()),
+                "deployment stop store directory {} does not exist",
+                parent.display()
+            );
+            Ok(true)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("looking for deployment stop store {}", path.display())),
+    }
+}
+
 fn read_checked(path: &Path, runtime_id: &str, owner: u32) -> Result<Option<DeploymentStop>> {
-    if std::fs::symlink_metadata(path).is_err() {
+    if is_absent(path)? {
         return Ok(None);
     }
     check_file(path, owner)?;
+    ensure!(
+        std::fs::metadata(path)?.len() > 0,
+        "deployment stop store is zero length"
+    );
     let entries = SingleFileMessagePackBackingStore::new(path).pull_all_read_only_snapshot()?;
     match entries.as_slice() {
-        [] => Ok(None),
+        [] => bail!("deployment stop store holds no record"),
         [entry] => {
             let record = DeploymentStop::decode(entry)?;
             ensure!(
@@ -215,15 +241,26 @@ pub(crate) fn read_stop(path: &Path, runtime_id: &str, expected_owner_uid: u32) 
         Ok(None) => Stop::Absent,
         Ok(Some(record)) if record.state == StopState::Clear => Stop::Clear(record),
         Ok(Some(record)) => Stop::Engaged(record),
-        Err(error) => Stop::Unreadable(format!("{error:#}")),
+        Err(error) => Stop::Unreadable(format!(
+            "{error:#}; to replace it run: idunn-provision deployment-brake-clear \
+             --store {} --runtime-id {runtime_id} --reason <text> (or deployment-brake-engage)",
+            path.display()
+        )),
     }
 }
 
 /// Write the next record under a compare-exchange of the whole store, so a
-/// concurrent verb or a store that moved since it was read is refused, and a
-/// foreign or corrupt predecessor is replaced only by an explicit verb. The
+/// concurrent verb or a store that moved since it was read is refused. The
 /// author is the login name of the process uid and the sequence is the
-/// predecessor's plus one; neither is an argument.
+/// predecessor's plus one (1 when there is none or it cannot be decoded);
+/// neither is an argument.
+///
+/// This is also the operator's break-glass. A predecessor that is a retired v1
+/// brake, another runtime's record, ambiguous, or zero length is replaced. A
+/// file that is not a CultCache store at all (junk bytes) is replaced only
+/// when it is a regular file owned by the caller, by removing it first. A
+/// symlink or another user's file is refused. The sequence is not validated
+/// beyond being positive: nothing reads it for authority.
 pub(crate) fn replace_stop(
     path: &Path,
     runtime_id: &str,
@@ -232,14 +269,22 @@ pub(crate) fn replace_stop(
     now_unix_millis: u64,
 ) -> Result<DeploymentStop> {
     let store = SingleFileMessagePackBackingStore::new(path);
-    let before = store.pull_all_read_only_snapshot()?;
+    let before = match store.pull_all_read_only_snapshot() {
+        Ok(entries) => entries,
+        Err(undecodable) => {
+            check_file(path, process_uid()).with_context(|| {
+                format!("deployment stop store is undecodable ({undecodable:#}) and not the caller's to replace")
+            })?;
+            std::fs::remove_file(path)?;
+            Vec::new()
+        }
+    };
     let sequence = match before.as_slice() {
-        [] => 1,
         [entry] => match DeploymentStop::decode(entry) {
             Ok(previous) => previous.sequence.saturating_add(1),
             Err(_) => 1,
         },
-        _ => bail!("deployment stop store is ambiguous"),
+        _ => 1,
     };
     let record = DeploymentStop {
         schema_version: DEPLOYMENT_STOP_SCHEMA.into(),
@@ -296,8 +341,12 @@ mod tests {
         engage(&path, "held", 100)?;
         // Another runtime's record.
         assert!(!read_stop(&path, "other", me).admits());
-        // Owned by someone other than the expected uid.
-        assert!(!read_stop(&path, "runtime", me + 1).admits());
+        // Owned by someone other than the expected uid: even a CLEAR record
+        // from a foreign owner must not admit.
+        let cleared = dir.path().join("cleared.cc");
+        replace_stop(&cleared, "runtime", StopState::Clear, "thaw", 100)?;
+        assert!(read_stop(&cleared, "runtime", me).admits());
+        assert!(matches!(read_stop(&cleared, "runtime", me + 1), Stop::Unreadable(_)));
         // A symlink to a valid, clear store.
         let real = dir.path().join("real.cc");
         replace_stop(&real, "runtime", StopState::Clear, "clear", 100)?;
@@ -384,6 +433,81 @@ mod tests {
         assert!(!store.compare_exchange_snapshot(&stale, &[next])?);
         assert!(replace_stop(&path, "runtime", StopState::Clear, "  ", 13).is_err());
         assert_eq!(DeploymentStop::decode(&store_entry(&path)?)?.reason, "moved");
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_missing_file_in_an_existing_directory_is_absent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let me = process_uid();
+        // Parent is a regular file: ENOTDIR, not absence.
+        let file = dir.path().join("plain");
+        std::fs::write(&file, b"x")?;
+        assert!(matches!(read_stop(&file.join("stop.cc"), "runtime", me), Stop::Unreadable(_)));
+        // Parent does not exist.
+        assert!(matches!(
+            read_stop(&dir.path().join("nope/stop.cc"), "runtime", me),
+            Stop::Unreadable(_)
+        ));
+        // Zero-length file.
+        let empty = dir.path().join("empty.cc");
+        std::fs::write(&empty, b"")?;
+        assert!(matches!(read_stop(&empty, "runtime", me), Stop::Unreadable(_)));
+        // An existing directory with no store is absent.
+        assert_eq!(read_stop(&dir.path().join("stop.cc"), "runtime", me), Stop::Absent);
+        // A parent that cannot be searched (skipped as root, which can).
+        #[cfg(unix)]
+        if me != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir(&locked)?;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))?;
+            let reading = read_stop(&locked.join("stop.cc"), "runtime", me);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))?;
+            assert!(matches!(reading, Stop::Unreadable(_)), "{reading:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_author_is_the_uid_login_never_the_environment() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("stop.cc");
+        // SAFETY: no other test reads USER, LOGNAME or LNAME.
+        unsafe {
+            std::env::set_var("USER", "spoof");
+            std::env::set_var("LOGNAME", "spoof");
+        }
+        let written = engage(&path, "held", 10)?;
+        assert_eq!(written.by, login_name(process_uid())?);
+        assert_ne!(written.by, "spoof");
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_names_the_command_and_a_break_glass_clear_replaces_junk_and_v1() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let me = process_uid();
+        let path = dir.path().join("stop.cc");
+        std::fs::write(&path, b"junk that is no store")?;
+        let Stop::Unreadable(why) = read_stop(&path, "runtime", me) else {
+            bail!("junk admitted")
+        };
+        assert!(why.contains("idunn-provision deployment-brake-clear --store"), "{why}");
+        assert!(why.contains("--runtime-id runtime"), "{why}");
+        let cleared = replace_stop(&path, "runtime", StopState::Clear, "operator break-glass", 50)?;
+        assert_eq!(cleared.sequence, 1);
+        assert!(read_stop(&path, "runtime", me).admits());
+        // A symlink is not the caller's to replace.
+        let real = dir.path().join("real.cc");
+        std::fs::write(&real, b"junk")?;
+        let link = dir.path().join("link.cc");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &link)?;
+            assert!(replace_stop(&link, "runtime", StopState::Clear, "x", 60).is_err());
+            assert_eq!(std::fs::read(&real)?, b"junk");
+        }
         Ok(())
     }
 }

@@ -8028,26 +8028,10 @@ impl Engine {
         let mut next = current.value.clone();
         match current.value.command_kind {
             CommandKind::Deploy | CommandKind::Rollback => {
-                match self.deployment_stop(current)? {
-                    Stop::Absent | Stop::Clear(_) => {
-                        next.deployment_admitted_at_unix_millis = Some(now)
-                    }
-                    Stop::Engaged(held) => {
-                        return self.record_gate_wait(
-                            current,
-                            &format!(
-                                "deployment brake engaged by {}: {}",
-                                held.by, held.reason
-                            ),
-                        );
-                    }
-                    Stop::Unreadable(why) => {
-                        return self.record_gate_wait(
-                            current,
-                            &format!("deployment brake is unreadable and fails closed: {why}"),
-                        );
-                    }
+                if let Some(note) = self.stop_note(current)? {
+                    return self.record_gate_wait(current, &note);
                 }
+                next.deployment_admitted_at_unix_millis = Some(now);
             }
             CommandKind::Continuity => {
                 if !self.lifecycle_allows(current, now)? {
@@ -8176,6 +8160,11 @@ impl Engine {
         let Some(flip) = &current.value.flip else {
             // Nothing has moved yet, so a refusal here ends the transaction
             // honestly: the release is still what was sealed, or it is not.
+            // The flip intent is the last point a stop can halt a static
+            // release: once it is recorded the flip runs to its end.
+            if let Some(note) = self.stop_note(current)? {
+                return self.record_gate_wait(current, &note);
+            }
             self.static_release.verify_installed(workload, release)?;
             let previous_release_id = self.static_release.observe_current(workload)?;
             let release_id = release.sealed_release_id.clone();
@@ -8188,6 +8177,7 @@ impl Engine {
                     flipped_at_unix_millis: None,
                 });
                 next.updated_at_unix_millis = now;
+                next.last_error = None;
                 Ok(())
             });
         };
@@ -8418,6 +8408,14 @@ impl Engine {
             });
         }
 
+        // Fencing is the last pre-fencing abort-able point of a deploy: an
+        // engaged stop halts here, before the incumbent is fenced. A fenced
+        // deploy runs to its end. Continuity is never gated by this stop.
+        if current.value.command_kind == CommandKind::Deploy
+            && let Some(note) = self.stop_note(current)?
+        {
+            return self.record_gate_wait(current, &note);
+        }
         self.transition(current, DeploymentPhase::Fencing)
     }
 
@@ -9341,6 +9339,22 @@ impl Engine {
             .find(|port| !used.contains(port))
             .map(Some)
             .context("no private candidate port remains in the operator range")
+    }
+
+    /// Why the deployment stop holds this transaction, or None when it admits.
+    /// Read live at each point that is still reversible: Sealing, the static
+    /// flip intent and the entry into Fencing.
+    fn stop_note(&self, current: &Stored<DeploymentTransaction>) -> Result<Option<String>> {
+        Ok(match self.deployment_stop(current)? {
+            Stop::Absent | Stop::Clear(_) => None,
+            Stop::Engaged(held) => Some(format!(
+                "deployment brake engaged by {}: {}",
+                held.by, held.reason
+            )),
+            Stop::Unreadable(why) => Some(format!(
+                "deployment brake is unreadable and fails closed: {why}"
+            )),
+        })
     }
 
     /// What the binding's deployment stop says about this transaction's
@@ -14111,6 +14125,10 @@ mod tests {
                     .split_once("[brakes]")
                     .context("binding has no brakes table")?
                     .1
+            )
+            .replace(
+                "/var/lib/gamecult/idunn/service-deployment-brake.cc",
+                &world.root.join("service-deployment-brake.cc").display().to_string(),
             ),
         )?;
         let recipe = RECIPE
@@ -19997,6 +20015,66 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         workload.spare(&candidate.runtime_instance_id);
         workload.kill();
         Ok(deploy)
+    }
+
+    /// An engaged stop halts a deploy before it fences, the last pre-fencing
+    /// abort-able point; clearing lets the same transaction fence.
+    #[test]
+    fn an_engaged_stop_halts_entry_into_fencing_and_a_clear_lets_it_through() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let deploy = dead_incumbent_with_a_deployment_ready_to_fence(&workload, &world)?;
+        let plan = deploy.plan.as_ref().context("no plan")?;
+        set_stop(plan, StopState::Engaged, "freeze before fencing")?;
+        for _ in 0..3 {
+            world.engine.run_scheduler_tick()?;
+        }
+        let held = resident_id(&world, &deploy.transaction_id)?.value;
+        assert_eq!(held.phase, DeploymentPhase::Warming);
+        assert!(held.pre_fencing_abort.is_none() && held.completion.is_none());
+        assert!(
+            held.last_error.as_deref().is_some_and(|note| note.contains("deployment brake engaged by")
+                && note.contains("freeze before fencing")),
+            "{:?}",
+            held.last_error
+        );
+        set_stop(plan, StopState::Clear, "thaw")?;
+        assert!(world.engine.run_scheduler_tick()?);
+        assert_eq!(resident_id(&world, &deploy.transaction_id)?.value.phase, DeploymentPhase::Fencing);
+        Ok(())
+    }
+
+    /// An Unreadable stop holds a Sealing deploy with a message that names the
+    /// remedy; it never admits.
+    #[test]
+    fn an_unreadable_stop_keeps_a_sealing_deploy_held_with_the_remedy() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let deploy = seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, None)?;
+        make_stop_first(&world, &deploy.transaction_id)?;
+        let sealing = resident_id(&world, &deploy.transaction_id)?;
+        let mut tail = sealing.value.clone();
+        tail.deployment_admitted_at_unix_millis = None;
+        tail.deployment_authorization = None;
+        replace_transaction(&world.state_store, &sealing, &tail)?;
+        let store = tail.plan.as_ref().context("no plan")?.parsed_inputs()?.1.brakes.deployment_store;
+        std::fs::create_dir_all(store.parent().context("no parent")?)?;
+        for bytes in [&b"junk that is no store"[..], &b""[..]] {
+            std::fs::write(&store, bytes)?;
+            let held = resident_id(&world, &deploy.transaction_id)?;
+            rephase(&world, &deploy.transaction_id, DeploymentPhase::Sealing)?;
+            let held_now = resident_id(&world, &deploy.transaction_id)?;
+            world.engine.advance_transaction(&held_now)?;
+            let after = resident_id(&world, &deploy.transaction_id)?.value;
+            assert_eq!(after.phase, DeploymentPhase::Sealing, "{:?}", held.value.last_error);
+            assert!(!after.deployment_admitted());
+            assert!(
+                after.last_error.as_deref().is_some_and(|note| note.contains("fails closed")
+                    && note.contains("idunn-provision deployment-brake-clear")),
+                "{:?}",
+                after.last_error
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -26239,6 +26317,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         )?;
         std::fs::create_dir_all(site.join("www"))?;
         std::fs::create_dir_all(site.join("config"))?;
+        std::fs::create_dir_all(site.join("authority"))?;
         std::fs::write(site.join("config/site.json"), SITE_CONFIG_ONE)?;
         *world.engine.runner_stand_in.lock().unwrap() =
             Some(Arc::new(SealingRunner { tree: tree.clone() }));
@@ -26401,6 +26480,51 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
             assert!(done.deployment_admitted_at_unix_millis.is_some());
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_engaged_after_admission_halts_the_static_flip_until_it_clears() -> Result<()> {
+        let w = static_world()?;
+        let first = w.deploy("up-service")?;
+        let incumbent = w.current_release().context("no incumbent")?;
+        assert!(first.is_terminal());
+        enqueue_deploy(&w.world, "up-service-2")?;
+        let id = w.transaction_of("up-service-2")?;
+        // Admitted by the absent-or-clear stop, flip intent not yet recorded.
+        w.tick_until(&id, "admission", |t| t.phase == DeploymentPhase::Starting)?;
+        assert!(latest_id(&w.world, &id)?.flip.is_none());
+        w.hold()?;
+        for _ in 0..4 {
+            w.world.engine.resume_backoff.lock().unwrap().clear();
+            let _ = w.world.engine.run_scheduler_tick();
+        }
+        let held = latest_id(&w.world, &id)?;
+        assert_eq!(held.phase, DeploymentPhase::Starting);
+        assert!(held.flip.is_none(), "a halted flip recorded an intent");
+        assert!(held.pre_fencing_abort.is_none() && held.completion.is_none());
+        assert!(held.last_error.as_deref().is_some_and(|n| n.contains("deployment brake engaged by")), "{:?}", held.last_error);
+        assert_eq!(w.current_release().as_deref(), Some(incumbent.as_str()), "the link moved under a stop");
+        w.release_brake(&held)?;
+        w.tick_until(&id, "the end", |t| t.is_terminal())?;
+        let done = latest_id(&w.world, &id)?;
+        assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
+        assert_ne!(w.current_release().as_deref(), Some(incumbent.as_str()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_engaged_after_the_flip_intent_does_not_halt_the_flip() -> Result<()> {
+        let w = static_world()?;
+        let id = w.transaction_of("up-service")?;
+        w.tick_until(&id, "the flip intent", |t| t.flip.is_some())?;
+        w.hold()?;
+        w.tick_until(&id, "the end", |t| t.is_terminal())?;
+        let done = latest_id(&w.world, &id)?;
+        assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
+        assert!(done.flip.as_ref().is_some_and(FlipEvidence::landed));
         Ok(())
     }
 

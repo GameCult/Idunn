@@ -153,7 +153,7 @@ deployment_target_policy() {
   esac
 }
 
-require_signed_deployment_grant() {
+require_deployment_admission() {
   source_commit="$3"
   deployment_request_id="$4"
   release_authority_id="$5"
@@ -179,15 +179,13 @@ require_signed_deployment_grant() {
   [ -z "$release_authority_sha256" ] || { echo "source-observed release cannot claim Bifrost authority digest" >&2; exit 1; }
 
   require_root_owned_resolved_executable "$idunn_provision"
-  require_root_owned_regular_path "$brake_store"
-  require_root_owned_regular_path "$brake_lock"
 
-  # This validation is the deployment-admission point. The signed expiry is a
-  # start-before deadline: it denies a later transaction, but does not become a
-  # timer-shaped veto over one already admitted. The root actuator remains the
-  # sole shared-lock holder through the synchronous consequence, so an explicit
-  # engage/release transition cannot race or rewrite that transaction.
-  exec 9<"$brake_lock"
+  # This validation is the deployment-admission point. An absent or clear stop
+  # admits; an engaged or unreadable one makes the status verb exit nonzero.
+  # The root actuator remains the sole shared-lock holder through the
+  # synchronous consequence, so an engage or clear cannot race or rewrite it.
+  # The lock file is created here when no store has ever been written.
+  exec 9>>"$brake_lock"
   /usr/bin/flock --shared 9
   "$idunn_provision" deployment-brake-status \
     --store "$brake_store" \
@@ -312,7 +310,7 @@ case "$action:$target" in
     manifest="/srv/odin/deploy-manifests/$target"
     require_root_owned_regular_path "$manifest"
     [ -x "$manifest" ] || { echo "root actuator manifest is not executable: $manifest" >&2; exit 1; }
-    require_signed_deployment_grant "$@"
+    require_deployment_admission "$@"
     export IDUNN_ACTUATOR=1
     export IDUNN_COMMAND_AUTHORITY=idunn-daemon
     export IDUNN_SOURCE_COMMIT="$source_commit"
