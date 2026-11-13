@@ -155,7 +155,7 @@ cleaned up.
   `idunn redeploy --daemon …`. The installed binary has no `redeploy` command
   (probe of its usage text), so the script is dead and is **not** the current
   pattern. The current pattern is `idunn up` followed by
-  `idunn-provision deployment-brake-release`
+  `idunn-provision deployment-brake-clear` when a stop is engaged (an absent or clear store admits)
   (`runbooks/idunn-host-raven.md`, "Deploy Muninn to Raven").
 - F24. Build placement (`gamecult-ops/inventory.md:559-566`): build on or for the
   target's host. Yggdrasil has 16 vCPU and 62 GiB and carries live services, so

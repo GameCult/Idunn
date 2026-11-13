@@ -1,3 +1,4 @@
+mod brake;
 pub mod control_plane;
 pub mod deployment;
 pub mod deployment_plan;

@@ -240,7 +240,7 @@ Fencing retries its phase forward on a capped backoff and never stops its live
 candidate, since that is the only running copy of the admitted body; the
 deadline opens the same incident. The one exception is yielding: a continuity
 whose route proof has not succeeded gives way, through its own post-fencing
-abort, to a deployment the deployment brake has released and that awaits the
+abort, to a deployment the deployment stop admits and that awaits the
 handover; a continuity that has proven its route never yields. The
 `ContinuityExhausted` incident (six charged attempts in an hour,
 `restarts_page`) pages and gates nothing. When continuity next acts is derived
@@ -257,9 +257,14 @@ held until a lift succeeds. It is a migration with a deletion line (follow-up
 still owe dependency failures not growing the streak and the dead-generation
 route refresh.
 
-The deployment brake gates changes to source, release, configuration, schema,
-unit, or authority binding. The lifecycle brake separately gates restart of an
-already-admitted incarnation. Neither target brake may gate Idunn itself or an
+The deployment brake is a stop, not a per-deploy gate: it gates changes to
+source, release, configuration, schema, unit, or authority binding only while
+engaged. Its one reader and writer is `src/brake.rs` (`idunn.deployment_stop.v1`:
+engaged or clear, who, why, when, sequence). An absent or clear store admits;
+a store that is present but unreadable, foreign, for another runtime, a symlink
+or owned by another uid fails closed. Nothing is signed, bound to a release or
+consumed, and one clear admits every deploy until it is engaged again. The
+lifecycle brake separately gates restart of an already-admitted incarnation. Neither target brake may gate Idunn itself or an
 unrelated service.
 
 If Odin is unavailable, Idunn preserves existing routes and continuity for

@@ -4,6 +4,15 @@ Status: target, Self, 2026-10-19 (campaign `idunn-deploy-provenance` in
 Eureka's mind). It states the ends. The map will live in
 `deploy-provenance-map.md`.
 
+Live as of cut `brake-is-a-stop` (2026-11-13): the deployment brake is the
+stop of invariant 3 and the signed per-deploy release is gone. `src/brake.rs`
+reads and writes it; `idunn-provision deployment-brake-engage|clear|status`
+take only `--store`, `--runtime-id` and `--reason`; the writer's login name and
+the verb's clock are recorded; an absent or clear store admits. The
+transaction stamps `deployment_admitted_at_unix_millis` (record v6). Still
+planned: the typed authority provenance on the transaction (invariant 2), and a
+steward-scoped store.
+
 ## Why
 
 Operator, 2026-10-19:

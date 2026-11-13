@@ -14,22 +14,23 @@ use cultcache_rs::{
 };
 use cultnet_rs::{
     AuthenticatedOdinRuntimeTopologyCorrelation, GameCultProviderHealthIdentity,
-    IDUNN_DEPLOYMENT_BRAKE_SCHEMA, IDUNN_LIFECYCLE_BRAKE_SCHEMA, IDUNN_PROCESS_WRITE_LEASE_SCHEMA,
-    IdunnDeploymentBrakeObservation, IdunnDeploymentBrakeOperatorIdentity,
-    IdunnDeploymentBrakeRecord, IdunnExpectedIncarnationRecord, IdunnLifecycleBrakeObservation,
+    IDUNN_LIFECYCLE_BRAKE_SCHEMA, IDUNN_PROCESS_WRITE_LEASE_SCHEMA,
+    IdunnExpectedIncarnationRecord, IdunnLifecycleBrakeObservation,
     IdunnLifecycleBrakeRecord, IdunnProcessWriteLeaseRecord, IdunnRuntimeActivationLaunch,
     IdunnRuntimeActivationRecord, IdunnServiceIdentity, OdinTopologyAuthenticationContext,
     OdinTopologyDisagreement, OdinTopologyIdentity, RuntimePresenceAuthenticationContext,
     ServiceIdentityProfile, ServiceIdentitySigner, ServiceIdentityTrustAnchor,
     authenticate_odin_runtime_topology_correlation, authenticate_runtime_presence_claim,
     correlate_runtime_presence_claim, derive_service_identity_id,
-    evaluate_idunn_continuity_restart, evaluate_idunn_deployment_brake, open_service_identity_at,
-    verify_idunn_deployment_brake_authorization, verify_runtime_authority,
+    evaluate_idunn_continuity_restart, open_service_identity_at, verify_runtime_authority,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::brake::{Stop, process_uid, read_stop};
+#[cfg(test)]
+use crate::brake::StopState;
 use crate::deployment::{
     DependencyKind, OperatorBinding, RolloutStrategy, RouteBinding, WorkloadBinding,
     capability_compatible,
@@ -56,7 +57,8 @@ use crate::host_actuator::{
 };
 
 const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
-const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v5";
+const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v6";
+const DEPLOYMENT_TRANSACTION_SCHEMA_V5: &str = "idunn.deployment_transaction.v5";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V4: &str = "idunn.deployment_transaction.v4";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V3: &str = "idunn.deployment_transaction.v3";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V2: &str = "idunn.deployment_transaction.v2";
@@ -243,34 +245,17 @@ enum DeploymentPhase {
     Complete,
 }
 
+/// The signed brake release a Deploy once consumed. Never written and never
+/// verified now: the deployment brake is a stop (`brake.rs`). It stays so the
+/// terminal records that hold one in key 16 still decode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 struct DeploymentAuthorization {
     authorization_id: String,
     brake_sha256: String,
     canonical_brake_bytes: Vec<u8>,
     authorized_at_unix_millis: u64,
-}
-
-impl DeploymentAuthorization {
-    fn validate_shape(&self) -> Result<()> {
-        require_id(&self.authorization_id, "deployment authorization id")?;
-        ensure!(
-            !self.canonical_brake_bytes.is_empty()
-                && self.brake_sha256 == sha256_id(&self.canonical_brake_bytes)
-                && self.authorized_at_unix_millis > 0,
-            "deployment authorization receipt is incomplete"
-        );
-        let record: IdunnDeploymentBrakeRecord =
-            rmp_serde::from_slice(&self.canonical_brake_bytes)?;
-        record.validate()?;
-        ensure!(
-            rmp_serde::to_vec(&record)? == self.canonical_brake_bytes
-                && record.authorization_id.as_deref() == Some(&self.authorization_id),
-            "deployment authorization receipt is noncanonical or mismatched"
-        );
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1517,7 +1502,7 @@ mod cleanup_evidence {
         }
     }
 
-    /// The schema migration's one entry point: read a stored v2, v3 or v4
+    /// The schema migration's one entry point: read a stored v2, v3, v4 or v5
     /// transaction (lifting older ones) and return its key and current-shape
     /// envelope. The record may carry the marker the lift just set.
     pub(super) fn migrate_transaction_record(
@@ -1678,7 +1663,7 @@ impl PostCommitCleanup {
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(
     type = "idunn.deployment_transaction",
-    schema = "idunn.deployment_transaction.v5"
+    schema = "idunn.deployment_transaction.v6"
 )]
 struct DeploymentTransaction {
     #[cultcache(key = 0)]
@@ -1764,6 +1749,155 @@ struct DeploymentTransaction {
     /// predates it, which decodes as None: no schema bump (precedent key 34).
     #[cultcache(key = 37, default)]
     flip: Option<FlipEvidence>,
+    /// When the deployment stop admitted this Deploy or Rollback at Sealing:
+    /// the stamp that replaced the signed release in key 16. Absent on every
+    /// record that predates it.
+    #[cultcache(key = 38, default)]
+    deployment_admitted_at_unix_millis: Option<u64>,
+}
+
+/// The v5 transaction layout: the one before `deployment_admitted_at_unix_millis`
+/// (key 38), which replaced the signed brake release. Records are decoded by it
+/// and lifted, because the control store refuses a record whose bytes differ
+/// from its re-encoding. Migration to v6 is forward-only: an Idunn that predates
+/// v6 cannot read a migrated store. `history.cc` is never migrated, so this
+/// struct lives until history is pruned.
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(
+    type = "idunn.deployment_transaction",
+    schema = "idunn.deployment_transaction.v5"
+)]
+struct LegacyDeploymentTransactionV5 {
+    #[cultcache(key = 0)]
+    schema_version: String,
+    #[cultcache(key = 1)]
+    transaction_id: String,
+    #[cultcache(key = 2)]
+    command_id: String,
+    #[cultcache(key = 3)]
+    command_kind: CommandKind,
+    #[cultcache(key = 4)]
+    target: String,
+    #[cultcache(key = 5)]
+    ordinal: u32,
+    #[cultcache(key = 6)]
+    phase: DeploymentPhase,
+    #[cultcache(key = 7)]
+    created_at_unix_millis: u64,
+    #[cultcache(key = 8)]
+    updated_at_unix_millis: u64,
+    #[cultcache(key = 9)]
+    incumbent_generation_id: Option<String>,
+    #[cultcache(key = 10)]
+    plan: Option<CompiledDeploymentPlan>,
+    #[cultcache(key = 11)]
+    frozen_source: Option<FrozenSourceReceipt>,
+    #[cultcache(key = 12)]
+    sealed_release: Option<SealedRelease>,
+    #[cultcache(key = 13)]
+    installed_release: Option<InstalledReleaseObservation>,
+    #[cultcache(key = 14)]
+    expected: Option<IdunnExpectedIncarnationRecord>,
+    #[cultcache(key = 15)]
+    expected_publication_sha256: Option<String>,
+    #[cultcache(key = 16)]
+    deployment_authorization: Option<DeploymentAuthorization>,
+    #[cultcache(key = 17)]
+    lifecycle_authorized_at_unix_millis: Option<u64>,
+    #[cultcache(key = 18)]
+    activation: Option<IdunnRuntimeActivationRecord>,
+    #[cultcache(key = 19)]
+    workload: Option<WorkloadObservation>,
+    #[cultcache(key = 20)]
+    activation_publication_sha256: Option<String>,
+    #[cultcache(key = 21)]
+    latest_odin_observation: Option<TopologyEvidence>,
+    #[cultcache(key = 22)]
+    warming: Option<WarmingEvidence>,
+    #[cultcache(key = 23)]
+    route_preflight: Option<RoutePreflightReceipt>,
+    #[cultcache(key = 24)]
+    isolation: Option<IsolationEvidence>,
+    #[cultcache(key = 25)]
+    fencing: Option<FencingEvidence>,
+    #[cultcache(key = 26)]
+    leasing: Option<LeasingEvidence>,
+    #[cultcache(key = 27)]
+    ready: Option<ReadinessEvidence>,
+    #[cultcache(key = 28)]
+    routing: Option<RoutingEvidence>,
+    #[cultcache(key = 29)]
+    odin_publisher_sequence_cursor: u64,
+    #[cultcache(key = 30)]
+    last_error: Option<String>,
+    #[cultcache(key = 31)]
+    completion: Option<TransactionCompletion>,
+    #[cultcache(key = 32)]
+    pre_fencing_abort: Option<PreFencingAbort>,
+    #[cultcache(key = 33)]
+    post_commit_cleanup: Option<PostCommitCleanup>,
+    //  because every transaction already durable predates this field:
+    // an absent key 34 decodes as None, which is exactly "this transaction has
+    // no post-fencing abort". Without it the daemon refuses to read its own
+    // control store and crashloops.
+    #[cultcache(key = 34, default)]
+    post_fencing_abort: Option<PostFencingAbort>,
+    /// Set by `transition` on entry to each post-fencing phase.
+    #[cultcache(key = 35)]
+    phase_deadline: Option<PhaseDeadline>,
+    #[cultcache(key = 36)]
+    lease_adoption: Option<LeaseAdoptionEvidence>,
+    /// A static release's carry and flip. Absent on every record that
+    /// predates it, which decodes as None: no schema bump (precedent key 34).
+    #[cultcache(key = 37, default)]
+    flip: Option<FlipEvidence>,
+}
+
+
+impl LegacyDeploymentTransactionV5 {
+    fn into_current(self) -> DeploymentTransaction {
+        DeploymentTransaction {
+            schema_version: DEPLOYMENT_TRANSACTION_SCHEMA.into(),
+            transaction_id: self.transaction_id,
+            command_id: self.command_id,
+            command_kind: self.command_kind,
+            target: self.target,
+            ordinal: self.ordinal,
+            phase: self.phase,
+            created_at_unix_millis: self.created_at_unix_millis,
+            updated_at_unix_millis: self.updated_at_unix_millis,
+            incumbent_generation_id: self.incumbent_generation_id,
+            plan: self.plan,
+            frozen_source: self.frozen_source,
+            sealed_release: self.sealed_release,
+            installed_release: self.installed_release,
+            expected: self.expected,
+            expected_publication_sha256: self.expected_publication_sha256,
+            deployment_authorization: self.deployment_authorization,
+            lifecycle_authorized_at_unix_millis: self.lifecycle_authorized_at_unix_millis,
+            activation: self.activation,
+            workload: self.workload,
+            activation_publication_sha256: self.activation_publication_sha256,
+            latest_odin_observation: self.latest_odin_observation,
+            warming: self.warming,
+            route_preflight: self.route_preflight,
+            isolation: self.isolation,
+            fencing: self.fencing,
+            leasing: self.leasing,
+            ready: self.ready,
+            routing: self.routing,
+            odin_publisher_sequence_cursor: self.odin_publisher_sequence_cursor,
+            last_error: self.last_error,
+            completion: self.completion,
+            pre_fencing_abort: self.pre_fencing_abort,
+            post_commit_cleanup: self.post_commit_cleanup,
+            post_fencing_abort: self.post_fencing_abort,
+            phase_deadline: self.phase_deadline,
+            lease_adoption: self.lease_adoption,
+            flip: self.flip,
+            deployment_admitted_at_unix_millis: None,
+        }
+    }
 }
 
 /// The v4 transaction layout: the current one before a static release's
@@ -1900,6 +2034,7 @@ impl LegacyDeploymentTransactionV4 {
             phase_deadline: self.phase_deadline,
             lease_adoption: self.lease_adoption,
             flip: None,
+            deployment_admitted_at_unix_millis: None,
         }
     }
 }
@@ -2151,9 +2286,9 @@ impl DeploymentTransaction {
         self.flip.is_some() && error.downcast_ref::<FlipRefused>().is_none()
     }
 
-    /// The runtime and the sealed release a deployment brake release must name.
-    /// One reading for both kinds of target: the binding's runtime identity and
-    /// the sealed release, which a service's Expected projection copies.
+    /// The runtime and the sealed release this transaction names, for the
+    /// status listing. One reading for both kinds of target: the binding's
+    /// runtime identity and the sealed release.
     fn brake_subject(&self) -> Result<(String, String)> {
         let plan = required(&self.plan, "transaction plan")?;
         let release = required(&self.sealed_release, "sealed release")?;
@@ -2219,6 +2354,7 @@ impl DeploymentTransaction {
             phase_deadline: None,
             lease_adoption: None,
             flip: None,
+            deployment_admitted_at_unix_millis: None,
         };
         transaction.validate()?;
         Ok(transaction)
@@ -2400,6 +2536,12 @@ impl DeploymentTransaction {
     /// What a static release transaction may hold. It never runs a workload, so
     /// every piece of evidence of one is absent, and it uses three phases:
     /// Sealing, Starting (the flip, behind the brake) and Complete.
+    /// Whether the deployment stop admitted this transaction: stamped at
+    /// Sealing now, or a legacy record that holds a consumed signed release.
+    fn deployment_admitted(&self) -> bool {
+        self.deployment_admitted_at_unix_millis.is_some() || self.deployment_authorization.is_some()
+    }
+
     fn validate_static(&self) -> Result<()> {
         ensure!(
             self.command_kind != CommandKind::Continuity,
@@ -2443,13 +2585,13 @@ impl DeploymentTransaction {
                     && self.sealed_release.is_some()
                     && self.installed_release.is_some()
                     && (self.command_kind == CommandKind::Rollback || self.frozen_source.is_some())
-                    && self.deployment_authorization.is_some(),
-                "static release entered Starting without sealed release evidence and brake consumption"
+                    && self.deployment_admitted(),
+                "static release entered Starting without sealed release evidence and the stop's admission"
             );
         } else {
             ensure!(
-                self.flip.is_none() && self.deployment_authorization.is_none(),
-                "static release flipped or consumed the brake before Starting"
+                self.flip.is_none() && !self.deployment_admitted(),
+                "static release flipped or was admitted by the stop before Starting"
             );
         }
         if self.phase == DeploymentPhase::Complete {
@@ -2661,9 +2803,6 @@ impl DeploymentTransaction {
                 "lease adoption does not name the granted lease"
             );
         }
-        if let Some(authorization) = &self.deployment_authorization {
-            authorization.validate_shape()?;
-        }
         let is_static = self.is_static();
         if let Some(flip) = &self.flip {
             ensure!(is_static, "a flip belongs to a static release transaction");
@@ -2818,13 +2957,13 @@ impl DeploymentTransaction {
                     );
                     match self.command_kind {
                         CommandKind::Deploy => ensure!(
-                            self.frozen_source.is_some() && self.deployment_authorization.is_some(),
-                            "deployment entered Starting without frozen source and brake consumption"
+                            self.frozen_source.is_some() && self.deployment_admitted(),
+                            "deployment entered Starting without frozen source and the stop's admission"
                         ),
                         CommandKind::Rollback => bail!("a rollback is a static release transaction"),
                         CommandKind::Continuity => ensure!(
                             self.lifecycle_authorized_at_unix_millis.is_some()
-                                && self.deployment_authorization.is_none(),
+                                && !self.deployment_admitted(),
                             "continuity entered Starting without its lifecycle gate"
                         ),
                     }
@@ -3202,7 +3341,6 @@ struct RuntimeOptions {
     odin_correlation_store: PathBuf,
     odin_trust_anchor: PathBuf,
     idunn_identity_store: PathBuf,
-    deployment_brake_operator_anchor: PathBuf,
     source_identity: Option<ProcessIdentity>,
     topology_maximum_age_millis: u64,
     topology_maximum_future_skew_millis: u64,
@@ -3231,9 +3369,6 @@ impl Default for RuntimeOptions {
             odin_trust_anchor: PathBuf::from("/etc/gamecult/idunn/odin-topology-anchor.cc"),
             idunn_identity_store: PathBuf::from(
                 "/var/lib/gamecult/idunn/idunn-service-identity.cc",
-            ),
-            deployment_brake_operator_anchor: PathBuf::from(
-                "/etc/gamecult/idunn/deployment-brake-operator-anchor.cc",
             ),
             source_identity: None,
             topology_maximum_age_millis: DEFAULT_TOPOLOGY_MAXIMUM_AGE_MILLIS,
@@ -3404,9 +3539,6 @@ fn parse_serve(mut args: impl Iterator<Item = String>) -> Result<Command> {
             "--odin-trust-anchor" => options.odin_trust_anchor = path_value(&mut args, &argument)?,
             "--idunn-identity-store" => {
                 options.idunn_identity_store = path_value(&mut args, &argument)?
-            }
-            "--deployment-brake-operator-anchor" => {
-                options.deployment_brake_operator_anchor = path_value(&mut args, &argument)?
             }
             "--topology-maximum-age-millis" => {
                 options.topology_maximum_age_millis = u64_value(&mut args, &argument)?
@@ -3906,17 +4038,6 @@ impl ControlSnapshot {
                 }
             }
         }
-        let mut authorizations = BTreeSet::new();
-        for authorization in self
-            .transactions
-            .iter()
-            .filter_map(|stored| stored.value.deployment_authorization.as_ref())
-        {
-            ensure!(
-                authorizations.insert(authorization.authorization_id.as_str()),
-                "deployment authorization was consumed more than once"
-            );
-        }
         Ok(())
     }
 
@@ -4234,6 +4355,7 @@ impl LegacyDeploymentTransaction {
             phase_deadline: None,
             lease_adoption: None,
             flip: None,
+            deployment_admitted_at_unix_millis: None,
         }
     }
 }
@@ -4442,10 +4564,19 @@ impl LegacyAdmittedGenerationV3 {
     }
 }
 
-/// Decode a v2, v3 or v4 transaction and lift it to the current shape, without
+/// Decode a v2, v3, v4 or v5 transaction and lift it to the current shape, without
 /// validating it. History reads stop here; the control store validates.
 fn lift_legacy_transaction(envelope: &CultCacheEnvelope) -> Result<DeploymentTransaction> {
     let schema = match envelope.schema_id.as_deref() {
+        Some(schema @ DEPLOYMENT_TRANSACTION_SCHEMA_V5) => {
+            let value: LegacyDeploymentTransactionV5 = rmp_serde::from_slice(&envelope.payload)
+                .with_context(|| format!("decoding a {schema} deployment transaction"))?;
+            ensure!(
+                value.schema_version == schema,
+                "stored transaction schema differs from its envelope"
+            );
+            return Ok(value.into_current());
+        }
         Some(schema @ DEPLOYMENT_TRANSACTION_SCHEMA_V4) => {
             let value: LegacyDeploymentTransactionV4 = rmp_serde::from_slice(&envelope.payload)
                 .with_context(|| format!("decoding a {schema} deployment transaction"))?;
@@ -4473,7 +4604,7 @@ fn lift_legacy_transaction(envelope: &CultCacheEnvelope) -> Result<DeploymentTra
     Ok(value.into_current())
 }
 
-/// Read one stored transaction, lifting a v2, v3 or v4 record to the current shape.
+/// Read one stored transaction, lifting a v2, v3, v4 or v5 record to the current shape.
 ///
 /// The control store refuses noncanonical bytes: a record must re-encode to
 /// exactly what is stored. That check is what makes tampering visible, and it
@@ -4628,6 +4759,7 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
                         DEPLOYMENT_TRANSACTION_SCHEMA_V2
                             | DEPLOYMENT_TRANSACTION_SCHEMA_V3
                             | DEPLOYMENT_TRANSACTION_SCHEMA_V4
+                            | DEPLOYMENT_TRANSACTION_SCHEMA_V5
                     )
                 ))
                 || (envelope.r#type == AdmittedGeneration::TYPE
@@ -4914,6 +5046,7 @@ fn decode_history_transactions(
                         DEPLOYMENT_TRANSACTION_SCHEMA_V2
                             | DEPLOYMENT_TRANSACTION_SCHEMA_V3
                             | DEPLOYMENT_TRANSACTION_SCHEMA_V4
+                            | DEPLOYMENT_TRANSACTION_SCHEMA_V5
                     ) => {
                 lift_legacy_transaction(&envelope)
             }
@@ -6030,40 +6163,14 @@ impl Engine {
     /// and authorize nothing further, so re-proving them only creates ways for
     /// history to refuse a boot. On yggdrasil that is 259 of 260 records.
     ///
-    /// The operator anchor is read on demand rather than up front. Reading it
-    /// unconditionally meant an absent brake artifact refused startup against
-    /// an *empty* store -- a deployment brake gating Idunn itself, which
-    /// `F:\Projects\CLAUDE.md` forbids outright: a target brake "may never gate
-    /// Idunn itself or unrelated service lifecycle".
+    /// The deployment stop is not durable authority: it is read live at
+    /// Sealing and gates nothing already admitted, so no brake artifact is
+    /// read here and none can refuse a boot.
     fn validate_durable_authority(&self, snapshot: &ControlSnapshot) -> Result<()> {
-        let mut operator_anchor = None;
         for stored in &snapshot.transactions {
             let transaction = &stored.value;
             if transaction.is_terminal() {
                 continue;
-            }
-            if let Some(authorization) = &transaction.deployment_authorization {
-                authorization.validate_shape()?;
-                let record: IdunnDeploymentBrakeRecord =
-                    rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
-                if operator_anchor.is_none() {
-                    operator_anchor =
-                        Some(read_trust_anchor::<IdunnDeploymentBrakeOperatorIdentity>(
-                            &self.options.deployment_brake_operator_anchor,
-                        )?);
-                }
-                verify_idunn_deployment_brake_authorization(
-                    &record,
-                    operator_anchor.as_ref().expect("read directly above"),
-                )?;
-                let (runtime_id, sealed_release_id) = transaction.brake_subject()?;
-                ensure!(
-                    record.authorized_release_id.as_deref() == Some(sealed_release_id.as_str())
-                        && record.authorized_deployment_id.as_deref()
-                            == Some(transaction.transaction_id.as_str())
-                        && record.runtime_id == runtime_id,
-                    "durable deployment authorization names another release or transaction"
-                );
             }
             let lease = transaction
                 .leasing
@@ -6341,16 +6448,11 @@ impl Engine {
         {
             return LiftDecision::KeepAborting;
         }
-        match now_millis() {
-            Ok(now) => {
-                if self
-                    .deploy_the_continuity_yields_to(snapshot, transaction, now)
-                    .is_some()
-                {
-                    return LiftDecision::KeepAborting;
-                }
-            }
-            Err(error) => return LiftDecision::Undecided(error),
+        if self
+            .deploy_the_continuity_yields_to(snapshot, transaction)
+            .is_some()
+        {
+            return LiftDecision::KeepAborting;
         }
         let lifted = (|| -> Result<bool> {
             let plan = required(&transaction.plan, "transaction plan")?;
@@ -7926,13 +8028,10 @@ impl Engine {
         let mut next = current.value.clone();
         match current.value.command_kind {
             CommandKind::Deploy | CommandKind::Rollback => {
-                let Some(authorization) = self.deployment_authorization(current, now)? else {
-                    return self.record_gate_wait(
-                        current,
-                        "deployment brake has not released this exact transaction",
-                    );
-                };
-                next.deployment_authorization = Some(authorization);
+                if let Some(note) = self.stop_note(current)? {
+                    return self.record_gate_wait(current, &note);
+                }
+                next.deployment_admitted_at_unix_millis = Some(now);
             }
             CommandKind::Continuity => {
                 if !self.lifecycle_allows(current, now)? {
@@ -8061,6 +8160,11 @@ impl Engine {
         let Some(flip) = &current.value.flip else {
             // Nothing has moved yet, so a refusal here ends the transaction
             // honestly: the release is still what was sealed, or it is not.
+            // The flip intent is the last point a stop can halt a static
+            // release: once it is recorded the flip runs to its end.
+            if let Some(note) = self.stop_note(current)? {
+                return self.record_gate_wait(current, &note);
+            }
             self.static_release.verify_installed(workload, release)?;
             let previous_release_id = self.static_release.observe_current(workload)?;
             let release_id = release.sealed_release_id.clone();
@@ -8073,6 +8177,7 @@ impl Engine {
                     flipped_at_unix_millis: None,
                 });
                 next.updated_at_unix_millis = now;
+                next.last_error = None;
                 Ok(())
             });
         };
@@ -8303,6 +8408,14 @@ impl Engine {
             });
         }
 
+        // Fencing is the last pre-fencing abort-able point of a deploy: an
+        // engaged stop halts here, before the incumbent is fenced. A fenced
+        // deploy runs to its end. Continuity is never gated by this stop.
+        if current.value.command_kind == CommandKind::Deploy
+            && let Some(note) = self.stop_note(current)?
+        {
+            return self.record_gate_wait(current, &note);
+        }
         self.transition(current, DeploymentPhase::Fencing)
     }
 
@@ -9228,66 +9341,43 @@ impl Engine {
             .context("no private candidate port remains in the operator range")
     }
 
-    fn deployment_authorization(
-        &self,
-        current: &Stored<DeploymentTransaction>,
-        now: u64,
-    ) -> Result<Option<DeploymentAuthorization>> {
-        let (runtime_id, sealed_release_id) = current.value.brake_subject()?;
+    /// Why the deployment stop holds this transaction, or None when it admits.
+    /// Read live at each point that is still reversible: Sealing, the static
+    /// flip intent and the entry into Fencing.
+    fn stop_note(&self, current: &Stored<DeploymentTransaction>) -> Result<Option<String>> {
+        Ok(match self.deployment_stop(current)? {
+            Stop::Absent | Stop::Clear(_) => None,
+            Stop::Engaged(held) => Some(format!(
+                "deployment brake engaged by {}: {}",
+                held.by, held.reason
+            )),
+            Stop::Unreadable(why) => Some(format!(
+                "deployment brake is unreadable and fails closed: {why}"
+            )),
+        })
+    }
+
+    /// What the binding's deployment stop says about this transaction's
+    /// runtime. Read live; never cached, never consumed.
+    fn deployment_stop(&self, current: &Stored<DeploymentTransaction>) -> Result<Stop> {
         let plan = required(&current.value.plan, "transaction plan")?;
         let binding = plan.parsed_inputs()?.1;
-        let Some((record, canonical_bytes)) =
-            read_deployment_brake(&binding.brakes.deployment_store)?
-        else {
-            return Ok(None);
-        };
-        let anchor = read_trust_anchor::<IdunnDeploymentBrakeOperatorIdentity>(
-            &self.options.deployment_brake_operator_anchor,
-        )?;
-        if evaluate_idunn_deployment_brake(
-            IdunnDeploymentBrakeObservation::Present(&record),
-            &anchor,
-            &runtime_id,
-            &sealed_release_id,
-            &current.value.transaction_id,
-            now,
-        )
-        .is_err()
-        {
-            return Ok(None);
-        }
-        let authorization_id = record
-            .authorization_id
-            .clone()
-            .context("released brake has no authorization id")?;
-        let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-        ensure!(
-            !snapshot.transactions.iter().any(|stored| {
-                stored
-                    .value
-                    .deployment_authorization
-                    .as_ref()
-                    .is_some_and(|used| used.authorization_id == authorization_id)
-            }),
-            "deployment authorization was already consumed"
-        );
-        Ok(Some(DeploymentAuthorization {
-            authorization_id,
-            brake_sha256: sha256_id(&canonical_bytes),
-            canonical_brake_bytes: canonical_bytes,
-            authorized_at_unix_millis: now,
-        }))
+        Ok(read_stop(
+            &binding.brakes.deployment_store,
+            &binding.runtime_identity.runtime_id,
+            process_uid(),
+        ))
     }
 
     /// Whether a deployment awaiting the handover is free to take it: the
-    /// deployment brake has released its exact transaction, so the stop a yield
-    /// makes is followed by the deployment's own landing. A Deploy at its
-    /// Sealing tail has not passed the brake yet and is read live; one that is
-    /// still building, or whose brake cannot be read, is held. An operator's
+    /// deployment stop admits it, so the stop a yield makes is followed by the
+    /// deployment's own landing. A Deploy at its Sealing tail has not passed
+    /// the stop yet and is read live; one that is still building, or whose
+    /// stop is engaged or cannot be read, is held. An operator's
     /// hold is a reason to leave a serving or retrying body alone.
-    fn deploy_can_move(&self, deploy: &Stored<DeploymentTransaction>, now: u64) -> bool {
-        deploy.value.deployment_authorization.is_some()
-            || matches!(self.deployment_authorization(deploy, now), Ok(Some(_)))
+    fn deploy_can_move(&self, deploy: &Stored<DeploymentTransaction>) -> bool {
+        deploy.value.deployment_admitted()
+            || self.deployment_stop(deploy).is_ok_and(|stop| stop.admits())
     }
 
     /// The deployment a continuity gives way to: one on its target that awaits
@@ -9299,13 +9389,12 @@ impl Engine {
         &self,
         snapshot: &'a ControlSnapshot,
         continuity: &DeploymentTransaction,
-        now: u64,
     ) -> Option<&'a Stored<DeploymentTransaction>> {
         if continuity.serving_proven() {
             return None;
         }
         snapshot.on_target(&continuity.target).find(|other| {
-            other.value.awaits_handover() && self.deploy_can_move(other, now)
+            other.value.awaits_handover() && self.deploy_can_move(other)
         })
     }
 
@@ -10503,10 +10592,9 @@ impl Engine {
             }
             PhaseEnd::RetryForward => {
                 let snapshot = ControlSnapshot::read(&self.options.state_store)?;
-                let now = now_millis()?;
                 if let Some(deploy) = transaction
                     .yields_to_a_deploy()
-                    .then(|| self.deploy_the_continuity_yields_to(&snapshot, transaction, now))
+                    .then(|| self.deploy_the_continuity_yields_to(&snapshot, transaction))
                     .flatten()
                 {
                     self.begin_post_fencing_abort(
@@ -11159,24 +11247,6 @@ fn is_semantic_ready(authenticated: &AuthenticatedOdinRuntimeTopologyCorrelation
         && record.disagreements.is_empty()
 }
 
-fn read_deployment_brake(path: &Path) -> Result<Option<(IdunnDeploymentBrakeRecord, Vec<u8>)>> {
-    let Some(envelope) = read_single_envelope(path)? else {
-        return Ok(None);
-    };
-    ensure!(
-        envelope.r#type == IdunnDeploymentBrakeRecord::TYPE
-            && envelope.schema_id.as_deref() == Some(IDUNN_DEPLOYMENT_BRAKE_SCHEMA),
-        "deployment brake store contains a foreign record"
-    );
-    let record: IdunnDeploymentBrakeRecord = rmp_serde::from_slice(&envelope.payload)?;
-    record.validate()?;
-    ensure!(
-        rmp_serde::to_vec(&record)? == envelope.payload && envelope.key == record.brake_id,
-        "deployment brake is noncanonical or keyed by another authority"
-    );
-    Ok(Some((record, envelope.payload)))
-}
-
 fn read_lifecycle_brake(path: &Path) -> Result<Option<IdunnLifecycleBrakeRecord>> {
     let Some(envelope) = read_single_envelope(path)? else {
         return Ok(None);
@@ -11659,7 +11729,6 @@ mod tests {
                 odin_correlation_store: root.join("odin-correlation.cc"),
                 odin_trust_anchor: odin_anchor,
                 idunn_identity_store: idunn,
-                deployment_brake_operator_anchor: root.join("brake-anchor.cc"),
                 #[cfg(unix)]
                 route_actuators,
                 ..RuntimeOptions::default()
@@ -11880,27 +11949,6 @@ mod tests {
         let archived = read_history_transactions(&world.state_store);
         assert_eq!(archived.len(), 1, "the readable record must survive");
         assert_eq!(archived[0].transaction_id, live.transaction_id);
-        Ok(())
-    }
-
-    #[test]
-    fn an_absent_brake_anchor_does_not_gate_an_empty_store() -> Result<()> {
-        // `F:\Projects\CLAUDE.md`: a target brake "may never gate Idunn itself
-        // or unrelated service lifecycle". Reading the operator anchor up front
-        // meant a missing brake artifact refused startup against a store with
-        // nothing in it -- the deployment authority held hostage by an artifact
-        // describing one target's consent.
-        let world = EngineFixture::new()?;
-        assert!(
-            !world
-                .engine
-                .options
-                .deployment_brake_operator_anchor
-                .exists(),
-            "fixture must not have written a brake anchor"
-        );
-        let snapshot = ControlSnapshot::read(&world.state_store)?;
-        world.engine.validate_durable_authority(&snapshot)?;
         Ok(())
     }
 
@@ -13979,77 +14027,18 @@ mod tests {
         if incumbent.is_some() { 14 } else { 4 }
     }
 
-    /// A released deployment brake receipt, signed by an operator identity
-    /// enrolled in the world: what a Deploy's `deployment_authorization` holds.
-    fn deployment_authorization(
-        world: &EngineFixture,
-        expected: &IdunnExpectedIncarnationRecord,
-        transaction_id: &str,
-        now: u64,
-    ) -> Result<DeploymentAuthorization> {
-        released_brake(world, &expected.runtime_id, &expected.sealed_release_id, transaction_id, now)
-    }
-
-    /// The release receipt for one runtime, release and transaction: all a
-    /// brake release names, so a target with no Expected can be released too.
-    fn released_brake(
-        world: &EngineFixture,
-        runtime_id: &str,
-        sealed_release_id: &str,
-        transaction_id: &str,
-        now: u64,
-    ) -> Result<DeploymentAuthorization> {
-        use cultnet_rs::{
-            IDUNN_DEPLOYMENT_BRAKE_AUTHORITY, IDUNN_DEPLOYMENT_BRAKE_ID,
-            IDUNN_DEPLOYMENT_BRAKE_SCOPE, IDUNN_DEPLOYMENT_RELEASE_PURPOSE,
-            IdunnDeploymentBrakeReleasePurpose, enroll_service_identity_at,
-        };
-        // One operator per world, however many deployments it releases.
-        let signer_path = world.root.join("identities/brake-operator.cc");
-        let signer = if signer_path.exists() {
-            open_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(&signer_path)?
-        } else {
-            let signer =
-                enroll_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(&signer_path)?;
-            export_service_identity_trust_anchor(&signer, &world.root.join("brake-anchor.cc"))?;
-            signer
-        };
-        let authorization_id = format!("authorization-{transaction_id}");
-        let mut record = IdunnDeploymentBrakeRecord {
-            schema_version: IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into(),
-            brake_id: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
-            authority: IDUNN_DEPLOYMENT_BRAKE_AUTHORITY.into(),
-            runtime_id: runtime_id.to_owned(),
-            status: "released".into(),
-            scope: IDUNN_DEPLOYMENT_BRAKE_SCOPE.into(),
-            reason: "test rollout".into(),
-            observed_at_unix_millis: now,
-            expires_at_unix_millis: Some(now + 600_000),
-            authorization_id: Some(authorization_id.clone()),
-            authorization_purpose: Some(IDUNN_DEPLOYMENT_RELEASE_PURPOSE.into()),
-            authorized_release_id: Some(sealed_release_id.to_owned()),
-            authorized_deployment_id: Some(transaction_id.to_owned()),
-            authorized_by: Some(signer.trust_anchor()?.identity_id),
-            authorization_issued_at_unix_millis: Some(now),
-            authorization_expires_at_unix_millis: Some(now + 600_000),
-            signature_algorithm: Some("ed25519".into()),
-            signature: None,
-            private_state_exposed: false,
-            updated_by: "operator/test".into(),
-        };
-        record.signature = Some(
-            signer
-                .sign::<IdunnDeploymentBrakeReleasePurpose>(&rmp_serde::to_vec(&record)?)
-                .signature,
-        );
-        record.validate()?;
-        let canonical_brake_bytes = rmp_serde::to_vec(&record)?;
-        Ok(DeploymentAuthorization {
-            authorization_id,
-            brake_sha256: sha256_id(&canonical_brake_bytes),
-            canonical_brake_bytes,
-            authorized_at_unix_millis: now,
-        })
+    /// Write the deployment stop of the binding `plan` names, as the verb
+    /// would: engaged halts that runtime's deployments, clear admits them.
+    fn set_stop(plan: &CompiledDeploymentPlan, state: StopState, reason: &str) -> Result<()> {
+        let binding = plan.parsed_inputs()?.1;
+        crate::brake::replace_stop(
+            &binding.brakes.deployment_store,
+            &binding.runtime_identity.runtime_id,
+            state,
+            reason,
+            now_millis()?,
+        )?;
+        Ok(())
     }
 
     /// `binding` with its provider trust anchor and signer pointed at this
@@ -14136,6 +14125,10 @@ mod tests {
                     .split_once("[brakes]")
                     .context("binding has no brakes table")?
                     .1
+            )
+            .replace(
+                "/var/lib/gamecult/idunn/service-deployment-brake.cc",
+                &world.root.join("service-deployment-brake.cc").display().to_string(),
             ),
         )?;
         let recipe = RECIPE
@@ -14233,12 +14226,7 @@ mod tests {
                     plan_id: plan.plan_id.clone(),
                     snapshot_sha256: sha256_id(b"frozen source snapshot"),
                 });
-                transaction.deployment_authorization = Some(deployment_authorization(
-                    world,
-                    &expected,
-                    &transaction.transaction_id,
-                    now,
-                )?);
+                transaction.deployment_admitted_at_unix_millis = Some(now);
             }
         }
         transaction.expected_publication_sha256 = Some(expected.canonical_sha256()?);
@@ -18760,11 +18748,12 @@ mod tests {
         make_stop_first(world, deploy_id)?;
         let sealing = resident_id(world, deploy_id)?;
         let mut tail = sealing.value.clone();
-        tail.deployment_authorization = None;
+        tail.deployment_admitted_at_unix_millis = None;
         replace_transaction(&world.state_store, &sealing, &tail)?;
+        set_stop(tail.plan.as_ref().context("no plan")?, StopState::Engaged, "test hold")?;
         let tail = resident_id(world, deploy_id)?.value;
         assert!(tail.awaits_handover());
-        assert!(!world.engine.deploy_can_move(&resident_id(world, deploy_id)?, now_millis()?));
+        assert!(!world.engine.deploy_can_move(&resident_id(world, deploy_id)?));
         Ok(())
     }
 
@@ -19027,13 +19016,14 @@ mod tests {
     /// for it; once the brake releases, the continuity yields. The yield closes
     /// the continuity's operator-required incident Recovered.
     #[test]
-    fn a_continuity_does_not_yield_to_a_braked_deploy_and_yields_once_the_brake_releases() -> Result<()> {
+    fn a_continuity_does_not_yield_to_a_stopped_deploy_and_yields_once_the_stop_clears() -> Result<()> {
         let (world, workload, _, deploy_id, owner_id, _) = waiter_beside_gate_waiting_continuity()?;
         make_stop_first(&world, &deploy_id).context("A make_stop_first")?;
         let sealing = resident_id(&world, &deploy_id).context("B sealing")?;
         let mut tail = sealing.value.clone();
-        tail.deployment_authorization = None;
+        tail.deployment_admitted_at_unix_millis = None;
         replace_transaction(&world.state_store, &sealing, &tail)?;
+        set_stop(tail.plan.as_ref().context("no plan")?, StopState::Engaged, "test hold")?;
         assert!(resident_id(&world, &deploy_id).context("C awaits")?.value.awaits_handover());
         pass_deadline_of(&world, &owner_id)?;
         let stops = stops_of(&workload);
@@ -19046,30 +19036,9 @@ mod tests {
         assert_eq!(operator_required(&world)?, [owner_id.as_str()]);
         assert_eq!(stops_of(&workload), stops);
 
-        // The operator releases the brake for this exact Deploy.
+        // The steward clears the stop; no per-deploy release exists.
         let deploy = resident_id(&world, &deploy_id).context("E deploy")?.value;
-        let authorization = deployment_authorization(
-            &world,
-            deploy.expected.as_ref().context("no Expected")?,
-            &deploy_id,
-            now_millis()?,
-        )?;
-        let store = deploy.plan.as_ref().context("no plan")?.parsed_inputs()?.1.brakes.deployment_store;
-        let record: IdunnDeploymentBrakeRecord = rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
-        assert!(SingleFileMessagePackBackingStore::new(&store).compare_exchange(
-            &[CultCacheExpectedEnvelope {
-                r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
-                key: record.brake_id.clone(),
-                current: None,
-            }],
-            &[CultCacheEnvelope {
-                key: record.brake_id.clone(),
-                r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
-                payload: authorization.canonical_brake_bytes.clone(),
-                stored_at: rfc3339_millis(now_millis()?)?,
-                schema_id: Some(IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into()),
-            }],
-        )?);
+        set_stop(deploy.plan.as_ref().context("no plan")?, StopState::Clear, "test thaw")?;
         world.engine.resume_backoff.lock().unwrap().clear();
         waiter_then_owner(&world, "", &owner_id)?;
         let yielded = resident_id(&world, &owner_id).context("F yielded")?.value;
@@ -19460,8 +19429,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 plan_id: plan.plan_id.clone(),
                 snapshot_sha256: sha256_id(b"frozen source snapshot"),
             });
-            next.deployment_authorization =
-                Some(deployment_authorization(world, &expected, id, now)?);
+            next.deployment_admitted_at_unix_millis = Some(now);
         }
         next.installed_release = Some(crate::drivers::InstalledReleaseObservation {
             sealed_release_id: release.sealed_release_id.clone(),
@@ -19791,8 +19759,9 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         let sealing = resident_id(&world, deploy_id)?;
         world.engine.advance_transaction(&sealing)?;
         let after = resident_id(&world, deploy_id)?.value;
+        // The target has no stop, so Sealing passes it and is not held.
         assert!(
-            after.last_error.as_deref().is_some_and(|note| !note.contains(&continuity.transaction_id)),
+            after.last_error.as_deref().is_none_or(|note| !note.contains(&continuity.transaction_id)),
             "Sealing was held by the owner: {:?}",
             after.last_error
         );
@@ -20046,6 +20015,66 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         workload.spare(&candidate.runtime_instance_id);
         workload.kill();
         Ok(deploy)
+    }
+
+    /// An engaged stop halts a deploy before it fences, the last pre-fencing
+    /// abort-able point; clearing lets the same transaction fence.
+    #[test]
+    fn an_engaged_stop_halts_entry_into_fencing_and_a_clear_lets_it_through() -> Result<()> {
+        let workload = SwitchWorkload::new();
+        let world = EngineFixture::with_workload(workload.clone())?;
+        let deploy = dead_incumbent_with_a_deployment_ready_to_fence(&workload, &world)?;
+        let plan = deploy.plan.as_ref().context("no plan")?;
+        set_stop(plan, StopState::Engaged, "freeze before fencing")?;
+        for _ in 0..3 {
+            world.engine.run_scheduler_tick()?;
+        }
+        let held = resident_id(&world, &deploy.transaction_id)?.value;
+        assert_eq!(held.phase, DeploymentPhase::Warming);
+        assert!(held.pre_fencing_abort.is_none() && held.completion.is_none());
+        assert!(
+            held.last_error.as_deref().is_some_and(|note| note.contains("deployment brake engaged by")
+                && note.contains("freeze before fencing")),
+            "{:?}",
+            held.last_error
+        );
+        set_stop(plan, StopState::Clear, "thaw")?;
+        assert!(world.engine.run_scheduler_tick()?);
+        assert_eq!(resident_id(&world, &deploy.transaction_id)?.value.phase, DeploymentPhase::Fencing);
+        Ok(())
+    }
+
+    /// An Unreadable stop holds a Sealing deploy with a message that names the
+    /// remedy; it never admits.
+    #[test]
+    fn an_unreadable_stop_keeps_a_sealing_deploy_held_with_the_remedy() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let deploy = seeded_transaction(&world, DeploymentPhase::Warming, CommandKind::Deploy, None)?;
+        make_stop_first(&world, &deploy.transaction_id)?;
+        let sealing = resident_id(&world, &deploy.transaction_id)?;
+        let mut tail = sealing.value.clone();
+        tail.deployment_admitted_at_unix_millis = None;
+        tail.deployment_authorization = None;
+        replace_transaction(&world.state_store, &sealing, &tail)?;
+        let store = tail.plan.as_ref().context("no plan")?.parsed_inputs()?.1.brakes.deployment_store;
+        std::fs::create_dir_all(store.parent().context("no parent")?)?;
+        for bytes in [&b"junk that is no store"[..], &b""[..]] {
+            std::fs::write(&store, bytes)?;
+            let held = resident_id(&world, &deploy.transaction_id)?;
+            rephase(&world, &deploy.transaction_id, DeploymentPhase::Sealing)?;
+            let held_now = resident_id(&world, &deploy.transaction_id)?;
+            world.engine.advance_transaction(&held_now)?;
+            let after = resident_id(&world, &deploy.transaction_id)?.value;
+            assert_eq!(after.phase, DeploymentPhase::Sealing, "{:?}", held.value.last_error);
+            assert!(!after.deployment_admitted());
+            assert!(
+                after.last_error.as_deref().is_some_and(|note| note.contains("fails closed")
+                    && note.contains("idunn-provision deployment-brake-clear")),
+                "{:?}",
+                after.last_error
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -22019,12 +22048,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                         plan_id: plan.plan_id.clone(),
                         snapshot_sha256: sha256_id(b"frozen source snapshot"),
                     });
-                    transaction.deployment_authorization = Some(deployment_authorization(
-                        &world,
-                        &expected,
-                        &transaction.transaction_id,
-                        now,
-                    )?);
+                    transaction.deployment_admitted_at_unix_millis = Some(now);
                 }
             }
             let launch = IdunnRuntimeActivationLaunch::issue(
@@ -25835,7 +25859,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 assert!(!envelope.r#type.contains("runner_failure"), "{}", envelope.r#type);
                 if envelope.r#type == DeploymentTransaction::TYPE {
                     transactions += 1;
-                    assert_eq!(envelope.schema_id.as_deref(), Some("idunn.deployment_transaction.v5"));
+                    assert_eq!(envelope.schema_id.as_deref(), Some("idunn.deployment_transaction.v6"));
                 }
             }
         }
@@ -25874,9 +25898,12 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
 
     const PINNED_COMMAND_HEX: &str = "96bb6964756e6e2e6465706c6f796d656e745f636f6d6d616e642e7632aa75702d73657276696365a66465706c6f79a773657276696365a47465737464";
     /// The v4 bytes of the same record, captured at base 804ed75: a legacy
-    /// fixture. v5 adds key 37 (`flip`), so it is one element longer and names v5.
+    /// fixture. v5 added key 37 (`flip`) and v6 key 38, so v4 is two elements shorter.
     const PINNED_TRANSACTION_HEX_V4: &str = "dc0025bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7634a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0";
-    const PINNED_TRANSACTION_HEX: &str = "dc0026bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7635a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0c0";
+    const PINNED_TRANSACTION_HEX_V5: &str = "dc0026bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7635a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0c0";
+    /// The v6 bytes: v5 with key 38 (`deployment_admitted_at_unix_millis`) appended, so
+    /// one element longer and naming v6.
+    const PINNED_TRANSACTION_HEX: &str = "dc0027bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7636a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0c0c0";
 
     fn pinned_v4_envelope() -> Result<CultCacheEnvelope> {
         let payload = (0..PINNED_TRANSACTION_HEX_V4.len())
@@ -25893,14 +25920,15 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     }
 
     #[test]
-    fn a_pinned_v4_transaction_lifts_and_reencodes_as_the_pinned_v5() -> Result<()> {
+    fn a_pinned_v4_transaction_lifts_and_reencodes_as_the_pinned_v6() -> Result<()> {
         let lifted = read_transaction_record(&pinned_v4_envelope()?)?;
         assert_eq!(lifted.schema_version, DEPLOYMENT_TRANSACTION_SCHEMA);
         assert_eq!(lifted.flip, None);
+        assert_eq!(lifted.deployment_admitted_at_unix_millis, None);
         let bytes = encode_transaction(&lifted, 100)?.payload;
         let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(hex, PINNED_TRANSACTION_HEX);
-        // Read as v5 the v4 bytes are refused, never silently accepted.
+        // Read as v6 the v4 bytes are refused, never silently accepted.
         let mut mislabeled = pinned_v4_envelope()?;
         mislabeled.schema_id = Some(DEPLOYMENT_TRANSACTION_SCHEMA.into());
         assert!(read_transaction_record(&mislabeled).is_err());
@@ -25909,7 +25937,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
 
     /// Always a copy in a temp dir: never a live control.cc.
     #[test]
-    fn a_v4_control_store_boots_into_v5_and_a_v5_store_is_left_alone() -> Result<()> {
+    fn a_v4_control_store_boots_into_v6_and_a_v6_store_is_left_alone() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let path = temporary.path().join("control.cc");
         let store = SingleFileMessagePackBackingStore::new(&path);
@@ -25929,7 +25957,68 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         assert_eq!(after[0].stored_at, v4.stored_at);
         let migrated: String = after[0].payload.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(migrated, PINNED_TRANSACTION_HEX);
-        // Negative: an already-v5 store is untouched, byte for byte.
+        // Negative: an already-v6 store is untouched, byte for byte.
+        let file_before = std::fs::read(&path)?;
+        assert_eq!(migrate_control_store_to_current_schema(&path)?, 0);
+        assert_eq!(std::fs::read(&path)?, file_before);
+        read_transaction_record(&after[0])?;
+        Ok(())
+    }
+    fn pinned_v5_envelope() -> Result<CultCacheEnvelope> {
+        let payload = (0..PINNED_TRANSACTION_HEX_V5.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&PINNED_TRANSACTION_HEX_V5[i..i + 2], 16))
+            .collect::<std::result::Result<Vec<u8>, _>>()?;
+        Ok(CultCacheEnvelope {
+            key: "tx-pinned".into(),
+            r#type: DeploymentTransaction::TYPE.into(),
+            payload,
+            stored_at: rfc3339_millis(100)?,
+            schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA_V5.into()),
+        })
+    }
+
+    #[test]
+    fn a_pinned_v5_transaction_lifts_and_reencodes_as_the_pinned_v6() -> Result<()> {
+        let lifted = read_transaction_record(&pinned_v5_envelope()?)?;
+        assert_eq!(lifted.schema_version, DEPLOYMENT_TRANSACTION_SCHEMA);
+        assert_eq!(lifted.deployment_admitted_at_unix_millis, None);
+        let bytes = encode_transaction(&lifted, 100)?.payload;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, PINNED_TRANSACTION_HEX);
+        // Read as v6 the v5 bytes are refused, never silently accepted.
+        let mut mislabeled = pinned_v5_envelope()?;
+        mislabeled.schema_id = Some(DEPLOYMENT_TRANSACTION_SCHEMA.into());
+        assert!(read_transaction_record(&mislabeled).is_err());
+        // History is never migrated: it lifts a v5 record the same way.
+        let (history, undecodable) = decode_history_transactions(vec![pinned_v5_envelope()?]);
+        assert!(undecodable.is_empty(), "{undecodable:?}");
+        assert_eq!(history, vec![lifted]);
+        Ok(())
+    }
+
+    /// Always a copy in a temp dir: never a live control.cc.
+    #[test]
+    fn a_v5_control_store_copy_boots_into_v6_and_a_v6_store_is_left_alone() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("control.cc");
+        let store = SingleFileMessagePackBackingStore::new(&path);
+        let v5 = pinned_v5_envelope()?;
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: v5.r#type.clone(),
+                key: v5.key.clone(),
+                current: None,
+            }],
+            std::slice::from_ref(&v5),
+        )?);
+        assert_eq!(migrate_control_store_to_current_schema(&path)?, 1);
+        let after = store.pull_all_read_only_snapshot()?;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].schema_id.as_deref(), Some(DEPLOYMENT_TRANSACTION_SCHEMA));
+        assert_eq!(after[0].stored_at, v5.stored_at);
+        let migrated: String = after[0].payload.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(migrated, PINNED_TRANSACTION_HEX);
         let file_before = std::fs::read(&path)?;
         assert_eq!(migrate_control_store_to_current_schema(&path)?, 0);
         assert_eq!(std::fs::read(&path)?, file_before);
@@ -26107,8 +26196,23 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             latest_id(&self.world, &id)
         }
 
+        /// Engage the stop for this world's runtime, as a steward would.
+        fn hold(&self) -> Result<()> {
+            crate::brake::replace_stop(
+                &self.site.join("authority/deployment-brake.cc"),
+                "site-yggdrasil",
+                StopState::Engaged,
+                "test hold",
+                now_millis()?,
+            )?;
+            Ok(())
+        }
+
         /// Submit a rollback command and tick until the daemon freezes it.
+        /// A rollback is born at Sealing with its evidence, so a test that
+        /// wants it held at the stop engages the stop first.
         fn submit_rollback(&self, command_id: &str) -> Result<String> {
+            self.hold()?;
             commit_deployment_command(
                 &self.world.state_store,
                 CommandKind::Rollback,
@@ -26160,51 +26264,32 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             Ok(error)
         }
 
-        /// The operator releases the brake for this exact transaction.
+        /// The steward clears the stop. It is not bound to this transaction and
+        /// not consumed by it.
         fn release_brake(&self, transaction: &DeploymentTransaction) -> Result<()> {
-            let (runtime_id, release_id) = transaction.brake_subject()?;
-            let authorization = released_brake(
-                &self.world,
-                &runtime_id,
-                &release_id,
-                &transaction.transaction_id,
-                now_millis()?,
-            )?;
-            let store = self.site.join("authority/deployment-brake.cc");
-            let record: IdunnDeploymentBrakeRecord =
-                rmp_serde::from_slice(&authorization.canonical_brake_bytes)?;
-            let backing = SingleFileMessagePackBackingStore::new(&store);
-            let current = backing
-                .pull_all_read_only_snapshot()
-                .ok()
-                .and_then(|entries| entries.into_iter().next());
-            ensure!(backing.compare_exchange(
-                &[CultCacheExpectedEnvelope {
-                    r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
-                    key: record.brake_id.clone(),
-                    current,
-                }],
-                &[CultCacheEnvelope {
-                    key: record.brake_id.clone(),
-                    r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
-                    payload: authorization.canonical_brake_bytes.clone(),
-                    stored_at: rfc3339_millis(now_millis()?)?,
-                    schema_id: Some(IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into()),
-                }],
-            )?);
-            Ok(())
+            set_stop(
+                transaction.plan.as_ref().context("no plan")?,
+                StopState::Clear,
+                "test thaw",
+            )
         }
 
-        /// Run a Deploy up to the brake and say where it waits.
+        /// Run a Deploy or a Rollback up to the stop and say where it waits.
         fn run_to_brake(&self, id: &str) -> Result<DeploymentTransaction> {
-            self.tick_until(id, "the brake", |t| t.installed_release.is_some())?;
+            self.hold()?;
+            self.tick_until(id, "the sealed release", |t| t.installed_release.is_some())?;
             for _ in 0..2 {
                 self.world.engine.resume_backoff.lock().unwrap().clear();
                 let _ = self.world.engine.run_scheduler_tick();
             }
             let waiting = latest_id(&self.world, id)?;
             assert_eq!(waiting.phase, DeploymentPhase::Sealing, "{waiting:?}");
-            assert!(waiting.deployment_authorization.is_none());
+            assert!(!waiting.deployment_admitted());
+            assert!(
+                waiting.last_error.as_deref().is_some_and(|why| why.contains("deployment brake engaged by")),
+                "{:?}",
+                waiting.last_error
+            );
             Ok(waiting)
         }
     }
@@ -26232,6 +26317,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         )?;
         std::fs::create_dir_all(site.join("www"))?;
         std::fs::create_dir_all(site.join("config"))?;
+        std::fs::create_dir_all(site.join("authority"))?;
         std::fs::write(site.join("config/site.json"), SITE_CONFIG_ONE)?;
         *world.engine.runner_stand_in.lock().unwrap() =
             Some(Arc::new(SealingRunner { tree: tree.clone() }));
@@ -26286,7 +26372,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         assert_eq!(flip.previous_release_id, None);
         assert_eq!(flip.carried_sha256.as_deref(), Some(sha256_of(SITE_CONFIG_TWO).as_str()));
         assert_eq!(flip.carry_source, w.site_config());
-        assert!(done.deployment_authorization.is_some(), "the brake was not consumed");
+        assert!(done.deployment_admitted_at_unix_millis.is_some(), "the stop did not stamp its admission");
         assert_eq!(w.current_release().as_deref(), Some(sealed.sealed_release_id.as_str()));
         let carried = w.current_link().join("config.json");
         assert_eq!(std::fs::read(&carried)?, SITE_CONFIG_TWO);
@@ -26348,6 +26434,97 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         );
         // The first release is still on disk: rollback is a flip back to it.
         assert!(w.site.join("releases").join(&first_release).join("dist/index.html").is_file());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_store_admits_and_stamps_admission() -> Result<()> {
+        let w = static_world()?;
+        let id = w.transaction_of("up-service")?;
+        w.tick_until(&id, "the end", |t| t.is_terminal())?;
+        assert!(!w.site.join("authority/deployment-brake.cc").exists());
+        let done = latest_id(&w.world, &id)?;
+        assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
+        assert!(done.deployment_admitted_at_unix_millis.is_some());
+        assert!(done.deployment_authorization.is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_clear_admits_many_deploys_and_an_engaged_stop_names_who() -> Result<()> {
+        let w = static_world()?;
+        let first_id = w.transaction_of("up-service")?;
+        let first = w.run_to_brake(&first_id)?;
+        let held = first.last_error.clone().context("no wait note")?;
+        let me = crate::brake::process_uid();
+        let store = w.site.join("authority/deployment-brake.cc");
+        let crate::brake::Stop::Engaged(engaged) = crate::brake::read_stop(&store, "site-yggdrasil", me) else {
+            bail!("the stop is not engaged")
+        };
+        assert_eq!(held, format!("deployment brake engaged by {}: {}", engaged.by, engaged.reason));
+        w.release_brake(&first)?;
+        w.tick_until(&first_id, "the first end", |t| t.is_terminal())?;
+        // No engage in between: one Clear admits the second deploy too, with
+        // no release id or transaction id in sight.
+        enqueue_deploy(&w.world, "up-service-2")?;
+        let second_id = w.transaction_of("up-service-2")?;
+        w.tick_until(&second_id, "the second end", |t| t.is_terminal())?;
+        let crate::brake::Stop::Clear(record) = crate::brake::read_stop(&store, "site-yggdrasil", me) else {
+            bail!("the stop did not stay clear")
+        };
+        assert_eq!(record.sequence, 2);
+        for id in [&first_id, &second_id] {
+            let done = latest_id(&w.world, id)?;
+            assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
+            assert!(done.deployment_admitted_at_unix_millis.is_some());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_engaged_after_admission_halts_the_static_flip_until_it_clears() -> Result<()> {
+        let w = static_world()?;
+        let first = w.deploy("up-service")?;
+        let incumbent = w.current_release().context("no incumbent")?;
+        assert!(first.is_terminal());
+        enqueue_deploy(&w.world, "up-service-2")?;
+        let id = w.transaction_of("up-service-2")?;
+        // Admitted by the absent-or-clear stop, flip intent not yet recorded.
+        w.tick_until(&id, "admission", |t| t.phase == DeploymentPhase::Starting)?;
+        assert!(latest_id(&w.world, &id)?.flip.is_none());
+        w.hold()?;
+        for _ in 0..4 {
+            w.world.engine.resume_backoff.lock().unwrap().clear();
+            let _ = w.world.engine.run_scheduler_tick();
+        }
+        let held = latest_id(&w.world, &id)?;
+        assert_eq!(held.phase, DeploymentPhase::Starting);
+        assert!(held.flip.is_none(), "a halted flip recorded an intent");
+        assert!(held.pre_fencing_abort.is_none() && held.completion.is_none());
+        assert!(held.last_error.as_deref().is_some_and(|n| n.contains("deployment brake engaged by")), "{:?}", held.last_error);
+        assert_eq!(w.current_release().as_deref(), Some(incumbent.as_str()), "the link moved under a stop");
+        w.release_brake(&held)?;
+        w.tick_until(&id, "the end", |t| t.is_terminal())?;
+        let done = latest_id(&w.world, &id)?;
+        assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
+        assert_ne!(w.current_release().as_deref(), Some(incumbent.as_str()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_engaged_after_the_flip_intent_does_not_halt_the_flip() -> Result<()> {
+        let w = static_world()?;
+        let id = w.transaction_of("up-service")?;
+        w.tick_until(&id, "the flip intent", |t| t.flip.is_some())?;
+        w.hold()?;
+        w.tick_until(&id, "the end", |t| t.is_terminal())?;
+        let done = latest_id(&w.world, &id)?;
+        assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
+        assert!(done.flip.as_ref().is_some_and(FlipEvidence::landed));
         Ok(())
     }
 
@@ -26500,15 +26677,26 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         Ok(())
     }
 
+    /// A populated record an older Idunn could have written: a static deploy
+    /// that consumed a signed brake release (key 16, now legacy) and ended
+    /// before fencing. `drop_keys` is how many trailing nil keys the older
+    /// layout lacks: v5 lacks key 38, v4 also lacks key 37.
     #[cfg(unix)]
-    #[test]
-    fn a_populated_v4_transaction_lifts_to_the_exact_v5_field_by_field() -> Result<()> {
+    fn populated_legacy_lifts_to_the_exact_current_field_by_field(
+        schema: &str,
+        drop_keys: usize,
+    ) -> Result<()> {
         let w = static_world()?;
         let done = drive_static_to_end(&w)?;
-        // A populated record a v4 Idunn could have written: a deploy that
-        // consumed its brake and ended before fencing.
         let mut expected = done.clone();
         expected.flip = None;
+        expected.deployment_admitted_at_unix_millis = None;
+        expected.deployment_authorization = Some(DeploymentAuthorization {
+            authorization_id: "authorization-legacy".into(),
+            brake_sha256: sha256_id(b"legacy brake bytes"),
+            canonical_brake_bytes: b"legacy brake bytes".to_vec(),
+            authorized_at_unix_millis: 99,
+        });
         expected.completion = Some(TransactionCompletion::FailedBeforeFencing { error: "refused".into() });
         expected.pre_fencing_abort = Some(PreFencingAbort {
             error: "refused".into(),
@@ -26519,40 +26707,45 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         expected.post_commit_cleanup = None;
         expected.phase_deadline = None;
         expected.last_error = Some("refused".into());
+        // Starting accepts the legacy receipt as the admission.
         expected.validate()?;
         assert_ne!(expected.created_at_unix_millis, expected.updated_at_unix_millis);
-        assert!(expected.completion.is_some() && expected.deployment_authorization.is_some());
-        // The v4 bytes of this record: the v5 encoding with the old schema name,
-        // one element shorter (key 37 is the last, a nil here).
-        let mut as_v4 = expected.clone();
-        as_v4.schema_version = DEPLOYMENT_TRANSACTION_SCHEMA_V4.into();
-        let mut payload = rmp_serde::to_vec(&as_v4)?;
-        assert_eq!(&payload[..3], &[0xdc, 0x00, 0x26]);
-        payload[2] = 0x25;
-        assert_eq!(payload.pop(), Some(0xc0));
+        // The older bytes: the current encoding with the old schema name and
+        // `drop_keys` fewer elements, every one a nil.
+        let mut older = expected.clone();
+        older.schema_version = schema.into();
+        let mut payload = rmp_serde::to_vec(&older)?;
+        assert_eq!(&payload[..3], &[0xdc, 0x00, 0x27]);
+        payload[2] -= u8::try_from(drop_keys)?;
+        for _ in 0..drop_keys {
+            assert_eq!(payload.pop(), Some(0xc0));
+        }
         let envelope = CultCacheEnvelope {
             key: expected.transaction_id.clone(),
             r#type: DeploymentTransaction::TYPE.into(),
             payload,
             stored_at: rfc3339_millis(100)?,
-            schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA_V4.into()),
+            schema_id: Some(schema.into()),
         };
         let lifted = read_transaction_record(&envelope)?;
         assert_eq!(lifted.schema_version, DEPLOYMENT_TRANSACTION_SCHEMA);
-        assert_eq!(lifted.transaction_id, expected.transaction_id);
-        assert_eq!(lifted.created_at_unix_millis, expected.created_at_unix_millis);
-        assert_eq!(lifted.updated_at_unix_millis, expected.updated_at_unix_millis);
-        assert_eq!(lifted.completion, expected.completion);
-        assert_eq!(lifted.plan, expected.plan);
-        assert_eq!(lifted.sealed_release, expected.sealed_release);
-        assert_eq!(lifted.installed_release, expected.installed_release);
-        assert_eq!(lifted.frozen_source, expected.frozen_source);
         assert_eq!(lifted.deployment_authorization, expected.deployment_authorization);
-        assert_eq!(lifted.post_commit_cleanup, expected.post_commit_cleanup);
-        assert_eq!(lifted.phase_deadline, expected.phase_deadline);
+        assert_eq!(lifted.deployment_admitted_at_unix_millis, None);
         assert_eq!(lifted.flip, None);
         assert_eq!(lifted, expected, "some field changed in the lift");
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_populated_v4_transaction_lifts_to_the_exact_v6_field_by_field() -> Result<()> {
+        populated_legacy_lifts_to_the_exact_current_field_by_field(DEPLOYMENT_TRANSACTION_SCHEMA_V4, 2)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_populated_v5_transaction_with_a_consumed_release_lifts_to_the_exact_v6_field_by_field() -> Result<()> {
+        populated_legacy_lifts_to_the_exact_current_field_by_field(DEPLOYMENT_TRANSACTION_SCHEMA_V5, 1)
     }
 
     #[cfg(unix)]
@@ -26616,7 +26809,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         assert_eq!(flip.carried_sha256.as_deref(), Some(sha256_of(SITE_CONFIG_THREE).as_str()));
         assert_eq!(w.current_release().as_deref(), Some(first.as_str()));
         assert_eq!(std::fs::read(w.current_link().join("config.json"))?, SITE_CONFIG_THREE);
-        assert!(done.deployment_authorization.is_some(), "the brake was not consumed");
+        assert!(done.deployment_admitted_at_unix_millis.is_some(), "the stop did not stamp its admission");
         // Negatives: no source, no source cleanup, no generation, no pruning.
         assert!(done.frozen_source.is_none());
         assert_eq!(
