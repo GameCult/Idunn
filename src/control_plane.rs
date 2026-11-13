@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::brake::{Stop, process_uid, read_stop};
+use crate::brake::{NamedStop, read_stops};
 #[cfg(test)]
 use crate::brake::StopState;
 use crate::deployment::{
@@ -9345,27 +9345,26 @@ impl Engine {
     /// Read live at each point that is still reversible: Sealing, the static
     /// flip intent and the entry into Fencing.
     fn stop_note(&self, current: &Stored<DeploymentTransaction>) -> Result<Option<String>> {
-        Ok(match self.deployment_stop(current)? {
-            Stop::Absent | Stop::Clear(_) => None,
-            Stop::Engaged(held) => Some(format!(
-                "deployment brake engaged by {}: {}",
-                held.by, held.reason
-            )),
-            Stop::Unreadable(why) => Some(format!(
-                "deployment brake is unreadable and fails closed: {why}"
-            )),
-        })
+        let notes: Vec<String> = self
+            .deployment_stops(current)?
+            .iter()
+            .filter_map(NamedStop::note)
+            .collect();
+        Ok((!notes.is_empty()).then(|| notes.join("; ")))
     }
 
-    /// What the binding's deployment stop says about this transaction's
-    /// runtime. Read live; never cached, never consumed.
-    fn deployment_stop(&self, current: &Stored<DeploymentTransaction>) -> Result<Stop> {
+    /// What the binding's stops say about this transaction's runtime: the
+    /// operator's store and, when the binding names one, the steward's. Read
+    /// live; never cached, never consumed.
+    fn deployment_stops(
+        &self,
+        current: &Stored<DeploymentTransaction>,
+    ) -> Result<Vec<NamedStop>> {
         let plan = required(&current.value.plan, "transaction plan")?;
         let binding = plan.parsed_inputs()?.1;
-        Ok(read_stop(
-            &binding.brakes.deployment_store,
+        Ok(read_stops(
+            &binding.brakes,
             &binding.runtime_identity.runtime_id,
-            process_uid(),
         ))
     }
 
@@ -9377,7 +9376,8 @@ impl Engine {
     /// hold is a reason to leave a serving or retrying body alone.
     fn deploy_can_move(&self, deploy: &Stored<DeploymentTransaction>) -> bool {
         deploy.value.deployment_admitted()
-            || self.deployment_stop(deploy).is_ok_and(|stop| stop.admits())
+            || self.deployment_stops(deploy)
+                .is_ok_and(|stops| stops.iter().all(|named| named.stop.admits()))
     }
 
     /// The deployment a continuity gives way to: one on its target that awaits
@@ -26298,6 +26298,13 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     /// that seals it, and a stand-in site beside it.
     #[cfg(unix)]
     fn static_world() -> Result<StaticWorld> {
+        static_world_with_steward(None)
+    }
+
+    /// The static world, its binding naming `steward` (a login) as a second
+    /// stop whose store is `steward/brake.cc`.
+    #[cfg(unix)]
+    fn static_world_with_steward(steward: Option<&str>) -> Result<StaticWorld> {
         use crate::deployment::tests::{STATIC_BINDING, STATIC_RECIPE};
         let tools = TempDir::new()?;
         let tree = tools.path().join("tree");
@@ -26311,13 +26318,24 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             STATIC_RECIPE,
             |root| {
                 site = root.join("site");
-                STATIC_BINDING.replace("@SITE@", &site.display().to_string())
+                let text = STATIC_BINDING.replace("@SITE@", &site.display().to_string());
+                match steward {
+                    None => text,
+                    Some(user) => text.replace(
+                        "[rollout]",
+                        &format!(
+                            "[brakes.steward]\nuser = \"{user}\"\nstore = \"{}/steward/brake.cc\"\n\n[rollout]",
+                            site.display()
+                        ),
+                    ),
+                }
             },
             Arc::new(InstallingWorkload),
         )?;
         std::fs::create_dir_all(site.join("www"))?;
         std::fs::create_dir_all(site.join("config"))?;
         std::fs::create_dir_all(site.join("authority"))?;
+        std::fs::create_dir_all(site.join("steward"))?;
         std::fs::write(site.join("config/site.json"), SITE_CONFIG_ONE)?;
         *world.engine.runner_stand_in.lock().unwrap() =
             Some(Arc::new(SealingRunner { tree: tree.clone() }));
@@ -26448,6 +26466,61 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         assert!(matches!(done.completion, Some(TransactionCompletion::Admitted { .. })), "{done:?}");
         assert!(done.deployment_admitted_at_unix_millis.is_some());
         assert!(done.deployment_authorization.is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_steward_stop_holds_a_deploy_beside_the_operators_and_names_who() -> Result<()> {
+        let me = crate::brake::process_uid();
+        if me == 0 {
+            eprintln!("SKIPPED: a steward is never root, and this run is root");
+            return Ok(());
+        }
+        let user = crate::brake::login_name(me)?;
+        let w = static_world_with_steward(Some(&user))?;
+        let steward_store = w.site.join("steward/brake.cc");
+        let op_store = w.site.join("authority/deployment-brake.cc");
+        let stop = |store: &Path, state, reason: &str| -> Result<()> {
+            crate::brake::replace_stop(store, "site-yggdrasil", state, reason, now_millis()?)?;
+            Ok(())
+        };
+        stop(&steward_store, StopState::Engaged, "steward hold")?;
+        let id = w.transaction_of("up-service")?;
+        w.tick_until(&id, "the sealed release", |t| t.installed_release.is_some())?;
+        let settle = |w: &StaticWorld| -> Result<DeploymentTransaction> {
+            for _ in 0..2 {
+                w.world.engine.resume_backoff.lock().unwrap().clear();
+                let _ = w.world.engine.run_scheduler_tick();
+            }
+            latest_id(&w.world, &id)
+        };
+        let held = settle(&w)?;
+        assert_eq!(held.phase, DeploymentPhase::Sealing);
+        assert_eq!(
+            held.last_error.as_deref(),
+            Some(format!("steward {user} deployment brake engaged: steward hold").as_str())
+        );
+        // The operator engages too; the steward clears its own. The operator's holds.
+        stop(&op_store, StopState::Engaged, "operator hold")?;
+        stop(&steward_store, StopState::Clear, "steward thaw")?;
+        let held = settle(&w)?;
+        assert!(!held.deployment_admitted());
+        assert_eq!(
+            held.last_error.as_deref(),
+            Some(format!("deployment brake engaged by {user}: operator hold").as_str())
+        );
+        // Both engaged: both named.
+        stop(&steward_store, StopState::Engaged, "steward again")?;
+        let held = settle(&w)?;
+        assert!(held.last_error.as_deref().is_some_and(|note| note.contains("operator hold")
+            && note.contains("steward again")));
+        // The operator clears, the steward still holds; then both clear.
+        stop(&op_store, StopState::Clear, "operator thaw")?;
+        assert!(!settle(&w)?.deployment_admitted());
+        stop(&steward_store, StopState::Clear, "steward thaw")?;
+        w.tick_until(&id, "the end", |t| t.is_terminal())?;
+        assert!(latest_id(&w.world, &id)?.deployment_admitted());
         Ok(())
     }
 

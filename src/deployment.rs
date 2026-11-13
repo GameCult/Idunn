@@ -753,6 +753,20 @@ impl ProcessWriteLeaseBinding {
 pub struct BrakeBinding {
     pub deployment_store: PathBuf,
     pub lifecycle_store: PathBuf,
+    /// A second deployment stop, written by the target's steward in a
+    /// directory only the steward can write. Absent means the operator's store
+    /// is the only stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steward: Option<StewardBrakeBinding>,
+}
+
+/// The steward's own stop: the file's owner uid proves who wrote it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StewardBrakeBinding {
+    /// Login name; must resolve to a non-root uid when the store is read.
+    pub user: String,
+    pub store: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1430,6 +1444,39 @@ impl OperatorBinding {
             self.brakes.deployment_store != self.brakes.lifecycle_store,
             "deployment and lifecycle brakes are identical"
         );
+        if let Some(steward) = &self.brakes.steward {
+            require_absolute_path(&steward.store, "steward deployment brake")?;
+            ensure!(
+                crate::steward_orders::login_grammar_ok(&steward.user) && steward.user != "root",
+                "steward brake user is invalid or root"
+            );
+            ensure!(
+                steward.store != self.brakes.deployment_store
+                    && steward.store != self.brakes.lifecycle_store,
+                "steward brake store is identical to another brake store"
+            );
+            // The steward owns its store's directory, so it could unlink any
+            // file there. Every other authority store must therefore live
+            // outside that directory, and the steward's directory must be
+            // clear of every directory an operator store lives in.
+            let steward_dir = steward.store.parent().unwrap_or(&steward.store);
+            let others = [
+                Some(&self.brakes.deployment_store),
+                Some(&self.brakes.lifecycle_store),
+                Some(&self.runtime_identity.trust_anchor_store),
+                self.process_write_lease.as_ref().map(|lease| &lease.record_path),
+                self.repository.release_authority_store.as_ref(),
+            ];
+            for other in others.into_iter().flatten() {
+                let other_dir = other.parent().unwrap_or(other);
+                ensure!(
+                    !paths_overlap(steward_dir, other_dir),
+                    "steward brake directory {} is shared with or nested in the directory of Idunn authority {}: the steward owns its directory and could remove that file",
+                    steward_dir.display(),
+                    other.display()
+                );
+            }
+        }
         self.workload.validate_launch_environment()?;
         let workload = match &self.workload {
             WorkloadBinding::HostActuator(workload) => {
@@ -1462,7 +1509,10 @@ impl OperatorBinding {
                     &self.brakes.deployment_store,
                     &self.brakes.lifecycle_store,
                     &self.runtime_identity.trust_anchor_store,
-                ] {
+                ]
+                .into_iter()
+                .chain(self.brakes.steward.as_ref().map(|steward| &steward.store))
+                {
                     ensure!(
                         !paths_overlap(authority, &workload.release_root)
                             && !paths_overlap(authority, &workload.current_link),
@@ -1531,6 +1581,7 @@ impl OperatorBinding {
             self.brakes.deployment_store.clone(),
             self.brakes.lifecycle_store.clone(),
         ];
+        authority_paths.extend(self.brakes.steward.as_ref().map(|steward| steward.store.clone()));
         if let Some(write_lease) = &self.process_write_lease {
             authority_paths.push(write_lease.record_path.clone());
             authority_paths.push(write_lease.lock_path());
@@ -3063,6 +3114,65 @@ nodes = ["yggdrasil"]
             text = text.replace(from, to);
         }
         text
+    }
+
+    const STEWARD: &str = "\n[brakes.steward]\nuser = \"mind-streampixels\"\nstore = \"/var/lib/gamecult/idunn-steward/streampixels/deployment-brake.cc\"\n";
+
+    #[test]
+    fn binding_without_steward_parses_and_admits_on_operator_store_only() {
+        for text in [BINDING.to_string(), static_binding(&[])] {
+            assert_eq!(OperatorBinding::parse(&text).unwrap().brakes.steward, None);
+        }
+        let steward = OperatorBinding::parse(&BINDING.replace("\n[rollout]", &format!("{STEWARD}\n[rollout]")))
+            .unwrap()
+            .brakes
+            .steward
+            .unwrap();
+        assert_eq!(steward.user, "mind-streampixels");
+    }
+
+    #[test]
+    fn a_steward_brake_must_be_a_distinct_absolute_non_root_login_and_clear_of_the_workload() {
+        let with = |steward: &str| BINDING.replace("\n[rollout]", &format!("{steward}\n[rollout]"));
+        let store = "/var/lib/gamecult/idunn-steward/x/deployment-brake.cc";
+        for bad in [
+            format!("\n[brakes.steward]\nuser = \"root\"\nstore = \"{store}\"\n"),
+            format!("\n[brakes.steward]\nuser = \"Bad User\"\nstore = \"{store}\"\n"),
+            "\n[brakes.steward]\nuser = \"mind\"\nstore = \"relative.cc\"\n".into(),
+            "\n[brakes.steward]\nuser = \"mind\"\nstore = \"/var/lib/gamecult/idunn-authority/test-service-deployment-brake.cc\"\n".into(),
+            "\n[brakes.steward]\nuser = \"mind\"\nstore = \"/var/lib/gamecult/idunn-authority/test-service-lifecycle-brake.cc\"\n".into(),
+            format!("\n[brakes.steward]\nuser = \"mind\"\nstore = \"{store}\"\nextra = 1\n"),
+        ] {
+            assert!(OperatorBinding::parse(&with(&bad)).is_err(), "{bad}");
+        }
+        // A steward directory shared with, or enclosing, an operator store
+        // lets the steward unlink a root-owned file: refused.
+        for (deployment, steward_store) in [
+            ("/var/lib/gamecult/steward-x/op.cc", "/var/lib/gamecult/steward-x/s.cc"),
+            ("/var/lib/gamecult/steward-x/sub/op.cc", "/var/lib/gamecult/steward-x/s.cc"),
+            ("/var/lib/gamecult/op.cc", "/var/lib/gamecult/steward-x/s.cc"),
+        ] {
+            let shared = BINDING
+                .replace("/var/lib/gamecult/idunn-authority/test-service-deployment-brake.cc", deployment)
+                .replace("\n[rollout]", &format!("\n[brakes.steward]\nuser = \"mind\"\nstore = \"{steward_store}\"\n\n[rollout]"));
+            assert!(OperatorBinding::parse(&shared).is_err(), "{deployment} {steward_store}");
+        }
+        // Disjoint directories are the one admitted shape.
+        let disjoint = BINDING.replace(
+            "\n[rollout]",
+            "\n[brakes.steward]\nuser = \"mind\"\nstore = \"/var/lib/gamecult/steward-x/s.cc\"\n\n[rollout]",
+        );
+        OperatorBinding::parse(&disjoint).unwrap();
+        // steward_store_overlap_with_workload_path_refused
+        let overlapping = BINDING
+            .replace("\n[rollout]", &format!("\n[brakes.steward]\nuser = \"mind\"\nstore = \"{store}\"\n\n[rollout]"))
+            .replace(
+                "cpu_quota_percent = 200\n\n[workload.argument_bindings]",
+                "cpu_quota_percent = 200\nread_write_paths = [\"/var/lib/gamecult/idunn-steward/x\"]\n\n[workload.argument_bindings]",
+            );
+        assert!(OperatorBinding::parse(&overlapping).is_err());
+        let static_overlap = static_binding(&[("[rollout]", "[brakes.steward]\nuser = \"mind\"\nstore = \"/srv/site/releases/x/brake.cc\"\n\n[rollout]")]);
+        assert!(OperatorBinding::parse(&static_overlap).is_err());
     }
 
     #[test]

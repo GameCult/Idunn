@@ -318,6 +318,57 @@ runtime's record, another owner, an unsearchable or non-directory parent) reads
 as unreadable and fails closed; the wait note carries the
 `idunn-provision deployment-brake-clear` command that replaces it.
 
+A binding may name a second stop, the target's steward:
+
+```toml
+[brakes.steward]
+user = "mind-streampixels"            # a login, never root
+store = "/var/lib/gamecult/idunn-steward/streampixels/deployment-brake.cc"
+```
+
+Deploys admit only when every stop admits. The steward's store is read as owned
+by that user's uid: the owner uid proves who wrote the file, and the wait note
+names the stop by the binding's steward user, never by the record's `by` (which
+is the verb's own text). Idunn never writes the steward directory and no key,
+group or ACL is involved. The operator's store is a separate stop the steward
+cannot clear, and the wait note names each holding stop.
+
+The steward owns its directory, so it could unlink any file in it. Binding
+validation therefore refuses a steward store whose directory is shared with,
+inside or around the directory of any other Idunn authority store (deployment
+and lifecycle brakes, trust anchor, write-lease record, release authority).
+Validation cannot see the file system: the root who provisions the directory
+makes it contain the steward's store and nothing else.
+
+A steward store owned by another uid, or a steward user that does not resolve
+to a non-root uid, is unreadable and fails closed. Only the steward (the
+owner uid) can repair it: a clear run as root leaves a root-owned file that is
+still unreadable.
+
+### Provisioning a steward (root, once per target)
+
+1. Create the store directory, owned by the steward and holding nothing else:
+   `install -d -o mind-streampixels -g mind-streampixels -m 0755
+   /var/lib/gamecult/idunn-steward/streampixels`. It must not be, contain or sit
+   inside any other authority directory, and no workload `ReadWritePaths` may
+   cover it. Idunn (root) reads it without further grants; no group or ACL.
+2. Add the stanza above to the target's operator binding, after `[brakes]`,
+   with the steward's real login. Deploys planned afterwards see it.
+3. The steward engages and clears as itself, never through root:
+   `idunn-provision deployment-brake-engage --store <store> --runtime-id <id>
+   --reason <text>` and `deployment-brake-clear` with the same flags.
+4. The operator reads it with `idunn-provision deployment-brake-status --store
+   <store> --runtime-id <id> --owner-user mind-streampixels`.
+
+The binding is sealed into each plan. A deploy already planned keeps the
+binding it was sealed with: editing the stanza does not apply to it. If the
+steward's login is deleted or its directory is lost, that deploy stays
+unreadable-held at Sealing (or the static flip intent). `idunn cancel` withdraws
+only a deploy held for a readiness disagreement before Fencing, and `idunn
+expire` only one in Warming through Committing, so neither frees a deploy held
+by the stop. Recovery is to restore the steward's login or recreate the
+directory owned by it (and have the steward clear its store).
+
 Record v6 (`deployment_admitted_at_unix_millis`, key 38) is forward-only: an
 Idunn that predates v6 cannot read a migrated `control.cc`, so, as for v5 (see
 `route-continuity-cut.md`, "An older Idunn refuses the v5 store"), take a
