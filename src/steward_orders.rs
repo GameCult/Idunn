@@ -1528,12 +1528,7 @@ impl StewardBinding {
             !self.principal.starts_with('-') && !self.principal.contains('/'),
             "steward principal is invalid"
         );
-        let user_ok = !self.user.is_empty()
-            && self.user.len() <= 32
-            && self.user.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-            })
-            && !self.user.starts_with(|first: char| first.is_ascii_digit() || first == '-');
+        let user_ok = login_grammar_ok(&self.user);
         ensure!(user_ok && self.user != "root", "steward user is invalid or root");
         ensure!(
             self.mind_control.is_absolute(),
@@ -1581,7 +1576,18 @@ fn load_binding(path: &Path) -> Result<StewardBinding> {
     StewardBinding::parse(&text)
 }
 
-fn user_uid(name: &str) -> Result<u32> {
+/// A login name Idunn will resolve: the one grammar for every binding that names
+/// a user.
+pub(crate) fn login_grammar_ok(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= 32
+        && user.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+        && !user.starts_with(|first: char| first.is_ascii_digit() || first == '-')
+}
+
+pub(crate) fn user_uid(name: &str) -> Result<u32> {
     let name = std::ffi::CString::new(name)?;
     // SAFETY: `passwd` is plain data and getpwnam_r fills it, with strings in
     // `buffer`, which outlives every read of them below (none are read).
