@@ -634,6 +634,20 @@ pub struct StaticFlip {
     pub carried_sha256: String,
 }
 
+/// A flip that was refused before the link moved. It is the only error that may
+/// end a static transaction before fencing: once the rename has happened,
+/// nothing may say the flip did not.
+#[derive(Debug)]
+pub(crate) struct FlipRefused(pub(crate) String);
+
+impl std::fmt::Display for FlipRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FlipRefused {}
+
 /// The one external change a static release makes: copy the operator's site
 /// file into an installed release and repoint the current link at it. The port
 /// decides nothing; the engine decides when, and records what it reports.
@@ -646,8 +660,15 @@ pub trait StaticReleasePort {
     /// Copy the carry into `release_id` and repoint the link at it. Nothing
     /// moves unless the carry source was read, so a missing site file leaves
     /// the link where it was. Repeating it is harmless.
+    ///
+    /// An error is `FlipRefused` exactly when the link did not move; the rename
+    /// is the last fallible step, and what follows it cannot fail the flip.
     fn carry_and_flip(&self, binding: &StaticReleaseBinding, release_id: &str)
     -> Result<StaticFlip>;
+
+    /// The digest of the carry already inside an installed release: what a
+    /// resumed flip records when an earlier attempt landed.
+    fn carried_sha256(&self, binding: &StaticReleaseBinding, release_id: &str) -> Result<String>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -694,6 +715,22 @@ impl StaticReleasePort for FilesystemStaticRelease {
         Ok(Some(id.to_owned()))
     }
 
+    fn carried_sha256(&self, binding: &StaticReleaseBinding, release_id: &str) -> Result<String> {
+        require_sha256_id(release_id, "release carrying the site file")?;
+        let carried = binding
+            .release_root
+            .join(release_id)
+            .join(&binding.carry.destination);
+        ensure!(
+            fs::symlink_metadata(&carried)?.is_file(),
+            "carried {} is not a regular file",
+            carried.display()
+        );
+        let mut hasher = Sha256::new();
+        hash_file_exact(&carried, fs::metadata(&carried)?.len(), &mut hasher)?;
+        Ok(format!("sha256-{:x}", hasher.finalize()))
+    }
+
     fn carry_and_flip(
         &self,
         binding: &StaticReleaseBinding,
@@ -701,94 +738,107 @@ impl StaticReleasePort for FilesystemStaticRelease {
     ) -> Result<StaticFlip> {
         use std::os::unix::fs::{OpenOptionsExt, symlink};
 
-        require_sha256_id(release_id, "release to flip to")?;
-        let release = binding.release_root.join(release_id);
-        let release_metadata = fs::symlink_metadata(&release)
-            .with_context(|| format!("installed release {}", release.display()))?;
-        ensure!(
-            release_metadata.is_dir(),
-            "installed release {} is not a directory",
-            release.display()
-        );
-        let link_parent = binding
-            .current_link
-            .parent()
-            .context("current link has no parent")?;
-        match fs::symlink_metadata(&binding.current_link) {
-            Ok(metadata) => ensure!(
-                metadata.file_type().is_symlink(),
-                "current {} is not a symlink and will not be replaced",
-                binding.current_link.display()
-            ),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("reading current link"),
-        }
-
-        // Everything that can fail on the operator's side fails here, before
-        // the link moves.
-        let source = &binding.carry.source;
-        let source_metadata = fs::symlink_metadata(source)
-            .with_context(|| format!("reading carry source {}", source.display()))?;
-        ensure!(
-            source_metadata.is_file(),
-            "carry source {} is not a regular file",
-            source.display()
-        );
-        ensure!(
-            source_metadata.len() <= STATIC_CARRY_LIMIT_BYTES,
-            "carry source {} is larger than {STATIC_CARRY_LIMIT_BYTES} bytes",
-            source.display()
-        );
-        let mut bytes = Vec::new();
-        fs::File::open(source)?
-            .take(STATIC_CARRY_LIMIT_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 <= STATIC_CARRY_LIMIT_BYTES,
-            "carry source {} grew past {STATIC_CARRY_LIMIT_BYTES} bytes",
-            source.display()
-        );
-        let carried_sha256 = format!("sha256-{:x}", Sha256::digest(&bytes));
-
-        let carried = release.join(&binding.carry.destination);
-        let temporary_carry = release.join(format!(".carry-{}", Uuid::new_v4()));
-        let written = (|| -> Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o444)
-                .open(&temporary_carry)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary_carry, &carried)?;
-            fs::File::open(&release)?.sync_all()?;
-            Ok(())
-        })();
-        if let Err(error) = written {
-            let _ = fs::remove_file(&temporary_carry);
-            return Err(error)
-                .with_context(|| format!("carrying the site file into {}", release.display()));
-        }
-
-        // A link is renamed over, never edited: a reader sees the old release
-        // or the new one. A temporary link a crashed flip left is replaced.
-        let temporary_link = link_parent.join(format!(
-            ".{}.flip",
-            binding
+        // Everything up to and including the rename can refuse, and only that
+        // refuses: the link has not moved when `FlipRefused` is returned.
+        let refuse = |error: anyhow::Error| anyhow::Error::new(FlipRefused(format!("{error:#}")));
+        let staged = (|| -> Result<(PathBuf, PathBuf, String)> {
+            require_sha256_id(release_id, "release to flip to")?;
+            let release = binding.release_root.join(release_id);
+            let release_metadata = fs::symlink_metadata(&release)
+                .with_context(|| format!("installed release {}", release.display()))?;
+            ensure!(
+                release_metadata.is_dir(),
+                "installed release {} is not a directory",
+                release.display()
+            );
+            let link_parent = binding
                 .current_link
-                .file_name()
-                .and_then(OsStr::to_str)
-                .context("current link has no name")?
-        ));
-        if fs::symlink_metadata(&temporary_link).is_ok() {
-            fs::remove_file(&temporary_link).context("removing a stale flip link")?;
-        }
-        symlink(&release, &temporary_link).context("creating the flip link")?;
+                .parent()
+                .context("current link has no parent")?;
+            match fs::symlink_metadata(&binding.current_link) {
+                Ok(metadata) => ensure!(
+                    metadata.file_type().is_symlink(),
+                    "current {} is not a symlink and will not be replaced",
+                    binding.current_link.display()
+                ),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("reading current link"),
+            }
+
+            let source = &binding.carry.source;
+            let source_metadata = fs::symlink_metadata(source)
+                .with_context(|| format!("reading carry source {}", source.display()))?;
+            ensure!(
+                source_metadata.is_file(),
+                "carry source {} is not a regular file",
+                source.display()
+            );
+            ensure!(
+                source_metadata.len() <= STATIC_CARRY_LIMIT_BYTES,
+                "carry source {} is larger than {STATIC_CARRY_LIMIT_BYTES} bytes",
+                source.display()
+            );
+            let mut bytes = Vec::new();
+            fs::File::open(source)?
+                .take(STATIC_CARRY_LIMIT_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 <= STATIC_CARRY_LIMIT_BYTES,
+                "carry source {} grew past {STATIC_CARRY_LIMIT_BYTES} bytes",
+                source.display()
+            );
+            let carried_sha256 = format!("sha256-{:x}", Sha256::digest(&bytes));
+
+            let carried = release.join(&binding.carry.destination);
+            let temporary_carry = release.join(format!(".carry-{}", Uuid::new_v4()));
+            let written = (|| -> Result<()> {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o444)
+                    .open(&temporary_carry)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                fs::rename(&temporary_carry, &carried)?;
+                fs::File::open(&release)?.sync_all()?;
+                Ok(())
+            })();
+            if let Err(error) = written {
+                let _ = fs::remove_file(&temporary_carry);
+                return Err(error)
+                    .with_context(|| format!("carrying the site file into {}", release.display()));
+            }
+
+            // A link is renamed over, never edited: a reader sees the old
+            // release or the new one. A temporary link a crashed flip left is
+            // replaced.
+            let temporary_link = link_parent.join(format!(
+                ".{}.flip",
+                binding
+                    .current_link
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .context("current link has no name")?
+            ));
+            if fs::symlink_metadata(&temporary_link).is_ok() {
+                fs::remove_file(&temporary_link).context("removing a stale flip link")?;
+            }
+            symlink(&release, &temporary_link).context("creating the flip link")?;
+            Ok((temporary_link, release, carried_sha256))
+        })()
+        .map_err(refuse)?;
+        let (temporary_link, _, carried_sha256) = staged;
         if let Err(error) = fs::rename(&temporary_link, &binding.current_link) {
             let _ = fs::remove_file(&temporary_link);
-            return Err(error).context("repointing the current link");
+            return Err(refuse(
+                anyhow::Error::new(error).context("repointing the current link"),
+            ));
         }
-        fs::File::open(link_parent)?.sync_all()?;
+        // The link has moved and nothing below can say it did not. The parent
+        // directory sync is durability only, so it is best-effort.
+        if let Some(parent) = binding.current_link.parent() {
+            let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
+        }
         Ok(StaticFlip { carried_sha256 })
     }
 }
@@ -800,6 +850,10 @@ impl StaticReleasePort for FilesystemStaticRelease {
     }
 
     fn carry_and_flip(&self, _: &StaticReleaseBinding, _: &str) -> Result<StaticFlip> {
+        bail!("a static release flip requires Unix symlinks")
+    }
+
+    fn carried_sha256(&self, _: &StaticReleaseBinding, _: &str) -> Result<String> {
         bail!("a static release flip requires Unix symlinks")
     }
 }
@@ -16970,6 +17024,7 @@ processes 9
         fs::remove_file(&site.binding.carry.source)?;
         let error = port.carry_and_flip(&site.binding, RELEASE_B).unwrap_err();
         assert!(format!("{error:#}").contains("carry source"), "{error:#}");
+        assert!(error.downcast_ref::<FlipRefused>().is_some(), "a pre-rename refusal is typed");
         assert_eq!(port.observe_current(&site.binding)?.as_deref(), Some(RELEASE_A));
         assert!(
             !site.binding.release_root.join(RELEASE_B).join("config.json").exists(),
@@ -17018,8 +17073,13 @@ processes 9
         let port = FilesystemStaticRelease;
         // A real directory where the link belongs is left alone.
         fs::create_dir(&site.binding.current_link)?;
-        assert!(port.carry_and_flip(&site.binding, RELEASE_A).is_err());
+        let error = port.carry_and_flip(&site.binding, RELEASE_A).unwrap_err();
+        assert!(error.downcast_ref::<FlipRefused>().is_some(), "{error:#}");
         assert!(site.binding.current_link.is_dir());
+        assert!(
+            !site.binding.release_root.join(RELEASE_A).join("config.json").exists(),
+            "a refused flip wrote its carry"
+        );
         assert!(port.observe_current(&site.binding).is_err());
         fs::remove_dir(&site.binding.current_link)?;
         // A link that names something outside the release root has no release

@@ -40,10 +40,10 @@ use crate::deployment_plan::{
 };
 use crate::drivers::{
     ChallengeFailure, CultCacheTopologyDriver, CultCacheWriteLeaseDriver, DockerRunnerDriver, FilesystemStaticRelease,
-    FrozenSourceReceipt, GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
+    FlipRefused, FrozenSourceReceipt, GitSourceDriver, InstalledReleaseObservation, IsolationEvidence, NginxRouteDriver,
     LockContended, ProcessIdentity, RouteActuation, RouteActuationGate, RouteActuationRefused, RouteActuators,
     RouteObservation, RoutePreflightReceipt, RunnerPort, RunnerStepFailure, SourcePort,
-    StaticReleasePort, SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
+    StaticFlip, StaticReleasePort, SystemdTransientWorkloadDriver, TopologyPort, WorkloadObservation, WorkloadPort,
     WriteLeasePort, require_sha256_id,
 };
 use crate::incident::{CloseReason, IncidentCondition, IncidentStore, render_incidents};
@@ -2136,6 +2136,14 @@ impl DeploymentTransaction {
             .is_some_and(|(_, binding)| matches!(binding.workload, WorkloadBinding::StaticRelease(_)))
     }
 
+    /// Whether `error` can no longer end this transaction before fencing: a
+    /// static flip is recorded as intended and only `FlipRefused` (the link did
+    /// not move) says it did not happen. Any other error after the intent may
+    /// follow the rename, so the step is retried, and a retry observes the link.
+    fn flip_may_have_moved_current(&self, error: &anyhow::Error) -> bool {
+        self.flip.is_some() && error.downcast_ref::<FlipRefused>().is_none()
+    }
+
     /// The runtime and the sealed release a deployment brake release must name.
     /// One reading for both kinds of target: the binding's runtime identity and
     /// the sealed release, which a service's Expected projection copies.
@@ -2644,6 +2652,11 @@ impl DeploymentTransaction {
         }
         if let Some(abort) = &self.pre_fencing_abort {
             require_detail(&abort.error, "pre-fencing abort error")?;
+            ensure!(
+                !self.flip.as_ref().is_some_and(FlipEvidence::landed),
+                "a transaction whose flip landed cannot fail before fencing"
+            );
+
             ensure!(
                 self.post_commit_cleanup.is_none(),
                 "aborted transaction also carries post-commit cleanup"
@@ -6738,6 +6751,7 @@ impl Engine {
                 // phase deadline, not an abort, bounds the wait.
                 if latest.value.pre_fencing_abort.is_none()
                     && error.downcast_ref::<LockContended>().is_none()
+                    && !latest.value.flip_may_have_moved_current(&error)
                 {
                     if let Some(line) = self.keep_runner_failure(&latest.value, &error) {
                         eprintln!("{line}");
@@ -7917,9 +7931,21 @@ impl Engine {
             });
         };
         if !flip.landed() {
-            let landed = self
-                .static_release
-                .carry_and_flip(workload, &flip.release_id)?;
+            // An earlier attempt may have moved the link and failed to record
+            // it: then nothing is flipped again, and the carry already inside
+            // the release is what is recorded.
+            let landed = if self.static_release.observe_current(workload)?.as_deref()
+                == Some(flip.release_id.as_str())
+            {
+                StaticFlip {
+                    carried_sha256: self
+                        .static_release
+                        .carried_sha256(workload, &flip.release_id)?,
+                }
+            } else {
+                self.static_release
+                    .carry_and_flip(workload, &flip.release_id)?
+            };
             return self.persist_same_phase(current, |next| {
                 let flip = next.flip.as_mut().expect("flip intent read above");
                 flip.carried_sha256 = Some(landed.carried_sha256);
@@ -26130,5 +26156,164 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         Ok(())
     }
 
+
+    /// The filesystem port, with faults injected where the real one could only
+    /// fail after the link had moved: `flip_fault_after_rename` fails the flip
+    /// call after the rename landed, `observe_fault_at` fails the nth observe.
+    struct FaultyPort {
+        inner: FilesystemStaticRelease,
+        flip_fault_after_rename: std::sync::atomic::AtomicBool,
+        observe_calls: std::sync::atomic::AtomicUsize,
+        observe_fault_at: usize,
+    }
+
+    impl FaultyPort {
+        fn new(flip_fault_after_rename: bool, observe_fault_at: usize) -> Arc<Self> {
+            Arc::new(Self {
+                inner: FilesystemStaticRelease,
+                flip_fault_after_rename: flip_fault_after_rename.into(),
+                observe_calls: 0.into(),
+                observe_fault_at,
+            })
+        }
+    }
+
+    impl crate::drivers::StaticReleasePort for FaultyPort {
+        fn observe_current(&self, binding: &crate::deployment::StaticReleaseBinding) -> Result<Option<String>> {
+            use std::sync::atomic::Ordering;
+            let call = self.observe_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            ensure!(call != self.observe_fault_at, "injected observe fault (call {call})");
+            self.inner.observe_current(binding)
+        }
+
+        fn carry_and_flip(
+            &self,
+            binding: &crate::deployment::StaticReleaseBinding,
+            release_id: &str,
+        ) -> Result<StaticFlip> {
+            let flip = self.inner.carry_and_flip(binding, release_id)?;
+            if self.flip_fault_after_rename.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                bail!("injected fault after the rename");
+            }
+            Ok(flip)
+        }
+
+        fn carried_sha256(
+            &self,
+            binding: &crate::deployment::StaticReleaseBinding,
+            release_id: &str,
+        ) -> Result<String> {
+            self.inner.carried_sha256(binding, release_id)
+        }
+    }
+
+    /// Drive the first Deploy through the brake to its end.
+    fn drive_static_to_end(w: &StaticWorld) -> Result<DeploymentTransaction> {
+        let id = w.transaction_of("up-service")?;
+        let waiting = w.run_to_brake(&id)?;
+        w.release_brake(&waiting)?;
+        w.tick_until(&id, "the end", |t| t.is_terminal())?;
+        latest_id(&w.world, &id)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_error_after_the_rename_never_ends_before_fencing() -> Result<()> {
+        for (flip_fault, observe_fault_at) in [(true, 0), (false, 4)] {
+            let mut w = static_world()?;
+            w.world.engine.static_release = FaultyPort::new(flip_fault, observe_fault_at);
+            let done = drive_static_to_end(&w)?;
+            assert!(
+                matches!(done.completion, Some(TransactionCompletion::Admitted { .. })),
+                "a post-rename fault ended the transaction: {:?} {:?}",
+                done.completion,
+                done.last_error
+            );
+            assert!(done.pre_fencing_abort.is_none());
+            let flip = done.flip.as_ref().context("no flip")?;
+            assert!(flip.landed());
+            assert_eq!(w.current_release().as_deref(), Some(flip.release_id.as_str()));
+            assert_eq!(
+                flip.carried_sha256.as_deref(),
+                Some(sha256_of(SITE_CONFIG_ONE).as_str())
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_validation_refuses_a_landed_flip_that_failed_before_fencing() -> Result<()> {
+        let w = static_world()?;
+        let mut done = drive_static_to_end(&w)?;
+        assert!(done.flip.as_ref().is_some_and(FlipEvidence::landed));
+        done.completion = Some(TransactionCompletion::FailedBeforeFencing { error: "x".into() });
+        done.pre_fencing_abort = Some(PreFencingAbort {
+            error: "x".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Complete,
+        });
+        done.post_commit_cleanup = None;
+        done.phase_deadline = None;
+        let error = done.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("flip landed"), "{error:#}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_populated_v4_transaction_lifts_to_the_exact_v5_field_by_field() -> Result<()> {
+        let w = static_world()?;
+        let done = drive_static_to_end(&w)?;
+        // A populated record a v4 Idunn could have written: a deploy that
+        // consumed its brake and ended before fencing.
+        let mut expected = done.clone();
+        expected.flip = None;
+        expected.completion = Some(TransactionCompletion::FailedBeforeFencing { error: "refused".into() });
+        expected.pre_fencing_abort = Some(PreFencingAbort {
+            error: "refused".into(),
+            candidate_cleanup: CleanupEvidence::Skipped,
+            topology_reconciliation: CleanupEvidence::Skipped,
+            source_cleanup: CleanupEvidence::Complete,
+        });
+        expected.post_commit_cleanup = None;
+        expected.phase_deadline = None;
+        expected.last_error = Some("refused".into());
+        expected.validate()?;
+        assert_ne!(expected.created_at_unix_millis, expected.updated_at_unix_millis);
+        assert!(expected.completion.is_some() && expected.deployment_authorization.is_some());
+        // The v4 bytes of this record: the v5 encoding with the old schema name,
+        // one element shorter (key 37 is the last, a nil here).
+        let mut as_v4 = expected.clone();
+        as_v4.schema_version = DEPLOYMENT_TRANSACTION_SCHEMA_V4.into();
+        let mut payload = rmp_serde::to_vec(&as_v4)?;
+        assert_eq!(&payload[..3], &[0xdc, 0x00, 0x26]);
+        payload[2] = 0x25;
+        assert_eq!(payload.pop(), Some(0xc0));
+        let envelope = CultCacheEnvelope {
+            key: expected.transaction_id.clone(),
+            r#type: DeploymentTransaction::TYPE.into(),
+            payload,
+            stored_at: rfc3339_millis(100)?,
+            schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA_V4.into()),
+        };
+        let lifted = read_transaction_record(&envelope)?;
+        assert_eq!(lifted.schema_version, DEPLOYMENT_TRANSACTION_SCHEMA);
+        assert_eq!(lifted.transaction_id, expected.transaction_id);
+        assert_eq!(lifted.created_at_unix_millis, expected.created_at_unix_millis);
+        assert_eq!(lifted.updated_at_unix_millis, expected.updated_at_unix_millis);
+        assert_eq!(lifted.completion, expected.completion);
+        assert_eq!(lifted.plan, expected.plan);
+        assert_eq!(lifted.sealed_release, expected.sealed_release);
+        assert_eq!(lifted.installed_release, expected.installed_release);
+        assert_eq!(lifted.frozen_source, expected.frozen_source);
+        assert_eq!(lifted.deployment_authorization, expected.deployment_authorization);
+        assert_eq!(lifted.post_commit_cleanup, expected.post_commit_cleanup);
+        assert_eq!(lifted.phase_deadline, expected.phase_deadline);
+        assert_eq!(lifted.flip, None);
+        assert_eq!(lifted, expected, "some field changed in the lift");
+        Ok(())
+    }
     // END static-release tests
 }
