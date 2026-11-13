@@ -26102,6 +26102,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         let first_release = first_done.flip.context("no first flip")?.release_id;
         assert_eq!(w.current_release().as_deref(), Some(first_release.as_str()));
 
+        // The same tree is deployed again with a changed site config. Release
+        // ids are per transaction (the plan names its own incarnation), so the
+        // redeploy is a new release that carries the new file; the first keeps
+        // the bytes it was flipped with. No redeploy can name its own release.
+        std::fs::write(w.site_config(), SITE_CONFIG_TWO)?;
         enqueue_deploy(&w.world, "up-service-2")?;
         let second_id = w.transaction_of("up-service-2")?;
         let second = w.run_to_brake(&second_id)?;
@@ -26115,6 +26120,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         assert_eq!(flip.previous_release_id.as_deref(), Some(first_release.as_str()));
         assert_ne!(flip.release_id, first_release);
         assert_eq!(w.current_release().as_deref(), Some(flip.release_id.as_str()));
+        assert_eq!(std::fs::read(w.current_link().join("config.json"))?, SITE_CONFIG_TWO);
+        assert_eq!(
+            std::fs::read(w.site.join("releases").join(&first_release).join("config.json"))?,
+            SITE_CONFIG_ONE
+        );
         // The first release is still on disk: rollback is a flip back to it.
         assert!(w.site.join("releases").join(&first_release).join("dist/index.html").is_file());
         Ok(())
@@ -26313,6 +26323,32 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         assert_eq!(lifted.phase_deadline, expected.phase_deadline);
         assert_eq!(lifted.flip, None);
         assert_eq!(lifted, expected, "some field changed in the lift");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_release_with_a_foreign_current_retries_visibly_and_cannot_be_cancelled() -> Result<()> {
+        let w = static_world()?;
+        let id = w.transaction_of("up-service")?;
+        let waiting = w.run_to_brake(&id)?;
+        w.release_brake(&waiting)?;
+        w.tick_until(&id, "the flip intent", |t| t.flip.is_some())?;
+        // The operator replaces the link's place with a directory.
+        std::fs::create_dir(w.current_link())?;
+        for _ in 0..4 {
+            w.world.engine.resume_backoff.lock().unwrap().clear();
+            let _ = w.world.engine.run_scheduler_tick();
+        }
+        let stuck = latest_id(&w.world, &id)?;
+        assert!(!stuck.is_terminal() && stuck.phase == DeploymentPhase::Starting, "{stuck:?}");
+        assert!(stuck.pre_fencing_abort.is_none(), "an error after the intent ended the flip");
+        let reason = stuck.last_error.clone().context("the retry kept no error")?;
+        assert!(reason.contains("not a symlink"), "{reason}");
+        let printed = printed_status(&w.world)?;
+        assert!(printed.contains(&format!("waiting on {reason}")), "{printed}");
+        let refused = cancel(&w.world.state_store, "up-service", "operator").unwrap_err();
+        assert!(format!("{refused:#}").contains("can only be cancelled"), "{refused:#}");
         Ok(())
     }
     // END static-release tests

@@ -210,7 +210,15 @@ What `current_link` names is observed from the symlink and confirmed by the
 latest Admitted static transaction's `flip.release_id`; it is stored nowhere
 else. A rollback is a flip back to `flip.previous_release_id`: release
 directories stay, and Idunn prunes none. The brake is read exactly as for a
-service, naming the binding's runtime id and the sealed release id. A new
+service, naming the binding's runtime id and the sealed release id. Release ids are per transaction, so
+redeploying an unchanged tarball with a changed site file is a new release that
+carries the new file, never an in-place re-carry of an existing one: the carry
+is part of a release. If `current_link` is replaced by a directory or by a link
+that names nothing under the release root after the flip was recorded, the
+transaction keeps retrying with backoff: `idunn status --command <id>` shows the
+error as "waiting on ...", operator cancel is refused (Starting, not held), and
+the fix is by hand (restore the link or remove the directory); it then
+completes. A bounded retry is follow-up work. A new
 upstream tarball enters as a recipe `external_input` with a pinned url and
 sha256, so each release is a recipe commit whose pin is its provenance.
 
