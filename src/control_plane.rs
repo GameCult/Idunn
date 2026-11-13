@@ -56,7 +56,8 @@ use crate::host_actuator::{
 };
 
 const DEPLOYMENT_COMMAND_SCHEMA: &str = "idunn.deployment_command.v2";
-const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v4";
+const DEPLOYMENT_TRANSACTION_SCHEMA: &str = "idunn.deployment_transaction.v5";
+const DEPLOYMENT_TRANSACTION_SCHEMA_V4: &str = "idunn.deployment_transaction.v4";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V3: &str = "idunn.deployment_transaction.v3";
 const DEPLOYMENT_TRANSACTION_SCHEMA_V2: &str = "idunn.deployment_transaction.v2";
 const ADMITTED_GENERATION_SCHEMA: &str = "idunn.admitted_generation.v4";
@@ -1670,7 +1671,7 @@ impl PostCommitCleanup {
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(
     type = "idunn.deployment_transaction",
-    schema = "idunn.deployment_transaction.v4"
+    schema = "idunn.deployment_transaction.v5"
 )]
 struct DeploymentTransaction {
     #[cultcache(key = 0)]
@@ -1756,6 +1757,144 @@ struct DeploymentTransaction {
     /// predates it, which decodes as None: no schema bump (precedent key 34).
     #[cultcache(key = 37, default)]
     flip: Option<FlipEvidence>,
+}
+
+/// The v4 transaction layout: the current one before a static release's
+/// `flip` (key 37). Records are decoded by it and lifted, because the control
+/// store refuses a record whose bytes differ from its re-encoding. Migration
+/// to v5 is forward-only: an Idunn that predates v5 cannot read a migrated
+/// store. `history.cc` is never migrated, so this struct lives until history
+/// is pruned.
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(
+    type = "idunn.deployment_transaction",
+    schema = "idunn.deployment_transaction.v4"
+)]
+struct LegacyDeploymentTransactionV4 {
+    #[cultcache(key = 0)]
+    schema_version: String,
+    #[cultcache(key = 1)]
+    transaction_id: String,
+    #[cultcache(key = 2)]
+    command_id: String,
+    #[cultcache(key = 3)]
+    command_kind: CommandKind,
+    #[cultcache(key = 4)]
+    target: String,
+    #[cultcache(key = 5)]
+    ordinal: u32,
+    #[cultcache(key = 6)]
+    phase: DeploymentPhase,
+    #[cultcache(key = 7)]
+    created_at_unix_millis: u64,
+    #[cultcache(key = 8)]
+    updated_at_unix_millis: u64,
+    #[cultcache(key = 9)]
+    incumbent_generation_id: Option<String>,
+    #[cultcache(key = 10)]
+    plan: Option<CompiledDeploymentPlan>,
+    #[cultcache(key = 11)]
+    frozen_source: Option<FrozenSourceReceipt>,
+    #[cultcache(key = 12)]
+    sealed_release: Option<SealedRelease>,
+    #[cultcache(key = 13)]
+    installed_release: Option<InstalledReleaseObservation>,
+    #[cultcache(key = 14)]
+    expected: Option<IdunnExpectedIncarnationRecord>,
+    #[cultcache(key = 15)]
+    expected_publication_sha256: Option<String>,
+    #[cultcache(key = 16)]
+    deployment_authorization: Option<DeploymentAuthorization>,
+    #[cultcache(key = 17)]
+    lifecycle_authorized_at_unix_millis: Option<u64>,
+    #[cultcache(key = 18)]
+    activation: Option<IdunnRuntimeActivationRecord>,
+    #[cultcache(key = 19)]
+    workload: Option<WorkloadObservation>,
+    #[cultcache(key = 20)]
+    activation_publication_sha256: Option<String>,
+    #[cultcache(key = 21)]
+    latest_odin_observation: Option<TopologyEvidence>,
+    #[cultcache(key = 22)]
+    warming: Option<WarmingEvidence>,
+    #[cultcache(key = 23)]
+    route_preflight: Option<RoutePreflightReceipt>,
+    #[cultcache(key = 24)]
+    isolation: Option<IsolationEvidence>,
+    #[cultcache(key = 25)]
+    fencing: Option<FencingEvidence>,
+    #[cultcache(key = 26)]
+    leasing: Option<LeasingEvidence>,
+    #[cultcache(key = 27)]
+    ready: Option<ReadinessEvidence>,
+    #[cultcache(key = 28)]
+    routing: Option<RoutingEvidence>,
+    #[cultcache(key = 29)]
+    odin_publisher_sequence_cursor: u64,
+    #[cultcache(key = 30)]
+    last_error: Option<String>,
+    #[cultcache(key = 31)]
+    completion: Option<TransactionCompletion>,
+    #[cultcache(key = 32)]
+    pre_fencing_abort: Option<PreFencingAbort>,
+    #[cultcache(key = 33)]
+    post_commit_cleanup: Option<PostCommitCleanup>,
+    //  because every transaction already durable predates this field:
+    // an absent key 34 decodes as None, which is exactly "this transaction has
+    // no post-fencing abort". Without it the daemon refuses to read its own
+    // control store and crashloops.
+    #[cultcache(key = 34, default)]
+    post_fencing_abort: Option<PostFencingAbort>,
+    /// Set by `transition` on entry to each post-fencing phase.
+    #[cultcache(key = 35)]
+    phase_deadline: Option<PhaseDeadline>,
+    #[cultcache(key = 36)]
+    lease_adoption: Option<LeaseAdoptionEvidence>,
+}
+
+impl LegacyDeploymentTransactionV4 {
+    fn into_current(self) -> DeploymentTransaction {
+        DeploymentTransaction {
+            schema_version: DEPLOYMENT_TRANSACTION_SCHEMA.into(),
+            transaction_id: self.transaction_id,
+            command_id: self.command_id,
+            command_kind: self.command_kind,
+            target: self.target,
+            ordinal: self.ordinal,
+            phase: self.phase,
+            created_at_unix_millis: self.created_at_unix_millis,
+            updated_at_unix_millis: self.updated_at_unix_millis,
+            incumbent_generation_id: self.incumbent_generation_id,
+            plan: self.plan,
+            frozen_source: self.frozen_source,
+            sealed_release: self.sealed_release,
+            installed_release: self.installed_release,
+            expected: self.expected,
+            expected_publication_sha256: self.expected_publication_sha256,
+            deployment_authorization: self.deployment_authorization,
+            lifecycle_authorized_at_unix_millis: self.lifecycle_authorized_at_unix_millis,
+            activation: self.activation,
+            workload: self.workload,
+            activation_publication_sha256: self.activation_publication_sha256,
+            latest_odin_observation: self.latest_odin_observation,
+            warming: self.warming,
+            route_preflight: self.route_preflight,
+            isolation: self.isolation,
+            fencing: self.fencing,
+            leasing: self.leasing,
+            ready: self.ready,
+            routing: self.routing,
+            odin_publisher_sequence_cursor: self.odin_publisher_sequence_cursor,
+            last_error: self.last_error,
+            completion: self.completion,
+            pre_fencing_abort: self.pre_fencing_abort,
+            post_commit_cleanup: self.post_commit_cleanup,
+            post_fencing_abort: self.post_fencing_abort,
+            phase_deadline: self.phase_deadline,
+            lease_adoption: self.lease_adoption,
+            flip: None,
+        }
+    }
 }
 
 /// The note a deployment keeps while another transaction owns its target.
@@ -4253,10 +4392,19 @@ impl LegacyAdmittedGenerationV3 {
     }
 }
 
-/// Decode a v2 or v3 transaction and lift it to the current shape, without
+/// Decode a v2, v3 or v4 transaction and lift it to the current shape, without
 /// validating it. History reads stop here; the control store validates.
 fn lift_legacy_transaction(envelope: &CultCacheEnvelope) -> Result<DeploymentTransaction> {
     let schema = match envelope.schema_id.as_deref() {
+        Some(schema @ DEPLOYMENT_TRANSACTION_SCHEMA_V4) => {
+            let value: LegacyDeploymentTransactionV4 = rmp_serde::from_slice(&envelope.payload)
+                .with_context(|| format!("decoding a {schema} deployment transaction"))?;
+            ensure!(
+                value.schema_version == schema,
+                "stored transaction schema differs from its envelope"
+            );
+            return Ok(value.into_current());
+        }
         Some(schema @ (DEPLOYMENT_TRANSACTION_SCHEMA_V2 | DEPLOYMENT_TRANSACTION_SCHEMA_V3)) => {
             schema
         }
@@ -4275,7 +4423,7 @@ fn lift_legacy_transaction(envelope: &CultCacheEnvelope) -> Result<DeploymentTra
     Ok(value.into_current())
 }
 
-/// Read one stored transaction, lifting a v2 or v3 record to the current shape.
+/// Read one stored transaction, lifting a v2, v3 or v4 record to the current shape.
 ///
 /// The control store refuses noncanonical bytes: a record must re-encode to
 /// exactly what is stored. That check is what makes tampering visible, and it
@@ -4426,7 +4574,11 @@ fn migrate_control_store_to_current_schema(store_path: &Path) -> Result<usize> {
             (envelope.r#type == DeploymentTransaction::TYPE
                 && matches!(
                     schema,
-                    Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2 | DEPLOYMENT_TRANSACTION_SCHEMA_V3)
+                    Some(
+                        DEPLOYMENT_TRANSACTION_SCHEMA_V2
+                            | DEPLOYMENT_TRANSACTION_SCHEMA_V3
+                            | DEPLOYMENT_TRANSACTION_SCHEMA_V4
+                    )
                 ))
                 || (envelope.r#type == AdmittedGeneration::TYPE
                     && matches!(
@@ -4708,7 +4860,11 @@ fn decode_history_transactions(
         .filter(|envelope| envelope.r#type == DeploymentTransaction::TYPE)
     {
         let decoded = match envelope.schema_id.as_deref() {
-            Some(DEPLOYMENT_TRANSACTION_SCHEMA_V2 | DEPLOYMENT_TRANSACTION_SCHEMA_V3) => {
+            Some(
+                        DEPLOYMENT_TRANSACTION_SCHEMA_V2
+                            | DEPLOYMENT_TRANSACTION_SCHEMA_V3
+                            | DEPLOYMENT_TRANSACTION_SCHEMA_V4
+                    ) => {
                 lift_legacy_transaction(&envelope)
             }
             _ => rmp_serde::from_slice::<DeploymentTransaction>(&envelope.payload)
@@ -25498,7 +25654,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 assert!(!envelope.r#type.contains("runner_failure"), "{}", envelope.r#type);
                 if envelope.r#type == DeploymentTransaction::TYPE {
                     transactions += 1;
-                    assert_eq!(envelope.schema_id.as_deref(), Some("idunn.deployment_transaction.v4"));
+                    assert_eq!(envelope.schema_id.as_deref(), Some("idunn.deployment_transaction.v5"));
                 }
             }
         }
@@ -25506,11 +25662,10 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         Ok(())
     }
 
-    /// The records control.cc holds re-encode byte for byte. The hex was
-    /// captured at base 804ed75, before this cut touched anything: a runner
+    /// The records control.cc holds re-encode byte for byte at v5. A runner
     /// failure adds no field, no type and no schema to the control store.
     #[test]
-    fn control_records_encode_exactly_as_they_did_at_base() -> Result<()> {
+    fn control_records_encode_exactly_as_pinned() -> Result<()> {
         let command = DeploymentCommand {
             schema_version: DEPLOYMENT_COMMAND_SCHEMA.into(),
             command_id: "up-service".into(),
@@ -25537,7 +25692,69 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     }
 
     const PINNED_COMMAND_HEX: &str = "96bb6964756e6e2e6465706c6f796d656e745f636f6d6d616e642e7632aa75702d73657276696365a66465706c6f79a773657276696365a47465737464";
-    const PINNED_TRANSACTION_HEX: &str = "dc0025bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7634a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0";
+    /// The v4 bytes of the same record, captured at base 804ed75: a legacy
+    /// fixture. v5 adds key 37 (`flip`), so it is one element longer and names v5.
+    const PINNED_TRANSACTION_HEX_V4: &str = "dc0025bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7634a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0";
+    const PINNED_TRANSACTION_HEX: &str = "dc0026bf6964756e6e2e6465706c6f796d656e745f7472616e73616374696f6e2e7635a974782d70696e6e6564aa75702d73657276696365a66465706c6f79a77365727669636500a77365616c696e676464c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033c094d94072756e6e6572207374657020746573742d6461656d6f6e206f6e2072756e6e657220727573742065786974656420776974682065786974207374617475732033a7736b6970706564a7736b6970706564a8636f6d706c657465c0c0c0c0c0";
+
+    fn pinned_v4_envelope() -> Result<CultCacheEnvelope> {
+        let payload = (0..PINNED_TRANSACTION_HEX_V4.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&PINNED_TRANSACTION_HEX_V4[i..i + 2], 16))
+            .collect::<std::result::Result<Vec<u8>, _>>()?;
+        Ok(CultCacheEnvelope {
+            key: "tx-pinned".into(),
+            r#type: DeploymentTransaction::TYPE.into(),
+            payload,
+            stored_at: rfc3339_millis(100)?,
+            schema_id: Some(DEPLOYMENT_TRANSACTION_SCHEMA_V4.into()),
+        })
+    }
+
+    #[test]
+    fn a_pinned_v4_transaction_lifts_and_reencodes_as_the_pinned_v5() -> Result<()> {
+        let lifted = read_transaction_record(&pinned_v4_envelope()?)?;
+        assert_eq!(lifted.schema_version, DEPLOYMENT_TRANSACTION_SCHEMA);
+        assert_eq!(lifted.flip, None);
+        let bytes = encode_transaction(&lifted, 100)?.payload;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, PINNED_TRANSACTION_HEX);
+        // Read as v5 the v4 bytes are refused, never silently accepted.
+        let mut mislabeled = pinned_v4_envelope()?;
+        mislabeled.schema_id = Some(DEPLOYMENT_TRANSACTION_SCHEMA.into());
+        assert!(read_transaction_record(&mislabeled).is_err());
+        Ok(())
+    }
+
+    /// Always a copy in a temp dir: never a live control.cc.
+    #[test]
+    fn a_v4_control_store_boots_into_v5_and_a_v5_store_is_left_alone() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("control.cc");
+        let store = SingleFileMessagePackBackingStore::new(&path);
+        let v4 = pinned_v4_envelope()?;
+        assert!(store.compare_exchange(
+            &[CultCacheExpectedEnvelope {
+                r#type: v4.r#type.clone(),
+                key: v4.key.clone(),
+                current: None,
+            }],
+            std::slice::from_ref(&v4),
+        )?);
+        assert_eq!(migrate_control_store_to_current_schema(&path)?, 1);
+        let after = store.pull_all_read_only_snapshot()?;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].schema_id.as_deref(), Some(DEPLOYMENT_TRANSACTION_SCHEMA));
+        assert_eq!(after[0].stored_at, v4.stored_at);
+        let migrated: String = after[0].payload.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(migrated, PINNED_TRANSACTION_HEX);
+        // Negative: an already-v5 store is untouched, byte for byte.
+        let file_before = std::fs::read(&path)?;
+        assert_eq!(migrate_control_store_to_current_schema(&path)?, 0);
+        assert_eq!(std::fs::read(&path)?, file_before);
+        read_transaction_record(&after[0])?;
+        Ok(())
+    }
     // END runner-failure-evidence tests
 
     // BEGIN static-release tests
