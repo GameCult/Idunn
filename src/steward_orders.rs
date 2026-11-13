@@ -871,6 +871,7 @@ pub(crate) fn execute(ctx: &Ctx, order_id: &str) -> Result<()> {
     if let Operation::Deploy { selector } = &order.operation {
         let outcome = match commit_deployment_command(
             &ctx.state_store,
+            crate::control_plane::CommandKind::Deploy,
             &command_id,
             selector,
             &requester(&order.principal, order_id),
