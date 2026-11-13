@@ -3435,11 +3435,11 @@ impl SystemdTransientWorkloadDriver {
         installed: &Path,
     ) -> Result<Vec<OsString>> {
         let executable_artifact =
-            release_artifact(declaration, &declaration.service.executable_artifact)?;
+            release_artifact(declaration, &declaration.service()?.executable_artifact)?;
         let executable = installed.join(&executable_artifact.destination);
         ensure!(executable.is_file(), "sealed service executable is absent");
         let mut command = vec![executable.into_os_string()];
-        for argument in &declaration.service.arguments {
+        for argument in &declaration.service()?.arguments {
             command.push(match argument {
                 LaunchArgument::Literal { value } => value.into(),
                 LaunchArgument::Binding { name } => binding.workload.systemd()?.argument_bindings
@@ -3734,7 +3734,7 @@ impl SystemdTransientWorkloadDriver {
     ) -> Result<()> {
         ensure!(
             declaration
-                .service
+                .service()?
                 .required_environment
                 .contains(IDUNN_RUNTIME_BUNDLE_ENVIRONMENT),
             "target does not declare the standard Idunn runtime bundle"
@@ -3757,7 +3757,7 @@ impl SystemdTransientWorkloadDriver {
             parent_only_open_file_properties(parent_only_file_descriptors)?;
         let environment = self.launch_environment(binding, bundle, expected, unit)?;
         let executable_artifact =
-            release_artifact(declaration, &declaration.service.executable_artifact)?;
+            release_artifact(declaration, &declaration.service()?.executable_artifact)?;
         let executable = installed.join(&executable_artifact.destination);
         ensure!(executable.is_file(), "sealed service executable is absent");
         let unit_description = format!(
@@ -3967,7 +3967,7 @@ impl WorkloadPort for SystemdTransientWorkloadDriver {
         let (declaration, binding) = plan.parsed_inputs()?;
         self.validate_writable_bindings(&binding)?;
         let executable_artifact =
-            release_artifact(&declaration, &declaration.service.executable_artifact)?;
+            release_artifact(&declaration, &declaration.service()?.executable_artifact)?;
         let executable = installed.root.join(&executable_artifact.destination);
         let unit = self.unit_name(
             &binding.workload.systemd()?.unit_prefix,

@@ -5546,7 +5546,9 @@ impl Engine {
     fn runner_for(&self, plan: &CompiledDeploymentPlan) -> Result<Box<dyn RunnerPort + '_>> {
         let (_, binding) = plan.parsed_inputs()?;
         Ok(match &binding.workload {
-            WorkloadBinding::SystemdTransient(_) => Box::new(self.docker_runner.clone()),
+            WorkloadBinding::SystemdTransient(_) | WorkloadBinding::StaticRelease(_) => {
+                Box::new(self.docker_runner.clone())
+            }
             WorkloadBinding::HostActuator(_) => Box::new(HostActuatorRunnerDriver {
                 access: self.host_access()?,
             }),
@@ -5557,7 +5559,11 @@ impl Engine {
     fn workload_for(&self, plan: &CompiledDeploymentPlan) -> Result<Arc<dyn WorkloadPort + '_>> {
         let (_, binding) = plan.parsed_inputs()?;
         Ok(match &binding.workload {
-            WorkloadBinding::SystemdTransient(_) => Arc::clone(&self.systemd_workload),
+            // A static release has no workload to run: the systemd driver
+            // serves its install, and nothing else is ever asked of it.
+            WorkloadBinding::SystemdTransient(_) | WorkloadBinding::StaticRelease(_) => {
+                Arc::clone(&self.systemd_workload)
+            }
             WorkloadBinding::HostActuator(_) => {
                 #[cfg(test)]
                 if let Some(port) = self.host_workload.lock().expect("host workload mutex").clone() {

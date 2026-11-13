@@ -854,14 +854,15 @@ impl SealedRelease {
     ) -> Result<ExpectedIncarnation> {
         self.validate_against(plan)?;
         let (declaration, binding) = plan.parsed_inputs()?;
+        let service = declaration.service()?;
         let route = match (&binding.route, plan.candidate_port) {
             (Some(bound), Some(port)) => Some(IdunnExpectedRoute {
                 route_id: bound.route_id.clone(),
-                transport: endpoint_scheme(declaration.service.transport)?.into(),
+                transport: endpoint_scheme(service.transport)?.into(),
                 stable_endpoint: bound.stable_endpoint.clone(),
                 candidate_endpoint: format!(
                     "{}://{}:{port}",
-                    endpoint_scheme(declaration.service.transport)?,
+                    endpoint_scheme(service.transport)?,
                     bound.private_host
                 ),
             }),
@@ -871,7 +872,7 @@ impl SealedRelease {
         let artifact_sha256 = self
             .artifacts
             .iter()
-            .find(|artifact| artifact.artifact_id == declaration.service.executable_artifact)
+            .find(|artifact| artifact.artifact_id == service.executable_artifact)
             .context("sealed release has no executable service artifact")?
             .sha256
             .clone();
@@ -918,7 +919,7 @@ impl SealedRelease {
                 .runtime_identity
                 .expected_signer_identity_id
                 .clone(),
-            health_contract: declaration.service.health.contract.clone(),
+            health_contract: service.health.contract.clone(),
             artifact_sha256,
             state_schema_generation: declaration
                 .state
