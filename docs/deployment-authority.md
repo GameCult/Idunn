@@ -48,8 +48,8 @@ and health. CultMesh carries typed projections between them.
   scaling, restart, host reboot recovery, and crash recovery use the same
   source-to-recipe-to-artifact provenance and the same distinct write-lease and
   route-membership primitives.
-  Deployment may change that chain only while the deployment brake admits the
-  exact transaction. Continuity may restart only the already-admitted chain and
+  Deployment may change that chain only while the deployment stop admits it
+  (absent or clear; an engaged stop halts). Continuity may restart only the already-admitted chain and
   is governed by a separate lifecycle brake.
 - **Deletion line:** hard-coded target copies, raw `deploy_command` and
   `restart_command` state, `sh -c` actuation, root Git inspection, staged
@@ -209,8 +209,8 @@ non-regular carry source fails the deployment before anything moves.
 What `current_link` names is observed from the symlink and confirmed by the
 latest Admitted static transaction's `flip.release_id`; it is stored nowhere
 else. A rollback is a flip back to `flip.previous_release_id`: release
-directories stay, and Idunn prunes none. The brake is read exactly as for a
-service, naming the binding's runtime id and the sealed release id. Release ids are per transaction, so
+directories stay, and Idunn prunes none. The deployment stop is read exactly as for a
+service, by the binding's runtime id. Release ids are per transaction, so
 redeploying an unchanged tarball with a changed site file is a new release that
 carries the new file, never an in-place re-carry of an existing one: the carry
 is part of a release. If `current_link` is replaced by a directory or by a link
@@ -230,9 +230,8 @@ transaction (`CommandKind::Rollback`) that reuses the previous release exactly:
 the plan, sealed release and installed release are copied from the transaction
 that flipped it, so there is no source, no build and no source cleanup, and it
 creates no admitted generation. It starts at Sealing with that evidence and
-reaches the same deployment brake as a deploy, which the operator releases for
-the rollback transaction's id and the previous sealed release id; then
-`advance_static` flips, with the same three durable steps, the same
+reaches the same deployment stop as a deploy, which admits it unless engaged;
+then `advance_static` flips, with the same three durable steps, the same
 nothing-aborts-after-the-rename rule and the same stuck-flip behavior.
 
 The previous release is derived, never stored: the newest Admitted static
@@ -338,7 +337,7 @@ For a singleton incarnation:
    declaration, binding, launch contract, and input digests.
 5. Derive the release-bound Expected incarnation from the validated sealed
    release and its exact compiled plan. Publish it only once the deployment
-   brake has admitted this exact transaction, under the candidate's own
+   stop has admitted this transaction (stamping `deployment_admitted_at_unix_millis`), under the candidate's own
    incarnation key, beside whatever the target's admitted incarnation projects.
 6. Issue one opaque runtime-instance activation bound to the Expected digest,
    pass the exact Expected and activation documents through the actuator's
@@ -361,8 +360,8 @@ For a singleton incarnation:
     and stop the incumbent.
 
 Sealing resolves the source, freezes it, runs every recipe step, and installs
-the release before the deployment brake is consulted at all (`advance_sealing`).
-The brake gates step 5, the first Verse-visible change: publishing the
+the release before the deployment stop is consulted at all (`advance_sealing`).
+The stop gates step 5, the first Verse-visible change: publishing the
 candidate's Expected incarnation on the move into `Starting`. Build and test
 already run unbraked, inside the sealing phase.
 
@@ -393,7 +392,7 @@ identity, and route membership. Every restart receives a new runtime-instance
 activation and, for a state writer, a new process-bound lease only after the new
 warming presence is observed. A lease from the dead process is never reused. A
 continuity restart does not fetch a branch, rebuild, rerun a migration, alter
-the launch contract, or consume the deployment brake. An explicit lifecycle
+the launch contract, or pass the deployment stop. An explicit lifecycle
 brake may suspend this actuation without changing deployment authority.
 
 Continuity never stops. Six charged attempts in an hour only open the
@@ -426,7 +425,7 @@ the admitted body. Both operator cases open an `operator-required` incident
 on.
 
 The one yield: a continuity whose route proof has not succeeded gives way to a
-deployment the deployment brake has released that awaits the handover of the
+deployment the deployment stop admits that awaits the handover of the
 target. It begins its own post-fencing abort and the deployment fences what is
 admitted. A continuity that has proven its route is serving never yields.
 

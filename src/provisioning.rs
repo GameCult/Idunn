@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, anyhow, bail};
+use crate::brake::{Stop, StopState, process_uid, read_stop, replace_stop};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use cultcache_rs::{
     CultCacheEnvelope, CultCacheExpectedEnvelope, DatabaseEntry, SingleFileMessagePackBackingStore,
 };
@@ -6,15 +7,13 @@ use cultnet_rs::{
     GAMECULT_SERVICE_TRUST_ANCHOR_SCHEMA, GameCultProviderHealthIdentity,
     GameCultServiceTrustAnchorRecord, IDUNN_AUTHENTICATED_PROVIDER_HEALTH_PROJECTION_SCHEMA,
     IDUNN_AUTHENTICATED_PROVIDER_HEALTH_PROJECTION_SIGNING_PURPOSE,
-    IDUNN_DAEMON_HEALTH_TRUST_BINDING_SCHEMA, IDUNN_DEPLOYMENT_BRAKE_AUTHORITY,
-    IDUNN_DEPLOYMENT_BRAKE_ID, IDUNN_DEPLOYMENT_BRAKE_SCHEMA, IDUNN_DEPLOYMENT_BRAKE_SCOPE,
-    IDUNN_DEPLOYMENT_RELEASE_PURPOSE, IDUNN_LIFECYCLE_BRAKE_AUTHORITY,
+    IDUNN_DAEMON_HEALTH_TRUST_BINDING_SCHEMA, 
+    IDUNN_LIFECYCLE_BRAKE_AUTHORITY,
     IDUNN_LIFECYCLE_BRAKE_SCHEMA, IDUNN_LIFECYCLE_BRAKE_SCOPE, IdunnDaemonHealthTrustBindingRecord,
-    IdunnDeploymentBrakeObservation, IdunnDeploymentBrakeOperatorIdentity,
-    IdunnDeploymentBrakeRecord, IdunnDeploymentBrakeReleasePurpose, IdunnLifecycleBrakeObservation,
+    IdunnLifecycleBrakeObservation,
     IdunnLifecycleBrakeRecord, IdunnServiceIdentity, OdinTopologyIdentity, ServiceIdentityProfile,
     ServiceIdentityTrustAnchor, derive_service_identity_id, enroll_service_identity_at,
-    evaluate_idunn_continuity_restart, evaluate_idunn_deployment_brake,
+    evaluate_idunn_continuity_restart,
     export_service_identity_trust_anchor, open_service_identity_at,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,17 +79,8 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         "export-odin-topology-public-anchor" => {
             export_identity_anchor::<OdinTopologyIdentity>(&options, "Odin topology public anchor")?
         }
-        "enroll-deployment-brake-operator" => {
-            enroll_identity::<IdunnDeploymentBrakeOperatorIdentity>(&options)?
-        }
-        "export-deployment-brake-operator-anchor" => {
-            export_identity_anchor::<IdunnDeploymentBrakeOperatorIdentity>(
-                &options,
-                "deployment brake operator anchor",
-            )?
-        }
-        "deployment-brake-engage" => deployment_brake_engage(&options)?,
-        "deployment-brake-release" => deployment_brake_release(&options)?,
+        "deployment-brake-engage" => deployment_brake_write(&options, StopState::Engaged)?,
+        "deployment-brake-clear" => deployment_brake_write(&options, StopState::Clear)?,
         "deployment-brake-status" => deployment_brake_status(&options)?,
         "lifecycle-brake-engage" => lifecycle_brake_engage(&options)?,
         "lifecycle-brake-release" => lifecycle_brake_release(&options)?,
@@ -157,150 +147,55 @@ fn provider_health_public_key(options: &BTreeMap<String, String>) -> Result<Stri
     encode_public_key(&signer.entry().public_key)
 }
 
-fn deployment_brake_engage(options: &BTreeMap<String, String>) -> Result<()> {
-    require_only(
-        options,
-        &[
-            "store",
-            "runtime-id",
-            "owner",
-            "reason",
-            "observed-at-unix-millis",
-        ],
+/// Engage or clear the deployment stop. The author is the process uid's login
+/// name and the time is this verb's clock: neither is an argument.
+fn deployment_brake_write(options: &BTreeMap<String, String>, state: StopState) -> Result<()> {
+    require_only(options, &["store", "runtime-id", "reason"])?;
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
     )?;
-    let observed = parse_u64(options, "observed-at-unix-millis")?;
-    let record = IdunnDeploymentBrakeRecord {
-        schema_version: IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into(),
-        brake_id: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
-        authority: IDUNN_DEPLOYMENT_BRAKE_AUTHORITY.into(),
-        runtime_id: required(options, "runtime-id")?.into(),
-        status: "engaged".into(),
-        scope: IDUNN_DEPLOYMENT_BRAKE_SCOPE.into(),
-        reason: required(options, "reason")?.into(),
-        observed_at_unix_millis: observed,
-        expires_at_unix_millis: None,
-        authorization_id: None,
-        authorization_purpose: None,
-        authorized_release_id: None,
-        authorized_deployment_id: None,
-        authorized_by: None,
-        authorization_issued_at_unix_millis: None,
-        authorization_expires_at_unix_millis: None,
-        signature_algorithm: None,
-        signature: None,
-        private_state_exposed: false,
-        updated_by: required(options, "owner")?.into(),
-    };
-    record.validate()?;
-    replace_brake(&path(options, "store")?, record, observed)
-}
-
-fn deployment_brake_release(options: &BTreeMap<String, String>) -> Result<()> {
-    require_only(
-        options,
-        &[
-            "store",
-            "private-store",
-            "runtime-id",
-            "owner",
-            "reason",
-            "authorization-id",
-            "release-id",
-            "deployment-id",
-            "issued-at-unix-millis",
-            "expires-at-unix-millis",
-        ],
-    )?;
-    let issued = parse_u64(options, "issued-at-unix-millis")?;
-    let expires = parse_u64(options, "expires-at-unix-millis")?;
-    let signer = open_service_identity_at::<IdunnDeploymentBrakeOperatorIdentity>(&path(
-        options,
-        "private-store",
-    )?)?;
-    let mut record = IdunnDeploymentBrakeRecord {
-        schema_version: IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into(),
-        brake_id: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
-        authority: IDUNN_DEPLOYMENT_BRAKE_AUTHORITY.into(),
-        runtime_id: required(options, "runtime-id")?.into(),
-        status: "released".into(),
-        scope: IDUNN_DEPLOYMENT_BRAKE_SCOPE.into(),
-        reason: required(options, "reason")?.into(),
-        observed_at_unix_millis: issued,
-        expires_at_unix_millis: Some(expires),
-        authorization_id: Some(required(options, "authorization-id")?.into()),
-        authorization_purpose: Some(IDUNN_DEPLOYMENT_RELEASE_PURPOSE.into()),
-        authorized_release_id: Some(required(options, "release-id")?.into()),
-        authorized_deployment_id: Some(required(options, "deployment-id")?.into()),
-        authorized_by: Some(signer.trust_anchor()?.identity_id),
-        authorization_issued_at_unix_millis: Some(issued),
-        authorization_expires_at_unix_millis: Some(expires),
-        signature_algorithm: Some("ed25519".into()),
-        signature: None,
-        private_state_exposed: false,
-        updated_by: required(options, "owner")?.into(),
-    };
-    record.signature = Some(
-        signer
-            .sign::<IdunnDeploymentBrakeReleasePurpose>(&rmp_serde::to_vec(&record)?)
-            .signature,
-    );
-    record.validate()?;
-    replace_brake(&path(options, "store")?, record, issued)
-}
-
-fn deployment_brake_status(options: &BTreeMap<String, String>) -> Result<()> {
-    allow_only(
-        options,
-        &[
-            "store",
-            "operator-anchor",
-            "runtime-id",
-            "release-id",
-            "deployment-id",
-            "now-unix-millis",
-        ],
-    )?;
-    let exact_actuation_fields = ["release-id", "deployment-id", "now-unix-millis"];
-    let exact_actuation_field_count = exact_actuation_fields
-        .into_iter()
-        .filter(|field| options.contains_key(*field))
-        .count();
-    if exact_actuation_field_count != 0
-        && exact_actuation_field_count != exact_actuation_fields.len()
-    {
-        bail!("exact deployment-brake actuation validation requires release, deployment, and time");
-    }
-    let record = read_brake(&path(options, "store")?)?;
-    if record.runtime_id != required(options, "runtime-id")? {
-        bail!("deployment brake belongs to another runtime")
-    }
-    if record.status == "engaged" {
-        if exact_actuation_field_count != 0 {
-            bail!("engaged deployment brake denies exact actuation validation");
-        }
-        println!(
-            "engaged runtime={} scope={} owner={} reason={}",
-            record.runtime_id, record.scope, record.updated_by, record.reason
-        );
-        return Ok(());
-    }
-    let anchor = read_operator_anchor(&path(options, "operator-anchor")?)?;
-    evaluate_idunn_deployment_brake(
-        IdunnDeploymentBrakeObservation::Present(&record),
-        &anchor,
+    let record = replace_stop(
+        &path(options, "store")?,
         required(options, "runtime-id")?,
-        required(options, "release-id")?,
-        required(options, "deployment-id")?,
-        parse_u64(options, "now-unix-millis")?,
-    )
-    .map_err(|d| anyhow!("deployment brake denied actuation: {d:?}"))?;
+        state,
+        required(options, "reason")?,
+        now,
+    )?;
     println!(
-        "released runtime={} release={} deployment={} owner={}",
+        "{} runtime={} by={} sequence={}",
+        record.state.name(),
         record.runtime_id,
-        record.authorized_release_id.unwrap(),
-        record.authorized_deployment_id.unwrap(),
-        record.updated_by
+        record.by,
+        record.sequence
     );
+    Ok(())
+}
+
+/// Print the stop and exit nonzero unless deployments admit, so a script can
+/// gate on it as it could on the retired exact-actuation validation.
+fn deployment_brake_status(options: &BTreeMap<String, String>) -> Result<()> {
+    require_only(options, &["store", "runtime-id"])?;
+    let stop = read_stop(
+        &path(options, "store")?,
+        required(options, "runtime-id")?,
+        process_uid(),
+    );
+    match &stop {
+        Stop::Absent => println!("absent: deployments admit"),
+        Stop::Unreadable(why) => println!("unreadable: deployments wait ({why})"),
+        Stop::Clear(record) | Stop::Engaged(record) => println!(
+            "{} runtime={} by={} at={} sequence={} reason={}",
+            record.state.name(),
+            record.runtime_id,
+            record.by,
+            record.at_unix_millis,
+            record.sequence,
+            record.reason
+        ),
+    }
+    ensure!(stop.admits(), "the deployment brake does not admit deployments");
     Ok(())
 }
 
@@ -480,70 +375,6 @@ fn lifecycle_identifier<'a>(options: &'a BTreeMap<String, String>, name: &str) -
         bail!("--{name} is empty, oversized, or contains control characters");
     }
     Ok(value)
-}
-
-fn replace_brake(path: &Path, record: IdunnDeploymentBrakeRecord, millis: u64) -> Result<()> {
-    let store = SingleFileMessagePackBackingStore::new(path);
-    let entries = store.pull_all_read_only_snapshot()?;
-    let current = match entries.as_slice() {
-        [] => None,
-        [entry]
-            if entry.r#type == IdunnDeploymentBrakeRecord::TYPE
-                && entry.key == IDUNN_DEPLOYMENT_BRAKE_ID =>
-        {
-            Some(entry.clone())
-        }
-        _ => bail!("deployment brake store is corrupt or ambiguous"),
-    };
-    let next = typed_envelope(
-        IDUNN_DEPLOYMENT_BRAKE_ID,
-        &record,
-        IDUNN_DEPLOYMENT_BRAKE_SCHEMA,
-        millis,
-    )?;
-    if !store.compare_exchange(
-        &[CultCacheExpectedEnvelope {
-            r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
-            key: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
-            current,
-        }],
-        &[next],
-    )? {
-        bail!("deployment brake changed during transition");
-    }
-    Ok(())
-}
-
-fn read_brake(path: &Path) -> Result<IdunnDeploymentBrakeRecord> {
-    let entries = SingleFileMessagePackBackingStore::new(path).pull_all_read_only_snapshot()?;
-    let [entry] = entries.as_slice() else {
-        bail!("deployment brake is missing or ambiguous")
-    };
-    if entry.r#type != IdunnDeploymentBrakeRecord::TYPE
-        || entry.key != IDUNN_DEPLOYMENT_BRAKE_ID
-        || entry.schema_id.as_deref() != Some(IDUNN_DEPLOYMENT_BRAKE_SCHEMA)
-    {
-        bail!("deployment brake is foreign")
-    }
-    let record: IdunnDeploymentBrakeRecord = rmp_serde::from_slice(&entry.payload)?;
-    if rmp_serde::to_vec(&record)? != entry.payload {
-        bail!("deployment brake is noncanonical")
-    }
-    record.validate()?;
-    Ok(record)
-}
-
-fn read_operator_anchor(path: &Path) -> Result<ServiceIdentityTrustAnchor> {
-    let entries = SingleFileMessagePackBackingStore::new(path).pull_all_read_only_snapshot()?;
-    let [entry] = entries.as_slice() else {
-        bail!("operator anchor is missing or ambiguous")
-    };
-    if entry.r#type != IdunnDeploymentBrakeOperatorIdentity::TRUST_ANCHOR_TYPE
-        || entry.key != IdunnDeploymentBrakeOperatorIdentity::TRUST_ANCHOR_KEY
-    {
-        bail!("operator anchor is foreign")
-    }
-    Ok(rmp_serde::from_slice(&entry.payload)?)
 }
 
 fn validate_health_binding_store(path: &Path) -> Result<()> {
@@ -1127,7 +958,7 @@ fn normalized(path: &Path) -> Result<PathBuf> {
 }
 
 fn usage() -> &'static str {
-    "Usage: idunn-provision enroll-provider-health-identity --private-store <path>\n       idunn-provision provider-health-public-key --private-store <path>\n       idunn-provision export-provider-health-public-anchor --private-store <path> --public-anchor <path>\n       idunn-provision enroll-idunn-identity --private-store <path>\n       idunn-provision export-idunn-public-anchor --private-store <path> --public-anchor <path>\n       idunn-provision enroll-odin-topology-identity --private-store <path>\n       idunn-provision export-odin-topology-public-anchor --private-store <path> --public-anchor <path>\n       idunn-provision enroll-deployment-brake-operator --private-store <path>\n       idunn-provision export-deployment-brake-operator-anchor --private-store <path> --public-anchor <path>\n       idunn-provision deployment-brake-engage --store <path> --runtime-id <id> --owner <principal> --reason <text> --observed-at-unix-millis <u64>\n       idunn-provision deployment-brake-release --store <path> --private-store <path> --runtime-id <id> --owner <principal> --reason <text> --authorization-id <id> --release-id <id> --deployment-id <id> --issued-at-unix-millis <u64> --expires-at-unix-millis <u64>\n       idunn-provision deployment-brake-status --store <path> --operator-anchor <path> --runtime-id <id> [--release-id <id> --deployment-id <id> --now-unix-millis <u64>]\n       idunn-provision lifecycle-brake-engage --store <path> --runtime-id <id> --target <id> --reason <text> --updated-at-unix-millis <u64>\n       idunn-provision lifecycle-brake-release --store <path> --runtime-id <id> --target <id> --reason <text> --updated-at-unix-millis <u64> [--released-until-unix-millis <u64>]\n       idunn-provision lifecycle-brake-status --store <path> --runtime-id <id> --target <id> --now-unix-millis <u64>\n       idunn-provision create-daemon-health-trust-binding --output <path> --binding-id <id> --daemon <id> --health-contract <id> --source-runtime <id> --signer-public-key-hex <hex> --bound-at-unix-millis <u64> --release-binding-required <true|false>\n       idunn-provision add-daemon-health-trust-binding --output <path> --binding-id <id> --daemon <id> --health-contract <id> --source-runtime <id> --signer-public-key-hex <hex> --bound-at-unix-millis <u64> --release-binding-required <true|false>\n       idunn-provision require-daemon-health-release-binding --store <path> --binding-id <id> --daemon <id> --health-contract <id> --source-runtime <id> --signer-public-key-hex <hex>\n       idunn-provision rotate-daemon-health-trust-signer --output <path> --binding-id <id> --signer-public-key-hex <hex> --bound-at-unix-millis <u64>\n       idunn-provision validate-daemon-health-trust-binding --input <path>\n       idunn-provision create-provider-projection-trust-anchor --output <path> --trust-anchor-id <id> --runtime-id <id> --idunn-public-anchor <path> --bound-at-unix-millis <u64> --expires-at-unix-millis <u64>\n       idunn-provision validate-provider-projection-trust-anchor --input <path> --idunn-public-anchor <path>"
+    "Usage: idunn-provision enroll-provider-health-identity --private-store <path>\n       idunn-provision provider-health-public-key --private-store <path>\n       idunn-provision export-provider-health-public-anchor --private-store <path> --public-anchor <path>\n       idunn-provision enroll-idunn-identity --private-store <path>\n       idunn-provision export-idunn-public-anchor --private-store <path> --public-anchor <path>\n       idunn-provision enroll-odin-topology-identity --private-store <path>\n       idunn-provision export-odin-topology-public-anchor --private-store <path> --public-anchor <path>\n       idunn-provision deployment-brake-engage --store <path> --runtime-id <id> --reason <text>\n       idunn-provision deployment-brake-clear --store <path> --runtime-id <id> --reason <text>\n       idunn-provision deployment-brake-status --store <path> --runtime-id <id>\n       idunn-provision lifecycle-brake-engage --store <path> --runtime-id <id> --target <id> --reason <text> --updated-at-unix-millis <u64>\n       idunn-provision lifecycle-brake-release --store <path> --runtime-id <id> --target <id> --reason <text> --updated-at-unix-millis <u64> [--released-until-unix-millis <u64>]\n       idunn-provision lifecycle-brake-status --store <path> --runtime-id <id> --target <id> --now-unix-millis <u64>\n       idunn-provision create-daemon-health-trust-binding --output <path> --binding-id <id> --daemon <id> --health-contract <id> --source-runtime <id> --signer-public-key-hex <hex> --bound-at-unix-millis <u64> --release-binding-required <true|false>\n       idunn-provision add-daemon-health-trust-binding --output <path> --binding-id <id> --daemon <id> --health-contract <id> --source-runtime <id> --signer-public-key-hex <hex> --bound-at-unix-millis <u64> --release-binding-required <true|false>\n       idunn-provision require-daemon-health-release-binding --store <path> --binding-id <id> --daemon <id> --health-contract <id> --source-runtime <id> --signer-public-key-hex <hex>\n       idunn-provision rotate-daemon-health-trust-signer --output <path> --binding-id <id> --signer-public-key-hex <hex> --bound-at-unix-millis <u64>\n       idunn-provision validate-daemon-health-trust-binding --input <path>\n       idunn-provision create-provider-projection-trust-anchor --output <path> --trust-anchor-id <id> --runtime-id <id> --idunn-public-anchor <path> --bound-at-unix-millis <u64> --expires-at-unix-millis <u64>\n       idunn-provision validate-provider-projection-trust-anchor --input <path> --idunn-public-anchor <path>"
 }
 
 #[cfg(test)]
@@ -2157,120 +1988,74 @@ mod tests {
     }
 
     #[test]
-    fn brake_operator_can_issue_one_exact_bounded_rollout_grant() -> Result<()> {
+    fn provision_engage_clear_sequence() -> Result<()> {
         let temp = TempDir::new()?;
-        let private = temp.path().join("operator-private.cc");
-        let anchor = temp.path().join("operator-public.cc");
         let store = temp.path().join("brake.cc");
-        invoke(&[
-            "enroll-deployment-brake-operator",
-            "--private-store",
-            private.to_str().unwrap(),
-        ])?;
-        invoke(&[
-            "export-deployment-brake-operator-anchor",
-            "--private-store",
-            private.to_str().unwrap(),
-            "--public-anchor",
-            anchor.to_str().unwrap(),
-        ])?;
-        invoke(&[
-            "deployment-brake-engage",
-            "--store",
-            store.to_str().unwrap(),
-            "--runtime-id",
-            "yggdrasil",
-            "--owner",
-            "operator/metacrat",
-            "--reason",
-            "sleep mode",
-            "--observed-at-unix-millis",
-            "100",
-        ])?;
-        assert_eq!(read_brake(&store)?.status, "engaged");
+        let me = process_uid();
+        let engage = |verb: &str, reason: &str| {
+            invoke(&[
+                verb,
+                "--store",
+                store.to_str().unwrap(),
+                "--runtime-id",
+                "yggdrasil",
+                "--reason",
+                reason,
+            ])
+        };
+        assert_eq!(read_stop(&store, "yggdrasil", me), Stop::Absent);
         invoke(&[
             "deployment-brake-status",
             "--store",
             store.to_str().unwrap(),
-            "--operator-anchor",
-            anchor.to_str().unwrap(),
             "--runtime-id",
             "yggdrasil",
         ])?;
-        assert!(
+        engage("deployment-brake-engage", "freeze")?;
+        let status = || {
             invoke(&[
                 "deployment-brake-status",
                 "--store",
                 store.to_str().unwrap(),
-                "--operator-anchor",
-                anchor.to_str().unwrap(),
                 "--runtime-id",
                 "yggdrasil",
-                "--release-id",
-                "commit-4",
-                "--deployment-id",
-                "request-4",
-                "--now-unix-millis",
-                "150",
             ])
-            .is_err()
-        );
-        invoke(&[
-            "deployment-brake-release",
-            "--store",
-            store.to_str().unwrap(),
-            "--private-store",
-            private.to_str().unwrap(),
-            "--runtime-id",
-            "yggdrasil",
-            "--owner",
-            "operator/metacrat",
-            "--reason",
-            "one rollout",
-            "--authorization-id",
-            "auth/r4",
-            "--release-id",
-            "commit-4",
-            "--deployment-id",
-            "request-4",
-            "--issued-at-unix-millis",
-            "200",
-            "--expires-at-unix-millis",
-            "800",
-        ])?;
-        invoke(&[
-            "deployment-brake-status",
-            "--store",
-            store.to_str().unwrap(),
-            "--operator-anchor",
-            anchor.to_str().unwrap(),
-            "--runtime-id",
-            "yggdrasil",
-            "--release-id",
-            "commit-4",
-            "--deployment-id",
-            "request-4",
-            "--now-unix-millis",
-            "500",
-        ])?;
-        assert!(
-            invoke(&[
-                "deployment-brake-status",
-                "--store",
-                store.to_str().unwrap(),
-                "--operator-anchor",
-                anchor.to_str().unwrap(),
-                "--runtime-id",
-                "yggdrasil",
-                "--release-id",
-                "substituted",
-                "--deployment-id",
-                "request-4",
-                "--now-unix-millis",
-                "500"
-            ])
-            .is_err()
-        );
+        };
+        assert!(status().is_err(), "an engaged stop must not pass status");
+        let Stop::Engaged(first) = read_stop(&store, "yggdrasil", me) else {
+            bail!("engage did not engage")
+        };
+        assert_eq!((first.sequence, first.reason.as_str()), (1, "freeze"));
+        assert!(!first.by.is_empty() && first.at_unix_millis > 0);
+        engage("deployment-brake-clear", "thawed")?;
+        status()?;
+        let Stop::Clear(second) = read_stop(&store, "yggdrasil", me) else {
+            bail!("clear did not clear")
+        };
+        assert_eq!((second.sequence, second.by), (2, first.by));
+        assert!(second.at_unix_millis >= first.at_unix_millis);
+        // The author and the time are not arguments, and the retired
+        // signing arguments are refused.
+        for stray in ["--owner", "--observed-at-unix-millis", "--private-store"] {
+            assert!(
+                invoke(&[
+                    "deployment-brake-engage",
+                    "--store",
+                    store.to_str().unwrap(),
+                    "--runtime-id",
+                    "yggdrasil",
+                    "--reason",
+                    "x",
+                    stray,
+                    "y",
+                ])
+                .is_err(),
+                "{stray}"
+            );
+        }
+        for gone in ["deployment-brake-release", "enroll-deployment-brake-operator"] {
+            assert!(invoke(&[gone]).is_err(), "{gone}");
+        }
         Ok(())
     }
 
@@ -2309,7 +2094,6 @@ mod tests {
         assert_eq!(engaged.status, "engaged");
         assert_eq!(engaged.runtime_id, "idunn-yggdrasil");
         assert_eq!(engaged.target, "ghostlight");
-        assert!(read_brake(&store).is_err());
         assert!(
             invoke(&[
                 "lifecycle-brake-status",
@@ -2424,59 +2208,6 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(&store)?, released_bytes);
-        Ok(())
-    }
-
-    #[test]
-    fn brake_compare_exchange_rejects_stale_transition_snapshot() -> Result<()> {
-        let temp = TempDir::new()?;
-        let store_path = temp.path().join("brake.cc");
-        let base = IdunnDeploymentBrakeRecord {
-            schema_version: IDUNN_DEPLOYMENT_BRAKE_SCHEMA.into(),
-            brake_id: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
-            authority: IDUNN_DEPLOYMENT_BRAKE_AUTHORITY.into(),
-            runtime_id: "yggdrasil".into(),
-            status: "engaged".into(),
-            scope: IDUNN_DEPLOYMENT_BRAKE_SCOPE.into(),
-            reason: "first".into(),
-            observed_at_unix_millis: 100,
-            expires_at_unix_millis: None,
-            authorization_id: None,
-            authorization_purpose: None,
-            authorized_release_id: None,
-            authorized_deployment_id: None,
-            authorized_by: None,
-            authorization_issued_at_unix_millis: None,
-            authorization_expires_at_unix_millis: None,
-            signature_algorithm: None,
-            signature: None,
-            private_state_exposed: false,
-            updated_by: "operator/a".into(),
-        };
-        replace_brake(&store_path, base.clone(), 100)?;
-        let stale = SingleFileMessagePackBackingStore::new(&store_path)
-            .pull_all_read_only_snapshot()?
-            .remove(0);
-        let mut changed = base.clone();
-        changed.reason = "racing writer".into();
-        changed.observed_at_unix_millis = 101;
-        replace_brake(&store_path, changed, 101)?;
-        let candidate = typed_envelope(
-            IDUNN_DEPLOYMENT_BRAKE_ID,
-            &base,
-            IDUNN_DEPLOYMENT_BRAKE_SCHEMA,
-            102,
-        )?;
-        assert!(
-            !SingleFileMessagePackBackingStore::new(&store_path).compare_exchange(
-                &[CultCacheExpectedEnvelope {
-                    r#type: IdunnDeploymentBrakeRecord::TYPE.into(),
-                    key: IDUNN_DEPLOYMENT_BRAKE_ID.into(),
-                    current: Some(stale)
-                }],
-                &[candidate]
-            )?
-        );
         Ok(())
     }
 }
