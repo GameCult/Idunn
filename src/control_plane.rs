@@ -8935,10 +8935,11 @@ impl Engine {
                     rollback_allowed,
                     &gate,
                 )?;
-                let observation = match self.prove_stable_route(
+                let observation = match self.prove_routed_candidate_through_handoff(
                     &admitted.value,
                     &driver,
                     membership_sha256,
+                    preflight,
                 ) {
                     Ok(observation) => observation,
                     Err(proof_error) if !rollback_allowed => {
@@ -9863,6 +9864,42 @@ impl Engine {
         )
     }
 
+    /// Routing's proof, waiting out nginx's reload handoff. `systemctl reload`
+    /// only signals the master: the old workers keep answering the stable
+    /// listener until the new configuration is parsed and they are told to
+    /// quit, so Idunn's first challenge can reach the incumbent. An answer
+    /// that names the preflight's incumbent is therefore not-yet for
+    /// `ROUTE_RELOAD_HANDOFF`; it can delay and never admit (the id is read
+    /// unauthenticated, and the candidate's proof is checked as before).
+    /// Anything else fails the attempt at once. One challenge per poll and
+    /// nothing else: no install, rollback, route gate or persistence.
+    fn prove_routed_candidate_through_handoff(
+        &self,
+        transaction: &DeploymentTransaction,
+        driver: &NginxRouteDriver,
+        membership_sha256: String,
+        preflight: &crate::drivers::RoutePreflightReceipt,
+    ) -> Result<RouteObservation> {
+        let candidate = &required(&transaction.activation, "route activation")?.runtime_instance_id;
+        let until = handoff_now() + ROUTE_RELOAD_HANDOFF;
+        loop {
+            match self.prove_stable_route(transaction, driver, membership_sha256.clone()) {
+                Err(error)
+                    if preflight.changes_route()
+                        && handoff_now() < until
+                        && error.downcast_ref::<RouteProofAnswer>().is_some_and(|answer| {
+                            preflight.incumbent_runtime_instance_id.as_deref()
+                                == Some(answer.answered_instance.as_str())
+                                && answer.answered_instance != *candidate
+                        }) =>
+                {
+                    handoff_sleep(ROUTE_RELOAD_HANDOFF_POLL);
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn prove_stable_route_against(
         &self,
         expected: &IdunnExpectedIncarnationRecord,
@@ -9887,7 +9924,15 @@ impl Engine {
             challenged_at_unix_millis,
             received_at_unix_millis,
             &response.canonical_presence,
-        )?;
+        )
+        .map_err(|error| match presence_answer_ids(&response.canonical_presence) {
+            Some((answered_instance, answered_activation_signer)) => error.context(RouteProofAnswer {
+                answered_instance: route_proof_label(&answered_instance),
+                answered_activation_signer: route_proof_label(&answered_activation_signer),
+                candidate_instance: route_proof_label(&activation.runtime_instance_id),
+            }),
+            None => error,
+        })?;
         let observation = RouteObservation {
             route_id: driver.binding.route_id.clone(),
             runtime_instance_id: activation.runtime_instance_id.clone(),
@@ -11510,10 +11555,97 @@ fn route_proof_report_key(transaction_id: &str) -> String {
     format!("route-proof:{transaction_id}")
 }
 
+/// How long Routing waits for nginx's old workers to let go of the stable
+/// listener after a reload, derived from two ceilings: one Forward actuation
+/// must suffice per attempt (12 an hour), and the 120 s Routing deadline must
+/// keep room for at least four more backoff-spaced attempts if the route
+/// genuinely never switches.
+const ROUTE_RELOAD_HANDOFF: Duration =
+    if cfg!(test) { Duration::from_millis(400) } else { Duration::from_secs(10) };
+const ROUTE_RELOAD_HANDOFF_POLL: Duration =
+    if cfg!(test) { Duration::from_millis(20) } else { Duration::from_millis(250) };
+
+/// The handoff loop's clock. Production reads the real one; a test may install
+/// a virtual one on its own thread, so the window and the poll cadence are
+/// measured exactly, whatever the host load.
+#[cfg(not(test))]
+fn handoff_now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+#[cfg(not(test))]
+fn handoff_sleep(pause: Duration) {
+    thread::sleep(pause);
+}
+#[cfg(test)]
+thread_local! {
+    /// (virtual offset, sleeps taken, clock reads) while a test holds it.
+    static HANDOFF_CLOCK: std::cell::RefCell<Option<(Duration, Vec<Duration>, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn handoff_now() -> std::time::Instant {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(std::time::Instant::now);
+    HANDOFF_CLOCK.with(|clock| match clock.borrow_mut().as_mut() {
+        Some((offset, _, reads)) => {
+            *reads += 1;
+            assert!(*reads < 10_000, "the handoff loop spins without sleeping");
+            base + *offset
+        }
+        None => std::time::Instant::now(),
+    })
+}
+#[cfg(test)]
+fn handoff_sleep(pause: Duration) {
+    HANDOFF_CLOCK.with(|clock| match clock.borrow_mut().as_mut() {
+        Some((offset, sleeps, _)) => {
+            *offset += pause;
+            sleeps.push(pause);
+        }
+        None => thread::sleep(pause),
+    })
+}
+
+/// Who answered a stable route challenge that failed authentication, as the
+/// answer claimed itself: ids only, unauthenticated, never signature bytes.
+/// A label on a rejection, and the one thing that may say "challenge again".
+#[derive(Debug)]
+struct RouteProofAnswer {
+    answered_instance: String,
+    answered_activation_signer: String,
+    candidate_instance: String,
+}
+
+impl std::fmt::Display for RouteProofAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stable route answered as runtime instance {}, activation signer {} (unauthenticated); the candidate is {}",
+            self.answered_instance, self.answered_activation_signer, self.candidate_instance
+        )
+    }
+}
+
+/// The ids a presence claims, if it decodes at all. No re-encode check and no
+/// validation: this labels a rejection and is never evidence.
+fn presence_answer_ids(canonical: &[u8]) -> Option<(String, String)> {
+    let presence =
+        rmp_serde::from_slice::<cultnet_rs::GameCultRuntimePresenceHealthRecord>(canonical).ok()?;
+    Some((presence.runtime_instance_id, presence.activation_signer_identity_id))
+}
+
+/// An id cut to 96 bytes at a char boundary, control characters stripped.
+fn route_proof_label(id: &str) -> String {
+    let id: String = id.chars().filter(|c| !c.is_control()).collect();
+    id[..id.floor_char_boundary(96)].to_owned()
+}
+
 /// The stable route proof's failure in words: whether the listener said
 /// nothing or answered wrongly, then the specific refusal (HTTP status line,
 /// presence not active, challenge or authority disagreement). The texts it
-/// carries name states and codes, never keys or signature bytes.
+/// carries name states and codes, never keys or signature bytes. A rejected
+/// answer names the instance and activation signer it claimed, unauthenticated,
+/// ids only.
 fn route_proof_reason(error: &anyhow::Error) -> String {
     match error.downcast_ref::<ChallengeFailure>() {
         Some(ChallengeFailure::Silent(_)) => format!("silent, nothing answered: {error:#}"),
@@ -21964,6 +22096,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             activation: IdunnRuntimeActivationRecord,
             provider: cultnet_rs::ServiceIdentitySigner<GameCultProviderHealthIdentity>,
             activation_signer: cultnet_rs::IdunnRuntimeActivationSigner,
+            /// A second key the transaction's activation record never named.
+            other_signer: cultnet_rs::IdunnRuntimeActivationSigner,
+            /// The instance the stable listener answered as before the reload.
+            incumbent_instance: Mutex<Option<String>>,
+            stable_answers: AtomicUsize,
             state: Mutex<&'static str>,
             capacity: AtomicU32,
             sequence: AtomicU64,
@@ -21993,11 +22130,36 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             /// A first Odin candidate answering its Warming challenge: the
             /// detail names the challenge as `idunn-warming:<id>`.
             FirstOdinWarming,
+            /// The stable listener's first n answers come from the incumbent
+            /// (its instance id, a key the record never named), then Honest.
+            IncumbentFirst(usize),
+            /// The candidate's own instance id, signed with the wrong key.
+            ForeignActivation,
+            /// Neither the candidate nor the incumbent, wrong key.
+            StrangerInstance,
         }
 
         impl RuntimeStub {
             fn answer(&self, message_id: &str) -> Result<Vec<u8>> {
+                self.answer_on(message_id, false)
+            }
+
+            fn answer_on(&self, message_id: &str, stable: bool) -> Result<Vec<u8>> {
                 let expected = &self.expected;
+                let own = self.activation.runtime_instance_id.clone();
+                let (instance, signer) = match *self.reply.lock().unwrap() {
+                    Reply::IncumbentFirst(n)
+                        if stable && self.stable_answers.fetch_add(1, Ordering::SeqCst) < n =>
+                    {
+                        let incumbent = self.incumbent_instance.lock().unwrap().clone();
+                        (incumbent.context("no incumbent instance set")?, &self.other_signer)
+                    }
+                    Reply::ForeignActivation if stable => (own, &self.other_signer),
+                    Reply::StrangerInstance if stable => {
+                        (sha256_id(b"stranger instance"), &self.other_signer)
+                    }
+                    _ => (own, &self.activation_signer),
+                };
                 let mut presence = cultnet_rs::GameCultRuntimePresenceHealthRecord {
                     schema_version: cultnet_rs::GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into(),
                     target: expected.target.clone(),
@@ -22009,7 +22171,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                     state_schema_generation: expected.state_schema_generation.clone(),
                     state_contract_sha256: expected.state_contract_sha256.clone(),
                     runtime_id: expected.runtime_id.clone(),
-                    runtime_instance_id: self.activation.runtime_instance_id.clone(),
+                    runtime_instance_id: instance,
                     bound_endpoint: expected
                         .route
                         .as_ref()
@@ -22036,7 +22198,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                     observed_at_unix_millis: now_millis()?,
                     signature_algorithm: "ed25519".into(),
                     signature: Vec::new(),
-                    activation_signer_identity_id: self.activation_signer.identity_id(),
+                    activation_signer_identity_id: signer.identity_id(),
                     activation_signature: Vec::new(),
                 };
                 let proof = presence.canonical_proof_payload()?;
@@ -22044,8 +22206,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                     .provider
                     .sign::<cultnet_rs::GameCultRuntimePresenceHealthPurpose>(&proof)
                     .signature;
-                presence.activation_signature =
-                    self.activation_signer.sign_presence_proof(&presence)?;
+                presence.activation_signature = signer.sign_presence_proof(&presence)?;
                 Ok(rmp_serde::to_vec(&presence)?)
             }
 
@@ -22053,7 +22214,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 *self.state.lock().unwrap() = state;
             }
 
-            fn serve_one(&self, mut stream: TcpStream) -> Result<()> {
+            fn serve_one(&self, mut stream: TcpStream, stable: bool) -> Result<()> {
                 stream.set_read_timeout(Some(Duration::from_secs(3)))?;
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 4096];
@@ -22100,7 +22261,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                         record_key: self.expected.target.clone(),
                         stored_at: rfc3339_millis(now_millis()?)?,
                         payload_encoding: cultnet_rs::CultNetRawPayloadEncoding::Messagepack,
-                        payload: self.answer(&message_id)?,
+                        payload: self.answer_on(&message_id, stable)?,
                         source_runtime_id: None,
                         source_agent_id: None,
                         source_role: None,
@@ -22142,7 +22303,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                                     hook();
                                 }
                                 if !stub.hang_up.load(Ordering::SeqCst) {
-                                    let _ = stub.serve_one(stream);
+                                    let _ = stub.serve_one(stream, !candidate);
                                 }
                             }
                             Err(_) => std::thread::sleep(Duration::from_millis(5)),
@@ -22362,6 +22523,14 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             )?;
             let mut seed = Vec::new();
             let activation = launch.write_credential(&mut seed)?;
+            let mut other_seed = Vec::new();
+            IdunnRuntimeActivationLaunch::issue(
+                &expected,
+                sha256_id(b"unrecorded activation"),
+                now,
+                &world.engine.idunn_signer,
+            )?
+            .write_credential(&mut other_seed)?;
             let recorded = fixture_transaction(FIXTURE_TRANSACTIONS[0].1)?.1;
             let mut workload = recorded.workload.clone().context("no recorded workload")?;
             match &mut workload {
@@ -22393,6 +22562,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 activation_signer: cultnet_rs::IdunnRuntimeActivationSigner::from_credential_reader(
                     &seed[..],
                 )?,
+                other_signer: cultnet_rs::IdunnRuntimeActivationSigner::from_credential_reader(
+                    &other_seed[..],
+                )?,
+                incumbent_instance: Mutex::new(None),
+                stable_answers: AtomicUsize::new(0),
                 state: Mutex::new("warming"),
                 capacity: AtomicU32::new(minimum_capacity),
                 sequence: AtomicU64::new(0),
@@ -24931,6 +25105,199 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert_eq!(records[0].close_reason, Some(CloseReason::Recovered));
             assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
             assert!(said(&routed).is_none(), "recovery left the proof report armed");
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // The reload handoff: nginx's old workers may answer the stable
+        // listener for a moment after `systemctl reload` returns.
+        // -----------------------------------------------------------------
+
+        /// A deploy world at Routing whose preflight found an incumbent route
+        /// (another instance, another membership), so the install changes it.
+        #[cfg(unix)]
+        fn handoff_world(reply: Reply) -> Result<(RoutedWorld, String)> {
+            handoff_world_with(reply, false)
+        }
+
+        /// `same_membership`: the incumbent's membership equals the
+        /// candidate's, so the install changes no route.
+        #[cfg(unix)]
+        fn handoff_world_with(reply: Reply, same_membership: bool) -> Result<(RoutedWorld, String)> {
+            let routed = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
+            let incumbent = sha256_id(b"incumbent instance");
+            let current = resident(&routed.world)?;
+            let mut next = current.value.clone();
+            let mut on_disk = b"incumbent route\n".to_vec();
+            if same_membership {
+                on_disk = NginxRouteDriver::new(
+                    next.plan.as_ref().unwrap().parsed_inputs()?.1.route.context("no route binding")?,
+                )
+                .render(next.expected.as_ref().context("no Expected")?)?;
+            }
+            let preflight = next.route_preflight.as_mut().context("no preflight")?;
+            preflight.incumbent_runtime_instance_id = Some(incumbent.clone());
+            preflight.incumbent_membership_sha256 = Some(sha256_id(&on_disk));
+            preflight.incumbent_configuration = Some(on_disk.clone());
+            replace_transaction(&routed.world.state_store, &current, &next)?;
+            std::fs::write(routed.fragment_path(), &on_disk)?;
+            routed.stub.set_state("active");
+            routed.run_to_routing()?;
+            *routed.stub.incumbent_instance.lock().unwrap() = Some(incumbent.clone());
+            *routed.stub.reply.lock().unwrap() = reply;
+            Ok((routed, incumbent))
+        }
+
+        fn forwards(routed: &RoutedWorld) -> Result<usize> {
+            Ok(meters_of(&routed.world, "service")?.route_actuations.len())
+        }
+
+        fn proof_report(routed: &RoutedWorld) -> Result<Option<String>> {
+            let key = route_proof_report_key(&routed.transaction()?.transaction_id);
+            Ok(routed
+                .world
+                .engine
+                .fault_reports
+                .lock()
+                .unwrap()
+                .get(&key)
+                .and_then(|report| report.last.lock().unwrap().clone()))
+        }
+
+        /// Holds a virtual handoff clock on this thread: the wait is measured
+        /// in the loop's own sleeps, so no host load can move it.
+        struct VirtualHandoffClock;
+
+        impl VirtualHandoffClock {
+            fn hold() -> Self {
+                HANDOFF_CLOCK.with(|c| *c.borrow_mut() = Some((Duration::ZERO, Vec::new(), 0)));
+                Self
+            }
+
+            /// The pauses the loop took so far.
+            fn sleeps(&self) -> Vec<Duration> {
+                HANDOFF_CLOCK.with(|c| c.borrow().as_ref().unwrap().1.clone())
+            }
+        }
+
+        impl Drop for VirtualHandoffClock {
+            fn drop(&mut self) {
+                HANDOFF_CLOCK.with(|c| *c.borrow_mut() = None);
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn routing_waits_out_the_incumbent_answering_after_reload() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
+            let (routed, _) = handoff_world(Reply::IncumbentFirst(3))?;
+            let before = routed.reloads();
+            let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
+            routed.promote()?;
+            assert_eq!(routed.reloads() - before, 1, "an install and no rollback");
+            assert_eq!(forwards(&routed)?, 1);
+            assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, 4);
+            assert_eq!(clock.sleeps(), vec![ROUTE_RELOAD_HANDOFF_POLL; 3]);
+            assert!(proof_report(&routed)?.is_none(), "a route proof report remains");
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn routing_fails_once_when_the_incumbent_never_lets_go() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
+            let (routed, incumbent) = handoff_world(Reply::IncumbentFirst(usize::MAX))?;
+            let before = routed.reloads();
+            let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
+            let error = routed.step().unwrap_err();
+            // The window is exactly ROUTE_RELOAD_HANDOFF of polls at exactly
+            // the poll cadence: one challenge before each pause and one after
+            // the last.
+            let sleeps = clock.sleeps();
+            let polls = (ROUTE_RELOAD_HANDOFF.as_millis() / ROUTE_RELOAD_HANDOFF_POLL.as_millis()) as usize;
+            assert_eq!(sleeps, vec![ROUTE_RELOAD_HANDOFF_POLL; polls]);
+            assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, polls + 1);
+            assert_eq!(routed.reloads() - before, 2, "install and one rollback");
+            assert_eq!(forwards(&routed)?, 1);
+            let said = proof_report(&routed)?.context("no route proof report")?;
+            let candidate = routed.transaction()?.activation.unwrap().runtime_instance_id;
+            let signer = routed.stub.other_signer.identity_id();
+            for text in [format!("{error:#}"), said] {
+                assert!(text.contains(&format!("runtime instance {incumbent}")), "{text}");
+                assert!(text.contains(&format!("activation signer {signer}")), "{text}");
+                assert!(text.contains(&format!("the candidate is {candidate}")), "{text}");
+            }
+            routed.step().unwrap_err();
+            assert_eq!(forwards(&routed)?, 2, "the second attempt charges one more Forward");
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn routing_fails_at_once_when_the_candidate_answers_with_a_foreign_activation() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
+            let (routed, _) = handoff_world(Reply::ForeignActivation)?;
+            let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
+            let error = routed.step().unwrap_err();
+            assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, 1);
+            assert!(clock.sleeps().is_empty());
+            let text = format!("{error:#}");
+            let candidate = routed.transaction()?.activation.unwrap().runtime_instance_id;
+            assert!(text.contains("runtime activation proof verification failed"), "{text}");
+            assert!(text.contains(&format!("runtime instance {candidate}")), "{text}");
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn routing_fails_at_once_for_a_stranger_instance() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
+            let (routed, _) = handoff_world(Reply::StrangerInstance)?;
+            let before = routed.reloads();
+            let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
+            routed.step().unwrap_err();
+            assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, 1);
+            assert!(clock.sleeps().is_empty());
+            assert_eq!(routed.reloads() - before, 2);
+            Ok(())
+        }
+
+        /// An incumbent whose membership equals the candidate's has no route
+        /// to hand off, so its answer is a plain failure, never waited on.
+        #[cfg(unix)]
+        #[test]
+        fn routing_does_not_wait_when_the_route_is_unchanged() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
+            let (routed, _) = handoff_world_with(Reply::IncumbentFirst(1), true)?;
+            let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
+            routed.step().unwrap_err();
+            assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, 1);
+            assert!(clock.sleeps().is_empty());
+            Ok(())
+        }
+
+        #[test]
+        fn route_proof_answer_names_ids_only() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            let mut presence = rmp_serde::from_slice::<cultnet_rs::GameCultRuntimePresenceHealthRecord>(
+                &routed.stub.answer("probe")?,
+            )?;
+            presence.runtime_instance_id = format!("a\u{7}{}", "é".repeat(5_000));
+            presence.activation_signer_identity_id = "b".repeat(10_240);
+            presence.signature = vec![0xAB; 64];
+            presence.activation_signature = vec![0xCD; 64];
+            let (instance, signer) = presence_answer_ids(&rmp_serde::to_vec(&presence)?)
+                .context("a decodable presence gave no ids")?;
+            let text = RouteProofAnswer {
+                answered_instance: route_proof_label(&instance),
+                answered_activation_signer: route_proof_label(&signer),
+                candidate_instance: route_proof_label(&"c".repeat(10_240)),
+            }
+            .to_string();
+            assert!(text.len() <= 400, "{} bytes", text.len());
+            assert!(!text.contains('\u{7}'));
+            assert!(!text.contains("abab") && !text.contains("cdcd"));
+            assert!(presence_answer_ids(b"not msgpack presence").is_none());
             Ok(())
         }
 
