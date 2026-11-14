@@ -5525,14 +5525,24 @@ fn render_supervision(
     }
     if let Some(route) = generation.and_then(|value| value.route_supervision.as_ref()) {
         lines.push(format!(
-            "  route {} consecutive-failures {} last-challenge-at {} next-challenge-at {}",
+            "  route {} consecutive-failures {} last-challenge-at {}{} next-challenge-at {}{}",
             match route.degraded_since_unix_millis {
                 Some(since) => format!("degraded-since {since}"),
                 None => "healthy".to_owned(),
             },
             route.consecutive_failures,
             at(route.last_challenge_at_unix_millis),
-            at(route.next_challenge_at_unix_millis)
+            route
+                .last_challenge_at_unix_millis
+                .map_or(String::new(), |last| format!(" ({} ms ago)", now.saturating_sub(last))),
+            at(route.next_challenge_at_unix_millis),
+            // Route supervision runs only for a running incarnation, so a
+            // challenge left past due is not a route that is being watched.
+            if route.next_challenge_at_unix_millis.is_some_and(|next| next < now) {
+                ", waits on a running incarnation"
+            } else {
+                ""
+            }
         ));
     }
     if generation.is_none_or(|value| value.route_supervision.is_some())
@@ -5684,6 +5694,11 @@ struct Engine {
     /// One `ReportOnce` per faulting record, so one wedged transaction says
     /// its fault once and never drowns another's.
     fault_reports: Mutex<BTreeMap<String, ReportOnce>>,
+    /// The key of every `report_once` line that reached stderr: what a test
+    /// counts, since stderr is not observable from inside it, and a key's
+    /// own entry is dropped when its fault clears.
+    #[cfg(test)]
+    printed_reports: Mutex<Vec<String>>,
     /// Retry pacing for a transaction whose step keeps failing, by
     /// transaction id: consecutive failures and the earliest next attempt.
     /// Process-local on purpose: a restart retries at once, and no schema
@@ -5811,6 +5826,8 @@ impl Engine {
             runner_stand_in: Mutex::default(),
             history_report: ReportOnce::default(),
             fault_reports: Mutex::default(),
+            #[cfg(test)]
+            printed_reports: Mutex::default(),
             resume_backoff: Mutex::default(),
             lift_held: Mutex::default(),
             lift_unsettled: std::sync::atomic::AtomicBool::new(false),
@@ -5929,6 +5946,8 @@ impl Engine {
             .or_default()
             .offer(Some(message));
         if let Some(message) = offered {
+            #[cfg(test)]
+            self.printed_reports.lock().unwrap().push(key.to_string());
             eprintln!("{message}");
         }
     }
@@ -7271,10 +7290,13 @@ impl Engine {
                     progressed = true;
                     continue;
                 }
-                Ok(false) => {}
-                Err(error) => eprintln!(
-                    "Idunn preserved a stale {} incarnation projection: {error:#}",
-                    current.value.target
+                Ok(false) => self.clear_fault(&format!("stale-incarnation:{}", current.value.target)),
+                Err(error) => self.report_once(
+                    &format!("stale-incarnation:{}", current.value.target),
+                    format!(
+                        "Idunn preserved a stale {} incarnation projection: {error:#}",
+                        current.value.target
+                    ),
                 ),
             }
             // Restore the admitted Expected before anything is asked of the
@@ -7303,11 +7325,16 @@ impl Engine {
                 }
                 Ok(())
             })();
-            if let Err(error) = repair {
-                eprintln!(
-                    "Idunn preserved admitted {} after refusing topology projection repair: {error:#}",
-                    current.value.target
-                );
+            let repair_key = format!("projection-repair:{}", current.value.target);
+            match repair {
+                Ok(()) => self.clear_fault(&repair_key),
+                Err(error) => self.report_once(
+                    &repair_key,
+                    format!(
+                        "Idunn preserved admitted {} after refusing topology projection repair: {error:#}",
+                        current.value.target
+                    ),
+                ),
             }
             let mut operational_error = None;
             let observation = match self.workload_for(&current.value.plan).and_then(|workload| {
@@ -7318,6 +7345,7 @@ impl Engine {
                 )
             }) {
                 Ok(observation) => {
+                    self.clear_fault(&format!("observe:{}", current.value.target));
                     let lease_is_missing = if let Some(lease) = current.value.leasing.lease() {
                         let lease_health = (|| -> Result<bool> {
                             let lease_path = current
@@ -7338,6 +7366,10 @@ impl Engine {
                             }
                             bail!("write-lease store contains unexpected authority")
                         })();
+                        let lease_key = format!("write-lease:{}", current.value.target);
+                        if lease_health.is_ok() {
+                            self.clear_fault(&lease_key);
+                        }
                         match lease_health {
                             Ok(true) => false,
                             Ok(false) => {
@@ -7346,9 +7378,12 @@ impl Engine {
                                 true
                             }
                             Err(error) => {
-                                eprintln!(
-                                    "Idunn preserved admitted {} after refusing an unsafe write-lease mutation: {error:#}",
-                                    current.value.target
+                                self.report_once(
+                                    &lease_key,
+                                    format!(
+                                        "Idunn preserved admitted {} after refusing an unsafe write-lease mutation: {error:#}",
+                                        current.value.target
+                                    ),
                                 );
                                 continue;
                             }
@@ -7368,13 +7403,20 @@ impl Engine {
                     // silence, not a death; counting it as one burned every
                     // continuity attempt in the reattach window on
                     // 2026-09-11 and left a healthy Muninn demoted.
-                    eprintln!(
-                        "Idunn cannot observe admitted {} this tick: {error:#}",
-                        current.value.target
+                    // Said once while it lasts, and cleared the moment the host
+                    // answers: a reattach window is not a line per tick.
+                    self.report_once(
+                        &format!("observe:{}", current.value.target),
+                        format!(
+                            "Idunn cannot observe admitted {} this tick: {error:#}",
+                            current.value.target
+                        ),
                     );
                     continue;
                 }
                 Err(error) => {
+                    // The host answered, with a death: no longer silence.
+                    self.clear_fault(&format!("observe:{}", current.value.target));
                     operational_error = Some(error);
                     None
                 }
@@ -7414,7 +7456,9 @@ impl Engine {
                     }),
                 );
                 // Route and topology supervision are about a running incarnation;
-                // workload liveness decides whether there is one (route-continuity-cut F8).
+                // workload liveness decides whether there is one (route-continuity-cut F8,
+                // resolved by this order). Topology cannot bind without an observed
+                // activation, so a HostUnobservable tick skips both too.
                 let route_key = format!("route-supervision:{}", current.value.target);
                 match self.supervise_admitted_route(&snapshot, current) {
                     Ok(true) => {
@@ -7584,10 +7628,17 @@ impl Engine {
             // could not resolve. So a failed demotion mints nothing. The
             // failure is written to the generation, and the next attempt is
             // not before the deferral ends.
+            let demotion_key = format!("demotion:{}", current.value.target);
+            if demotion.is_ok() {
+                self.clear_fault(&demotion_key);
+            }
             if let Err(error) = demotion {
-                eprintln!(
-                    "Idunn deferred continuity for admitted {} after refusing to demote its projection: {error:#}",
-                    current.value.target
+                self.report_once(
+                    &demotion_key,
+                    format!(
+                        "Idunn deferred continuity for admitted {} after refusing to demote its projection: {error:#}",
+                        current.value.target
+                    ),
                 );
                 let mut deferred = supervision.clone();
                 deferred.defer_continuity(now, &bounded_detail(&format!("{error:#}")));
@@ -15131,6 +15182,10 @@ mod tests {
         Ok(())
     }
 
+    fn printed(world: &EngineFixture, key: &str) -> usize {
+        world.engine.printed_reports.lock().unwrap().iter().filter(|printed| *printed == key).count()
+    }
+
     #[test]
     fn a_running_generation_with_a_non_binding_correlation_is_reported_once() -> Result<()> {
         let (world, seeded, first) = odin_admitted_world(Arc::new(StillWorkload))?;
@@ -15140,30 +15195,12 @@ mod tests {
             assert!(!world.engine.supervise_one_admitted_generation()?);
         }
         assert_eq!(incumbent_envelope(&world)?, envelope);
-        let said = {
-            let reports = world.engine.fault_reports.lock().unwrap();
-            reports
-                .get("topology:service")
-                .and_then(|report| report.last.lock().unwrap().clone())
-                .context("the rejection was not said")?
-        };
-        assert!(said.contains("after rejecting topology observation"), "{said}");
-        // Said once while it lasts: the same fault offered again is silent.
-        world.engine.report_once("topology:service", said.clone());
-        assert_eq!(
-            world.engine.fault_reports.lock().unwrap()["topology:service"].offer(Some(said)),
-            None
-        );
+        // The engine said it once over fifty ticks.
+        assert_eq!(printed(&world, "topology:service"), 1);
+        assert!(world.engine.fault_reports.lock().unwrap().contains_key("topology:service"));
 
-        // A reading withdrawn ends the fault too: the key clears, so a
-        // recurrence would be said again.
-        let store = SingleFileMessagePackBackingStore::new(&world.engine.options.odin_correlation_store);
-        assert!(store.delete_batch_if_unchanged(&store.pull_all_read_only_snapshot()?)?);
-        assert!(!world.engine.supervise_one_admitted_generation()?);
-        assert!(!world.engine.fault_reports.lock().unwrap().contains_key("topology:service"));
-
-        // A binding reading is adopted, and leaves nothing said.
-        odin_reports_ready(&world, &seeded, first + 6)?;
+        // A binding reading is adopted and ends the fault, so the key clears.
+        odin_republishes(&world, &seeded, first + 6)?;
         assert!(world.engine.supervise_one_admitted_generation()?);
         assert!(!world.engine.fault_reports.lock().unwrap().contains_key("topology:service"));
         let adopted = ControlSnapshot::read(&world.state_store)?
@@ -15172,6 +15209,17 @@ mod tests {
             .value
             .clone();
         assert_eq!(adopted.odin_publisher_sequence_cursor, first + 6);
+
+        // A recurrence is said again, once; a reading withdrawn ends it too.
+        odin_republishes_another_activation(&world, &seeded, first + 8)?;
+        for _ in 0..20 {
+            world.engine.supervise_one_admitted_generation()?;
+        }
+        assert_eq!(printed(&world, "topology:service"), 2);
+        let store = SingleFileMessagePackBackingStore::new(&world.engine.options.odin_correlation_store);
+        assert!(store.delete_batch_if_unchanged(&store.pull_all_read_only_snapshot()?)?);
+        assert!(!world.engine.supervise_one_admitted_generation()?);
+        assert!(!world.engine.fault_reports.lock().unwrap().contains_key("topology:service"));
         Ok(())
     }
 
@@ -21764,6 +21812,24 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     }
 
     #[test]
+    fn status_says_a_route_left_past_due_waits_on_a_running_incarnation() -> Result<()> {
+        let now = 10_000_000_u64;
+        let (_, mut generation) = fixture_generation(FIXTURE_GENERATION)?;
+        generation.route_supervision = Some(RouteSupervisionState {
+            last_challenge_at_unix_millis: Some(now - 5_000),
+            next_challenge_at_unix_millis: Some(now - 4_000),
+            ..RouteSupervisionState::default()
+        });
+        let lines = render_supervision("service", Some(&generation), None, now).join("\n");
+        assert!(lines.contains("last-challenge-at 9995000 (5000 ms ago)"), "{lines}");
+        assert!(lines.contains("waits on a running incarnation"), "{lines}");
+        generation.route_supervision.as_mut().unwrap().next_challenge_at_unix_millis = Some(now + 1);
+        let lines = render_supervision("service", Some(&generation), None, now).join("\n");
+        assert!(!lines.contains("waits on a running incarnation"), "{lines}");
+        Ok(())
+    }
+
+    #[test]
     fn status_shows_each_targets_meters_including_a_target_with_no_generation() -> Result<()> {
         let now = 10_000_000_u64;
         let mut meters = TargetSupervision::new("service");
@@ -24357,6 +24423,74 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 "{:?}",
                 reports.keys().collect::<Vec<_>>()
             );
+            Ok(())
+        }
+
+        fn printed_in(routed: &RoutedWorld, key: &str) -> usize {
+            routed.world.engine.printed_reports.lock().unwrap().iter().filter(|printed| *printed == key).count()
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_running_route_whose_fragment_cannot_be_read_is_reported_once() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            let key = "route-supervision:service";
+            let fragment = routed.fragment_path();
+            let bytes = std::fs::read(&fragment)?;
+            // The fragment is a directory: reading it fails, and nothing is
+            // written, so every tick meets the same error.
+            std::fs::remove_file(&fragment)?;
+            std::fs::create_dir(&fragment)?;
+            for _ in 0..30 {
+                routed.tick()?;
+            }
+            assert_eq!(printed_in(&routed, key), 1);
+            assert!(routed.world.engine.fault_reports.lock().unwrap().contains_key(key));
+
+            // The fragment is back: the fault ends and the key clears.
+            std::fs::remove_dir(&fragment)?;
+            std::fs::write(&fragment, &bytes)?;
+            routed.tick()?;
+            assert!(!routed.world.engine.fault_reports.lock().unwrap().contains_key(key));
+
+            // A recurrence is said again, once.
+            std::fs::remove_file(&fragment)?;
+            std::fs::create_dir(&fragment)?;
+            for _ in 0..30 {
+                routed.tick()?;
+            }
+            assert_eq!(printed_in(&routed, key), 2);
+            Ok(())
+        }
+
+        /// Skipping route and topology on a tick the host could not be asked is
+        /// the steward's ruling (no activation can be bound without an
+        /// observation; no routed target runs on a host actuator today).
+        #[cfg(unix)]
+        #[test]
+        fn a_host_that_cannot_be_asked_skips_route_supervision_and_is_said_once() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            routed.drift()?;
+            let envelope = incumbent_envelope(&routed.world)?;
+            let reloads = routed.reloads();
+            routed.workload.silence(true);
+            for _ in 0..30 {
+                routed.tick()?;
+            }
+            assert_eq!(routed.reloads(), reloads, "route supervision ran without an observation");
+            assert_eq!(incumbent_envelope(&routed.world)?, envelope);
+            assert_eq!(printed_in(&routed, "observe:service"), 1);
+
+            routed.workload.silence(false);
+            routed.tick()?;
+            assert!(!routed.world.engine.fault_reports.lock().unwrap().contains_key("observe:service"));
+            routed.workload.silence(true);
+            for _ in 0..5 {
+                routed.tick()?;
+            }
+            assert_eq!(printed_in(&routed, "observe:service"), 2);
             Ok(())
         }
 

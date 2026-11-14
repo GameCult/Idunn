@@ -390,6 +390,8 @@ read-only command on Yggdrasil on 2026-09-29. Nothing was written to the host.
   (`:3670`, `:3715`), and topology refresh (`:3780`). After three refused
   continuity restarts, supervision stops restarting (`:3522-3528`) but keeps
   supervising the route of a dead incarnation. Read.
+  Resolved by `cut-liveness-gates-presence`: route challenge and topology
+  refresh now run only for an incarnation observed running.
 - F9. The continuity restart limit counts refused restarts per generation
   (`is_refused_restart`, `:3469-3488`). A restart that succeeds admits a new
   generation and resets the count. A unit that starts, is admitted, and then
