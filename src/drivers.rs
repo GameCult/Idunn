@@ -762,7 +762,7 @@ impl StaticReleasePort for FilesystemStaticRelease {
         binding: &StaticReleaseBinding,
         release_id: &str,
     ) -> Result<StaticFlip> {
-        use std::os::unix::fs::{OpenOptionsExt, symlink};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 
         // Everything up to and including the rename can refuse, and only that
         // refuses: the link has not moved when `FlipRefused` is returned.
@@ -823,6 +823,10 @@ impl StaticReleasePort for FilesystemStaticRelease {
                     .create_new(true)
                     .mode(0o444)
                     .open(&temporary_carry)?;
+                // The creation mode is masked by the service's umask
+                // (UMask=0027 yields 0440), and the web server reads this file
+                // as "other"; say 0444 on the open handle.
+                file.set_permissions(fs::Permissions::from_mode(0o444))?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
                 fs::rename(&temporary_carry, &carried)?;
@@ -17042,6 +17046,43 @@ processes 9
         // Rolling back is the same flip to the release the link named before.
         port.carry_and_flip(&site.binding, RELEASE_A)?;
         assert_eq!(port.observe_current(&site.binding)?.as_deref(), Some(RELEASE_A));
+        Ok(())
+    }
+
+    /// The service runs with UMask=0027, which masks the create mode to 0440
+    /// and hides the carry from the web user. The umask is process-global, so
+    /// the proof runs in a child copy of this test binary and no sibling test
+    /// ever sees it.
+    #[cfg(unix)]
+    #[test]
+    fn static_release_carry_is_0444_under_the_service_umask() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "IDUNN_TEST_CARRY_UMASK_CHILD";
+        const NAME: &str = "static_release_carry_is_0444_under_the_service_umask";
+        if std::env::var_os(CHILD).is_none() {
+            let path = format!("{}::{NAME}", module_path!().split_once("::").map_or("", |(_, rest)| rest));
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", path.as_str(), "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "child under umask 0027 failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the child filter matched no test:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return Ok(());
+        }
+        unsafe { libc::umask(0o027) };
+        let site = stand_in_site()?;
+        FilesystemStaticRelease.carry_and_flip(&site.binding, RELEASE_A)?;
+        let carried = site.binding.current_link.join("config.json");
+        assert_eq!(fs::metadata(&carried)?.permissions().mode() & 0o777, 0o444);
         Ok(())
     }
 
