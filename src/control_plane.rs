@@ -24349,9 +24349,39 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             routed.run_to_routing()?;
             let deadline = routed.transaction()?.phase_deadline.context("Routing has no deadline")?;
             routed.stub.hang_up.store(true, Ordering::SeqCst);
-            for _ in 0..3 {
+            // The Routing tick itself reports why the proof failed, once per
+            // distinct reason, and recovery clears it.
+            let proof_key = route_proof_report_key(&routed.transaction()?.transaction_id);
+            let said = |routed: &RoutedWorld| -> Option<String> {
+                routed
+                    .world
+                    .engine
+                    .fault_reports
+                    .lock()
+                    .unwrap()
+                    .get(&proof_key)
+                    .and_then(|report| report.last.lock().unwrap().clone())
+            };
+            assert!(said(&routed).is_none(), "a proof report existed before any failure");
+            routed.resume()?;
+            let first = said(&routed).context("the failing Routing tick reported no proof failure")?;
+            assert!(first.contains("route proof") && first.contains("silent, nothing answered"), "{first}");
+            // The hung-up stub fails the same way each attempt, but the OS
+            // words the tail either as an early EOF or a broken pipe, so a
+            // retry may honestly report a second distinct reason. What may
+            // not change is everything up to that tail, and a repeat must not
+            // mint a new line each attempt.
+            let head = |text: &str| text.split("answered:").next().unwrap().to_owned();
+            let mut seen = vec![first.clone()];
+            for _ in 0..2 {
                 routed.resume()?;
+                let again = said(&routed).context("a retry cleared the proof report")?;
+                assert_eq!(head(&again), head(&first), "a retry reworded the report");
+                if !seen.contains(&again) {
+                    seen.push(again);
+                }
             }
+            assert!(seen.len() <= 2, "the same failure was reported afresh on every retry: {seen:#?}");
             // Before the deadline each attempt installs and rolls back, and no
             // resume moves the deadline.
             assert_eq!(routed.reloads(), 6);
@@ -24394,6 +24424,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].close_reason, Some(CloseReason::Recovered));
             assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
+            assert!(said(&routed).is_none(), "recovery left the proof report armed");
             Ok(())
         }
 
@@ -25005,6 +25036,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert!(
                 abort.error.contains("its last attempt failed"),
                 "the deadline abort dropped the proof's failure: {}",
+                abort.error
+            );
+            assert!(
+                abort.error.contains("stable CultNet route stopped before its headers ended"),
+                "the deadline abort dropped the proof's own failure text: {}",
                 abort.error
             );
             assert!(
