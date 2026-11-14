@@ -304,7 +304,7 @@ fn lifecycle_brake_status(options: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-fn replace_lifecycle_brake(path: &Path, record: IdunnLifecycleBrakeRecord) -> Result<()> {
+pub(crate) fn replace_lifecycle_brake(path: &Path, record: IdunnLifecycleBrakeRecord) -> Result<()> {
     record.validate()?;
     let store = SingleFileMessagePackBackingStore::new(path);
     let entries = store.pull_all_read_only_snapshot()?;
