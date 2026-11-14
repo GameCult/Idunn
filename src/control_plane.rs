@@ -5525,8 +5525,7 @@ fn render_supervision(
     }
     if let Some(route) = generation.and_then(|value| value.route_supervision.as_ref()) {
         lines.push(format!(
-            "  route {} consecutive-failures {} last-challenge-at {}{} next-challenge-at {}{}",
-            match route.degraded_since_unix_millis {
+            "  route {} consecutive-failures {} last-challenge-at {}{} next-challenge-at {}{}",            match route.degraded_since_unix_millis {
                 Some(since) => format!("degraded-since {since}"),
                 None => "healthy".to_owned(),
             },
@@ -5536,13 +5535,13 @@ fn render_supervision(
                 .last_challenge_at_unix_millis
                 .map_or(String::new(), |last| format!(" ({} ms ago)", now.saturating_sub(last))),
             at(route.next_challenge_at_unix_millis),
-            // Route supervision runs only for a running incarnation, so a
-            // challenge left past due is not a route that is being watched.
-            if route.next_challenge_at_unix_millis.is_some_and(|next| next < now) {
-                ", waits on a running incarnation"
-            } else {
-                ""
-            }
+            // Status sees the stored schedule, not why it is not being kept
+            // (a refused write, a transaction, a daemon that is down): it
+            // says only how overdue the challenge is.
+            route
+                .next_challenge_at_unix_millis
+                .filter(|next| *next < now)
+                .map_or(String::new(), |next| format!(" (past due {} ms)", now - next))
         ));
     }
     if generation.is_none_or(|value| value.route_supervision.is_some())
@@ -14226,6 +14225,10 @@ mod tests {
             .replace(
                 "/var/lib/gamecult/idunn/service-deployment-brake.cc",
                 &world.root.join("service-deployment-brake.cc").display().to_string(),
+            )
+            .replace(
+                "/var/lib/gamecult/idunn/service-lifecycle-brake.cc",
+                &world.root.join("service-lifecycle-brake.cc").display().to_string(),
             ),
         )?;
         let recipe = RECIPE
@@ -15155,11 +15158,39 @@ mod tests {
         odin_republishes(world, &other, sequence)
     }
 
+    /// Engage the admitted target's lifecycle brake, at the path its seeded
+    /// binding names: a dead incarnation mints no continuity, so every later
+    /// tick reaches the same gates.
+    fn engage_lifecycle_brake_in(world: &EngineFixture) -> Result<()> {
+        let generation = ControlSnapshot::read(&world.state_store)?
+            .admitted_for("service")
+            .context("no admitted generation")?
+            .value
+            .clone();
+        crate::provisioning::replace_lifecycle_brake(
+            &world.root.join("service-lifecycle-brake.cc"),
+            IdunnLifecycleBrakeRecord {
+                schema_version: IDUNN_LIFECYCLE_BRAKE_SCHEMA.into(),
+                authority: cultnet_rs::IDUNN_LIFECYCLE_BRAKE_AUTHORITY.into(),
+                runtime_id: generation.expected.runtime_id.clone(),
+                target: "service".into(),
+                scope: cultnet_rs::IDUNN_LIFECYCLE_BRAKE_SCOPE.into(),
+                status: "engaged".into(),
+                reason: "test".into(),
+                updated_at_unix_millis: now_millis()?,
+                released_until_unix_millis: None,
+            },
+        )
+    }
+
     #[test]
     fn a_dead_generation_does_not_take_odin_correlations() -> Result<()> {
         let switch = SwitchWorkload::new();
         let (world, seeded, first) = odin_admitted_world(switch.clone())?;
         switch.kill();
+        // No continuity is minted, so no transaction ever owns the target and
+        // every tick reaches the topology gate.
+        engage_lifecycle_brake_in(&world)?;
         let envelope = incumbent_envelope(&world)?;
 
         // A newer reading that binds the admitted activation, and one that does
@@ -15173,6 +15204,10 @@ mod tests {
             for _ in 0..100 {
                 world.engine.supervise_one_admitted_generation()?;
             }
+            assert!(
+                ControlSnapshot::read(&world.state_store)?.transactions.is_empty(),
+                "a transaction owns the target: later ticks never reach the gate"
+            );
             assert_eq!(incumbent_envelope(&world)?, envelope);
             assert!(
                 !world.engine.fault_reports.lock().unwrap().contains_key("topology:service"),
@@ -21812,7 +21847,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
     }
 
     #[test]
-    fn status_says_a_route_left_past_due_waits_on_a_running_incarnation() -> Result<()> {
+    fn status_says_how_overdue_a_route_challenge_is_and_claims_no_cause() -> Result<()> {
         let now = 10_000_000_u64;
         let (_, mut generation) = fixture_generation(FIXTURE_GENERATION)?;
         generation.route_supervision = Some(RouteSupervisionState {
@@ -21822,10 +21857,11 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         });
         let lines = render_supervision("service", Some(&generation), None, now).join("\n");
         assert!(lines.contains("last-challenge-at 9995000 (5000 ms ago)"), "{lines}");
-        assert!(lines.contains("waits on a running incarnation"), "{lines}");
-        generation.route_supervision.as_mut().unwrap().next_challenge_at_unix_millis = Some(now + 1);
+        assert!(lines.contains("next-challenge-at 9996000 (past due 4000 ms)"), "{lines}");
+        assert!(!lines.contains("waits on"), "{lines}");
+        generation.route_supervision.as_mut().unwrap().next_challenge_at_unix_millis = Some(now);
         let lines = render_supervision("service", Some(&generation), None, now).join("\n");
-        assert!(!lines.contains("waits on a running incarnation"), "{lines}");
+        assert!(!lines.contains("past due"), "{lines}");
         Ok(())
     }
 
@@ -24358,28 +24394,9 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             Ok(())
         }
 
-        /// Engage the target's lifecycle brake: the dead path may not mint.
-        fn engage_lifecycle_brake(routed: &RoutedWorld) -> Result<()> {
-            let generation = admitted(routed)?;
-            crate::provisioning::replace_lifecycle_brake(
-                &routed.world.root.join("service-lifecycle-brake.cc"),
-                IdunnLifecycleBrakeRecord {
-                    schema_version: IDUNN_LIFECYCLE_BRAKE_SCHEMA.into(),
-                    authority: cultnet_rs::IDUNN_LIFECYCLE_BRAKE_AUTHORITY.into(),
-                    runtime_id: generation.expected.runtime_id.clone(),
-                    target: "service".into(),
-                    scope: cultnet_rs::IDUNN_LIFECYCLE_BRAKE_SCOPE.into(),
-                    status: "engaged".into(),
-                    reason: "test".into(),
-                    updated_at_unix_millis: now_millis()?,
-                    released_until_unix_millis: None,
-                },
-            )
-        }
-
+        /// A target with a process write lease, admitted and running.
         #[cfg(unix)]
-        #[test]
-        fn a_parked_routed_target_is_not_route_supervised() -> Result<()> {
+        fn admitted_stateful_world() -> Result<RoutedWorld> {
             let routed = stateful_routed_world(Odin::Unreachable, DeploymentPhase::Fencing)?;
             routed.drive_until(|t| t.phase == DeploymentPhase::AwaitingReady)?;
             let granted_lease = routed
@@ -24396,6 +24413,17 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             routed.promote()?;
             routed.drive_until(|transaction| transaction.is_terminal())?;
             assert!(routed.world.engine.retire_one_terminal_transaction()?);
+            Ok(routed)
+        }
+
+        /// Engage the target's lifecycle brake: the dead path may not mint.
+        fn engage_lifecycle_brake(routed: &RoutedWorld) -> Result<()> {
+            engage_lifecycle_brake_in(&routed.world)
+        }
+        #[cfg(unix)]
+        #[test]
+        fn a_parked_routed_target_is_not_route_supervised() -> Result<()> {
+            let routed = admitted_stateful_world()?;
             let generation = admitted(&routed)?;
             let lease = generation.leasing.lease().context("no lease")?.clone();
             CultCacheWriteLeaseDriver::new(
@@ -24423,6 +24451,178 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 "{:?}",
                 reports.keys().collect::<Vec<_>>()
             );
+            Ok(())
+        }
+
+        fn fault_keys(routed: &RoutedWorld) -> Vec<String> {
+            routed.world.engine.fault_reports.lock().unwrap().keys().cloned().collect()
+        }
+
+        /// Soul's probe: a route record that cannot be written leaves the
+        /// challenge past due on a running incarnation. Status shows the age
+        /// and does not name a cause it cannot see.
+        #[cfg(unix)]
+        #[test]
+        fn status_of_a_past_due_route_on_a_running_incarnation_claims_no_wait() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            routed.stub.hang_up.store(true, Ordering::SeqCst);
+            routed.drift()?;
+            assert!(routed.tick()?);
+            assert!(admitted(&routed)?.route_supervision.unwrap().degraded_since_unix_millis.is_some());
+            routed.stub.hang_up.store(false, Ordering::SeqCst);
+            edit_incumbent(&routed.world, |generation| {
+                generation.route_supervision.as_mut().unwrap().next_challenge_at_unix_millis = Some(1);
+            })?;
+            let fragment = routed.fragment_path();
+            std::fs::remove_file(&fragment)?;
+            std::fs::create_dir(&fragment)?;
+            for _ in 0..20 {
+                routed.tick()?;
+            }
+            assert!(ControlSnapshot::read(&routed.world.state_store)?.transactions.is_empty());
+            assert!(fault_keys(&routed).contains(&"route-supervision:service".to_owned()));
+            let generation = admitted(&routed)?;
+            let lines = render_supervision("service", Some(&generation), None, now_millis()?).join("\n");
+            assert!(lines.contains("(past due "), "{lines}");
+            assert!(!lines.contains("waits on"), "{lines}");
+            Ok(())
+        }
+
+        /// A target whose lease store is empty while its process runs is a
+        /// dead-path case: the route is not challenged for it.
+        #[cfg(unix)]
+        #[test]
+        fn a_running_target_with_an_empty_lease_is_not_route_challenged() -> Result<()> {
+            let routed = admitted_stateful_world()?;
+            let lease = admitted(&routed)?.leasing.lease().context("no lease")?.clone();
+            CultCacheWriteLeaseDriver::new(
+                "service",
+                routed.world.root.join("lease/process-write-lease.cc"),
+            )
+            .revoke_exact(Some(&lease))?;
+            engage_lifecycle_brake(&routed)?;
+            routed.drift()?;
+            let envelope = incumbent_envelope(&routed.world)?;
+            let reloads = routed.reloads();
+            let programs = routed.world.route_stubs.count("");
+            for _ in 0..50 {
+                routed.tick()?;
+            }
+            assert_eq!(routed.reloads(), reloads, "an empty-lease target's route was reloaded");
+            assert_eq!(routed.world.route_stubs.count(""), programs, "a program ran");
+            assert_eq!(incumbent_envelope(&routed.world)?, envelope);
+            assert!(ControlSnapshot::read(&routed.world.state_store)?.transactions.is_empty());
+            assert!(
+                !fault_keys(&routed).iter().any(|key| key.starts_with("route")),
+                "{:?}",
+                fault_keys(&routed)
+            );
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_host_that_answers_with_a_death_ends_the_silence_fault() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            engage_lifecycle_brake(&routed)?;
+            routed.workload.silence(true);
+            for _ in 0..5 {
+                routed.tick()?;
+            }
+            assert_eq!(printed_in(&routed, "observe:service"), 1);
+            routed.workload.silence(false);
+            routed.workload.kill();
+            routed.tick()?;
+            assert!(!fault_keys(&routed).contains(&"observe:service".to_owned()));
+            Ok(())
+        }
+
+        /// Replace the topology store with a directory: every read of it fails.
+        #[cfg(unix)]
+        fn break_topology(routed: &RoutedWorld) -> Result<()> {
+            let store = routed.world.root.join("topology.cc");
+            if store.exists() {
+                std::fs::rename(&store, routed.world.root.join("topology.aside"))?;
+            }
+            std::fs::create_dir(&store)?;
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        fn mend_topology(routed: &RoutedWorld) -> Result<()> {
+            let store = routed.world.root.join("topology.cc");
+            std::fs::remove_dir(&store)?;
+            let aside = routed.world.root.join("topology.aside");
+            if aside.exists() {
+                std::fs::rename(aside, &store)?;
+            }
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_stale_incarnation_and_a_projection_repair_that_fail_are_each_said_once() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            let keys = ["stale-incarnation:service", "projection-repair:service"];
+            for round in 1..=2 {
+                break_topology(&routed)?;
+                for _ in 0..30 {
+                    routed.tick()?;
+                }
+                for key in keys {
+                    assert_eq!(printed_in(&routed, key), round, "{key}");
+                    assert!(fault_keys(&routed).contains(&key.to_owned()), "{key}");
+                }
+                mend_topology(&routed)?;
+                routed.tick()?;
+                for key in keys {
+                    assert!(!fault_keys(&routed).contains(&key.to_owned()), "{key}");
+                }
+            }
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_refused_demotion_is_said_once_and_cleared_when_it_succeeds() -> Result<()> {
+            let routed = routed_world(Odin::Unreachable, 1, DeploymentPhase::Fencing, false)?;
+            routed.admit()?;
+            routed.workload.kill();
+            break_topology(&routed)?;
+            // Each attempt is let through by forgetting the deferral it wrote.
+            for _ in 0..6 {
+                set_meters(&routed.world, &TargetSupervision::new("service"))?;
+                routed.tick()?;
+            }
+            assert_eq!(printed_in(&routed, "demotion:service"), 1);
+            assert!(fault_keys(&routed).contains(&"demotion:service".to_owned()));
+            mend_topology(&routed)?;
+            set_meters(&routed.world, &TargetSupervision::new("service"))?;
+            routed.tick()?;
+            assert!(!fault_keys(&routed).contains(&"demotion:service".to_owned()));
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn an_unsafe_write_lease_store_is_said_once_and_cleared_when_it_is_exact() -> Result<()> {
+            let routed = admitted_stateful_world()?;
+            let store = routed.world.root.join("lease/process-write-lease.cc");
+            let exact = std::fs::read(&store)?;
+            for round in 1..=2 {
+                std::fs::write(&store, b"not a lease store")?;
+                for _ in 0..30 {
+                    routed.tick()?;
+                }
+                assert_eq!(printed_in(&routed, "write-lease:service"), round);
+                assert!(fault_keys(&routed).contains(&"write-lease:service".to_owned()));
+                std::fs::write(&store, &exact)?;
+                routed.tick()?;
+                assert!(!fault_keys(&routed).contains(&"write-lease:service".to_owned()));
+            }
             Ok(())
         }
 
