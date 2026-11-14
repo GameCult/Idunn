@@ -9823,19 +9823,19 @@ impl Engine {
         preflight: &crate::drivers::RoutePreflightReceipt,
     ) -> Result<RouteObservation> {
         let candidate = &required(&transaction.activation, "route activation")?.runtime_instance_id;
-        let until = std::time::Instant::now() + ROUTE_RELOAD_HANDOFF;
+        let until = handoff_now() + ROUTE_RELOAD_HANDOFF;
         loop {
             match self.prove_stable_route(transaction, driver, membership_sha256.clone()) {
                 Err(error)
                     if preflight.changes_route()
-                        && std::time::Instant::now() < until
+                        && handoff_now() < until
                         && error.downcast_ref::<RouteProofAnswer>().is_some_and(|answer| {
                             preflight.incumbent_runtime_instance_id.as_deref()
                                 == Some(answer.answered_instance.as_str())
                                 && answer.answered_instance != *candidate
                         }) =>
                 {
-                    thread::sleep(ROUTE_RELOAD_HANDOFF_POLL);
+                    handoff_sleep(ROUTE_RELOAD_HANDOFF_POLL);
                 }
                 result => return result,
             }
@@ -11506,6 +11506,47 @@ const ROUTE_RELOAD_HANDOFF: Duration =
     if cfg!(test) { Duration::from_millis(400) } else { Duration::from_secs(10) };
 const ROUTE_RELOAD_HANDOFF_POLL: Duration =
     if cfg!(test) { Duration::from_millis(20) } else { Duration::from_millis(250) };
+
+/// The handoff loop's clock. Production reads the real one; a test may install
+/// a virtual one on its own thread, so the window and the poll cadence are
+/// measured exactly, whatever the host load.
+#[cfg(not(test))]
+fn handoff_now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+#[cfg(not(test))]
+fn handoff_sleep(pause: Duration) {
+    thread::sleep(pause);
+}
+#[cfg(test)]
+thread_local! {
+    /// (virtual offset, sleeps taken, clock reads) while a test holds it.
+    static HANDOFF_CLOCK: std::cell::RefCell<Option<(Duration, Vec<Duration>, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn handoff_now() -> std::time::Instant {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(std::time::Instant::now);
+    HANDOFF_CLOCK.with(|clock| match clock.borrow_mut().as_mut() {
+        Some((offset, _, reads)) => {
+            *reads += 1;
+            assert!(*reads < 10_000, "the handoff loop spins without sleeping");
+            base + *offset
+        }
+        None => std::time::Instant::now(),
+    })
+}
+#[cfg(test)]
+fn handoff_sleep(pause: Duration) {
+    HANDOFF_CLOCK.with(|clock| match clock.borrow_mut().as_mut() {
+        Some((offset, sleeps, _)) => {
+            *offset += pause;
+            sleeps.push(pause);
+        }
+        None => thread::sleep(pause),
+    })
+}
 
 /// Who answered a stable route challenge that failed authentication, as the
 /// answer claimed itself: ids only, unauthenticated, never signature bytes.
@@ -24570,16 +24611,30 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         /// (another instance, another membership), so the install changes it.
         #[cfg(unix)]
         fn handoff_world(reply: Reply) -> Result<(RoutedWorld, String)> {
+            handoff_world_with(reply, false)
+        }
+
+        /// `same_membership`: the incumbent's membership equals the
+        /// candidate's, so the install changes no route.
+        #[cfg(unix)]
+        fn handoff_world_with(reply: Reply, same_membership: bool) -> Result<(RoutedWorld, String)> {
             let routed = routed_deploy_world(Odin::Unreachable, 1, DeploymentPhase::Fencing)?;
             let incumbent = sha256_id(b"incumbent instance");
             let current = resident(&routed.world)?;
             let mut next = current.value.clone();
+            let mut on_disk = b"incumbent route\n".to_vec();
+            if same_membership {
+                on_disk = NginxRouteDriver::new(
+                    next.plan.as_ref().unwrap().parsed_inputs()?.1.route.context("no route binding")?,
+                )
+                .render(next.expected.as_ref().context("no Expected")?)?;
+            }
             let preflight = next.route_preflight.as_mut().context("no preflight")?;
             preflight.incumbent_runtime_instance_id = Some(incumbent.clone());
-            preflight.incumbent_membership_sha256 = Some(sha256_id(b"incumbent route\n"));
-            preflight.incumbent_configuration = Some(b"incumbent route\n".to_vec());
+            preflight.incumbent_membership_sha256 = Some(sha256_id(&on_disk));
+            preflight.incumbent_configuration = Some(on_disk.clone());
             replace_transaction(&routed.world.state_store, &current, &next)?;
-            std::fs::write(routed.fragment_path(), b"incumbent route\n")?;
+            std::fs::write(routed.fragment_path(), &on_disk)?;
             routed.stub.set_state("active");
             routed.run_to_routing()?;
             *routed.stub.incumbent_instance.lock().unwrap() = Some(incumbent.clone());
@@ -24603,9 +24658,32 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 .and_then(|report| report.last.lock().unwrap().clone()))
         }
 
+        /// Holds a virtual handoff clock on this thread: the wait is measured
+        /// in the loop's own sleeps, so no host load can move it.
+        struct VirtualHandoffClock;
+
+        impl VirtualHandoffClock {
+            fn hold() -> Self {
+                HANDOFF_CLOCK.with(|c| *c.borrow_mut() = Some((Duration::ZERO, Vec::new(), 0)));
+                Self
+            }
+
+            /// The pauses the loop took so far.
+            fn sleeps(&self) -> Vec<Duration> {
+                HANDOFF_CLOCK.with(|c| c.borrow().as_ref().unwrap().1.clone())
+            }
+        }
+
+        impl Drop for VirtualHandoffClock {
+            fn drop(&mut self) {
+                HANDOFF_CLOCK.with(|c| *c.borrow_mut() = None);
+            }
+        }
+
         #[cfg(unix)]
         #[test]
         fn routing_waits_out_the_incumbent_answering_after_reload() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
             let (routed, _) = handoff_world(Reply::IncumbentFirst(3))?;
             let before = routed.reloads();
             let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
@@ -24613,6 +24691,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert_eq!(routed.reloads() - before, 1, "an install and no rollback");
             assert_eq!(forwards(&routed)?, 1);
             assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, 4);
+            assert_eq!(clock.sleeps(), vec![ROUTE_RELOAD_HANDOFF_POLL; 3]);
             assert!(proof_report(&routed)?.is_none(), "a route proof report remains");
             Ok(())
         }
@@ -24620,17 +24699,26 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         #[cfg(unix)]
         #[test]
         fn routing_fails_once_when_the_incumbent_never_lets_go() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
             let (routed, incumbent) = handoff_world(Reply::IncumbentFirst(usize::MAX))?;
             let before = routed.reloads();
-            let started = std::time::Instant::now();
+            let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
             let error = routed.step().unwrap_err();
-            assert!(started.elapsed() >= ROUTE_RELOAD_HANDOFF, "gave up before the handoff window");
+            // The window is exactly ROUTE_RELOAD_HANDOFF of polls at exactly
+            // the poll cadence: one challenge before each pause and one after
+            // the last.
+            let sleeps = clock.sleeps();
+            let polls = (ROUTE_RELOAD_HANDOFF.as_millis() / ROUTE_RELOAD_HANDOFF_POLL.as_millis()) as usize;
+            assert_eq!(sleeps, vec![ROUTE_RELOAD_HANDOFF_POLL; polls]);
+            assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, polls + 1);
             assert_eq!(routed.reloads() - before, 2, "install and one rollback");
             assert_eq!(forwards(&routed)?, 1);
             let said = proof_report(&routed)?.context("no route proof report")?;
             let candidate = routed.transaction()?.activation.unwrap().runtime_instance_id;
+            let signer = routed.stub.other_signer.identity_id();
             for text in [format!("{error:#}"), said] {
                 assert!(text.contains(&format!("runtime instance {incumbent}")), "{text}");
+                assert!(text.contains(&format!("activation signer {signer}")), "{text}");
                 assert!(text.contains(&format!("the candidate is {candidate}")), "{text}");
             }
             routed.step().unwrap_err();
@@ -24641,12 +24729,12 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         #[cfg(unix)]
         #[test]
         fn routing_fails_at_once_when_the_candidate_answers_with_a_foreign_activation() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
             let (routed, _) = handoff_world(Reply::ForeignActivation)?;
             let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
-            let started = std::time::Instant::now();
             let error = routed.step().unwrap_err();
-            assert!(started.elapsed() < ROUTE_RELOAD_HANDOFF);
             assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, 1);
+            assert!(clock.sleeps().is_empty());
             let text = format!("{error:#}");
             let candidate = routed.transaction()?.activation.unwrap().runtime_instance_id;
             assert!(text.contains("runtime activation proof verification failed"), "{text}");
@@ -24657,14 +24745,28 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
         #[cfg(unix)]
         #[test]
         fn routing_fails_at_once_for_a_stranger_instance() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
             let (routed, _) = handoff_world(Reply::StrangerInstance)?;
             let before = routed.reloads();
             let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
-            let started = std::time::Instant::now();
             routed.step().unwrap_err();
-            assert!(started.elapsed() < ROUTE_RELOAD_HANDOFF);
             assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, 1);
+            assert!(clock.sleeps().is_empty());
             assert_eq!(routed.reloads() - before, 2);
+            Ok(())
+        }
+
+        /// An incumbent whose membership equals the candidate's has no route
+        /// to hand off, so its answer is a plain failure, never waited on.
+        #[cfg(unix)]
+        #[test]
+        fn routing_does_not_wait_when_the_route_is_unchanged() -> Result<()> {
+            let clock = VirtualHandoffClock::hold();
+            let (routed, _) = handoff_world_with(Reply::IncumbentFirst(1), true)?;
+            let hits = routed.stub.stable_hits.load(Ordering::SeqCst);
+            routed.step().unwrap_err();
+            assert_eq!(routed.stub.stable_hits.load(Ordering::SeqCst) - hits, 1);
+            assert!(clock.sleeps().is_empty());
             Ok(())
         }
 
