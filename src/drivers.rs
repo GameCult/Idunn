@@ -824,8 +824,8 @@ impl StaticReleasePort for FilesystemStaticRelease {
                     .mode(0o444)
                     .open(&temporary_carry)?;
                 // The creation mode is masked by the service's umask
-                // (UMask=0027 yields 0440); the sealed-tree verifier accepts
-                // exactly 0444, so say it on the open handle.
+                // (UMask=0027 yields 0440), and the web server reads this file
+                // as "other"; say 0444 on the open handle.
                 file.set_permissions(fs::Permissions::from_mode(0o444))?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
