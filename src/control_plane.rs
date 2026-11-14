@@ -6730,10 +6730,23 @@ impl Engine {
     }
 
     fn clear_fault(&self, transaction_id: &str) {
-        self.fault_reports
-            .lock()
-            .expect("fault report mutex")
-            .remove(transaction_id);
+        let mut reports = self.fault_reports.lock().expect("fault report mutex");
+        reports.remove(transaction_id);
+        reports.remove(&route_proof_report_key(transaction_id));
+    }
+
+    /// Say why the stable route's proof failed. The Routing phase retries the
+    /// proof until its deadline, and the deadline's own cause names only the
+    /// clock, so this line is where an operator learns what the listener
+    /// actually did. Said once per distinct reason while the fault lasts.
+    fn report_route_proof_failure(&self, transaction_id: &str, error: &anyhow::Error) {
+        self.report_once(
+            &route_proof_report_key(transaction_id),
+            format!(
+                "Idunn route proof for {transaction_id} failed: {}",
+                route_proof_reason(error)
+            ),
+        );
     }
 
     /// Write `detail` as the record's `last_error`, touching nothing else and
@@ -8871,11 +8884,13 @@ impl Engine {
                 ) {
                     Ok(observation) => observation,
                     Err(proof_error) if !rollback_allowed => {
+                        self.report_route_proof_failure(&admitted.value.transaction_id, &proof_error);
                         return Err(proof_error).context(
                             "incumbent authority was fenced; candidate route remains installed for fail-closed retry",
                         );
                     }
                     Err(proof_error) => {
+                        self.report_route_proof_failure(&admitted.value.transaction_id, &proof_error);
                         return match driver.rollback(
                             expected,
                             &activation.runtime_instance_id,
@@ -10560,8 +10575,15 @@ impl Engine {
                 .iter()
                 .any(|request| request.value.command_id == transaction.command_id);
         let cause = if now >= deadline.deadline_at_unix_millis {
+            // The step's latest failure is the reason the phase never
+            // finished, and the abort that ends it must not drop it.
+            let last_attempt = transaction
+                .last_error
+                .as_deref()
+                .map(|error| format!("; its last attempt failed: {error}"))
+                .unwrap_or_default();
             format!(
-                "the {:?} phase passed its deadline at unix ms {}",
+                "the {:?} phase passed its deadline at unix ms {}{last_attempt}",
                 transaction.phase, deadline.deadline_at_unix_millis
             )
         } else if requested {
@@ -11423,6 +11445,22 @@ fn runner_failure_journal_line(
             )
         }
         Err(error) => format!("{head}; evidence was not kept: {error:#}"),
+    }
+}
+
+fn route_proof_report_key(transaction_id: &str) -> String {
+    format!("route-proof:{transaction_id}")
+}
+
+/// The stable route proof's failure in words: whether the listener said
+/// nothing or answered wrongly, then the specific refusal (HTTP status line,
+/// presence not active, challenge or authority disagreement). The texts it
+/// carries name states and codes, never keys or signature bytes.
+fn route_proof_reason(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<ChallengeFailure>() {
+        Some(ChallengeFailure::Silent(_)) => format!("silent, nothing answered: {error:#}"),
+        Some(ChallengeFailure::Refused(_)) => format!("refused: {error:#}"),
+        None => format!("{error:#}"),
     }
 }
 
@@ -16951,6 +16989,60 @@ mod tests {
         expire();
         world.engine.resume_one_transaction()?;
         assert!(!reported(), "a step that ran and succeeded left the fault armed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_route_proof_failure_names_what_the_listener_did() {
+        let reason = |error: anyhow::Error| route_proof_reason(&error);
+        let silent = anyhow::Error::new(ChallengeFailure::Silent(anyhow!(
+            "connecting stable CultNet HTTP route 127.0.0.1:9: refused"
+        )));
+        let text = reason(silent);
+        assert!(text.contains("silent") && text.contains("127.0.0.1:9"), "{text}");
+
+        let status = anyhow::Error::new(ChallengeFailure::Refused(anyhow!(
+            "stable CultNet HTTP route rejected the snapshot challenge: HTTP/1.1 502 Bad Gateway"
+        )))
+        .context("candidate did not answer its stable route challenge");
+        let text = reason(status);
+        assert!(text.contains("refused") && text.contains("502 Bad Gateway"), "{text}");
+
+        let inactive = anyhow!("route proof runtime is warming, not active");
+        assert!(reason(inactive).contains("warming, not active"));
+
+        let disagrees = anyhow::Error::new(PresenceDisagrees {
+            disagreements: vec![OdinTopologyDisagreement {
+                code: "runtime-instance-mismatch".into(),
+                expected: Some("a".into()),
+                observed: Some("b".into()),
+            }],
+        });
+        let text = reason(disagrees);
+        assert!(text.contains("runtime-instance-mismatch (expected a, observed b)"), "{text}");
+
+        let unbound = anyhow!("route proof response is not bound to the exact challenge");
+        assert!(reason(unbound).contains("not bound to the exact challenge"));
+    }
+
+    #[test]
+    fn a_route_proof_failure_is_reported_once_per_reason_and_cleared_on_recovery() -> Result<()> {
+        let world = EngineFixture::new()?;
+        let key = route_proof_report_key("tx-1");
+        let said = |world: &EngineFixture| {
+            world
+                .engine
+                .fault_reports
+                .lock()
+                .unwrap()
+                .get(&key)
+                .and_then(|report| report.last.lock().unwrap().clone())
+        };
+        world.engine.report_route_proof_failure("tx-1", &anyhow!("route proof runtime is warming, not active"));
+        let first = said(&world).context("no report")?;
+        assert!(first.contains("tx-1") && first.contains("warming, not active"), "{first}");
+        world.engine.clear_fault("tx-1");
+        assert!(said(&world).is_none(), "recovery left the proof report armed");
         Ok(())
     }
 
@@ -24257,9 +24349,39 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             routed.run_to_routing()?;
             let deadline = routed.transaction()?.phase_deadline.context("Routing has no deadline")?;
             routed.stub.hang_up.store(true, Ordering::SeqCst);
-            for _ in 0..3 {
+            // The Routing tick itself reports why the proof failed, once per
+            // distinct reason, and recovery clears it.
+            let proof_key = route_proof_report_key(&routed.transaction()?.transaction_id);
+            let said = |routed: &RoutedWorld| -> Option<String> {
+                routed
+                    .world
+                    .engine
+                    .fault_reports
+                    .lock()
+                    .unwrap()
+                    .get(&proof_key)
+                    .and_then(|report| report.last.lock().unwrap().clone())
+            };
+            assert!(said(&routed).is_none(), "a proof report existed before any failure");
+            routed.resume()?;
+            let first = said(&routed).context("the failing Routing tick reported no proof failure")?;
+            assert!(first.contains("route proof") && first.contains("silent, nothing answered"), "{first}");
+            // The hung-up stub fails the same way each attempt, but the OS
+            // words the tail either as an early EOF or a broken pipe, so a
+            // retry may honestly report a second distinct reason. What may
+            // not change is everything up to that tail, and a repeat must not
+            // mint a new line each attempt.
+            let head = |text: &str| text.split("answered:").next().unwrap().to_owned();
+            let mut seen = vec![first.clone()];
+            for _ in 0..2 {
                 routed.resume()?;
+                let again = said(&routed).context("a retry cleared the proof report")?;
+                assert_eq!(head(&again), head(&first), "a retry reworded the report");
+                if !seen.contains(&again) {
+                    seen.push(again);
+                }
             }
+            assert!(seen.len() <= 2, "the same failure was reported afresh on every retry: {seen:#?}");
             // Before the deadline each attempt installs and rolls back, and no
             // resume moves the deadline.
             assert_eq!(routed.reloads(), 6);
@@ -24302,6 +24424,7 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].close_reason, Some(CloseReason::Recovered));
             assert_eq!(routed.workload.stops.load(std::sync::atomic::Ordering::SeqCst), stops);
+            assert!(said(&routed).is_none(), "recovery left the proof report armed");
             Ok(())
         }
 
@@ -24910,6 +25033,16 @@ GAMECULT_RUNTIME_PRESENCE_IDENTITY = "/etc/gamecult/service/runtime-presence-ide
                 .post_fencing_abort
                 .context("the passed deadline did not end a deployment")?;
             assert!(abort.error.contains("Routing phase passed its deadline"), "{}", abort.error);
+            assert!(
+                abort.error.contains("its last attempt failed"),
+                "the deadline abort dropped the proof's failure: {}",
+                abort.error
+            );
+            assert!(
+                abort.error.contains("stable CultNet route stopped before its headers ended"),
+                "the deadline abort dropped the proof's own failure text: {}",
+                abort.error
+            );
             assert!(
                 routed.world.engine.return_wedged_continuity_aborts_forward()?.is_empty(),
                 "the boot lift took a deployment's abort"
